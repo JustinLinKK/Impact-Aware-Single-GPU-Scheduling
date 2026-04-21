@@ -1,0 +1,358 @@
+"""Core schemas for the local ML scheduler."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any
+import importlib
+import json
+import uuid
+
+
+def utc_now() -> str:
+    """Return an ISO8601 UTC timestamp."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def parse_timestamp(value: str | None) -> datetime | None:
+    """Parse an ISO8601 timestamp if present."""
+    if not value:
+        return None
+    return datetime.fromisoformat(value)
+
+
+def stable_job_id(explicit_job_id: str | None = None) -> str:
+    """Create a stable job id at submit time."""
+    return explicit_job_id or str(uuid.uuid4())
+
+
+def import_string(target: str) -> Any:
+    """Import a callable or object from ``module:attr`` syntax."""
+    if ":" not in target:
+        raise ValueError(f"Import target must be in module:attr form, got: {target}")
+    module_name, attr_name = target.split(":", 1)
+    module = importlib.import_module(module_name)
+    attr = module
+    for part in attr_name.split("."):
+        attr = getattr(attr, part)
+    return attr
+
+
+def _to_primitive(value: Any) -> Any:
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Path):
+        return str(value)
+    if is_dataclass(value):
+        return {name: _to_primitive(getattr(value, name)) for name in value.__dataclass_fields__}
+    if isinstance(value, dict):
+        return {str(key): _to_primitive(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_primitive(item) for item in value]
+    return value
+
+
+class JobStatus(str, Enum):
+    PENDING = "PENDING"
+    READY = "READY"
+    RUNNING = "RUNNING"
+    PAUSING = "PAUSING"
+    PAUSED = "PAUSED"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    RECOVERABLE = "RECOVERABLE"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in {self.COMPLETED, self.FAILED, self.CANCELLED}
+
+
+class SafePointType(str, Enum):
+    MANUAL = "manual"
+    STEP = "step"
+    EPOCH = "epoch"
+    EXPLICIT = "explicit"
+    BEFORE_TRAIN = "before_train"
+
+
+class CommandType(str, Enum):
+    SUBMIT = "SUBMIT"
+    PAUSE = "PAUSE"
+    RESUME = "RESUME"
+    CANCEL = "CANCEL"
+    PRELOAD = "PRELOAD"
+
+
+@dataclass(slots=True)
+class ResourceRequirements:
+    requires_gpu: bool = True
+    estimated_vram_mb: int | None = None
+    estimated_ram_mb: int | None = None
+    gpu_slots: int = 1
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "ResourceRequirements":
+        payload = payload or {}
+        return cls(**payload)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_primitive(self)
+
+
+@dataclass(slots=True)
+class CheckpointPolicy:
+    save_every_n_steps: int | None = None
+    save_every_epoch: bool = True
+    keep_last_n: int = 3
+    pause_mode: SafePointType = SafePointType.STEP
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "CheckpointPolicy":
+        payload = dict(payload or {})
+        pause_mode = payload.get("pause_mode", SafePointType.STEP.value)
+        payload["pause_mode"] = SafePointType(pause_mode)
+        return cls(**payload)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_primitive(self)
+
+
+@dataclass(slots=True)
+class JobConfig:
+    runner_target: str
+    runner_kwargs: dict[str, Any] = field(default_factory=dict)
+    loader_target: str | None = None
+    max_steps: int | None = None
+    max_epochs: int | None = None
+    seed: int | None = None
+    python_executable: str | None = None
+    env: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "JobConfig":
+        payload = dict(payload)
+        return cls(**payload)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_primitive(self)
+
+
+@dataclass(slots=True)
+class TrainingJob:
+    job_id: str
+    agent_id: str | None = None
+    workflow_id: str | None = None
+    baseline_model_id: str = ""
+    baseline_model_path: str = ""
+    task_type: str = "generic"
+    priority: int = 0
+    status: JobStatus = JobStatus.PENDING
+    submitted_at: str = field(default_factory=utc_now)
+    config: JobConfig = field(default_factory=lambda: JobConfig(runner_target=""))
+    resource_requirements: ResourceRequirements = field(default_factory=ResourceRequirements)
+    checkpoint_policy: CheckpointPolicy = field(default_factory=CheckpointPolicy)
+    max_steps: int | None = None
+    max_epochs: int | None = None
+    resume_from_checkpoint: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    queue_sequence: int = 0
+    status_reason: str | None = None
+    latest_checkpoint_path: str | None = None
+    status_timestamps: dict[str, str] = field(default_factory=dict)
+    last_heartbeat_at: str | None = None
+    last_dispatched_at: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    hold: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        runner_target: str,
+        baseline_model_id: str,
+        baseline_model_path: str,
+        *,
+        job_id: str | None = None,
+        agent_id: str | None = None,
+        workflow_id: str | None = None,
+        task_type: str = "generic",
+        priority: int = 0,
+        runner_kwargs: dict[str, Any] | None = None,
+        loader_target: str | None = None,
+        resource_requirements: ResourceRequirements | None = None,
+        checkpoint_policy: CheckpointPolicy | None = None,
+        max_steps: int | None = None,
+        max_epochs: int | None = None,
+        resume_from_checkpoint: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        seed: int | None = None,
+        python_executable: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> "TrainingJob":
+        config = JobConfig(
+            runner_target=runner_target,
+            runner_kwargs=runner_kwargs or {},
+            loader_target=loader_target,
+            max_steps=max_steps,
+            max_epochs=max_epochs,
+            seed=seed,
+            python_executable=python_executable,
+            env=env or {},
+        )
+        job = cls(
+            job_id=stable_job_id(job_id),
+            agent_id=agent_id,
+            workflow_id=workflow_id,
+            baseline_model_id=baseline_model_id,
+            baseline_model_path=baseline_model_path,
+            task_type=task_type,
+            priority=priority,
+            status=JobStatus.PENDING,
+            config=config,
+            resource_requirements=resource_requirements or ResourceRequirements(),
+            checkpoint_policy=checkpoint_policy or CheckpointPolicy(),
+            max_steps=max_steps,
+            max_epochs=max_epochs,
+            resume_from_checkpoint=resume_from_checkpoint,
+            metadata=metadata or {},
+        )
+        job.mark_status(JobStatus.PENDING)
+        return job
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "TrainingJob":
+        payload = dict(payload)
+        payload["status"] = JobStatus(payload.get("status", JobStatus.PENDING.value))
+        payload["config"] = JobConfig.from_dict(payload["config"])
+        payload["resource_requirements"] = ResourceRequirements.from_dict(payload.get("resource_requirements"))
+        payload["checkpoint_policy"] = CheckpointPolicy.from_dict(payload.get("checkpoint_policy"))
+        return cls(**payload)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_primitive(self)
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), sort_keys=True)
+
+    def copy(self, **updates: Any) -> "TrainingJob":
+        payload = self.to_dict()
+        payload.update(_to_primitive(updates))
+        return self.from_dict(payload)
+
+    def mark_status(self, status: JobStatus, reason: str | None = None) -> None:
+        now = utc_now()
+        self.status = status
+        self.status_reason = reason
+        self.status_timestamps[status.value] = now
+        if status == JobStatus.RUNNING:
+            self.started_at = self.started_at or now
+            self.last_dispatched_at = now
+        if status.is_terminal:
+            self.finished_at = now
+
+    def is_runnable(self) -> bool:
+        return (not self.hold) and self.status in {
+            JobStatus.PENDING,
+            JobStatus.READY,
+            JobStatus.PAUSED,
+            JobStatus.RECOVERABLE,
+        }
+
+    def waiting_since(self) -> str:
+        if self.status == JobStatus.PAUSED:
+            return self.status_timestamps.get(JobStatus.PAUSED.value, self.submitted_at)
+        return self.submitted_at
+
+
+@dataclass(slots=True)
+class ProgressSnapshot:
+    job_id: str
+    epoch: int = 0
+    global_step: int = 0
+    phase: str = "train"
+    metrics: dict[str, float] = field(default_factory=dict)
+    checkpoint_path: str | None = None
+    last_safe_point: str | None = None
+    heartbeat_at: str = field(default_factory=utc_now)
+    message: str | None = None
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "ProgressSnapshot | None":
+        if payload is None:
+            return None
+        return cls(**payload)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_primitive(self)
+
+
+@dataclass(slots=True)
+class CacheStats:
+    hits: int = 0
+    misses: int = 0
+    evictions: int = 0
+    entries: int = 0
+    pinned_entries: int = 0
+    used_bytes: int = 0
+    memory_budget_bytes: int = 0
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "CacheStats":
+        payload = payload or {}
+        return cls(**payload)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_primitive(self)
+
+
+@dataclass(slots=True)
+class JobCommand:
+    command_id: int
+    command_type: CommandType
+    created_at: str
+    job_id: str | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
+    processed_at: str | None = None
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "JobCommand":
+        payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
+        return cls(
+            command_id=row["command_id"],
+            command_type=CommandType(row["command_type"]),
+            created_at=row["created_at"],
+            job_id=row["job_id"],
+            payload=payload,
+            processed_at=row["processed_at"],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_primitive(self)
+
+
+@dataclass(slots=True)
+class PlacementDecision:
+    can_run: bool
+    reason: str = ""
+    gpu_slot: int = 0
+
+
+@dataclass(slots=True)
+class SchedulerReport:
+    total_jobs: int = 0
+    completed_jobs: int = 0
+    failed_jobs: int = 0
+    cancelled_jobs: int = 0
+    average_queue_wait_seconds: float = 0.0
+    average_runtime_seconds: float = 0.0
+    cache_hit_rate: float = 0.0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    cache_evictions: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_primitive(self)

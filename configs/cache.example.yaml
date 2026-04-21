@@ -1,0 +1,5 @@
+cache_memory_budget_bytes: 1073741824
+eager_preload_top_k: 3
+cache_socket_name: "cache_server.sock"
+cache_server_host: "127.0.0.1"
+cache_server_port: 8765

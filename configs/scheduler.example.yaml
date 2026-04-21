@@ -1,0 +1,13 @@
+runtime_root: "./localml_scheduler/runtime"
+scheduler_poll_interval_seconds: 0.2
+command_poll_limit: 100
+aging_interval_seconds: 120
+aging_priority_increment: 1
+enable_priority_aging: true
+preempt_check_interval_seconds: 0.2
+eager_preload_top_k: 2
+cache_memory_budget_bytes: 536870912
+cache_server_host: "127.0.0.1"
+cache_server_port: 8765
+cache_socket_name: "cache_server.sock"
+auto_resume_recoverable: false
