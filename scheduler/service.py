@@ -8,9 +8,9 @@ from typing import Any
 import json
 import time
 
-from ..cache.baseline_cache import BaselineModelCache, CachedModelEntry
-from ..cache.cache_server import CacheClient, CacheServer
-from ..cache.warming import select_models_to_warm
+from ..model_cache.baseline_cache import BaselineModelCache, CachedModelEntry
+from ..model_cache.cache_server import CacheClient, CacheServer
+from ..model_cache.warming import select_models_to_warm
 from ..observability.events import EventLogger
 from ..observability.logging_utils import setup_scheduler_logger
 from ..observability.metrics import MetricsCollector

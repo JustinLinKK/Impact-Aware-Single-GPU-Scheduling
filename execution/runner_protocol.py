@@ -8,8 +8,8 @@ from typing import Any, Protocol, runtime_checkable
 
 import torch
 
-from ..cache.baseline_cache import _materialize_payload_bytes
-from ..cache.cache_server import CacheClient
+from ..model_cache.baseline_cache import _materialize_payload_bytes
+from ..model_cache.cache_server import CacheClient
 from ..checkpointing.manager import CheckpointManager
 from ..execution.control import TrainingControlHook
 from ..observability.events import EventLogger

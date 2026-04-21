@@ -13,7 +13,7 @@ It is intentionally packaged as a root-level module so it can be used by MLEvolv
 - `scheduler/`: policy, queue, service loop, recovery, and worker supervision
 - `execution/`: subprocess launcher, file-based control plane, worker entrypoint, and runner context
 - `checkpointing/`: atomic local checkpoint save/load
-- `cache/`: in-memory LRU baseline cache plus a local socket server for worker access
+- `model_cache/`: in-memory LRU baseline cache plus a local socket server for worker access
 - `storage/`: SQLite-backed jobs, commands, checkpoints, cache metadata, and event history
 - `observability/`: JSONL events, log files, and aggregate reports
 - `examples/`: toy PyTorch training runner and a demo script

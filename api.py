@@ -8,7 +8,7 @@ import json
 
 import yaml
 
-from .cache.cache_server import CacheClient
+from .model_cache.cache_server import CacheClient
 from .schemas import CommandType, JobStatus, TrainingJob, stable_job_id, utc_now
 from .scheduler.service import SchedulerService
 from .settings import SchedulerSettings

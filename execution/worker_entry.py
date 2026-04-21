@@ -6,7 +6,7 @@ import argparse
 from pathlib import Path
 import traceback
 
-from ..cache.cache_server import CacheClient
+from ..model_cache.cache_server import CacheClient
 from ..checkpointing.manager import CheckpointManager
 from ..observability.events import EventLogger
 from ..observability.logging_utils import setup_scheduler_logger

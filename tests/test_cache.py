@@ -6,7 +6,7 @@ import unittest
 
 import torch
 
-from localml_scheduler.cache.baseline_cache import BaselineModelCache, _materialize_payload_bytes
+from localml_scheduler.model_cache.baseline_cache import BaselineModelCache, _materialize_payload_bytes
 
 
 class BaselineCacheTest(unittest.TestCase):
