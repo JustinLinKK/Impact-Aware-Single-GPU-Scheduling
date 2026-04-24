@@ -27,7 +27,7 @@ class SubprocessExecutor:
         self.settings = settings
         self.project_root = Path(__file__).resolve().parents[2]
 
-    def start(self, job: TrainingJob) -> WorkerProcessHandle:
+    def start(self, job: TrainingJob, *, extra_env: dict[str, str] | None = None) -> WorkerProcessHandle:
         runtime_dir = self.settings.job_runtime_dir(job.job_id)
         runtime_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = runtime_dir / "stdout.log"
@@ -38,6 +38,8 @@ class SubprocessExecutor:
         existing_pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = str(self.project_root) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
         env.update(job.config.env)
+        if extra_env:
+            env.update(extra_env)
 
         stdout_handle = stdout_path.open("a", encoding="utf-8")
         stderr_handle = stderr_path.open("a", encoding="utf-8")

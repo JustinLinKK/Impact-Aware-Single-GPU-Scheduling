@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -104,6 +104,22 @@ class ResourceRequirements:
 
 
 @dataclass(slots=True)
+class PackingSpec:
+    eligible: bool = False
+    signature: str | None = None
+    family: str | None = None
+    max_slowdown_ratio: float | None = None
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "PackingSpec":
+        payload = payload or {}
+        return cls(**payload)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_primitive(self)
+
+
+@dataclass(slots=True)
 class CheckpointPolicy:
     save_every_n_steps: int | None = None
     save_every_epoch: bool = True
@@ -154,6 +170,7 @@ class TrainingJob:
     submitted_at: str = field(default_factory=utc_now)
     config: JobConfig = field(default_factory=lambda: JobConfig(runner_target=""))
     resource_requirements: ResourceRequirements = field(default_factory=ResourceRequirements)
+    packing: PackingSpec = field(default_factory=PackingSpec)
     checkpoint_policy: CheckpointPolicy = field(default_factory=CheckpointPolicy)
     max_steps: int | None = None
     max_epochs: int | None = None
@@ -184,6 +201,7 @@ class TrainingJob:
         runner_kwargs: dict[str, Any] | None = None,
         loader_target: str | None = None,
         resource_requirements: ResourceRequirements | None = None,
+        packing: PackingSpec | None = None,
         checkpoint_policy: CheckpointPolicy | None = None,
         max_steps: int | None = None,
         max_epochs: int | None = None,
@@ -214,6 +232,7 @@ class TrainingJob:
             status=JobStatus.PENDING,
             config=config,
             resource_requirements=resource_requirements or ResourceRequirements(),
+            packing=packing or PackingSpec(),
             checkpoint_policy=checkpoint_policy or CheckpointPolicy(),
             max_steps=max_steps,
             max_epochs=max_epochs,
@@ -229,6 +248,7 @@ class TrainingJob:
         payload["status"] = JobStatus(payload.get("status", JobStatus.PENDING.value))
         payload["config"] = JobConfig.from_dict(payload["config"])
         payload["resource_requirements"] = ResourceRequirements.from_dict(payload.get("resource_requirements"))
+        payload["packing"] = PackingSpec.from_dict(payload.get("packing"))
         payload["checkpoint_policy"] = CheckpointPolicy.from_dict(payload.get("checkpoint_policy"))
         return cls(**payload)
 
@@ -266,6 +286,9 @@ class TrainingJob:
         if self.status == JobStatus.PAUSED:
             return self.status_timestamps.get(JobStatus.PAUSED.value, self.submitted_at)
         return self.submitted_at
+
+    def packing_signature(self) -> str | None:
+        return self.packing.signature
 
 
 @dataclass(slots=True)
@@ -310,6 +333,99 @@ class CacheStats:
 
 
 @dataclass(slots=True)
+class SoloProfile:
+    signature: str
+    family: str | None = None
+    peak_vram_mb: int | None = None
+    avg_gpu_utilization: float | None = None
+    avg_memory_utilization: float | None = None
+    sample_count: int = 0
+    last_job_id: str | None = None
+    updated_at: str = field(default_factory=utc_now)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "SoloProfile":
+        metadata = json.loads(row["metadata_json"]) if row.get("metadata_json") else {}
+        return cls(
+            signature=row["signature"],
+            family=row["family"],
+            peak_vram_mb=row["peak_vram_mb"],
+            avg_gpu_utilization=row["avg_gpu_utilization"],
+            avg_memory_utilization=row["avg_memory_utilization"],
+            sample_count=row["sample_count"],
+            last_job_id=row["last_job_id"],
+            updated_at=row["updated_at"],
+            metadata=metadata,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_primitive(self)
+
+
+def canonical_pair_key(left_signature: str, right_signature: str) -> str:
+    ordered = sorted((left_signature, right_signature))
+    return f"{ordered[0]}::{ordered[1]}"
+
+
+@dataclass(slots=True)
+class PairProfile:
+    pair_key: str
+    left_signature: str
+    right_signature: str
+    compatible: bool = True
+    observations: int = 0
+    peak_vram_mb: int | None = None
+    avg_gpu_utilization: float | None = None
+    avg_memory_utilization: float | None = None
+    slowdown_ratio: float | None = None
+    cooldown_until: str | None = None
+    last_failure_reason: str | None = None
+    updated_at: str = field(default_factory=utc_now)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def create(
+        cls,
+        left_signature: str,
+        right_signature: str,
+        **kwargs: Any,
+    ) -> "PairProfile":
+        return cls(
+            pair_key=canonical_pair_key(left_signature, right_signature),
+            left_signature=left_signature,
+            right_signature=right_signature,
+            **kwargs,
+        )
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "PairProfile":
+        metadata = json.loads(row["metadata_json"]) if row.get("metadata_json") else {}
+        return cls(
+            pair_key=row["pair_key"],
+            left_signature=row["left_signature"],
+            right_signature=row["right_signature"],
+            compatible=bool(row["compatible"]),
+            observations=row["observations"],
+            peak_vram_mb=row["peak_vram_mb"],
+            avg_gpu_utilization=row["avg_gpu_utilization"],
+            avg_memory_utilization=row["avg_memory_utilization"],
+            slowdown_ratio=row["slowdown_ratio"],
+            cooldown_until=row["cooldown_until"],
+            last_failure_reason=row["last_failure_reason"],
+            updated_at=row["updated_at"],
+            metadata=metadata,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_primitive(self)
+
+    def on_cooldown(self) -> bool:
+        cooldown_until = parse_timestamp(self.cooldown_until)
+        return cooldown_until is not None and cooldown_until > datetime.now(timezone.utc)
+
+
+@dataclass(slots=True)
 class JobCommand:
     command_id: int
     command_type: CommandType
@@ -339,6 +455,9 @@ class PlacementDecision:
     can_run: bool
     reason: str = ""
     gpu_slot: int = 0
+    mode: str = "exclusive"
+    backend_name: str = "exclusive"
+    job_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -353,6 +472,8 @@ class SchedulerReport:
     cache_hits: int = 0
     cache_misses: int = 0
     cache_evictions: int = 0
+    packed_dispatches: int = 0
+    packed_fallbacks: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return _to_primitive(self)

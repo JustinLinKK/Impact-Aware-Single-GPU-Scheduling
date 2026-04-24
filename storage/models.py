@@ -58,6 +58,36 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS solo_profiles (
+        signature TEXT PRIMARY KEY,
+        family TEXT,
+        peak_vram_mb INTEGER,
+        avg_gpu_utilization REAL,
+        avg_memory_utilization REAL,
+        sample_count INTEGER NOT NULL DEFAULT 0,
+        last_job_id TEXT,
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS pair_profiles (
+        pair_key TEXT PRIMARY KEY,
+        left_signature TEXT NOT NULL,
+        right_signature TEXT NOT NULL,
+        compatible INTEGER NOT NULL DEFAULT 1,
+        observations INTEGER NOT NULL DEFAULT 0,
+        peak_vram_mb INTEGER,
+        avg_gpu_utilization REAL,
+        avg_memory_utilization REAL,
+        slowdown_ratio REAL,
+        cooldown_until TEXT,
+        last_failure_reason TEXT,
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT
+    )
+    """,
+    """
     CREATE INDEX IF NOT EXISTS idx_jobs_status_priority
     ON jobs(status, priority DESC, queue_sequence ASC)
     """,
@@ -72,5 +102,13 @@ SCHEMA_STATEMENTS = [
     """
     CREATE INDEX IF NOT EXISTS idx_checkpoints_job_created
     ON checkpoints(job_id, created_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_solo_profiles_family
+    ON solo_profiles(family, updated_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_pair_profiles_signatures
+    ON pair_profiles(left_signature, right_signature, updated_at DESC)
     """,
 ]

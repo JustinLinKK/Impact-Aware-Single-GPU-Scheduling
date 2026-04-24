@@ -4,6 +4,7 @@
 
 - a single-GPU scheduler with priority queueing, safe-point pause/resume, persistence, and restart recovery
 - a RAM-backed baseline-model cache that keeps immutable CPU-side baselines warm and serves isolated copies to worker subprocesses
+- feature-gated pairwise packed training on one GPU for structured runner jobs when solo profiles and a compatible backend are available
 
 It is intentionally packaged as a root-level module so it can be used by MLEvolve or detached and integrated into other agent pipelines.
 
@@ -11,7 +12,10 @@ It is intentionally packaged as a root-level module so it can be used by MLEvolv
 
 - `schemas.py`: serializable job, checkpoint policy, progress, and cache schemas
 - `scheduler/`: policy, queue, service loop, recovery, and worker supervision
+- `scheduler/gpu_scheduler.py`: pair-placement planning based on solo profiles, VRAM headroom, and compatibility history
+- `scheduler/telemetry.py`: lightweight `nvidia-smi` device telemetry for solo and packed runs
 - `execution/`: subprocess launcher, file-based control plane, worker entrypoint, and runner context
+- `execution/backends.py`: exclusive and MPS-backed launch backends
 - `checkpointing/`: atomic local checkpoint save/load
 - `model_cache/`: in-memory LRU baseline cache plus a local socket server for worker access
 - `storage/`: SQLite-backed jobs, commands, checkpoints, cache metadata, and event history
@@ -46,6 +50,7 @@ Run the demo:
 
 ```bash
 python -m localml_scheduler.examples.demo_submit_jobs
+python -m localml_scheduler.examples.demo_mlevolve_bridge
 ```
 
 ## Custom PyTorch Integration
@@ -73,10 +78,16 @@ The normal pause flow is:
 4. worker exits cleanly
 5. scheduler later redispatches the paused job from checkpoint
 
+## Packed Execution Notes
+
+- packed execution is limited to at most two structured scheduler jobs on GPU 0
+- the packed path is opt-in per job via `packing.eligible: true` and a stable `packing.signature`
+- exclusive execution remains the default when MPS is unavailable, a solo profile is missing, or safety checks reject the pair
+- raw MLEvolve snippet execution is unchanged; the bridge only targets structured scheduler-managed training jobs
+
 ## Limitations In V1
 
-- exactly one active training worker owns the GPU slot at a time
-- no co-running, interference prediction, MPS packing, or distributed scheduling yet
+- no three-way packing, distributed scheduling, or automatic interception of arbitrary generated Python snippets
 - queued command intent is durable in SQLite, but CLI actions rely on the scheduler loop to consume them
 - cache payloads assume `torch.save` / `torch.load` compatibility unless a custom loader target is provided
 

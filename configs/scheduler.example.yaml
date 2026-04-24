@@ -11,3 +11,33 @@ cache_server_host: "127.0.0.1"
 cache_server_port: 8765
 cache_socket_name: "cache_server.sock"
 auto_resume_recoverable: false
+gpu_scheduler:
+  enabled: true
+  backend_priority: ["mps", "exclusive"]
+  max_packed_jobs_per_gpu: 2
+  allow_three_way_packing: false
+  fallback_cooldown_seconds: 900
+  profiling:
+    warmup_steps: 30
+    solo_probe_steps: 80
+    pair_probe_steps: 60
+    reuse_profile_if_confidence_ge: 0.8
+  memory:
+    safe_vram_budget_gib: 28.0
+    hard_stop_memory_fraction: 0.90
+  thresholds:
+    pack_prefer_sm_active_lt: 0.50
+    pack_reject_sm_active_ge: 0.80
+    pack_reject_max_slowdown: 1.30
+    latency_sensitive_max_slowdown: 1.15
+    min_aggregate_gain: 1.10
+  telemetry:
+    device_poll_ms: 500
+    pair_recheck_every_steps: 20
+  mps:
+    enabled: true
+    compute_mode: "EXCLUSIVE_PROCESS"
+    default_primary_active_thread_pct: 60
+    default_secondary_active_thread_pct: 40
+    default_omp_num_threads: 6
+    default_mkl_num_threads: 6

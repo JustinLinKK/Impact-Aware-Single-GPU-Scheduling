@@ -9,7 +9,7 @@ import json
 import yaml
 
 from .model_cache.cache_server import CacheClient
-from .schemas import CommandType, JobStatus, TrainingJob, stable_job_id, utc_now
+from .schemas import CommandType, JobStatus, PairProfile, SoloProfile, TrainingJob, stable_job_id, utc_now
 from .scheduler.service import SchedulerService
 from .settings import SchedulerSettings
 from .storage.sqlite_store import SQLiteStateStore
@@ -22,8 +22,8 @@ class LocalMLSchedulerAPI:
         self.settings = settings or SchedulerSettings()
         self.store = SQLiteStateStore(self.settings)
 
-    def create_scheduler_service(self) -> SchedulerService:
-        return SchedulerService(self.settings, store=self.store)
+    def create_scheduler_service(self, **kwargs: Any) -> SchedulerService:
+        return SchedulerService(self.settings, store=self.store, **kwargs)
 
     def _normalize_job_payload(self, payload: dict[str, Any]) -> TrainingJob:
         payload = dict(payload)
@@ -94,6 +94,18 @@ class LocalMLSchedulerAPI:
 
     def report(self) -> dict[str, Any]:
         return self.store.report().to_dict()
+
+    def get_solo_profile(self, signature: str) -> SoloProfile | None:
+        return self.store.get_solo_profile(signature)
+
+    def upsert_solo_profile(self, profile: SoloProfile) -> SoloProfile:
+        return self.store.upsert_solo_profile(profile)
+
+    def get_pair_profile(self, left_signature: str, right_signature: str) -> PairProfile | None:
+        return self.store.get_pair_profile(left_signature, right_signature)
+
+    def upsert_pair_profile(self, profile: PairProfile) -> PairProfile:
+        return self.store.upsert_pair_profile(profile)
 
     def dump_jobs_json(self) -> str:
         return json.dumps([job.to_dict() for job in self.list_jobs()], indent=2, sort_keys=True)

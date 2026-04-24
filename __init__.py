@@ -1,4 +1,4 @@
-"""Reusable local ML job scheduler with a single-GPU V1 execution model."""
+"""Reusable local ML job scheduler with GPU-aware single-node execution."""
 
 from .api import LocalMLSchedulerAPI
 from .schemas import (
@@ -6,11 +6,12 @@ from .schemas import (
     CheckpointPolicy,
     JobConfig,
     JobStatus,
+    PackingSpec,
     ProgressSnapshot,
     ResourceRequirements,
     TrainingJob,
 )
-from .settings import SchedulerSettings
+from .settings import GpuSchedulerSettings, SchedulerSettings
 
 __all__ = [
     "CacheStats",
@@ -18,8 +19,10 @@ __all__ = [
     "JobConfig",
     "JobStatus",
     "LocalMLSchedulerAPI",
+    "PackingSpec",
     "ProgressSnapshot",
     "ResourceRequirements",
+    "GpuSchedulerSettings",
     "SchedulerSettings",
     "TrainingJob",
 ]

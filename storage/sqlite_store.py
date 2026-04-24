@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 import json
 import sqlite3
 
-from ..schemas import CommandType, JobCommand, JobStatus, SchedulerReport, TrainingJob, parse_timestamp, utc_now
+from ..schemas import (
+    CommandType,
+    JobCommand,
+    JobStatus,
+    PairProfile,
+    SchedulerReport,
+    SoloProfile,
+    TrainingJob,
+    canonical_pair_key,
+    parse_timestamp,
+    utc_now,
+)
 from ..settings import SchedulerSettings
 from .models import SCHEMA_STATEMENTS
 
@@ -306,6 +318,130 @@ class SQLiteStateStore:
             ).fetchone()
         return dict(row)
 
+    def upsert_solo_profile(self, profile: SoloProfile) -> SoloProfile:
+        profile.updated_at = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO solo_profiles(signature, family, peak_vram_mb, avg_gpu_utilization, avg_memory_utilization, sample_count, last_job_id, updated_at, metadata_json)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(signature) DO UPDATE SET
+                    family=excluded.family,
+                    peak_vram_mb=excluded.peak_vram_mb,
+                    avg_gpu_utilization=excluded.avg_gpu_utilization,
+                    avg_memory_utilization=excluded.avg_memory_utilization,
+                    sample_count=excluded.sample_count,
+                    last_job_id=excluded.last_job_id,
+                    updated_at=excluded.updated_at,
+                    metadata_json=excluded.metadata_json
+                """,
+                (
+                    profile.signature,
+                    profile.family,
+                    profile.peak_vram_mb,
+                    profile.avg_gpu_utilization,
+                    profile.avg_memory_utilization,
+                    profile.sample_count,
+                    profile.last_job_id,
+                    profile.updated_at,
+                    json.dumps(profile.metadata or {}, sort_keys=True),
+                ),
+            )
+            connection.commit()
+        return profile
+
+    def get_solo_profile(self, signature: str) -> SoloProfile | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM solo_profiles WHERE signature = ?", (signature,)).fetchone()
+        return SoloProfile.from_row(dict(row)) if row else None
+
+    def list_solo_profiles(self) -> list[SoloProfile]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM solo_profiles ORDER BY updated_at DESC").fetchall()
+        return [SoloProfile.from_row(dict(row)) for row in rows]
+
+    def upsert_pair_profile(self, profile: PairProfile) -> PairProfile:
+        profile.updated_at = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO pair_profiles(pair_key, left_signature, right_signature, compatible, observations, peak_vram_mb, avg_gpu_utilization, avg_memory_utilization, slowdown_ratio, cooldown_until, last_failure_reason, updated_at, metadata_json)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(pair_key) DO UPDATE SET
+                    left_signature=excluded.left_signature,
+                    right_signature=excluded.right_signature,
+                    compatible=excluded.compatible,
+                    observations=excluded.observations,
+                    peak_vram_mb=excluded.peak_vram_mb,
+                    avg_gpu_utilization=excluded.avg_gpu_utilization,
+                    avg_memory_utilization=excluded.avg_memory_utilization,
+                    slowdown_ratio=excluded.slowdown_ratio,
+                    cooldown_until=excluded.cooldown_until,
+                    last_failure_reason=excluded.last_failure_reason,
+                    updated_at=excluded.updated_at,
+                    metadata_json=excluded.metadata_json
+                """,
+                (
+                    profile.pair_key,
+                    profile.left_signature,
+                    profile.right_signature,
+                    1 if profile.compatible else 0,
+                    profile.observations,
+                    profile.peak_vram_mb,
+                    profile.avg_gpu_utilization,
+                    profile.avg_memory_utilization,
+                    profile.slowdown_ratio,
+                    profile.cooldown_until,
+                    profile.last_failure_reason,
+                    profile.updated_at,
+                    json.dumps(profile.metadata or {}, sort_keys=True),
+                ),
+            )
+            connection.commit()
+        return profile
+
+    def get_pair_profile(self, left_signature: str, right_signature: str) -> PairProfile | None:
+        pair_key = canonical_pair_key(left_signature, right_signature)
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM pair_profiles WHERE pair_key = ?", (pair_key,)).fetchone()
+        return PairProfile.from_row(dict(row)) if row else None
+
+    def list_pair_profiles(self) -> list[PairProfile]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM pair_profiles ORDER BY updated_at DESC").fetchall()
+        return [PairProfile.from_row(dict(row)) for row in rows]
+
+    def mark_pair_incompatible(
+        self,
+        left_signature: str,
+        right_signature: str,
+        *,
+        reason: str,
+        cooldown_seconds: int,
+        peak_vram_mb: int | None = None,
+        avg_gpu_utilization: float | None = None,
+        avg_memory_utilization: float | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> PairProfile:
+        existing = self.get_pair_profile(left_signature, right_signature)
+        cooldown_until = None
+        if cooldown_seconds > 0:
+            cooldown_until = (parse_timestamp(utc_now()) + timedelta(seconds=cooldown_seconds)).isoformat()
+        profile = PairProfile.create(
+            left_signature,
+            right_signature,
+            compatible=False,
+            observations=(existing.observations + 1) if existing else 1,
+            peak_vram_mb=peak_vram_mb if peak_vram_mb is not None else (existing.peak_vram_mb if existing else None),
+            avg_gpu_utilization=avg_gpu_utilization if avg_gpu_utilization is not None else (existing.avg_gpu_utilization if existing else None),
+            avg_memory_utilization=avg_memory_utilization if avg_memory_utilization is not None else (existing.avg_memory_utilization if existing else None),
+            slowdown_ratio=existing.slowdown_ratio if existing else None,
+            cooldown_until=cooldown_until,
+            last_failure_reason=reason,
+            metadata={**(existing.metadata if existing else {}), **(metadata or {})},
+        )
+        return self.upsert_pair_profile(profile)
+
     def reconcile_incomplete_jobs(self) -> list[TrainingJob]:
         stale_jobs = self.list_jobs(statuses=[JobStatus.RUNNING, JobStatus.PAUSING])
         reconciled: list[TrainingJob] = []
@@ -329,6 +465,7 @@ class SQLiteStateStore:
 
     def report(self) -> SchedulerReport:
         jobs = self.list_jobs()
+        events = self.list_events(event_type=None)
         wait_times: list[float] = []
         runtimes: list[float] = []
         for job in jobs:
@@ -351,5 +488,7 @@ class SQLiteStateStore:
             cache_hit_rate=(int(cache_summary["hits"]) / total_cache) if total_cache else 0.0,
             cache_hits=int(cache_summary["hits"]),
             cache_misses=int(cache_summary["misses"]),
-            cache_evictions=sum(event["event_type"] == "cache_evicted" for event in self.list_events(event_type=None)),
+            cache_evictions=sum(event["event_type"] == "cache_evicted" for event in events),
+            packed_dispatches=sum(event["event_type"] == "packed_pair_dispatched" for event in events),
+            packed_fallbacks=sum(event["event_type"] == "packed_pair_fallback" for event in events),
         )
