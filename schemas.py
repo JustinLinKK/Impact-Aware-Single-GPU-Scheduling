@@ -442,7 +442,19 @@ class BatchProbeProfile:
 
 def build_batch_probe_shape_signature(job: TrainingJob) -> str:
     batch_param_name = job.batch_probe.batch_param_name or "batch_size"
-    runner_kwargs = dict(job.config.runner_kwargs)
+    ignored_runner_kwargs = {
+        "script_path",
+        "result_path",
+        "working_dir",
+        "timeout",
+        "probe_timeout_seconds",
+        "probe_poll_interval_seconds",
+    }
+    runner_kwargs = {
+        key: value
+        for key, value in dict(job.config.runner_kwargs).items()
+        if key not in ignored_runner_kwargs
+    }
     runner_kwargs.pop(batch_param_name, None)
     payload = {
         "runner_target": job.config.runner_target,

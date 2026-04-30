@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import gc
+import logging
 from typing import Any
 
 import torch
@@ -17,6 +18,8 @@ from ..schemas import (
     build_batch_probe_shape_signature,
     import_string,
 )
+
+logger = logging.getLogger("localml_scheduler")
 
 
 @dataclass(slots=True)
@@ -35,6 +38,69 @@ class ProbeAttempt:
     target_budget_mb: int
 
 
+def _message_indicates_oom(message: str | None) -> bool:
+    lowered = str(message or "").lower()
+    return "out of memory" in lowered or "cuda out of memory" in lowered
+
+
+def _failure_due_to_memory(attempt: ProbeAttempt | None) -> bool:
+    if attempt is None:
+        return False
+    if not attempt.within_budget:
+        return True
+    return _message_indicates_oom(attempt.result.message)
+
+
+def _probe_warning_details(
+    resolved: ProbeAttempt,
+    *,
+    failure: ProbeAttempt | None,
+    stop_reason: str,
+    max_batch_size: int | None,
+    max_search_rounds: int,
+    rounds: int,
+) -> tuple[str | None, str | None, bool]:
+    target_budget_mb = max(1, int(resolved.target_budget_mb))
+    peak_vram_mb = resolved.result.peak_vram_mb
+    utilization = (float(peak_vram_mb) / float(target_budget_mb)) if peak_vram_mb is not None else None
+    saturated_vram = utilization is not None and utilization >= 0.9
+    if saturated_vram:
+        return None, None, True
+
+    if stop_reason == "max_batch_size_cap":
+        return (
+            "max_batch_size_cap",
+            f"probe stopped at configured max batch size {max_batch_size} before VRAM saturation",
+            False,
+        )
+    if stop_reason == "max_search_rounds":
+        return (
+            "max_search_rounds",
+            f"probe exhausted max search rounds ({max_search_rounds}) before VRAM saturation",
+            False,
+        )
+    if failure is not None and not _failure_due_to_memory(failure):
+        failure_detail = (failure.result.message or "non-memory failure").strip().replace("\n", " ")
+        return (
+            "non_memory_failure_boundary",
+            f"probe stopped due to a non-memory failure at batch size {failure.batch_size}: {failure_detail}",
+            False,
+        )
+    if utilization is not None and utilization < 0.9:
+        return (
+            "underfilled_vram",
+            f"probe selected batch size {resolved.batch_size} at only {utilization:.0%} of the VRAM target",
+            False,
+        )
+    if peak_vram_mb is None and rounds >= max_search_rounds:
+        return (
+            "unknown_vram_max_search_rounds",
+            f"probe exhausted max search rounds ({max_search_rounds}) without enough VRAM telemetry to confirm saturation",
+            False,
+        )
+    return None, None, False
+
+
 def _is_raw_script_job(job: TrainingJob) -> bool:
     return job.config.runner_target == "localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job"
 
@@ -45,7 +111,6 @@ def _requires_probe(job: TrainingJob) -> bool:
         job.resource_requirements.requires_gpu
         and job.batch_probe.enabled
         and backend_name == "exclusive"
-        and not _is_raw_script_job(job)
     )
 
 
@@ -138,6 +203,19 @@ def _run_trial(
             "message": result.message,
         },
     )
+    message = (result.message or "").strip().replace("\n", " ")
+    if len(message) > 180:
+        message = f"{message[:177]}..."
+    logger.info(
+        "[batch_probe] job=%s trial batch_size=%s fits=%s within_budget=%s peak_vram_mb=%s target_budget_mb=%s detail=%s",
+        context.job.job_id,
+        batch_size,
+        result.fits,
+        within_budget,
+        result.peak_vram_mb,
+        effective_budget_mb,
+        message or "-",
+    )
     return ProbeAttempt(
         batch_size=batch_size,
         result=result,
@@ -170,7 +248,7 @@ def _run_probe_controller(context: RunnerContext, key_info: BatchProbeKeyInfo) -
     measure_steps = int(context.settings.gpu_scheduler.profiling.solo_probe_steps)
     min_batch_size = max(1, int(context.settings.gpu_scheduler.batch_probe_min_batch_size))
     max_search_rounds = max(1, int(context.settings.gpu_scheduler.batch_probe_max_search_rounds))
-    max_batch_size = context.settings.gpu_scheduler.batch_probe_max_batch_size
+    max_batch_size = context.job.config.runner_kwargs.get("probe_max_batch_size", context.settings.gpu_scheduler.batch_probe_max_batch_size)
     if max_batch_size is not None:
         max_batch_size = max(min_batch_size, int(max_batch_size))
 
@@ -189,8 +267,20 @@ def _run_probe_controller(context: RunnerContext, key_info: BatchProbeKeyInfo) -
             "start_batch_size": start_batch_size,
         },
     )
+    logger.info(
+        "[batch_probe] job=%s start probe_key=%s model_key=%s device=%s start_batch_size=%s max_batch_size=%s warmup_steps=%s measure_steps=%s",
+        context.job.job_id,
+        key_info.probe_key,
+        key_info.model_key,
+        key_info.device_type,
+        start_batch_size,
+        max_batch_size,
+        warmup_steps,
+        measure_steps,
+    )
 
     rounds = 0
+    stop_reason = "resolved"
 
     def run_attempt(batch_size: int) -> ProbeAttempt:
         nonlocal rounds
@@ -210,6 +300,7 @@ def _run_probe_controller(context: RunnerContext, key_info: BatchProbeKeyInfo) -
         attempt = run_attempt(current_batch_size)
         if _attempt_successful(attempt):
             success = attempt
+            stop_reason = "initial_success"
             break
         failure = attempt
         if current_batch_size <= min_batch_size:
@@ -230,10 +321,12 @@ def _run_probe_controller(context: RunnerContext, key_info: BatchProbeKeyInfo) -
             low = attempt.batch_size
             candidate = attempt.batch_size * 2
             search_method = "expand"
+            stop_reason = "expand_success"
             continue
         high = attempt.batch_size
         failure = attempt
         search_method = "binary"
+        stop_reason = "failure_boundary"
         break
 
     if high is not None:
@@ -243,12 +336,28 @@ def _run_probe_controller(context: RunnerContext, key_info: BatchProbeKeyInfo) -
             if _attempt_successful(attempt):
                 last_good = attempt
                 low = attempt.batch_size
+                stop_reason = "binary_success"
             else:
                 failure = attempt
                 high = attempt.batch_size
+                stop_reason = "failure_boundary"
+
+    if high is None:
+        if rounds >= max_search_rounds:
+            stop_reason = "max_search_rounds"
+        elif max_batch_size is not None and candidate > max_batch_size:
+            stop_reason = "max_batch_size_cap"
 
     existing = context.store.get_batch_probe_profile(key_info.probe_key)
     resolved = last_good
+    warning_reason, warning_message, saturated_vram = _probe_warning_details(
+        resolved,
+        failure=failure,
+        stop_reason=stop_reason,
+        max_batch_size=max_batch_size,
+        max_search_rounds=max_search_rounds,
+        rounds=rounds,
+    )
     return BatchProbeProfile(
         probe_key=key_info.probe_key,
         model_key=key_info.model_key,
@@ -264,11 +373,15 @@ def _run_probe_controller(context: RunnerContext, key_info: BatchProbeKeyInfo) -
         metadata={
             "probe_target": context.job.batch_probe.probe_target,
             "search_method": search_method,
+            "stop_reason": stop_reason,
             "failure_batch_size": failure.batch_size if failure else None,
             "avg_step_time_ms": resolved.result.avg_step_time_ms,
             "model_key": key_info.model_key,
             "device_type": key_info.device_type,
             "shape_signature": key_info.shape_signature,
+            "warning_reason": warning_reason,
+            "warning_message": warning_message,
+            "saturated_vram": saturated_vram,
         },
     )
 
@@ -315,6 +428,12 @@ def run_batch_probe_preflight(context: RunnerContext) -> TrainingJob:
     batch_param_name = context.job.batch_probe.batch_param_name or "batch_size"
 
     if _job_has_resolved_batch_size(context.job, key_info):
+        logger.info(
+            "[batch_probe] job=%s reusing previously resolved batch size=%s for probe_key=%s",
+            context.job.job_id,
+            context.job.metadata.get("resolved_batch_size"),
+            key_info.probe_key,
+        )
         return context.job
 
     cached = context.store.get_batch_probe_profile(key_info.probe_key)
@@ -328,6 +447,33 @@ def run_batch_probe_preflight(context: RunnerContext) -> TrainingJob:
                 "resolved_batch_size": cached.resolved_batch_size,
             },
         )
+        logger.info(
+            "[batch_probe] job=%s cache hit probe_key=%s resolved_batch_size=%s device=%s",
+            context.job.job_id,
+            key_info.probe_key,
+            cached.resolved_batch_size,
+            key_info.device_type,
+        )
+        cached_warning_message = str((cached.metadata or {}).get("warning_message") or "").strip()
+        if cached_warning_message:
+            context.event_logger.emit(
+                "batch_probe_warning",
+                job_id=context.job.job_id,
+                payload={
+                    "probe_key": key_info.probe_key,
+                    "device_type": key_info.device_type,
+                    "resolved_batch_size": cached.resolved_batch_size,
+                    "warning_reason": (cached.metadata or {}).get("warning_reason"),
+                    "warning_message": cached_warning_message,
+                    "source": "cache",
+                },
+            )
+            logger.warning(
+                "[batch_probe] job=%s warning probe_key=%s source=cache message=%s",
+                context.job.job_id,
+                key_info.probe_key,
+                cached_warning_message,
+            )
         context.job = _persist_resolved_batch_size(
             context,
             probe_key=key_info.probe_key,
@@ -343,6 +489,12 @@ def run_batch_probe_preflight(context: RunnerContext) -> TrainingJob:
         job_id=context.job.job_id,
         payload={"probe_key": key_info.probe_key, "device_type": key_info.device_type},
     )
+    logger.info(
+        "[batch_probe] job=%s cache miss probe_key=%s device=%s",
+        context.job.job_id,
+        key_info.probe_key,
+        key_info.device_type,
+    )
 
     try:
         profile = _run_probe_controller(context, key_info)
@@ -351,6 +503,13 @@ def run_batch_probe_preflight(context: RunnerContext) -> TrainingJob:
             "batch_probe_failed",
             job_id=context.job.job_id,
             payload={"probe_key": key_info.probe_key, "device_type": key_info.device_type, "reason": str(exc)},
+        )
+        logger.error(
+            "[batch_probe] job=%s failed probe_key=%s device=%s reason=%s",
+            context.job.job_id,
+            key_info.probe_key,
+            key_info.device_type,
+            str(exc).replace("\n", " "),
         )
         raise
 
@@ -371,8 +530,36 @@ def run_batch_probe_preflight(context: RunnerContext) -> TrainingJob:
             "device_type": key_info.device_type,
             "resolved_batch_size": profile.resolved_batch_size,
             "target_budget_mb": profile.target_budget_mb,
+            "warning_reason": (profile.metadata or {}).get("warning_reason"),
         },
     )
+    logger.info(
+        "[batch_probe] job=%s selected batch_size=%s probe_key=%s target_budget_mb=%s source=probe",
+        context.job.job_id,
+        profile.resolved_batch_size,
+        key_info.probe_key,
+        profile.target_budget_mb,
+    )
+    warning_message = str((profile.metadata or {}).get("warning_message") or "").strip()
+    if warning_message:
+        context.event_logger.emit(
+            "batch_probe_warning",
+            job_id=context.job.job_id,
+            payload={
+                "probe_key": key_info.probe_key,
+                "device_type": key_info.device_type,
+                "resolved_batch_size": profile.resolved_batch_size,
+                "warning_reason": (profile.metadata or {}).get("warning_reason"),
+                "warning_message": warning_message,
+                "source": "probe",
+            },
+        )
+        logger.warning(
+            "[batch_probe] job=%s warning probe_key=%s source=probe message=%s",
+            context.job.job_id,
+            key_info.probe_key,
+            warning_message,
+        )
     refreshed = context.store.get_job(context.job.job_id)
     if refreshed is not None:
         context.job = refreshed

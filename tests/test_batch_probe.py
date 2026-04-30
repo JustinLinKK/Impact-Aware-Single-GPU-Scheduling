@@ -187,6 +187,37 @@ class BatchProbeUnitTest(unittest.TestCase):
             self.assertEqual(profile.batch_param_name, "batch_size")
             self.assertGreater(profile.target_budget_mb, 0)
 
+    def test_probe_controller_warns_when_capped_before_vram_saturation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(runtime_root=tmpdir)
+            job = TrainingJob.create(
+                "pkg.runner:train",
+                "baseline-a",
+                "/tmp/a.pt",
+                task_type="classification",
+                runner_kwargs={"batch_size": 3, "probe_max_batch_size": 6},
+                batch_probe=BatchProbeSpec(
+                    enabled=True,
+                    probe_target="localml_scheduler.tests.test_batch_probe:fake_limit_probe",
+                ),
+                metadata={"placement_backend": "exclusive", "probe_threshold": 100},
+                resource_requirements=ResourceRequirements(requires_gpu=True),
+                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
+            )
+            context = _build_context(settings, job)
+            profile = _run_probe_controller(
+                context,
+                key_info=BatchProbeKeyInfo(
+                    probe_key="probe-capped",
+                    model_key="baseline-a",
+                    device_type="cuda-unavailable",
+                    shape_signature="shape-1",
+                ),
+            )
+            self.assertEqual(profile.resolved_batch_size, 6)
+            self.assertEqual(profile.metadata["warning_reason"], "max_batch_size_cap")
+            self.assertIn("before VRAM saturation", profile.metadata["warning_message"])
+
 
 class BatchProbeIntegrationTest(unittest.TestCase):
     def _build_probe_job(
