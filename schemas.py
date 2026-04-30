@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from hashlib import sha1
 from pathlib import Path
 from typing import Any
 import importlib
@@ -120,6 +121,23 @@ class PackingSpec:
 
 
 @dataclass(slots=True)
+class BatchProbeSpec:
+    enabled: bool = False
+    probe_target: str | None = None
+    batch_param_name: str = "batch_size"
+    model_key: str | None = None
+    shape_hints: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "BatchProbeSpec":
+        payload = payload or {}
+        return cls(**payload)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_primitive(self)
+
+
+@dataclass(slots=True)
 class CheckpointPolicy:
     save_every_n_steps: int | None = None
     save_every_epoch: bool = True
@@ -171,6 +189,7 @@ class TrainingJob:
     config: JobConfig = field(default_factory=lambda: JobConfig(runner_target=""))
     resource_requirements: ResourceRequirements = field(default_factory=ResourceRequirements)
     packing: PackingSpec = field(default_factory=PackingSpec)
+    batch_probe: BatchProbeSpec = field(default_factory=BatchProbeSpec)
     checkpoint_policy: CheckpointPolicy = field(default_factory=CheckpointPolicy)
     max_steps: int | None = None
     max_epochs: int | None = None
@@ -202,6 +221,7 @@ class TrainingJob:
         loader_target: str | None = None,
         resource_requirements: ResourceRequirements | None = None,
         packing: PackingSpec | None = None,
+        batch_probe: BatchProbeSpec | None = None,
         checkpoint_policy: CheckpointPolicy | None = None,
         max_steps: int | None = None,
         max_epochs: int | None = None,
@@ -233,6 +253,7 @@ class TrainingJob:
             config=config,
             resource_requirements=resource_requirements or ResourceRequirements(),
             packing=packing or PackingSpec(),
+            batch_probe=batch_probe or BatchProbeSpec(),
             checkpoint_policy=checkpoint_policy or CheckpointPolicy(),
             max_steps=max_steps,
             max_epochs=max_epochs,
@@ -249,6 +270,7 @@ class TrainingJob:
         payload["config"] = JobConfig.from_dict(payload["config"])
         payload["resource_requirements"] = ResourceRequirements.from_dict(payload.get("resource_requirements"))
         payload["packing"] = PackingSpec.from_dict(payload.get("packing"))
+        payload["batch_probe"] = BatchProbeSpec.from_dict(payload.get("batch_probe"))
         payload["checkpoint_policy"] = CheckpointPolicy.from_dict(payload.get("checkpoint_policy"))
         return cls(**payload)
 
@@ -361,6 +383,84 @@ class SoloProfile:
 
     def to_dict(self) -> dict[str, Any]:
         return _to_primitive(self)
+
+
+@dataclass(slots=True)
+class BatchProbeTrialResult:
+    fits: bool
+    peak_vram_mb: int | None = None
+    memory_total_mb: int | None = None
+    avg_step_time_ms: float | None = None
+    message: str | None = None
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "BatchProbeTrialResult":
+        return cls(**payload)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_primitive(self)
+
+
+@dataclass(slots=True)
+class BatchProbeProfile:
+    probe_key: str
+    model_key: str
+    device_type: str
+    shape_signature: str
+    batch_param_name: str
+    resolved_batch_size: int
+    peak_vram_mb: int | None = None
+    memory_total_mb: int | None = None
+    target_budget_mb: int | None = None
+    observations: int = 1
+    last_job_id: str | None = None
+    updated_at: str = field(default_factory=utc_now)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "BatchProbeProfile":
+        metadata = json.loads(row["metadata_json"]) if row.get("metadata_json") else {}
+        return cls(
+            probe_key=row["probe_key"],
+            model_key=row["model_key"],
+            device_type=row["device_type"],
+            shape_signature=row["shape_signature"],
+            batch_param_name=row["batch_param_name"],
+            resolved_batch_size=row["resolved_batch_size"],
+            peak_vram_mb=row["peak_vram_mb"],
+            memory_total_mb=row["memory_total_mb"],
+            target_budget_mb=row["target_budget_mb"],
+            observations=row["observations"],
+            last_job_id=row["last_job_id"],
+            updated_at=row["updated_at"],
+            metadata=metadata,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_primitive(self)
+
+
+def build_batch_probe_shape_signature(job: TrainingJob) -> str:
+    batch_param_name = job.batch_probe.batch_param_name or "batch_size"
+    runner_kwargs = dict(job.config.runner_kwargs)
+    runner_kwargs.pop(batch_param_name, None)
+    payload = {
+        "runner_target": job.config.runner_target,
+        "task_type": job.task_type,
+        "loader_target": job.config.loader_target,
+        "runner_kwargs": runner_kwargs,
+        "shape_hints": job.batch_probe.shape_hints,
+    }
+    return sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def build_batch_probe_key(model_key: str, device_type: str, shape_signature: str) -> str:
+    payload = {
+        "device_type": device_type,
+        "model_key": model_key,
+        "shape_signature": shape_signature,
+    }
+    return sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def canonical_pair_key(left_signature: str, right_signature: str) -> str:

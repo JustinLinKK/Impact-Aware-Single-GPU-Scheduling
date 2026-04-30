@@ -9,7 +9,7 @@ import json
 import yaml
 
 from .model_cache.cache_server import CacheClient
-from .schemas import CommandType, JobStatus, PairProfile, SoloProfile, TrainingJob, stable_job_id, utc_now
+from .schemas import BatchProbeProfile, CommandType, JobStatus, PairProfile, SoloProfile, TrainingJob, stable_job_id, utc_now
 from .scheduler.service import SchedulerService
 from .settings import SchedulerSettings
 from .storage.sqlite_store import SQLiteStateStore
@@ -106,6 +106,12 @@ class LocalMLSchedulerAPI:
 
     def upsert_pair_profile(self, profile: PairProfile) -> PairProfile:
         return self.store.upsert_pair_profile(profile)
+
+    def get_batch_probe_profile(self, probe_key: str) -> BatchProbeProfile | None:
+        return self.store.get_batch_probe_profile(probe_key)
+
+    def upsert_batch_probe_profile(self, profile: BatchProbeProfile) -> BatchProbeProfile:
+        return self.store.upsert_batch_probe_profile(profile)
 
     def dump_jobs_json(self) -> str:
         return json.dumps([job.to_dict() for job in self.list_jobs()], indent=2, sort_keys=True)

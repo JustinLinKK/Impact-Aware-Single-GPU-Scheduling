@@ -116,6 +116,11 @@ class GpuSchedulerSettings:
     allow_three_way_packing: bool = False
     device_index: int = 0
     fallback_cooldown_seconds: int = 900
+    batch_probe_enabled: bool = True
+    batch_probe_target_memory_fraction: float = 0.97
+    batch_probe_min_batch_size: int = 1
+    batch_probe_max_search_rounds: int = 12
+    batch_probe_max_batch_size: int | None = None
     profiling: GpuProfilingSettings = field(default_factory=GpuProfilingSettings)
     memory: GpuMemorySettings = field(default_factory=GpuMemorySettings)
     thresholds: GpuThresholdSettings = field(default_factory=GpuThresholdSettings)
@@ -146,6 +151,11 @@ class GpuSchedulerSettings:
             "allow_three_way_packing": self.allow_three_way_packing,
             "device_index": self.device_index,
             "fallback_cooldown_seconds": self.fallback_cooldown_seconds,
+            "batch_probe_enabled": self.batch_probe_enabled,
+            "batch_probe_target_memory_fraction": self.batch_probe_target_memory_fraction,
+            "batch_probe_min_batch_size": self.batch_probe_min_batch_size,
+            "batch_probe_max_search_rounds": self.batch_probe_max_search_rounds,
+            "batch_probe_max_batch_size": self.batch_probe_max_batch_size,
             "profiling": self.profiling.to_dict(),
             "memory": self.memory.to_dict(),
             "thresholds": self.thresholds.to_dict(),

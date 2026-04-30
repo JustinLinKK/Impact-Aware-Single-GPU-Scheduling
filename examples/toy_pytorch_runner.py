@@ -76,6 +76,116 @@ def _build_batches(num_samples: int, input_dim: int, output_dim: int, batch_size
     return batches
 
 
+def probe_toy_training_batch_size(
+    context: RunnerContext,
+    batch_size: int,
+    warmup_steps: int,
+    measure_steps: int,
+):
+    """Probe a candidate batch size for the toy runner."""
+    params = {
+        "input_dim": 16,
+        "hidden_dim": 32,
+        "output_dim": 2,
+        "learning_rate": 0.05,
+        "optimizer": "sgd",
+        "probe_memory_total_mb": 4096,
+        "probe_base_memory_mb": 256,
+        "probe_memory_per_sample_mb": 32,
+        "probe_max_batch_size": None,
+    }
+    params.update(context.job.config.runner_kwargs)
+
+    limit = params.get("probe_max_batch_size")
+    synthetic_memory_total_mb = int(params.get("probe_memory_total_mb", 4096))
+    synthetic_peak_vram_mb = int(params.get("probe_base_memory_mb", 256)) + (int(batch_size) * int(params.get("probe_memory_per_sample_mb", 32)))
+    if limit is not None and int(batch_size) > int(limit):
+        return {
+            "fits": False,
+            "peak_vram_mb": synthetic_peak_vram_mb,
+            "memory_total_mb": synthetic_memory_total_mb,
+            "message": f"batch size {batch_size} exceeds configured probe_max_batch_size {limit}",
+        }
+
+    if not torch.cuda.is_available():
+        return {
+            "fits": True,
+            "peak_vram_mb": synthetic_peak_vram_mb,
+            "memory_total_mb": synthetic_memory_total_mb,
+            "avg_step_time_ms": 1.0,
+            "message": "synthetic CPU probe result",
+        }
+
+    seed = context.job.config.seed if context.job.config.seed is not None else int(params.get("seed", 7))
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+    device = torch.device("cuda")
+    baseline = context.load_baseline_object()
+    model = None
+    optimizer = None
+    criterion = None
+    start_time = None
+    measured_steps = 0
+    try:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        model = ToyMLP(
+            int(baseline.get("input_dim", params["input_dim"])),
+            int(baseline.get("hidden_dim", params["hidden_dim"])),
+            int(baseline.get("output_dim", params["output_dim"])),
+        ).to(device)
+        model.load_state_dict(baseline["model_state"])
+
+        optimizer_name = str(params["optimizer"]).lower()
+        if optimizer_name == "adam":
+            optimizer = torch.optim.Adam(model.parameters(), lr=float(params["learning_rate"]))
+        else:
+            optimizer = torch.optim.SGD(model.parameters(), lr=float(params["learning_rate"]))
+        criterion = nn.CrossEntropyLoss()
+
+        input_dim = int(baseline.get("input_dim", params["input_dim"]))
+        output_dim = int(baseline.get("output_dim", params["output_dim"]))
+        total_steps = max(1, int(warmup_steps) + int(measure_steps))
+        for step_index in range(total_steps):
+            features = torch.randn(int(batch_size), input_dim, device=device)
+            labels = torch.randint(0, output_dim, (int(batch_size),), device=device)
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(features)
+            loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+            if step_index == int(warmup_steps):
+                torch.cuda.synchronize(device)
+                start_time = time.perf_counter()
+            if step_index >= int(warmup_steps):
+                measured_steps += 1
+        torch.cuda.synchronize(device)
+        elapsed_ms = ((time.perf_counter() - start_time) * 1000.0) if start_time is not None and measured_steps > 0 else None
+        return {
+            "fits": True,
+            "peak_vram_mb": int(torch.cuda.max_memory_allocated(device) / (1024 * 1024)),
+            "memory_total_mb": int(torch.cuda.get_device_properties(device).total_memory / (1024 * 1024)),
+            "avg_step_time_ms": (elapsed_ms / measured_steps) if elapsed_ms is not None and measured_steps > 0 else None,
+            "message": "cuda probe completed",
+        }
+    except RuntimeError as exc:
+        if "out of memory" not in str(exc).lower():
+            raise
+        return {
+            "fits": False,
+            "peak_vram_mb": int(torch.cuda.max_memory_allocated(device) / (1024 * 1024)),
+            "memory_total_mb": int(torch.cuda.get_device_properties(device).total_memory / (1024 * 1024)),
+            "message": str(exc),
+        }
+    finally:
+        del model
+        del optimizer
+        del criterion
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
     """Run a tiny training loop that cooperates with the scheduler."""
     params = {

@@ -9,6 +9,7 @@ import json
 import sqlite3
 
 from ..schemas import (
+    BatchProbeProfile,
     CommandType,
     JobCommand,
     JobStatus,
@@ -410,6 +411,70 @@ class SQLiteStateStore:
         with self._connect() as connection:
             rows = connection.execute("SELECT * FROM pair_profiles ORDER BY updated_at DESC").fetchall()
         return [PairProfile.from_row(dict(row)) for row in rows]
+
+    def upsert_batch_probe_profile(self, profile: BatchProbeProfile) -> BatchProbeProfile:
+        profile.updated_at = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO batch_probe_profiles(
+                    probe_key,
+                    model_key,
+                    device_type,
+                    shape_signature,
+                    batch_param_name,
+                    resolved_batch_size,
+                    peak_vram_mb,
+                    memory_total_mb,
+                    target_budget_mb,
+                    observations,
+                    last_job_id,
+                    updated_at,
+                    metadata_json
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(probe_key) DO UPDATE SET
+                    model_key=excluded.model_key,
+                    device_type=excluded.device_type,
+                    shape_signature=excluded.shape_signature,
+                    batch_param_name=excluded.batch_param_name,
+                    resolved_batch_size=excluded.resolved_batch_size,
+                    peak_vram_mb=excluded.peak_vram_mb,
+                    memory_total_mb=excluded.memory_total_mb,
+                    target_budget_mb=excluded.target_budget_mb,
+                    observations=excluded.observations,
+                    last_job_id=excluded.last_job_id,
+                    updated_at=excluded.updated_at,
+                    metadata_json=excluded.metadata_json
+                """,
+                (
+                    profile.probe_key,
+                    profile.model_key,
+                    profile.device_type,
+                    profile.shape_signature,
+                    profile.batch_param_name,
+                    profile.resolved_batch_size,
+                    profile.peak_vram_mb,
+                    profile.memory_total_mb,
+                    profile.target_budget_mb,
+                    profile.observations,
+                    profile.last_job_id,
+                    profile.updated_at,
+                    json.dumps(profile.metadata or {}, sort_keys=True),
+                ),
+            )
+            connection.commit()
+        return profile
+
+    def get_batch_probe_profile(self, probe_key: str) -> BatchProbeProfile | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM batch_probe_profiles WHERE probe_key = ?", (probe_key,)).fetchone()
+        return BatchProbeProfile.from_row(dict(row)) if row else None
+
+    def list_batch_probe_profiles(self) -> list[BatchProbeProfile]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM batch_probe_profiles ORDER BY updated_at DESC").fetchall()
+        return [BatchProbeProfile.from_row(dict(row)) for row in rows]
 
     def mark_pair_incompatible(
         self,

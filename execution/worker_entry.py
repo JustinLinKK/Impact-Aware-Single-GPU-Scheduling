@@ -10,6 +10,7 @@ from ..model_cache.cache_server import CacheClient
 from ..checkpointing.manager import CheckpointManager
 from ..observability.events import EventLogger
 from ..observability.logging_utils import setup_scheduler_logger
+from ..profiling.batch_probe import run_batch_probe_preflight
 from ..schemas import JobStatus, import_string
 from ..settings import SchedulerSettings
 from ..storage.sqlite_store import SQLiteStateStore
@@ -47,18 +48,18 @@ def _run_job(runtime_root: str, job_id: str) -> int:
     store.set_job_status(job_id, JobStatus.RUNNING, reason="worker started", hold=False)
     event_logger.emit("job_resumed" if is_resume else "job_started", job_id=job_id, payload={"resume": is_resume})
 
-    context = RunnerContext(
-        job=store.get_job(job_id) or job,
-        settings=settings,
-        store=store,
-        event_logger=event_logger,
-        control_hook=control_hook,
-        checkpoint_manager=checkpoint_manager,
-        cache_client=cache_client,
-    )
-    runner = import_string(context.job.config.runner_target)
-
     try:
+        context = RunnerContext(
+            job=store.get_job(job_id) or job,
+            settings=settings,
+            store=store,
+            event_logger=event_logger,
+            control_hook=control_hook,
+            checkpoint_manager=checkpoint_manager,
+            cache_client=cache_client,
+        )
+        context.job = run_batch_probe_preflight(context)
+        runner = import_string(context.job.config.runner_target)
         result = runner(context) if callable(runner) else runner.run(context)
     except PauseRequested:
         logger.info("Job %s paused cleanly at a safe point", job_id)

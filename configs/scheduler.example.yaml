@@ -13,10 +13,15 @@ cache_socket_name: "cache_server.sock"
 auto_resume_recoverable: false
 gpu_scheduler:
   enabled: true
-  backend_priority: ["mps", "exclusive"]
-  max_packed_jobs_per_gpu: 2
+  backend_priority: ["exclusive"]
+  max_packed_jobs_per_gpu: 1
   allow_three_way_packing: false
   fallback_cooldown_seconds: 900
+  batch_probe_enabled: true
+  batch_probe_target_memory_fraction: 0.97
+  batch_probe_min_batch_size: 1
+  batch_probe_max_search_rounds: 12
+  batch_probe_max_batch_size: null
   profiling:
     warmup_steps: 30
     solo_probe_steps: 80
@@ -35,7 +40,7 @@ gpu_scheduler:
     device_poll_ms: 500
     pair_recheck_every_steps: 20
   mps:
-    enabled: true
+    enabled: false
     compute_mode: "EXCLUSIVE_PROCESS"
     default_primary_active_thread_pct: 60
     default_secondary_active_thread_pct: 40

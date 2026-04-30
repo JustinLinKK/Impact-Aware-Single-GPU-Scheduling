@@ -19,6 +19,13 @@ packing:
   signature: "toy_classification:example"
   family: "toy-mlp"
   max_slowdown_ratio: 1.25
+batch_probe:
+  enabled: true
+  probe_target: "localml_scheduler.examples.toy_pytorch_runner:probe_toy_training_batch_size"
+  batch_param_name: "batch_size"
+  model_key: null
+  shape_hints:
+    tokens: 128
 checkpoint_policy:
   save_every_n_steps: 2
   save_every_epoch: true

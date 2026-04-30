@@ -2,6 +2,9 @@
 
 from .api import LocalMLSchedulerAPI
 from .schemas import (
+    BatchProbeProfile,
+    BatchProbeSpec,
+    BatchProbeTrialResult,
     CacheStats,
     CheckpointPolicy,
     JobConfig,
@@ -14,6 +17,9 @@ from .schemas import (
 from .settings import GpuSchedulerSettings, SchedulerSettings
 
 __all__ = [
+    "BatchProbeProfile",
+    "BatchProbeSpec",
+    "BatchProbeTrialResult",
     "CacheStats",
     "CheckpointPolicy",
     "JobConfig",

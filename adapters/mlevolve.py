@@ -7,7 +7,7 @@ from typing import Any
 import json
 
 from ..api import LocalMLSchedulerAPI
-from ..schemas import CheckpointPolicy, PackingSpec, ResourceRequirements, TrainingJob
+from ..schemas import BatchProbeSpec, CheckpointPolicy, PackingSpec, ResourceRequirements, TrainingJob
 
 
 def build_packing_signature(
@@ -46,6 +46,7 @@ def build_mlevolve_job(
     task_type: str = "mlevolve_candidate",
     loader_target: str | None = None,
     checkpoint_policy: CheckpointPolicy | None = None,
+    batch_probe: BatchProbeSpec | None = None,
     resource_requirements: ResourceRequirements | None = None,
     packing_family: str | None = None,
     packing_signature: str | None = None,
@@ -84,6 +85,7 @@ def build_mlevolve_job(
             family=packing_family,
             max_slowdown_ratio=packing_max_slowdown_ratio,
         ),
+        batch_probe=batch_probe or BatchProbeSpec(),
         max_steps=max_steps,
         max_epochs=max_epochs,
         metadata=metadata or {},

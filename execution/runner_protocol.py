@@ -13,7 +13,7 @@ from ..model_cache.cache_server import CacheClient
 from ..checkpointing.manager import CheckpointManager
 from ..execution.control import TrainingControlHook
 from ..observability.events import EventLogger
-from ..schemas import TrainingJob
+from ..schemas import BatchProbeTrialResult, TrainingJob
 from ..settings import SchedulerSettings
 from ..storage.sqlite_store import SQLiteStateStore
 
@@ -23,6 +23,20 @@ class RunnerProtocol(Protocol):
     """Custom training integration contract."""
 
     def __call__(self, context: "RunnerContext") -> dict[str, Any] | None:
+        ...
+
+
+@runtime_checkable
+class BatchProbeProtocol(Protocol):
+    """Optional runner-side contract for exclusive batch-size probing."""
+
+    def __call__(
+        self,
+        context: "RunnerContext",
+        batch_size: int,
+        warmup_steps: int,
+        measure_steps: int,
+    ) -> BatchProbeTrialResult:
         ...
 
 

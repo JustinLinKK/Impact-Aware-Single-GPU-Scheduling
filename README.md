@@ -5,6 +5,7 @@
 - a single-GPU scheduler with priority queueing, safe-point pause/resume, persistence, and restart recovery
 - a RAM-backed baseline-model cache that keeps immutable CPU-side baselines warm and serves isolated copies to worker subprocesses
 - feature-gated pairwise packed training on one GPU for structured runner jobs when solo profiles and a compatible backend are available
+- optional exclusive-path batch-size probing with SQLite-backed reuse for repeated model/device/shape combinations
 
 It is intentionally packaged as a root-level module so it can be used by MLEvolve or detached and integrated into other agent pipelines.
 
@@ -20,6 +21,7 @@ It is intentionally packaged as a root-level module so it can be used by MLEvolv
 - `model_cache/`: in-memory LRU baseline cache plus a local socket server for worker access
 - `storage/`: SQLite-backed jobs, commands, checkpoints, cache metadata, and event history
 - `observability/`: JSONL events, log files, and aggregate reports
+- `profiling/`: exclusive-path batch probe controller and cache key helpers
 - `examples/`: toy PyTorch training runner and a demo script
 - `adapters/`: thin helpers for wiring job submission from MLEvolve or other systems
 
@@ -69,6 +71,8 @@ The target receives a `RunnerContext` object with:
 - `checkpoint_manager`: load/save resume state when needed
 - `load_baseline_object()`: fetch a fresh baseline object from the RAM cache, or fall back to disk if needed
 - `load_resume_checkpoint()`: access the latest successful checkpoint
+
+Structured runners can also expose an optional batch probe hook in `module:function` form. When `batch_probe.enabled: true` is set on a GPU job running through the exclusive backend, the worker can probe candidate batch sizes before training, persist the selected result in SQLite, and reuse it for later matching jobs.
 
 The normal pause flow is:
 

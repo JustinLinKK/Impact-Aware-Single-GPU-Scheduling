@@ -88,6 +88,23 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS batch_probe_profiles (
+        probe_key TEXT PRIMARY KEY,
+        model_key TEXT NOT NULL,
+        device_type TEXT NOT NULL,
+        shape_signature TEXT NOT NULL,
+        batch_param_name TEXT NOT NULL,
+        resolved_batch_size INTEGER NOT NULL,
+        peak_vram_mb INTEGER,
+        memory_total_mb INTEGER,
+        target_budget_mb INTEGER,
+        observations INTEGER NOT NULL DEFAULT 1,
+        last_job_id TEXT,
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT
+    )
+    """,
+    """
     CREATE INDEX IF NOT EXISTS idx_jobs_status_priority
     ON jobs(status, priority DESC, queue_sequence ASC)
     """,
@@ -110,5 +127,9 @@ SCHEMA_STATEMENTS = [
     """
     CREATE INDEX IF NOT EXISTS idx_pair_profiles_signatures
     ON pair_profiles(left_signature, right_signature, updated_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_batch_probe_profiles_lookup
+    ON batch_probe_profiles(model_key, device_type, updated_at DESC)
     """,
 ]
