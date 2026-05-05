@@ -10,6 +10,25 @@ import sys
 import yaml
 
 
+SCHEDULER_MODE_SERIAL_BASIC = "serial_basic"
+SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED = "serial_batch_optimized"
+SCHEDULER_MODE_PARALLEL_DEFAULT = "parallel_default"
+SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED = "parallel_batch_optimized"
+
+
+def normalize_scheduler_mode(value: str | None) -> str:
+    normalized = str(value or SCHEDULER_MODE_PARALLEL_DEFAULT).strip().lower().replace("-", "_")
+    allowed = {
+        SCHEDULER_MODE_SERIAL_BASIC,
+        SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED,
+        SCHEDULER_MODE_PARALLEL_DEFAULT,
+        SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
+    }
+    if normalized not in allowed:
+        raise ValueError(f"Unsupported scheduler mode: {value}")
+    return normalized
+
+
 @dataclass(slots=True)
 class GpuProfilingSettings:
     warmup_steps: int = 30
@@ -92,6 +111,8 @@ class MPSSettings:
     default_secondary_active_thread_pct: int = 40
     default_omp_num_threads: int = 6
     default_mkl_num_threads: int = 6
+    pipe_directory: str = "/tmp/nvidia-mps"
+    log_directory: str = "/tmp/nvidia-mps-log"
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "MPSSettings":
@@ -105,15 +126,123 @@ class MPSSettings:
             "default_secondary_active_thread_pct": self.default_secondary_active_thread_pct,
             "default_omp_num_threads": self.default_omp_num_threads,
             "default_mkl_num_threads": self.default_mkl_num_threads,
+            "pipe_directory": self.pipe_directory,
+            "log_directory": self.log_directory,
+        }
+
+
+@dataclass(slots=True)
+class CudaProcessSettings:
+    enabled: bool = True
+    default_omp_num_threads: int = 6
+    default_mkl_num_threads: int = 6
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "CudaProcessSettings":
+        return cls(**(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "default_omp_num_threads": self.default_omp_num_threads,
+            "default_mkl_num_threads": self.default_mkl_num_threads,
+        }
+
+
+@dataclass(slots=True)
+class StreamSettings:
+    enabled: bool = False
+    host_poll_interval_seconds: float = 0.1
+    host_join_timeout_seconds: float = 3.0
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "StreamSettings":
+        return cls(**(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "host_poll_interval_seconds": self.host_poll_interval_seconds,
+            "host_join_timeout_seconds": self.host_join_timeout_seconds,
+        }
+
+
+@dataclass(slots=True)
+class ParallelOptimizerSettings:
+    batch_search_mode: str = "binary"
+    target_vram_fraction: float = 0.97
+    max_probe_jobs: int = 3
+    max_batch_multiplier: int = 32
+    min_batch_size: int = 1
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "ParallelOptimizerSettings":
+        instance = cls(**(payload or {}))
+        instance.batch_search_mode = instance.batch_search_mode or "binary"
+        return instance
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "batch_search_mode": self.batch_search_mode,
+            "target_vram_fraction": self.target_vram_fraction,
+            "max_probe_jobs": self.max_probe_jobs,
+            "max_batch_multiplier": self.max_batch_multiplier,
+            "min_batch_size": self.min_batch_size,
+        }
+
+
+@dataclass(slots=True)
+class SchedulerSubmissionDefaults:
+    requires_gpu: bool = True
+    estimated_vram_mb: int | None = None
+    estimated_ram_mb: int | None = None
+    packing_eligible: bool = False
+    packing_family: str = "mlevolve_script"
+    packing_max_slowdown_ratio: float | None = None
+    backend_allowlist: list[str] = field(default_factory=lambda: ["mps", "cuda_process"])
+    batch_probe_enabled: bool = True
+    batch_probe_model_key: str | None = None
+    batch_probe_probe_timeout_seconds: int = 45
+    batch_probe_poll_interval_seconds: float = 0.5
+    batch_probe_max_multiplier: int = 32
+    batch_probe_search_mode: str = "binary"
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "SchedulerSubmissionDefaults":
+        instance = cls(**(payload or {}))
+        if instance.backend_allowlist is None:
+            instance.backend_allowlist = ["mps", "cuda_process"]
+        else:
+            instance.backend_allowlist = [str(item) for item in instance.backend_allowlist]
+        instance.batch_probe_search_mode = instance.batch_probe_search_mode or "binary"
+        return instance
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "requires_gpu": self.requires_gpu,
+            "estimated_vram_mb": self.estimated_vram_mb,
+            "estimated_ram_mb": self.estimated_ram_mb,
+            "packing_eligible": self.packing_eligible,
+            "packing_family": self.packing_family,
+            "packing_max_slowdown_ratio": self.packing_max_slowdown_ratio,
+            "backend_allowlist": list(self.backend_allowlist),
+            "batch_probe_enabled": self.batch_probe_enabled,
+            "batch_probe_model_key": self.batch_probe_model_key,
+            "batch_probe_probe_timeout_seconds": self.batch_probe_probe_timeout_seconds,
+            "batch_probe_poll_interval_seconds": self.batch_probe_poll_interval_seconds,
+            "batch_probe_max_multiplier": self.batch_probe_max_multiplier,
+            "batch_probe_search_mode": self.batch_probe_search_mode,
         }
 
 
 @dataclass(slots=True)
 class GpuSchedulerSettings:
     enabled: bool = True
-    backend_priority: list[str] = field(default_factory=lambda: ["mps", "exclusive"])
+    mode: str = SCHEDULER_MODE_PARALLEL_DEFAULT
+    backend_priority: list[str] = field(default_factory=lambda: ["mps", "stream", "cuda_process", "exclusive"])
     max_packed_jobs_per_gpu: int = 2
     allow_three_way_packing: bool = False
+    candidate_window_size: int = 8
     device_index: int = 0
     fallback_cooldown_seconds: int = 900
     batch_probe_enabled: bool = True
@@ -121,23 +250,59 @@ class GpuSchedulerSettings:
     batch_probe_min_batch_size: int = 1
     batch_probe_max_search_rounds: int = 12
     batch_probe_max_batch_size: int | None = None
+    batch_probe_search_mode: str = "binary"
     profiling: GpuProfilingSettings = field(default_factory=GpuProfilingSettings)
     memory: GpuMemorySettings = field(default_factory=GpuMemorySettings)
     thresholds: GpuThresholdSettings = field(default_factory=GpuThresholdSettings)
     telemetry: GpuTelemetrySettings = field(default_factory=GpuTelemetrySettings)
+    parallel_optimizer: ParallelOptimizerSettings = field(default_factory=ParallelOptimizerSettings)
+    submission_defaults: SchedulerSubmissionDefaults = field(default_factory=SchedulerSubmissionDefaults)
     mps: MPSSettings = field(default_factory=MPSSettings)
+    cuda_process: CudaProcessSettings = field(default_factory=CudaProcessSettings)
+    stream: StreamSettings = field(default_factory=StreamSettings)
 
     def __post_init__(self) -> None:
+        self.mode = normalize_scheduler_mode(self.mode)
+        if self.backend_priority is None:
+            self.backend_priority = ["mps", "stream", "cuda_process", "exclusive"]
+        else:
+            self.backend_priority = [str(item) for item in self.backend_priority]
+        if self.profiling is None:
+            self.profiling = GpuProfilingSettings()
         if isinstance(self.profiling, dict):
             self.profiling = GpuProfilingSettings.from_dict(self.profiling)
+        if self.memory is None:
+            self.memory = GpuMemorySettings()
         if isinstance(self.memory, dict):
             self.memory = GpuMemorySettings.from_dict(self.memory)
+        if self.thresholds is None:
+            self.thresholds = GpuThresholdSettings()
         if isinstance(self.thresholds, dict):
             self.thresholds = GpuThresholdSettings.from_dict(self.thresholds)
+        if self.telemetry is None:
+            self.telemetry = GpuTelemetrySettings()
         if isinstance(self.telemetry, dict):
             self.telemetry = GpuTelemetrySettings.from_dict(self.telemetry)
+        if self.parallel_optimizer is None:
+            self.parallel_optimizer = ParallelOptimizerSettings()
+        if isinstance(self.parallel_optimizer, dict):
+            self.parallel_optimizer = ParallelOptimizerSettings.from_dict(self.parallel_optimizer)
+        if self.submission_defaults is None:
+            self.submission_defaults = SchedulerSubmissionDefaults()
+        if isinstance(self.submission_defaults, dict):
+            self.submission_defaults = SchedulerSubmissionDefaults.from_dict(self.submission_defaults)
+        if self.mps is None:
+            self.mps = MPSSettings()
         if isinstance(self.mps, dict):
             self.mps = MPSSettings.from_dict(self.mps)
+        if self.cuda_process is None:
+            self.cuda_process = CudaProcessSettings()
+        if isinstance(self.cuda_process, dict):
+            self.cuda_process = CudaProcessSettings.from_dict(self.cuda_process)
+        if self.stream is None:
+            self.stream = StreamSettings()
+        if isinstance(self.stream, dict):
+            self.stream = StreamSettings.from_dict(self.stream)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "GpuSchedulerSettings":
@@ -146,9 +311,11 @@ class GpuSchedulerSettings:
     def to_dict(self) -> dict[str, Any]:
         return {
             "enabled": self.enabled,
+            "mode": self.mode,
             "backend_priority": list(self.backend_priority),
             "max_packed_jobs_per_gpu": self.max_packed_jobs_per_gpu,
             "allow_three_way_packing": self.allow_three_way_packing,
+            "candidate_window_size": self.candidate_window_size,
             "device_index": self.device_index,
             "fallback_cooldown_seconds": self.fallback_cooldown_seconds,
             "batch_probe_enabled": self.batch_probe_enabled,
@@ -156,11 +323,16 @@ class GpuSchedulerSettings:
             "batch_probe_min_batch_size": self.batch_probe_min_batch_size,
             "batch_probe_max_search_rounds": self.batch_probe_max_search_rounds,
             "batch_probe_max_batch_size": self.batch_probe_max_batch_size,
+            "batch_probe_search_mode": self.batch_probe_search_mode,
             "profiling": self.profiling.to_dict(),
             "memory": self.memory.to_dict(),
             "thresholds": self.thresholds.to_dict(),
             "telemetry": self.telemetry.to_dict(),
+            "parallel_optimizer": self.parallel_optimizer.to_dict(),
+            "submission_defaults": self.submission_defaults.to_dict(),
             "mps": self.mps.to_dict(),
+            "cuda_process": self.cuda_process.to_dict(),
+            "stream": self.stream.to_dict(),
         }
 
 
@@ -192,6 +364,7 @@ class SchedulerSettings:
     events_jsonl_path: Path = field(init=False)
     scheduler_log_path: Path = field(init=False)
     cache_socket_path: Path = field(init=False)
+    service_heartbeat_path: Path = field(init=False)
 
     def __post_init__(self) -> None:
         if isinstance(self.gpu_scheduler, dict):
@@ -206,6 +379,7 @@ class SchedulerSettings:
         self.events_jsonl_path = self.logs_dir / "events.jsonl"
         self.scheduler_log_path = self.logs_dir / "scheduler.log"
         self.cache_socket_path = self.runtime_root / self.cache_socket_name
+        self.service_heartbeat_path = self.runtime_root / "service_heartbeat.json"
 
     @classmethod
     def from_file(cls, path: str | Path | None = None, **overrides: Any) -> "SchedulerSettings":

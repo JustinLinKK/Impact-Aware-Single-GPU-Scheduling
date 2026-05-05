@@ -13,15 +13,18 @@ cache_socket_name: "cache_server.sock"
 auto_resume_recoverable: false
 gpu_scheduler:
   enabled: true
-  backend_priority: ["exclusive"]
-  max_packed_jobs_per_gpu: 1
+  mode: "parallel_default"
+  backend_priority: ["mps", "stream", "cuda_process", "exclusive"]
+  max_packed_jobs_per_gpu: 2
   allow_three_way_packing: false
+  candidate_window_size: 8
   fallback_cooldown_seconds: 900
   batch_probe_enabled: true
   batch_probe_target_memory_fraction: 0.97
   batch_probe_min_batch_size: 1
   batch_probe_max_search_rounds: 12
   batch_probe_max_batch_size: null
+  batch_probe_search_mode: "binary"
   profiling:
     warmup_steps: 30
     solo_probe_steps: 80
@@ -39,6 +42,26 @@ gpu_scheduler:
   telemetry:
     device_poll_ms: 500
     pair_recheck_every_steps: 20
+  parallel_optimizer:
+    batch_search_mode: "binary"
+    target_vram_fraction: 0.97
+    max_probe_jobs: 3
+    max_batch_multiplier: 32
+    min_batch_size: 1
+  submission_defaults:
+    requires_gpu: true
+    estimated_vram_mb: null
+    estimated_ram_mb: null
+    packing_eligible: false
+    packing_family: "mlevolve_script"
+    packing_max_slowdown_ratio: null
+    backend_allowlist: ["mps", "cuda_process"]
+    batch_probe_enabled: true
+    batch_probe_model_key: null
+    batch_probe_probe_timeout_seconds: 45
+    batch_probe_poll_interval_seconds: 0.5
+    batch_probe_max_multiplier: 32
+    batch_probe_search_mode: "binary"
   mps:
     enabled: false
     compute_mode: "EXCLUSIVE_PROCESS"
@@ -46,3 +69,13 @@ gpu_scheduler:
     default_secondary_active_thread_pct: 40
     default_omp_num_threads: 6
     default_mkl_num_threads: 6
+    pipe_directory: "/tmp/nvidia-mps"
+    log_directory: "/tmp/nvidia-mps-log"
+  cuda_process:
+    enabled: true
+    default_omp_num_threads: 6
+    default_mkl_num_threads: 6
+  stream:
+    enabled: false
+    host_poll_interval_seconds: 0.1
+    host_join_timeout_seconds: 3.0

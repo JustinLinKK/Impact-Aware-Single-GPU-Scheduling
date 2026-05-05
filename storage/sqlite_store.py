@@ -9,7 +9,9 @@ import json
 import sqlite3
 
 from ..schemas import (
+    BatchSizeObservation,
     BatchProbeProfile,
+    CombinationProfile,
     CommandType,
     JobCommand,
     JobStatus,
@@ -21,8 +23,9 @@ from ..schemas import (
     parse_timestamp,
     utc_now,
 )
+from ..hardware import HardwareProfile, detect_hardware_profile
 from ..settings import SchedulerSettings
-from .models import SCHEMA_STATEMENTS
+from .models import MIGRATION_STATEMENTS, SCHEMA_STATEMENTS
 
 
 class SQLiteStateStore:
@@ -30,6 +33,7 @@ class SQLiteStateStore:
 
     def __init__(self, settings: SchedulerSettings):
         self.settings = settings
+        self._hardware_profile: HardwareProfile | None = None
         self.settings.ensure_runtime_layout()
         self.initialize()
 
@@ -44,7 +48,21 @@ class SQLiteStateStore:
         with self._connect() as connection:
             for statement in SCHEMA_STATEMENTS:
                 connection.execute(statement)
+            for statement in MIGRATION_STATEMENTS:
+                try:
+                    connection.execute(statement)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
             connection.commit()
+
+    def hardware_profile(self) -> HardwareProfile:
+        if self._hardware_profile is None:
+            self._hardware_profile = detect_hardware_profile(device_index=self.settings.gpu_scheduler.device_index)
+        return self._hardware_profile
+
+    def hardware_key(self) -> str:
+        return self.hardware_profile().hardware_key
 
     def next_queue_sequence(self) -> int:
         with self._connect() as connection:
@@ -321,12 +339,14 @@ class SQLiteStateStore:
 
     def upsert_solo_profile(self, profile: SoloProfile) -> SoloProfile:
         profile.updated_at = utc_now()
+        if not profile.hardware_key:
+            profile.hardware_key = self.hardware_key()
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO solo_profiles(signature, family, peak_vram_mb, avg_gpu_utilization, avg_memory_utilization, sample_count, last_job_id, updated_at, metadata_json)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(signature) DO UPDATE SET
+                INSERT INTO solo_profiles(signature, hardware_key, family, peak_vram_mb, avg_gpu_utilization, avg_memory_utilization, sample_count, last_job_id, updated_at, metadata_json)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(signature, hardware_key) DO UPDATE SET
                     family=excluded.family,
                     peak_vram_mb=excluded.peak_vram_mb,
                     avg_gpu_utilization=excluded.avg_gpu_utilization,
@@ -338,6 +358,7 @@ class SQLiteStateStore:
                 """,
                 (
                     profile.signature,
+                    profile.hardware_key,
                     profile.family,
                     profile.peak_vram_mb,
                     profile.avg_gpu_utilization,
@@ -351,24 +372,36 @@ class SQLiteStateStore:
             connection.commit()
         return profile
 
-    def get_solo_profile(self, signature: str) -> SoloProfile | None:
+    def get_solo_profile(self, signature: str, *, hardware_key: str | None = None) -> SoloProfile | None:
+        hardware_key = hardware_key or self.hardware_key()
         with self._connect() as connection:
-            row = connection.execute("SELECT * FROM solo_profiles WHERE signature = ?", (signature,)).fetchone()
+            row = connection.execute(
+                "SELECT * FROM solo_profiles WHERE signature = ? AND hardware_key = ?",
+                (signature, hardware_key),
+            ).fetchone()
         return SoloProfile.from_row(dict(row)) if row else None
 
-    def list_solo_profiles(self) -> list[SoloProfile]:
+    def list_solo_profiles(self, *, hardware_key: str | None = None) -> list[SoloProfile]:
         with self._connect() as connection:
-            rows = connection.execute("SELECT * FROM solo_profiles ORDER BY updated_at DESC").fetchall()
+            if hardware_key is None:
+                rows = connection.execute("SELECT * FROM solo_profiles ORDER BY updated_at DESC").fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM solo_profiles WHERE hardware_key = ? ORDER BY updated_at DESC",
+                    (hardware_key,),
+                ).fetchall()
         return [SoloProfile.from_row(dict(row)) for row in rows]
 
     def upsert_pair_profile(self, profile: PairProfile) -> PairProfile:
         profile.updated_at = utc_now()
+        if not profile.hardware_key:
+            profile.hardware_key = self.hardware_key()
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO pair_profiles(pair_key, left_signature, right_signature, compatible, observations, peak_vram_mb, avg_gpu_utilization, avg_memory_utilization, slowdown_ratio, cooldown_until, last_failure_reason, updated_at, metadata_json)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(pair_key) DO UPDATE SET
+                INSERT INTO pair_profiles(pair_key, hardware_key, left_signature, right_signature, compatible, observations, peak_vram_mb, avg_gpu_utilization, avg_memory_utilization, slowdown_ratio, cooldown_until, last_failure_reason, updated_at, metadata_json)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(pair_key, hardware_key) DO UPDATE SET
                     left_signature=excluded.left_signature,
                     right_signature=excluded.right_signature,
                     compatible=excluded.compatible,
@@ -384,6 +417,7 @@ class SQLiteStateStore:
                 """,
                 (
                     profile.pair_key,
+                    profile.hardware_key,
                     profile.left_signature,
                     profile.right_signature,
                     1 if profile.compatible else 0,
@@ -401,15 +435,25 @@ class SQLiteStateStore:
             connection.commit()
         return profile
 
-    def get_pair_profile(self, left_signature: str, right_signature: str) -> PairProfile | None:
+    def get_pair_profile(self, left_signature: str, right_signature: str, *, hardware_key: str | None = None) -> PairProfile | None:
         pair_key = canonical_pair_key(left_signature, right_signature)
+        hardware_key = hardware_key or self.hardware_key()
         with self._connect() as connection:
-            row = connection.execute("SELECT * FROM pair_profiles WHERE pair_key = ?", (pair_key,)).fetchone()
+            row = connection.execute(
+                "SELECT * FROM pair_profiles WHERE pair_key = ? AND hardware_key = ?",
+                (pair_key, hardware_key),
+            ).fetchone()
         return PairProfile.from_row(dict(row)) if row else None
 
-    def list_pair_profiles(self) -> list[PairProfile]:
+    def list_pair_profiles(self, *, hardware_key: str | None = None) -> list[PairProfile]:
         with self._connect() as connection:
-            rows = connection.execute("SELECT * FROM pair_profiles ORDER BY updated_at DESC").fetchall()
+            if hardware_key is None:
+                rows = connection.execute("SELECT * FROM pair_profiles ORDER BY updated_at DESC").fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM pair_profiles WHERE hardware_key = ? ORDER BY updated_at DESC",
+                    (hardware_key,),
+                ).fetchall()
         return [PairProfile.from_row(dict(row)) for row in rows]
 
     def upsert_batch_probe_profile(self, profile: BatchProbeProfile) -> BatchProbeProfile:
@@ -476,6 +520,236 @@ class SQLiteStateStore:
             rows = connection.execute("SELECT * FROM batch_probe_profiles ORDER BY updated_at DESC").fetchall()
         return [BatchProbeProfile.from_row(dict(row)) for row in rows]
 
+    def upsert_batch_size_observation(self, observation: BatchSizeObservation) -> BatchSizeObservation:
+        observation.updated_at = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO batch_size_observations(
+                    observation_key,
+                    model_key,
+                    shape_signature,
+                    hardware_key,
+                    backend_name,
+                    batch_param_name,
+                    batch_size,
+                    peak_vram_mb,
+                    memory_total_mb,
+                    avg_step_time_ms,
+                    avg_gpu_utilization,
+                    avg_memory_utilization,
+                    observations,
+                    last_job_id,
+                    updated_at,
+                    metadata_json
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(observation_key) DO UPDATE SET
+                    model_key=excluded.model_key,
+                    shape_signature=excluded.shape_signature,
+                    hardware_key=excluded.hardware_key,
+                    backend_name=excluded.backend_name,
+                    batch_param_name=excluded.batch_param_name,
+                    batch_size=excluded.batch_size,
+                    peak_vram_mb=excluded.peak_vram_mb,
+                    memory_total_mb=excluded.memory_total_mb,
+                    avg_step_time_ms=excluded.avg_step_time_ms,
+                    avg_gpu_utilization=excluded.avg_gpu_utilization,
+                    avg_memory_utilization=excluded.avg_memory_utilization,
+                    observations=excluded.observations,
+                    last_job_id=excluded.last_job_id,
+                    updated_at=excluded.updated_at,
+                    metadata_json=excluded.metadata_json
+                """,
+                (
+                    observation.observation_key,
+                    observation.model_key,
+                    observation.shape_signature,
+                    observation.hardware_key,
+                    observation.backend_name,
+                    observation.batch_param_name,
+                    observation.batch_size,
+                    observation.peak_vram_mb,
+                    observation.memory_total_mb,
+                    observation.avg_step_time_ms,
+                    observation.avg_gpu_utilization,
+                    observation.avg_memory_utilization,
+                    observation.observations,
+                    observation.last_job_id,
+                    observation.updated_at,
+                    json.dumps(observation.metadata or {}, sort_keys=True),
+                ),
+            )
+            connection.commit()
+        return observation
+
+    def get_batch_size_observation(
+        self,
+        *,
+        model_key: str,
+        shape_signature: str,
+        hardware_key: str,
+        backend_name: str,
+        batch_size: int,
+    ) -> BatchSizeObservation | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM batch_size_observations
+                WHERE model_key = ? AND shape_signature = ? AND hardware_key = ? AND backend_name = ? AND batch_size = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (model_key, shape_signature, hardware_key, backend_name, int(batch_size)),
+            ).fetchone()
+        return BatchSizeObservation.from_row(dict(row)) if row else None
+
+    def list_batch_size_observations(
+        self,
+        *,
+        model_key: str | None = None,
+        shape_signature: str | None = None,
+        hardware_key: str | None = None,
+        backend_name: str | None = None,
+    ) -> list[BatchSizeObservation]:
+        query = "SELECT * FROM batch_size_observations WHERE 1=1"
+        params: list[Any] = []
+        if model_key is not None:
+            query += " AND model_key = ?"
+            params.append(model_key)
+        if shape_signature is not None:
+            query += " AND shape_signature = ?"
+            params.append(shape_signature)
+        if hardware_key is not None:
+            query += " AND hardware_key = ?"
+            params.append(hardware_key)
+        if backend_name is not None:
+            query += " AND backend_name = ?"
+            params.append(backend_name)
+        query += " ORDER BY updated_at DESC"
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [BatchSizeObservation.from_row(dict(row)) for row in rows]
+
+    def upsert_combination_profile(self, profile: CombinationProfile) -> CombinationProfile:
+        profile.updated_at = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO combination_profiles(
+                    combination_key,
+                    group_signature,
+                    hardware_key,
+                    backend_name,
+                    scheduler_mode,
+                    batch_vector_json,
+                    compatible,
+                    observations,
+                    peak_vram_mb,
+                    memory_total_mb,
+                    avg_gpu_utilization,
+                    avg_memory_utilization,
+                    avg_step_time_ms,
+                    objective_score,
+                    resolved_optimal,
+                    last_failure_reason,
+                    fallback_order_json,
+                    updated_at,
+                    metadata_json
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(combination_key) DO UPDATE SET
+                    group_signature=excluded.group_signature,
+                    hardware_key=excluded.hardware_key,
+                    backend_name=excluded.backend_name,
+                    scheduler_mode=excluded.scheduler_mode,
+                    batch_vector_json=excluded.batch_vector_json,
+                    compatible=excluded.compatible,
+                    observations=excluded.observations,
+                    peak_vram_mb=excluded.peak_vram_mb,
+                    memory_total_mb=excluded.memory_total_mb,
+                    avg_gpu_utilization=excluded.avg_gpu_utilization,
+                    avg_memory_utilization=excluded.avg_memory_utilization,
+                    avg_step_time_ms=excluded.avg_step_time_ms,
+                    objective_score=excluded.objective_score,
+                    resolved_optimal=excluded.resolved_optimal,
+                    last_failure_reason=excluded.last_failure_reason,
+                    fallback_order_json=excluded.fallback_order_json,
+                    updated_at=excluded.updated_at,
+                    metadata_json=excluded.metadata_json
+                """,
+                (
+                    profile.combination_key,
+                    profile.group_signature,
+                    profile.hardware_key,
+                    profile.backend_name,
+                    profile.scheduler_mode,
+                    json.dumps(profile.batch_vector, sort_keys=True),
+                    1 if profile.compatible else 0,
+                    profile.observations,
+                    profile.peak_vram_mb,
+                    profile.memory_total_mb,
+                    profile.avg_gpu_utilization,
+                    profile.avg_memory_utilization,
+                    profile.avg_step_time_ms,
+                    profile.objective_score,
+                    1 if profile.resolved_optimal else 0,
+                    profile.last_failure_reason,
+                    json.dumps(profile.fallback_order),
+                    profile.updated_at,
+                    json.dumps(profile.metadata or {}, sort_keys=True),
+                ),
+            )
+            connection.commit()
+        return profile
+
+    def best_combination_profile(
+        self,
+        *,
+        group_signature: str,
+        hardware_key: str,
+        backend_name: str,
+        scheduler_mode: str,
+    ) -> CombinationProfile | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM combination_profiles
+                WHERE group_signature = ? AND hardware_key = ? AND backend_name = ? AND scheduler_mode = ? AND compatible = 1
+                ORDER BY resolved_optimal DESC, objective_score DESC, updated_at DESC
+                LIMIT 1
+                """,
+                (group_signature, hardware_key, backend_name, scheduler_mode),
+            ).fetchone()
+        return CombinationProfile.from_row(dict(row)) if row else None
+
+    def list_combination_profiles(
+        self,
+        *,
+        group_signature: str | None = None,
+        hardware_key: str | None = None,
+        backend_name: str | None = None,
+        scheduler_mode: str | None = None,
+    ) -> list[CombinationProfile]:
+        query = "SELECT * FROM combination_profiles WHERE 1=1"
+        params: list[Any] = []
+        if group_signature is not None:
+            query += " AND group_signature = ?"
+            params.append(group_signature)
+        if hardware_key is not None:
+            query += " AND hardware_key = ?"
+            params.append(hardware_key)
+        if backend_name is not None:
+            query += " AND backend_name = ?"
+            params.append(backend_name)
+        if scheduler_mode is not None:
+            query += " AND scheduler_mode = ?"
+            params.append(scheduler_mode)
+        query += " ORDER BY updated_at DESC"
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [CombinationProfile.from_row(dict(row)) for row in rows]
+
     def mark_pair_incompatible(
         self,
         left_signature: str,
@@ -488,13 +762,15 @@ class SQLiteStateStore:
         avg_memory_utilization: float | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> PairProfile:
-        existing = self.get_pair_profile(left_signature, right_signature)
+        hardware_key = self.hardware_key()
+        existing = self.get_pair_profile(left_signature, right_signature, hardware_key=hardware_key)
         cooldown_until = None
         if cooldown_seconds > 0:
             cooldown_until = (parse_timestamp(utc_now()) + timedelta(seconds=cooldown_seconds)).isoformat()
         profile = PairProfile.create(
             left_signature,
             right_signature,
+            hardware_key=hardware_key,
             compatible=False,
             observations=(existing.observations + 1) if existing else 1,
             peak_vram_mb=peak_vram_mb if peak_vram_mb is not None else (existing.peak_vram_mb if existing else None),
@@ -554,6 +830,6 @@ class SQLiteStateStore:
             cache_hits=int(cache_summary["hits"]),
             cache_misses=int(cache_summary["misses"]),
             cache_evictions=sum(event["event_type"] == "cache_evicted" for event in events),
-            packed_dispatches=sum(event["event_type"] == "packed_pair_dispatched" for event in events),
-            packed_fallbacks=sum(event["event_type"] == "packed_pair_fallback" for event in events),
+            packed_dispatches=sum(event["event_type"] in {"packed_pair_dispatched", "packed_group_dispatched"} for event in events),
+            packed_fallbacks=sum(event["event_type"] in {"packed_pair_fallback", "packed_group_fallback"} for event in events),
         )

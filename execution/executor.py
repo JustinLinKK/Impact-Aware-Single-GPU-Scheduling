@@ -18,6 +18,7 @@ class WorkerProcessHandle:
     process: subprocess.Popen
     stdout_path: Path
     stderr_path: Path
+    monitor_via_store: bool = False
 
 
 class SubprocessExecutor:

@@ -8,8 +8,19 @@ import json
 
 import yaml
 
+from .schemas import parse_timestamp, utc_now
 from .model_cache.cache_server import CacheClient
-from .schemas import BatchProbeProfile, CommandType, JobStatus, PairProfile, SoloProfile, TrainingJob, stable_job_id, utc_now
+from .schemas import (
+    BatchProbeProfile,
+    BatchSizeObservation,
+    CombinationProfile,
+    CommandType,
+    JobStatus,
+    PairProfile,
+    SoloProfile,
+    TrainingJob,
+    stable_job_id,
+)
 from .scheduler.service import SchedulerService
 from .settings import SchedulerSettings
 from .storage.sqlite_store import SQLiteStateStore
@@ -24,6 +35,32 @@ class LocalMLSchedulerAPI:
 
     def create_scheduler_service(self, **kwargs: Any) -> SchedulerService:
         return SchedulerService(self.settings, store=self.store, **kwargs)
+
+    def scheduler_service_heartbeat(self) -> dict[str, Any] | None:
+        path = self.settings.service_heartbeat_path
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def scheduler_service_active(self, *, max_staleness_seconds: float | None = None) -> bool:
+        heartbeat = self.scheduler_service_heartbeat()
+        if not heartbeat:
+            return False
+        if heartbeat.get("status") != "running":
+            return False
+        updated_at = parse_timestamp(heartbeat.get("updated_at"))
+        if updated_at is None:
+            return False
+        now = parse_timestamp(utc_now())
+        if now is None:
+            return False
+        stale_after = max_staleness_seconds
+        if stale_after is None:
+            stale_after = max(5.0, float(self.settings.scheduler_poll_interval_seconds) * 4.0)
+        return (now - updated_at).total_seconds() <= float(stale_after)
 
     def _normalize_job_payload(self, payload: dict[str, Any]) -> TrainingJob:
         payload = dict(payload)
@@ -112,6 +149,24 @@ class LocalMLSchedulerAPI:
 
     def upsert_batch_probe_profile(self, profile: BatchProbeProfile) -> BatchProbeProfile:
         return self.store.upsert_batch_probe_profile(profile)
+
+    def get_batch_size_observation(self, **kwargs: Any) -> BatchSizeObservation | None:
+        return self.store.get_batch_size_observation(**kwargs)
+
+    def list_batch_size_observations(self, **kwargs: Any) -> list[BatchSizeObservation]:
+        return self.store.list_batch_size_observations(**kwargs)
+
+    def upsert_batch_size_observation(self, observation: BatchSizeObservation) -> BatchSizeObservation:
+        return self.store.upsert_batch_size_observation(observation)
+
+    def best_combination_profile(self, **kwargs: Any) -> CombinationProfile | None:
+        return self.store.best_combination_profile(**kwargs)
+
+    def list_combination_profiles(self, **kwargs: Any) -> list[CombinationProfile]:
+        return self.store.list_combination_profiles(**kwargs)
+
+    def upsert_combination_profile(self, profile: CombinationProfile) -> CombinationProfile:
+        return self.store.upsert_combination_profile(profile)
 
     def dump_jobs_json(self) -> str:
         return json.dumps([job.to_dict() for job in self.list_jobs()], indent=2, sort_keys=True)

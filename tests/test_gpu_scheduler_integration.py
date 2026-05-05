@@ -8,7 +8,7 @@ import unittest
 
 from localml_scheduler.adapters.mlevolve import build_mlevolve_job
 from localml_scheduler.api import LocalMLSchedulerAPI
-from localml_scheduler.execution.backends import ExclusiveBackend, MPSBackend
+from localml_scheduler.execution.backends import CudaProcessBackend, ExclusiveBackend, MPSBackend
 from localml_scheduler.execution.executor import SubprocessExecutor
 from localml_scheduler.examples.toy_pytorch_runner import create_toy_baseline_checkpoint
 from localml_scheduler.execution.runner_protocol import RunnerContext
@@ -36,6 +36,15 @@ def _build_supervisor(settings: SchedulerSettings, *, mps_available: bool) -> Wo
     backends = {
         "exclusive": ExclusiveBackend(settings, executor),
         "mps": MPSBackend(settings, executor, mps_binary=mps_binary),
+    }
+    return WorkerSupervisor(settings, backends=backends)
+
+
+def _build_cuda_process_supervisor(settings: SchedulerSettings) -> WorkerSupervisor:
+    executor = SubprocessExecutor(settings)
+    backends = {
+        "exclusive": ExclusiveBackend(settings, executor),
+        "cuda_process": CudaProcessBackend(settings, executor),
     }
     return WorkerSupervisor(settings, backends=backends)
 
@@ -104,6 +113,111 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
                 pair_profile = api.get_pair_profile(first.packing.signature, second.packing.signature)
                 self.assertIsNotNone(pair_profile)
                 self.assertTrue(pair_profile.compatible)
+            finally:
+                service.stop()
+
+    def test_cuda_process_backend_dispatches_packed_pair_when_mps_is_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            settings = SchedulerSettings(
+                runtime_root=runtime_root,
+                scheduler_poll_interval_seconds=0.05,
+                gpu_scheduler={"backend_priority": ["cuda_process", "exclusive"]},
+            )
+            api = LocalMLSchedulerAPI(settings)
+            supervisor = _build_cuda_process_supervisor(settings)
+            service = api.create_scheduler_service(supervisor=supervisor).start(background=True)
+            try:
+                baseline = create_toy_baseline_checkpoint(runtime_root / "baselines" / "cuda-process-pair.pt", seed=89)
+                first = self._build_job(baseline, learning_rate=0.011, priority=7)
+                second = self._build_job(baseline, learning_rate=0.012, priority=6)
+                _seed_solo_profile(api, first)
+                _seed_solo_profile(api, second)
+
+                api.submit_job(first)
+                api.submit_job(second)
+
+                wait_for(
+                    lambda: api.get_job(first.job_id).status.is_terminal and api.get_job(second.job_id).status.is_terminal,
+                    timeout=30.0,
+                )
+                self.assertEqual(api.get_job(first.job_id).metadata["placement_mode"], "packed_pair")
+                self.assertEqual(api.get_job(second.job_id).metadata["placement_mode"], "packed_pair")
+                self.assertEqual(api.get_job(first.job_id).metadata["placement_backend"], "cuda_process")
+                self.assertEqual(api.get_job(second.job_id).metadata["placement_backend"], "cuda_process")
+                self.assertEqual(api.report()["packed_dispatches"], 1)
+            finally:
+                service.stop()
+
+    def test_cuda_process_backend_dispatches_three_way_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            settings = SchedulerSettings(
+                runtime_root=runtime_root,
+                scheduler_poll_interval_seconds=0.05,
+                gpu_scheduler={
+                    "backend_priority": ["cuda_process", "exclusive"],
+                    "max_packed_jobs_per_gpu": 3,
+                    "allow_three_way_packing": True,
+                },
+            )
+            api = LocalMLSchedulerAPI(settings)
+            supervisor = _build_cuda_process_supervisor(settings)
+            service = api.create_scheduler_service(supervisor=supervisor).start(background=True)
+            try:
+                baseline = create_toy_baseline_checkpoint(runtime_root / "baselines" / "cuda-process-group.pt", seed=88)
+                jobs = [
+                    self._build_job(baseline, learning_rate=0.021, priority=9),
+                    self._build_job(baseline, learning_rate=0.022, priority=8),
+                    self._build_job(baseline, learning_rate=0.023, priority=7),
+                ]
+                for job in jobs:
+                    _seed_solo_profile(api, job, peak_vram_mb=256)
+                    api.submit_job(job)
+
+                wait_for(lambda: all(api.get_job(job.job_id).status.is_terminal for job in jobs), timeout=30.0)
+                self.assertTrue(all(api.get_job(job.job_id).metadata["placement_mode"] == "packed_group" for job in jobs))
+                self.assertTrue(all(api.get_job(job.job_id).metadata["placement_backend"] == "cuda_process" for job in jobs))
+                self.assertEqual(api.report()["packed_dispatches"], 1)
+            finally:
+                service.stop()
+
+    def test_cuda_process_failure_records_fallback_and_keeps_peer_alive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            settings = SchedulerSettings(
+                runtime_root=runtime_root,
+                scheduler_poll_interval_seconds=0.05,
+                gpu_scheduler={"backend_priority": ["cuda_process", "exclusive"]},
+            )
+            api = LocalMLSchedulerAPI(settings)
+            supervisor = _build_cuda_process_supervisor(settings)
+            service = api.create_scheduler_service(supervisor=supervisor).start(background=True)
+            try:
+                baseline = create_toy_baseline_checkpoint(runtime_root / "baselines" / "cuda-process-failure.pt", seed=87)
+                primary = self._build_job(baseline, learning_rate=0.031, priority=9, max_steps=30)
+                failing = self._build_job(
+                    baseline,
+                    learning_rate=0.032,
+                    priority=8,
+                    max_steps=5,
+                    runner_target="localml_scheduler.tests.test_gpu_scheduler_integration:run_failing_job",
+                )
+                _seed_solo_profile(api, primary)
+                _seed_solo_profile(api, failing)
+
+                api.submit_job(primary)
+                api.submit_job(failing)
+
+                wait_for(
+                    lambda: api.get_job(primary.job_id).status.is_terminal and api.get_job(failing.job_id).status.is_terminal,
+                    timeout=30.0,
+                )
+                self.assertEqual(api.get_job(primary.job_id).status, JobStatus.COMPLETED)
+                self.assertEqual(api.get_job(failing.job_id).status, JobStatus.FAILED)
+                self.assertEqual(api.report()["packed_fallbacks"], 1)
+                self.assertEqual(api.get_job(primary.job_id).metadata["placement_backend"], "cuda_process")
+                self.assertEqual(api.get_job(failing.job_id).metadata["placement_backend"], "cuda_process")
             finally:
                 service.stop()
 

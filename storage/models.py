@@ -59,7 +59,8 @@ SCHEMA_STATEMENTS = [
     """,
     """
     CREATE TABLE IF NOT EXISTS solo_profiles (
-        signature TEXT PRIMARY KEY,
+        signature TEXT NOT NULL,
+        hardware_key TEXT NOT NULL DEFAULT '',
         family TEXT,
         peak_vram_mb INTEGER,
         avg_gpu_utilization REAL,
@@ -67,12 +68,14 @@ SCHEMA_STATEMENTS = [
         sample_count INTEGER NOT NULL DEFAULT 0,
         last_job_id TEXT,
         updated_at TEXT NOT NULL,
-        metadata_json TEXT
+        metadata_json TEXT,
+        PRIMARY KEY(signature, hardware_key)
     )
     """,
     """
     CREATE TABLE IF NOT EXISTS pair_profiles (
-        pair_key TEXT PRIMARY KEY,
+        pair_key TEXT NOT NULL,
+        hardware_key TEXT NOT NULL DEFAULT '',
         left_signature TEXT NOT NULL,
         right_signature TEXT NOT NULL,
         compatible INTEGER NOT NULL DEFAULT 1,
@@ -84,7 +87,8 @@ SCHEMA_STATEMENTS = [
         cooldown_until TEXT,
         last_failure_reason TEXT,
         updated_at TEXT NOT NULL,
-        metadata_json TEXT
+        metadata_json TEXT,
+        PRIMARY KEY(pair_key, hardware_key)
     )
     """,
     """
@@ -100,6 +104,49 @@ SCHEMA_STATEMENTS = [
         target_budget_mb INTEGER,
         observations INTEGER NOT NULL DEFAULT 1,
         last_job_id TEXT,
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS batch_size_observations (
+        observation_key TEXT PRIMARY KEY,
+        model_key TEXT NOT NULL,
+        shape_signature TEXT NOT NULL,
+        hardware_key TEXT NOT NULL,
+        backend_name TEXT NOT NULL,
+        batch_param_name TEXT NOT NULL,
+        batch_size INTEGER NOT NULL,
+        peak_vram_mb INTEGER,
+        memory_total_mb INTEGER,
+        avg_step_time_ms REAL,
+        avg_gpu_utilization REAL,
+        avg_memory_utilization REAL,
+        observations INTEGER NOT NULL DEFAULT 1,
+        last_job_id TEXT,
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS combination_profiles (
+        combination_key TEXT PRIMARY KEY,
+        group_signature TEXT NOT NULL,
+        hardware_key TEXT NOT NULL,
+        backend_name TEXT NOT NULL,
+        scheduler_mode TEXT NOT NULL,
+        batch_vector_json TEXT NOT NULL,
+        compatible INTEGER NOT NULL DEFAULT 1,
+        observations INTEGER NOT NULL DEFAULT 0,
+        peak_vram_mb INTEGER,
+        memory_total_mb INTEGER,
+        avg_gpu_utilization REAL,
+        avg_memory_utilization REAL,
+        avg_step_time_ms REAL,
+        objective_score REAL,
+        resolved_optimal INTEGER NOT NULL DEFAULT 0,
+        last_failure_reason TEXT,
+        fallback_order_json TEXT,
         updated_at TEXT NOT NULL,
         metadata_json TEXT
     )
@@ -122,14 +169,28 @@ SCHEMA_STATEMENTS = [
     """,
     """
     CREATE INDEX IF NOT EXISTS idx_solo_profiles_family
-    ON solo_profiles(family, updated_at DESC)
+    ON solo_profiles(family, hardware_key, updated_at DESC)
     """,
     """
     CREATE INDEX IF NOT EXISTS idx_pair_profiles_signatures
-    ON pair_profiles(left_signature, right_signature, updated_at DESC)
+    ON pair_profiles(left_signature, right_signature, hardware_key, updated_at DESC)
     """,
     """
     CREATE INDEX IF NOT EXISTS idx_batch_probe_profiles_lookup
     ON batch_probe_profiles(model_key, device_type, updated_at DESC)
     """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_batch_size_observations_lookup
+    ON batch_size_observations(model_key, shape_signature, hardware_key, backend_name, batch_size, updated_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_combination_profiles_lookup
+    ON combination_profiles(group_signature, hardware_key, backend_name, scheduler_mode, updated_at DESC)
+    """,
+]
+
+
+MIGRATION_STATEMENTS = [
+    "ALTER TABLE solo_profiles ADD COLUMN hardware_key TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE pair_profiles ADD COLUMN hardware_key TEXT NOT NULL DEFAULT ''",
 ]
