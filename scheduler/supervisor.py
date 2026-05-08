@@ -4,18 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import subprocess
+import uuid
 
-from ..execution.backends import CudaProcessBackend, ExclusiveBackend, ExecutionBackend, MPSBackend, StreamBackend
+from ..execution.backend_registry import BackendRegistry
+from ..execution.backends import ExecutionBackend
 from ..execution.control import ControlPlane
 from ..execution.executor import SubprocessExecutor, WorkerProcessHandle
-from ..schemas import JobStatus, PlacementDecision, TrainingJob
-from ..settings import SchedulerSettings
+from ..domain import JobStatus, PlacementDecision, TrainingJob
+from ..config import SchedulerSettings, SCHEDULER_MODE_PARALLEL_AUTO_PACK
 from ..storage.sqlite_store import SQLiteStateStore
 
 
 @dataclass(slots=True)
 class WorkerSnapshot:
     job_id: str
+    group_id: str
     alive: bool
     returncode: int | None = None
     reported_by: str = "process"
@@ -30,6 +33,7 @@ class ManagedWorker:
 
 @dataclass(slots=True)
 class PlacementGroupHandle:
+    group_id: str
     mode: str
     backend_name: str
     batch_overrides: dict[str, int] = field(default_factory=dict)
@@ -44,7 +48,7 @@ class PlacementGroupHandle:
 
 
 class WorkerSupervisor:
-    """Manage a single placement group on one physical GPU."""
+    """Manage placement groups on one physical GPU."""
 
     def __init__(
         self,
@@ -57,19 +61,29 @@ class WorkerSupervisor:
         self.store = store or SQLiteStateStore(settings)
         self.control_plane = ControlPlane(settings)
         self.executor = SubprocessExecutor(settings)
-        self.backends = backends or {
-            "exclusive": ExclusiveBackend(settings, self.executor),
-            "mps": MPSBackend(settings, self.executor),
-            "cuda_process": CudaProcessBackend(settings, self.executor),
-            "stream": StreamBackend(settings, self.executor),
-        }
-        self._group: PlacementGroupHandle | None = None
+        self.backend_registry = BackendRegistry(settings, self.executor, backends=backends)
+        self._groups: dict[str, PlacementGroupHandle] = {}
+
+    def _concurrency_enabled(self) -> bool:
+        return (
+            self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK
+            and self.settings.gpu_scheduler.concurrent_groups_enabled
+        )
+
+    def _overlap_allowed_for_backend(self, backend_name: str) -> bool:
+        return backend_name in set(self.settings.gpu_scheduler.concurrent_backend_allowlist)
 
     def available_backends(self) -> dict[str, bool]:
-        return {name: backend.available() for name, backend in self.backends.items()}
+        return self.backend_registry.availability()
+
+    def active_groups(self) -> dict[str, PlacementGroupHandle]:
+        return dict(self._groups)
 
     def active_group(self) -> PlacementGroupHandle | None:
-        return self._group
+        if not self._groups:
+            return None
+        first_key = next(iter(self._groups))
+        return self._groups[first_key]
 
     def active_group_mode(self) -> str | None:
         group = self.active_group()
@@ -94,10 +108,16 @@ class WorkerSupervisor:
         return worker.handle.process.poll() is None
 
     def active_job_ids(self) -> list[str]:
-        group = self.active_group()
-        if group is None:
-            return []
-        return [job_id for job_id, worker in group.workers.items() if self._worker_is_alive(worker)]
+        job_ids: list[str] = []
+        for group in self._groups.values():
+            job_ids.extend([job_id for job_id, worker in group.workers.items() if self._worker_is_alive(worker)])
+        return job_ids
+
+    def active_job_ids_by_group(self) -> dict[str, list[str]]:
+        payload: dict[str, list[str]] = {}
+        for group_id, group in self._groups.items():
+            payload[group_id] = [job_id for job_id, worker in group.workers.items() if self._worker_is_alive(worker)]
+        return payload
 
     def active_job_id(self) -> str | None:
         job_ids = self.active_job_ids()
@@ -112,19 +132,7 @@ class WorkerSupervisor:
         batch_overrides: dict[str, int] | None = None,
         fallback_order: list[str] | None = None,
     ) -> PlacementDecision:
-        group = self.active_group()
-        if group is not None:
-            return PlacementDecision(
-                can_run=False,
-                reason=f"GPU busy with jobs {', '.join(group.active_job_ids())}",
-                gpu_slot=0,
-                mode=group.mode,
-                backend_name=group.backend_name,
-                job_ids=group.active_job_ids(),
-                batch_overrides=group.batch_overrides,
-                fallback_order=group.fallback_order,
-            )
-        backend = self.backends.get(plan_backend_name)
+        backend = self.backend_registry.get(plan_backend_name)
         if backend is None:
             return PlacementDecision(
                 can_run=False,
@@ -147,9 +155,71 @@ class WorkerSupervisor:
                 batch_overrides=batch_overrides or {},
                 fallback_order=fallback_order or [],
             )
+        if not self._groups:
+            return PlacementDecision(
+                can_run=True,
+                reason="GPU slot available",
+                gpu_slot=0,
+                mode=plan_mode,
+                backend_name=plan_backend_name,
+                job_ids=job_ids,
+                batch_overrides=batch_overrides or {},
+                fallback_order=fallback_order or [],
+            )
+
+        if not self._concurrency_enabled():
+            active_jobs = self.active_job_ids()
+            return PlacementDecision(
+                can_run=False,
+                reason=f"GPU busy with jobs {', '.join(active_jobs)}",
+                gpu_slot=0,
+                mode=plan_mode,
+                backend_name=plan_backend_name,
+                job_ids=active_jobs,
+                batch_overrides=batch_overrides or {},
+                fallback_order=fallback_order or [],
+            )
+
+        if plan_backend_name == "exclusive":
+            return PlacementDecision(
+                can_run=False,
+                reason="exclusive groups cannot overlap with active groups",
+                gpu_slot=0,
+                mode=plan_mode,
+                backend_name=plan_backend_name,
+                job_ids=job_ids,
+                batch_overrides=batch_overrides or {},
+                fallback_order=fallback_order or [],
+            )
+
+        if not self._overlap_allowed_for_backend(plan_backend_name):
+            return PlacementDecision(
+                can_run=False,
+                reason=f"backend {plan_backend_name} is not enabled for overlapping groups",
+                gpu_slot=0,
+                mode=plan_mode,
+                backend_name=plan_backend_name,
+                job_ids=job_ids,
+                batch_overrides=batch_overrides or {},
+                fallback_order=fallback_order or [],
+            )
+
+        for active_group in self._groups.values():
+            if not self._overlap_allowed_for_backend(active_group.backend_name):
+                return PlacementDecision(
+                    can_run=False,
+                    reason=f"active backend {active_group.backend_name} blocks concurrent dispatch",
+                    gpu_slot=0,
+                    mode=plan_mode,
+                    backend_name=plan_backend_name,
+                    job_ids=active_group.active_job_ids(),
+                    batch_overrides=batch_overrides or {},
+                    fallback_order=fallback_order or [],
+                )
+
         return PlacementDecision(
             can_run=True,
-            reason="GPU slot available",
+            reason="concurrent group slot available",
             gpu_slot=0,
             mode=plan_mode,
             backend_name=plan_backend_name,
@@ -176,7 +246,10 @@ class WorkerSupervisor:
         )
         if not decision.can_run:
             return decision
-        backend = self.backends[backend_name]
+        group_id = uuid.uuid4().hex[:12]
+        backend = self.backend_registry.get(backend_name)
+        if backend is None:
+            return decision
         for job in jobs:
             self.control_plane.initialize_job(job.job_id)
             self.control_plane.clear_command(job.job_id)
@@ -190,41 +263,50 @@ class WorkerSupervisor:
             else:
                 role = f"slot-{index}"
             workers[handle.job_id] = ManagedWorker(job_id=handle.job_id, handle=handle, role=role)
-        self._group = PlacementGroupHandle(
+        self._groups[group_id] = PlacementGroupHandle(
+            group_id=group_id,
             mode=mode,
             backend_name=backend_name,
             batch_overrides=dict(batch_overrides or {}),
             fallback_order=list(fallback_order or []),
             workers=workers,
         )
+        decision.group_id = group_id
         return decision
 
     def poll(self) -> list[WorkerSnapshot]:
-        group = self.active_group()
-        if group is None:
-            return []
         snapshots: list[WorkerSnapshot] = []
-        for job_id, worker in list(group.workers.items()):
-            if worker.handle.monitor_via_store:
-                job = self.store.get_job(job_id)
-                if job is None or job.status not in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.PAUSED}:
+        for group_id, group in list(self._groups.items()):
+            for job_id, worker in list(group.workers.items()):
+                if worker.handle.monitor_via_store:
+                    job = self.store.get_job(job_id)
+                    if job is None or job.status not in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.PAUSED}:
+                        continue
+                    snapshots.append(
+                        WorkerSnapshot(
+                            job_id=job_id,
+                            group_id=group_id,
+                            alive=False,
+                            returncode=worker.handle.process.poll(),
+                            reported_by="store",
+                        )
+                    )
+                    del group.workers[job_id]
+                    continue
+                returncode = worker.handle.process.poll()
+                if returncode is None:
                     continue
                 snapshots.append(
                     WorkerSnapshot(
                         job_id=job_id,
+                        group_id=group_id,
                         alive=False,
-                        returncode=worker.handle.process.poll(),
-                        reported_by="store",
+                        returncode=returncode,
+                        reported_by="process",
                     )
                 )
                 del group.workers[job_id]
-                continue
-            returncode = worker.handle.process.poll()
-            if returncode is None:
-                continue
-            snapshots.append(WorkerSnapshot(job_id=job_id, alive=False, returncode=returncode, reported_by="process"))
-            del group.workers[job_id]
-        self._refresh_group_shape()
+            self._refresh_group_shape(group_id)
         return snapshots
 
     def request_pause(self, job_id: str, *, reason: str, hold: bool) -> bool:
@@ -240,44 +322,44 @@ class WorkerSupervisor:
         return True
 
     def request_fallback_pause(self, job_id: str, *, reason: str) -> bool:
-        group = self.active_group()
-        if group is None or job_id not in group.workers:
-            return False
-        self.control_plane.request_pause(job_id, reason=reason, hold=False)
-        return True
+        for group in self._groups.values():
+            if job_id not in group.workers:
+                continue
+            self.control_plane.request_pause(job_id, reason=reason, hold=False)
+            return True
+        return False
 
     def shutdown(self) -> None:
-        group = self._group
-        if group is None:
-            return
         seen_processes: set[int] = set()
-        for worker in group.workers.values():
-            process = worker.handle.process
-            if process.pid in seen_processes or process.poll() is not None:
-                continue
-            seen_processes.add(process.pid)
-            process.terminate()
-            try:
-                process.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-        self._group = None
+        for group in self._groups.values():
+            for worker in group.workers.values():
+                process = worker.handle.process
+                if process.pid in seen_processes or process.poll() is not None:
+                    continue
+                seen_processes.add(process.pid)
+                process.terminate()
+                try:
+                    process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        self._groups = {}
 
-    def _refresh_group_shape(self) -> None:
-        if self._group is None:
+    def _refresh_group_shape(self, group_id: str) -> None:
+        group = self._groups.get(group_id)
+        if group is None:
             return
         alive_workers = {
             job_id: worker
-            for job_id, worker in self._group.workers.items()
+            for job_id, worker in group.workers.items()
             if self._worker_is_alive(worker)
         }
-        self._group.workers = alive_workers
-        self._group.fallback_order = [job_id for job_id in self._group.fallback_order if job_id in alive_workers]
+        group.workers = alive_workers
+        group.fallback_order = [job_id for job_id in group.fallback_order if job_id in alive_workers]
         if not alive_workers:
-            self._group = None
+            self._groups.pop(group_id, None)
             return
         if len(alive_workers) == 1:
             sole_worker = next(iter(alive_workers.values()))
             sole_worker.role = "solo"
-            self._group.mode = "exclusive"
+            group.mode = "exclusive"

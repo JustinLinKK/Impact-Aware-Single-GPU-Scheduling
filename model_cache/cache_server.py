@@ -11,7 +11,7 @@ import struct
 import threading
 
 from .baseline_cache import BaselineModelCache
-from ..settings import SchedulerSettings
+from ..config import SchedulerSettings
 
 
 def _recv_message(reader) -> Any:
@@ -139,8 +139,12 @@ class CacheClient:
         address = self.settings.cache_address()
         if isinstance(address, str):
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.connect(address)
-            return sock
+            try:
+                sock.connect(address)
+                return sock
+            except Exception:
+                sock.close()
+                raise
         return socket.create_connection(address, timeout=5.0)
 
     def request(self, action: str, **payload: Any) -> Any:

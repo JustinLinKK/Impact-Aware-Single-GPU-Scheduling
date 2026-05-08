@@ -10,8 +10,8 @@ from localml_scheduler.checkpointing.manager import CheckpointManager
 from localml_scheduler.execution.control import ControlPlane, TrainingControlHook
 from localml_scheduler.execution.runner_protocol import RunnerContext
 from localml_scheduler.observability.events import EventLogger
-from localml_scheduler.schemas import BatchProbeSpec, CheckpointPolicy, SafePointType, TrainingJob
-from localml_scheduler.settings import SchedulerSettings
+from localml_scheduler.domain import BatchProbeSpec, CheckpointPolicy, SafePointType, TrainingJob
+from localml_scheduler.config import SchedulerSettings
 from localml_scheduler.storage.sqlite_store import SQLiteStateStore
 
 

@@ -7,16 +7,16 @@ import tempfile
 import time
 
 from ..adapters.mlevolve import submit_mlevolve_job
-from ..api import LocalMLSchedulerAPI
+from ..client import SchedulerClient
 from ..examples.toy_pytorch_runner import create_toy_baseline_checkpoint
-from ..schemas import CheckpointPolicy, ResourceRequirements
-from ..settings import SchedulerSettings
+from ..domain import CheckpointPolicy, ResourceRequirements
+from ..config import SchedulerSettings
 
 
-def _wait_for_terminal(api: LocalMLSchedulerAPI, job_ids: list[str], timeout: float = 60.0) -> None:
+def _wait_for_terminal(api: SchedulerClient, job_ids: list[str], timeout: float = 60.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        jobs = [api.get_job(job_id) for job_id in job_ids]
+        jobs = [api.inspect(job_id) for job_id in job_ids]
         if all(job is not None and job.status.is_terminal for job in jobs):
             return
         time.sleep(0.1)
@@ -26,8 +26,8 @@ def _wait_for_terminal(api: LocalMLSchedulerAPI, job_ids: list[str], timeout: fl
 def main() -> None:
     runtime_root = Path(tempfile.mkdtemp(prefix="localml_scheduler_mlevolve_bridge_"))
     settings = SchedulerSettings(runtime_root=runtime_root, scheduler_poll_interval_seconds=0.1)
-    api = LocalMLSchedulerAPI(settings)
-    service = api.create_scheduler_service().start(background=True)
+    api = SchedulerClient(settings)
+    service = api.create_service().start(background=True)
     try:
         baseline = create_toy_baseline_checkpoint(runtime_root / "baselines" / "bridge.pt", seed=77)
         shared_requirements = ResourceRequirements(requires_gpu=False, estimated_vram_mb=512, estimated_ram_mb=1024)

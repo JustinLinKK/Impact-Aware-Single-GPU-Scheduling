@@ -13,8 +13,9 @@ from ..model_cache.cache_server import CacheClient
 from ..checkpointing.manager import CheckpointManager
 from ..execution.control import TrainingControlHook
 from ..observability.events import EventLogger
-from ..schemas import BatchProbeTrialResult, TrainingJob
-from ..settings import SchedulerSettings
+from ..profiling.runtime_probe import build_runtime_profile, runtime_profile_for_job
+from ..domain import BatchProbeTrialResult, TrainingJob
+from ..config import SchedulerSettings
 from ..storage.sqlite_store import SQLiteStateStore
 
 
@@ -87,3 +88,38 @@ class RunnerContext:
             return None
         self._resume_checkpoint_cache = self.checkpoint_manager.load_checkpoint(checkpoint_path)
         return self._resume_checkpoint_cache
+
+    def get_runtime_profile(self, *, backend_name: str | None = None):
+        return runtime_profile_for_job(self.store, self.job, backend_name=backend_name)
+
+    def upsert_runtime_profile(
+        self,
+        *,
+        backend_name: str,
+        strategy: str,
+        startup_seconds: float | None,
+        epoch_1_seconds: float | None,
+        steps_per_epoch: int | None,
+        avg_step_time_ms: float | None,
+        estimated_total_runtime_seconds: float | None,
+        confidence: float,
+        source: str,
+        observations: int,
+        metadata: dict[str, Any] | None = None,
+    ):
+        profile = build_runtime_profile(
+            self.job,
+            hardware_key=self.store.hardware_key(),
+            backend_name=backend_name,
+            strategy=strategy,
+            startup_seconds=startup_seconds,
+            epoch_1_seconds=epoch_1_seconds,
+            steps_per_epoch=steps_per_epoch,
+            avg_step_time_ms=avg_step_time_ms,
+            estimated_total_runtime_seconds=estimated_total_runtime_seconds,
+            confidence=confidence,
+            source=source,
+            observations=observations,
+            metadata=metadata,
+        )
+        return self.store.upsert_runtime_profile(profile)

@@ -10,9 +10,10 @@ from typing import Any
 import torch
 
 from ..execution.runner_protocol import BatchProbeProtocol, RunnerContext
-from ..schemas import (
+from ..domain import (
     BATCH_PROBE_SEARCH_MODE_BINARY,
     BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
+    BatchResolution,
     BatchSizeObservation,
     BatchProbeProfile,
     BatchProbeTrialResult,
@@ -23,7 +24,7 @@ from ..schemas import (
     import_string,
     normalize_batch_probe_search_mode,
 )
-from ..settings import SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED
+from ..config import SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED
 
 logger = logging.getLogger("localml_scheduler")
 
@@ -253,14 +254,7 @@ def _attempt_successful(attempt: ProbeAttempt) -> bool:
 
 
 def _resolve_start_batch_size(job: TrainingJob) -> int:
-    batch_param_name = job.batch_probe.batch_param_name or "batch_size"
-    raw_value = job.config.runner_kwargs.get(batch_param_name)
-    if raw_value is None:
-        return max(1, int(job.metadata.get("resolved_batch_size") or 1))
-    try:
-        return max(1, int(raw_value))
-    except (TypeError, ValueError):
-        return 1
+    return BatchResolution.resolved_batch_size(job)
 
 
 def _normalize_candidate_bounds(
@@ -368,7 +362,7 @@ def _run_probe_controller(context: RunnerContext, key_info: BatchProbeKeyInfo) -
                 shape_signature=key_info.shape_signature,
                 hardware_key=hardware_key,
                 backend_name="exclusive",
-                batch_param_name=context.job.batch_probe.batch_param_name or "batch_size",
+                batch_param_name=BatchResolution.param_name(context.job),
                 batch_size=batch_size,
                 peak_vram_mb=attempt.result.peak_vram_mb,
                 memory_total_mb=attempt.result.memory_total_mb,
@@ -461,7 +455,7 @@ def _run_probe_controller(context: RunnerContext, key_info: BatchProbeKeyInfo) -
         model_key=key_info.model_key,
         device_type=key_info.device_type,
         shape_signature=key_info.shape_signature,
-        batch_param_name=context.job.batch_probe.batch_param_name or "batch_size",
+        batch_param_name=BatchResolution.param_name(context.job),
         resolved_batch_size=resolved.batch_size,
         peak_vram_mb=resolved.result.peak_vram_mb,
         memory_total_mb=resolved.result.memory_total_mb,
@@ -495,10 +489,9 @@ def _persist_resolved_batch_size(
     source: str,
 ) -> TrainingJob:
     job = context.store.get_job(context.job.job_id) or context.job
-    job.config.runner_kwargs[batch_param_name] = int(resolved_batch_size)
+    job = BatchResolution.apply(job, resolved_batch_size)
     job.metadata.update(
         {
-            "resolved_batch_size": int(resolved_batch_size),
             "batch_probe_source": source,
             "batch_probe_key": probe_key,
             "batch_probe_device_type": device_type,
@@ -509,7 +502,7 @@ def _persist_resolved_batch_size(
 
 
 def _job_has_resolved_batch_size(job: TrainingJob, key_info: BatchProbeKeyInfo) -> bool:
-    batch_param_name = job.batch_probe.batch_param_name or "batch_size"
+    batch_param_name = BatchResolution.param_name(job)
     if job.metadata.get("batch_probe_key") != key_info.probe_key:
         return False
     if job.metadata.get("resolved_batch_size") is None:
@@ -528,7 +521,7 @@ def run_batch_probe_preflight(context: RunnerContext) -> TrainingJob:
         raise ValueError("batch_probe.probe_target is required when batch_probe.enabled is true")
 
     key_info = _probe_key_info(context.job, default_search_mode=context.settings.gpu_scheduler.batch_probe_search_mode)
-    batch_param_name = context.job.batch_probe.batch_param_name or "batch_size"
+    batch_param_name = BatchResolution.param_name(context.job)
 
     if _job_has_resolved_batch_size(context.job, key_info):
         logger.info(

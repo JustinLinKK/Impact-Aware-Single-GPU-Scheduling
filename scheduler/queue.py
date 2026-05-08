@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from ..schemas import TrainingJob
+from ..domain import TrainingJob
 from .policies import SchedulingPolicy
 
 

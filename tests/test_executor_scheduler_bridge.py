@@ -7,8 +7,8 @@ import tempfile
 import unittest
 
 from engine.executor import Interpreter
-from localml_scheduler.schemas import JobStatus, TrainingJob
-from localml_scheduler.settings import SchedulerSettings
+from localml_scheduler.domain import JobStatus, TrainingJob
+from localml_scheduler.config import SchedulerSettings
 
 
 class _FakeStore:
@@ -16,16 +16,16 @@ class _FakeStore:
         return []
 
 
-class _FakeSchedulerAPI:
+class _FakeSchedulerClient:
     def __init__(self, settings: SchedulerSettings, *, active_service: bool = True):
         self.settings = settings
         self.store = _FakeStore()
         self.submitted_jobs: list[TrainingJob] = []
         self._jobs: dict[str, TrainingJob] = {}
         self.active_service = active_service
-        self.create_scheduler_service_calls = 0
+        self.create_service_calls = 0
 
-    def submit_job(self, job: TrainingJob) -> TrainingJob:
+    def submit(self, job: TrainingJob) -> TrainingJob:
         self.submitted_jobs.append(job)
         result_path = Path(job.config.runner_kwargs["result_path"])
         result_path.parent.mkdir(parents=True, exist_ok=True)
@@ -45,10 +45,10 @@ class _FakeSchedulerAPI:
         self._jobs[job.job_id] = job
         return job
 
-    def get_job(self, job_id: str) -> TrainingJob | None:
+    def inspect(self, job_id: str) -> TrainingJob | None:
         return self._jobs.get(job_id)
 
-    def cancel_job(self, job_id: str) -> None:
+    def cancel(self, job_id: str) -> None:
         job = self._jobs.get(job_id)
         if job is not None:
             job.mark_status(JobStatus.CANCELLED, reason="cancelled")
@@ -56,8 +56,8 @@ class _FakeSchedulerAPI:
     def scheduler_service_active(self, *, max_staleness_seconds: float | None = None) -> bool:
         return self.active_service
 
-    def create_scheduler_service(self):
-        self.create_scheduler_service_calls += 1
+    def create_service(self):
+        self.create_service_calls += 1
 
         api = self
 
@@ -73,7 +73,7 @@ class _FakeSchedulerAPI:
 
 
 class InterpreterSchedulerBridgeTest(unittest.TestCase):
-    def test_scheduler_submission_defaults_override_legacy_bridge_fields(self) -> None:
+    def test_scheduler_submission_uses_scheduler_defaults_and_preload_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir) / "runtime"
             workdir = Path(tmpdir) / "workdir"
@@ -99,24 +99,16 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
                 },
             )
             interpreter = Interpreter(working_dir=workdir, timeout=10, max_parallel_run=1)
-            fake_api = _FakeSchedulerAPI(settings)
-            legacy_cfg = SimpleNamespace(
+            fake_api = _FakeSchedulerClient(settings)
+            bridge_cfg = SimpleNamespace(
                 wait_timeout_seconds=5,
                 wait_poll_interval_seconds=0.01,
-                requires_gpu=False,
-                estimated_vram_mb=1024,
-                estimated_ram_mb=512,
-                packing_eligible=True,
-                packing_family="legacy-family",
-                packing_max_slowdown_ratio=1.5,
-                batch_probe_enabled=False,
-                batch_probe_model_key="legacy-model-key",
-                batch_probe_probe_timeout_seconds=3,
-                batch_probe_poll_interval_seconds=1.0,
-                batch_probe_max_multiplier=2,
-                batch_probe_search_mode="binary",
+                preload_source_model_id="shared-startpoint",
+                preload_source_model_path=str(workdir / "shared-start.ckpt"),
+                preload_source_loader_target="localml_scheduler.adapters.mlevolve_runner:load_raw_file",
             )
-            interpreter.attach_scheduler(fake_api, legacy_cfg)
+            (workdir / "shared-start.ckpt").write_bytes(b"checkpoint")
+            interpreter.attach_scheduler(fake_api, bridge_cfg)
 
             result = interpreter._run_scheduler_job(
                 code="batch_size = 3\nprint('hello from bridge')\n",
@@ -142,7 +134,14 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertEqual(submitted.config.runner_kwargs["probe_timeout_seconds"], 11)
             self.assertEqual(submitted.config.runner_kwargs["probe_poll_interval_seconds"], 0.25)
             self.assertEqual(submitted.config.runner_kwargs["probe_max_batch_size"], 12)
-            self.assertTrue(interpreter._scheduler_legacy_warnings)
+            self.assertTrue(submitted.baseline_model_id.startswith("mlevolve-script-"))
+            self.assertIsNotNone(submitted.preload_source)
+            self.assertEqual(submitted.preload_source.model_id, "shared-startpoint")
+            self.assertEqual(submitted.preload_source.model_path, str(workdir / "shared-start.ckpt"))
+            self.assertEqual(
+                submitted.preload_source.loader_target,
+                "localml_scheduler.adapters.mlevolve_runner:load_raw_file",
+            )
 
     def test_scheduler_bridge_starts_fallback_service_when_external_service_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -151,7 +150,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             workdir.mkdir(parents=True, exist_ok=True)
             settings = SchedulerSettings(runtime_root=runtime_root)
             interpreter = Interpreter(working_dir=workdir, timeout=10, max_parallel_run=1)
-            fake_api = _FakeSchedulerAPI(settings, active_service=False)
+            fake_api = _FakeSchedulerClient(settings, active_service=False)
             legacy_cfg = SimpleNamespace(start_service=False, wait_timeout_seconds=5, wait_poll_interval_seconds=0.01)
             interpreter.attach_scheduler(fake_api, legacy_cfg)
 
@@ -162,7 +161,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             )
 
             self.assertIsNone(result.exc_type)
-            self.assertEqual(fake_api.create_scheduler_service_calls, 1)
+            self.assertEqual(fake_api.create_service_calls, 1)
             self.assertTrue(fake_api.active_service)
             interpreter.cleanup_session(-1)
             self.assertFalse(fake_api.active_service)
@@ -182,7 +181,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
                 },
             )
             interpreter = Interpreter(working_dir=workdir, timeout=10, max_parallel_run=1)
-            fake_api = _FakeSchedulerAPI(settings)
+            fake_api = _FakeSchedulerClient(settings)
             interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
 
             result = interpreter._run_scheduler_job(
@@ -211,7 +210,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
                 },
             )
             interpreter = Interpreter(working_dir=workdir, timeout=10, max_parallel_run=1)
-            fake_api = _FakeSchedulerAPI(settings)
+            fake_api = _FakeSchedulerClient(settings)
             interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
 
             result = interpreter._run_scheduler_job(
@@ -224,6 +223,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             submitted = fake_api.submitted_jobs[0]
             self.assertTrue(submitted.packing.eligible)
             self.assertEqual(submitted.packing.backend_allowlist, ["mps", "cuda_process"])
+            self.assertIsNone(submitted.preload_source)
 
 
 if __name__ == "__main__":

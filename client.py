@@ -1,4 +1,4 @@
-"""Python API for the scheduler."""
+"""Public client facade for scheduler commands and queries."""
 
 from __future__ import annotations
 
@@ -8,32 +8,43 @@ import json
 
 import yaml
 
-from .schemas import parse_timestamp, utc_now
-from .model_cache.cache_server import CacheClient
-from .schemas import (
+from .config import SchedulerConfig
+from .domain import (
     BatchProbeProfile,
     BatchSizeObservation,
     CombinationProfile,
     CommandType,
+    JobRun,
+    JobSpec,
     JobStatus,
     PairProfile,
+    RuntimeProfile,
+    SchedulerReport,
     SoloProfile,
     TrainingJob,
+    parse_timestamp,
     stable_job_id,
+    utc_now,
 )
+from .dto import JobCommandRequest, JobQuery, PreloadRequest, ReportQuery, SubmitJobRequest
+from .model_cache.cache_server import CacheClient
 from .scheduler.service import SchedulerService
-from .settings import SchedulerSettings
 from .storage.sqlite_store import SQLiteStateStore
 
 
-class LocalMLSchedulerAPI:
-    """High-level Python API and CLI backend."""
+class SchedulerClient:
+    """Submit work and inspect state through a small command/query surface."""
 
-    def __init__(self, settings: SchedulerSettings | None = None):
-        self.settings = settings or SchedulerSettings()
+    def __init__(self, settings: SchedulerConfig | None = None):
+        self.settings = settings or SchedulerConfig()
         self.store = SQLiteStateStore(self.settings)
 
-    def create_scheduler_service(self, **kwargs: Any) -> SchedulerService:
+    def create_engine(self):
+        from .engine import SchedulerEngine
+
+        return SchedulerEngine(self.settings)
+
+    def create_service(self, **kwargs: Any) -> SchedulerService:
         return SchedulerService(self.settings, store=self.store, **kwargs)
 
     def scheduler_service_heartbeat(self) -> dict[str, Any] | None:
@@ -84,42 +95,51 @@ class LocalMLSchedulerAPI:
             }
         return TrainingJob.from_dict(payload)
 
-    def submit_job(self, job: TrainingJob) -> TrainingJob:
-        return self.store.submit_job(job)
+    def submit(self, request: SubmitJobRequest | JobSpec | TrainingJob) -> TrainingJob:
+        if isinstance(request, TrainingJob):
+            return self.store.submit_job(request)
+        if isinstance(request, JobSpec):
+            request = SubmitJobRequest(spec=request)
+        run = request.run or JobRun()
+        return self.store.submit_job(TrainingJob.from_parts(request.spec, run))
 
-    def submit_job_from_payload(self, payload: dict[str, Any]) -> TrainingJob:
-        return self.submit_job(self._normalize_job_payload(payload))
+    def submit_from_payload(self, payload: dict[str, Any]) -> TrainingJob:
+        return self.submit(self._normalize_job_payload(payload))
 
-    def submit_job_from_file(self, job_spec_path: str | Path) -> TrainingJob:
+    def submit_from_file(self, job_spec_path: str | Path) -> TrainingJob:
         with Path(job_spec_path).open("r", encoding="utf-8") as handle:
             payload = yaml.safe_load(handle) or {}
-        return self.submit_job_from_payload(payload)
+        return self.submit_from_payload(payload)
+
+    def command(self, request: JobCommandRequest) -> int:
+        return self.store.enqueue_command(request.command_type, job_id=request.job_id)
+
+    def inspect(self, query: JobQuery | str) -> TrainingJob | None:
+        job_id = query.job_id if isinstance(query, JobQuery) else str(query)
+        return self.store.get_job(job_id)
 
     def list_jobs(self) -> list[TrainingJob]:
         return self.store.list_jobs()
 
-    def get_job(self, job_id: str) -> TrainingJob | None:
-        return self.store.get_job(job_id)
-
-    def pause_job(self, job_id: str) -> int:
-        return self.store.enqueue_command(CommandType.PAUSE, job_id=job_id)
-
-    def resume_job(self, job_id: str) -> int:
-        return self.store.enqueue_command(CommandType.RESUME, job_id=job_id)
-
-    def cancel_job(self, job_id: str) -> int:
-        return self.store.enqueue_command(CommandType.CANCEL, job_id=job_id)
-
-    def preload_model(self, baseline_model_id: str, baseline_model_path: str, *, loader_target: str | None = None, pin: bool = False) -> int:
+    def preload(self, request: PreloadRequest) -> int:
         return self.store.enqueue_command(
             CommandType.PRELOAD,
             payload={
-                "baseline_model_id": baseline_model_id,
-                "baseline_model_path": baseline_model_path,
-                "loader_target": loader_target,
-                "pin": pin,
+                "baseline_model_id": request.model_id,
+                "baseline_model_path": str(request.model_path),
+                "loader_target": request.loader_target,
+                "pin": request.pin,
             },
         )
+
+    def pause(self, job_id: str) -> int:
+        return self.command(JobCommandRequest(job_id=job_id, command_type=CommandType.PAUSE))
+
+    def resume(self, job_id: str) -> int:
+        return self.command(JobCommandRequest(job_id=job_id, command_type=CommandType.RESUME))
+
+    def cancel(self, job_id: str) -> int:
+        return self.command(JobCommandRequest(job_id=job_id, command_type=CommandType.CANCEL))
 
     def cache_stats(self) -> dict[str, Any]:
         try:
@@ -127,10 +147,24 @@ class LocalMLSchedulerAPI:
             return client.stats()
         except Exception:
             summary = self.store.cache_metadata_summary()
+            summary.update(
+                {
+                    "memory_budget_bytes": self.settings.baseline_cache.memory_budget_bytes,
+                    "entry_capacity": self.settings.baseline_cache.entry_capacity,
+                    "max_ram_percent": self.settings.baseline_cache.max_ram_percent,
+                    "system_total_memory_bytes": None,
+                    "effective_memory_budget_bytes": self.settings.baseline_cache.memory_budget_bytes,
+                }
+            )
             return {"stats": summary, "entries": []}
 
-    def report(self) -> dict[str, Any]:
-        return self.store.report().to_dict()
+    def report(self, query: ReportQuery | None = None) -> dict[str, Any]:
+        del query
+        report: SchedulerReport = self.store.report()
+        return report.to_dict()
+
+    def list_events(self, *, job_id: str | None = None, event_type: str | None = None) -> list[dict[str, Any]]:
+        return self.store.list_events(job_id=job_id, event_type=event_type)
 
     def get_solo_profile(self, signature: str) -> SoloProfile | None:
         return self.store.get_solo_profile(signature)
@@ -138,11 +172,20 @@ class LocalMLSchedulerAPI:
     def upsert_solo_profile(self, profile: SoloProfile) -> SoloProfile:
         return self.store.upsert_solo_profile(profile)
 
-    def get_pair_profile(self, left_signature: str, right_signature: str) -> PairProfile | None:
-        return self.store.get_pair_profile(left_signature, right_signature)
+    def get_pair_profile(self, left_signature: str, right_signature: str, *, backend_name: str | None = None) -> PairProfile | None:
+        return self.store.get_pair_profile(left_signature, right_signature, backend_name=backend_name)
 
     def upsert_pair_profile(self, profile: PairProfile) -> PairProfile:
         return self.store.upsert_pair_profile(profile)
+
+    def get_runtime_profile(self, signature: str, *, resolved_batch_size: int, backend_name: str) -> RuntimeProfile | None:
+        return self.store.get_runtime_profile(signature, resolved_batch_size=resolved_batch_size, backend_name=backend_name)
+
+    def list_runtime_profiles(self, **kwargs: Any) -> list[RuntimeProfile]:
+        return self.store.list_runtime_profiles(**kwargs)
+
+    def upsert_runtime_profile(self, profile: RuntimeProfile) -> RuntimeProfile:
+        return self.store.upsert_runtime_profile(profile)
 
     def get_batch_probe_profile(self, probe_key: str) -> BatchProbeProfile | None:
         return self.store.get_batch_probe_profile(probe_key)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import unittest
 
-from localml_scheduler.schemas import TrainingJob
+from localml_scheduler.domain import TrainingJob
 from localml_scheduler.scheduler.policies import PriorityFifoPolicy
 
 

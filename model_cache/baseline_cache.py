@@ -8,9 +8,10 @@ from io import BytesIO
 from typing import Any, Callable
 import threading
 
+import psutil
 import torch
 
-from ..schemas import CacheStats, import_string, utc_now
+from ..domain import CacheStats, import_string, utc_now
 
 
 LoaderFn = Callable[[str], bytes | bytearray | Any]
@@ -69,8 +70,18 @@ class CachedModelEntry:
 class BaselineModelCache:
     """LRU RAM cache for CPU-side immutable baseline model payloads."""
 
-    def __init__(self, memory_budget_bytes: int, *, on_update: UpdateHook | None = None):
-        self.memory_budget_bytes = memory_budget_bytes
+    def __init__(
+        self,
+        memory_budget_bytes: int | None,
+        *,
+        entry_capacity: int | None = None,
+        max_ram_percent: float | None = None,
+        on_update: UpdateHook | None = None,
+    ):
+        self.memory_budget_bytes = None if memory_budget_bytes is None else max(0, int(memory_budget_bytes))
+        self.entry_capacity = None if entry_capacity is None else max(0, int(entry_capacity))
+        self.max_ram_percent = None if max_ram_percent is None else max(0.0, float(max_ram_percent))
+        self.system_total_memory_bytes = self._system_total_memory_bytes()
         self.on_update = on_update
         self._entries: OrderedDict[str, CachedModelEntry] = OrderedDict()
         self._lock = threading.RLock()
@@ -78,6 +89,12 @@ class BaselineModelCache:
         self._hits = 0
         self._misses = 0
         self._evictions = 0
+
+    def _system_total_memory_bytes(self) -> int | None:
+        try:
+            return max(0, int(psutil.virtual_memory().total))
+        except Exception:
+            return None
 
     def _notify(self, event_name: str, entry: CachedModelEntry, payload: dict[str, Any] | None = None) -> None:
         if self.on_update is not None:
@@ -87,19 +104,38 @@ class BaselineModelCache:
         entry.last_accessed_at = utc_now()
         self._entries.move_to_end(entry.model_id)
 
-    def _evict_as_needed(self, incoming_size: int) -> None:
-        while self._used_bytes + incoming_size > self.memory_budget_bytes and self._entries:
-            eviction_candidate_id, eviction_candidate = next(iter(self._entries.items()))
-            if eviction_candidate.pinned:
-                movable = [entry for entry in self._entries.values() if not entry.pinned]
-                if not movable:
-                    break
-                eviction_candidate = movable[0]
-                eviction_candidate_id = eviction_candidate.model_id
-            self._entries.pop(eviction_candidate_id)
-            self._used_bytes -= eviction_candidate.size_bytes
-            self._evictions += 1
-            self._notify("cache_evicted", eviction_candidate, {"used_bytes": self._used_bytes})
+    def _effective_memory_budget_bytes(self) -> int | None:
+        budgets: list[int] = []
+        if self.memory_budget_bytes is not None:
+            budgets.append(self.memory_budget_bytes)
+        if self.max_ram_percent is not None and self.system_total_memory_bytes is not None:
+            budgets.append(int(self.system_total_memory_bytes * self.max_ram_percent))
+        if not budgets:
+            return None
+        return max(0, min(budgets))
+
+    def _would_exceed_limits(self, *, incoming_size: int, incoming_entries: int) -> bool:
+        effective_budget = self._effective_memory_budget_bytes()
+        if effective_budget is not None and (self._used_bytes + incoming_size) > effective_budget:
+            return True
+        if self.entry_capacity is not None and (len(self._entries) + incoming_entries) > self.entry_capacity:
+            return True
+        return False
+
+    def _evict_one(self) -> bool:
+        eviction_candidate_id = next((model_id for model_id, entry in self._entries.items() if not entry.pinned), None)
+        if eviction_candidate_id is None:
+            return False
+        eviction_candidate = self._entries.pop(eviction_candidate_id)
+        self._used_bytes -= eviction_candidate.size_bytes
+        self._evictions += 1
+        self._notify("cache_evicted", eviction_candidate, {"used_bytes": self._used_bytes})
+        return True
+
+    def _evict_as_needed(self, *, incoming_size: int, incoming_entries: int) -> None:
+        while self._entries and self._would_exceed_limits(incoming_size=incoming_size, incoming_entries=incoming_entries):
+            if not self._evict_one():
+                break
 
     def _store_entry(
         self,
@@ -111,10 +147,13 @@ class BaselineModelCache:
         metadata: dict[str, Any] | None = None,
     ) -> CachedModelEntry | None:
         size_bytes = len(payload)
-        if size_bytes > self.memory_budget_bytes:
+        effective_budget = self._effective_memory_budget_bytes()
+        if self.entry_capacity is not None and self.entry_capacity <= 0:
             return None
-        self._evict_as_needed(size_bytes)
-        if self._used_bytes + size_bytes > self.memory_budget_bytes:
+        if effective_budget is not None and size_bytes > effective_budget:
+            return None
+        self._evict_as_needed(incoming_size=size_bytes, incoming_entries=1)
+        if self._would_exceed_limits(incoming_size=size_bytes, incoming_entries=1):
             return None
         entry = CachedModelEntry(
             model_id=model_id,
@@ -200,7 +239,7 @@ class BaselineModelCache:
                 misses=1,
                 metadata=metadata or {},
             )
-            self._notify("cache_miss_uncached", temp_entry, {"reason": "payload larger than cache budget"})
+            self._notify("cache_miss_uncached", temp_entry, {"reason": "payload could not be retained under cache limits"})
             return payload
 
     def evict(self, model_id: str) -> bool:
@@ -247,4 +286,8 @@ class BaselineModelCache:
                 pinned_entries=sum(1 for entry in self._entries.values() if entry.pinned),
                 used_bytes=self._used_bytes,
                 memory_budget_bytes=self.memory_budget_bytes,
+                entry_capacity=self.entry_capacity,
+                max_ram_percent=self.max_ram_percent,
+                system_total_memory_bytes=self.system_total_memory_bytes,
+                effective_memory_budget_bytes=self._effective_memory_budget_bytes(),
             )

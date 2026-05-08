@@ -5,8 +5,12 @@ aging_interval_seconds: 120
 aging_priority_increment: 1
 enable_priority_aging: true
 preempt_check_interval_seconds: 0.2
-eager_preload_top_k: 2
-cache_memory_budget_bytes: 536870912
+baseline_cache:
+  warm_queue_policy: "top_k"
+  warm_queue_top_k: 2
+  entry_capacity: 8
+  max_ram_percent: 0.20
+  memory_budget_bytes: 536870912
 cache_server_host: "127.0.0.1"
 cache_server_port: 8765
 cache_socket_name: "cache_server.sock"
@@ -19,12 +23,19 @@ gpu_scheduler:
   allow_three_way_packing: false
   candidate_window_size: 8
   fallback_cooldown_seconds: 900
+  concurrent_groups_enabled: false
+  concurrent_backend_allowlist: ["mps", "stream"]
   batch_probe_enabled: true
   batch_probe_target_memory_fraction: 0.97
   batch_probe_min_batch_size: 1
   batch_probe_max_search_rounds: 12
   batch_probe_max_batch_size: null
   batch_probe_search_mode: "binary"
+  auto_pack:
+    target_metric: "vram"
+    target_vram_fraction: 0.97
+    target_sm_fraction: 0.90
+    runtime_skew_guardrail_ratio: 2.0
   profiling:
     warmup_steps: 30
     solo_probe_steps: 80
@@ -46,8 +57,10 @@ gpu_scheduler:
     batch_search_mode: "binary"
     target_vram_fraction: 0.97
     max_probe_jobs: 3
-    max_batch_multiplier: 32
-    min_batch_size: 1
+    binary_range_up: 32
+    binary_range_down: 1
+    power_of_two_range_up: 5
+    power_of_two_range_down: 1
   submission_defaults:
     requires_gpu: true
     estimated_vram_mb: null
@@ -62,6 +75,10 @@ gpu_scheduler:
     batch_probe_poll_interval_seconds: 0.5
     batch_probe_max_multiplier: 32
     batch_probe_search_mode: "binary"
+    runtime_probe_enabled: true
+    runtime_probe_target: null
+    runtime_probe_model_key: null
+    runtime_probe_strategy: "epoch_1"
   mps:
     enabled: false
     compute_mode: "EXCLUSIVE_PROCESS"

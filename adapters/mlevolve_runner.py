@@ -17,7 +17,7 @@ import humanize
 
 from ..execution.runner_protocol import RunnerContext
 from ..scheduler.telemetry import GpuTelemetrySample, NvidiaSmiTelemetrySampler
-from ..schemas import BatchProbeTrialResult
+from ..domain import BatchProbeTrialResult, BatchResolution
 
 _BATCH_SIZE_NAMES = {
     "batch_size",
@@ -270,10 +270,9 @@ def _base_script_env(
 
 def _resolved_batch_size(context: RunnerContext) -> int | None:
     raw_value = context.job.metadata.get("resolved_batch_size")
-    try:
-        return int(raw_value) if raw_value is not None else None
-    except (TypeError, ValueError):
+    if raw_value is None:
         return None
+    return BatchResolution.resolved_batch_size(context.job)
 
 
 def _parse_batch_size_failure(stderr_text: str) -> str | None:

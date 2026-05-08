@@ -10,8 +10,8 @@ import tempfile
 import torch
 
 from ..observability.events import EventLogger
-from ..schemas import SafePointType, TrainingJob, utc_now
-from ..settings import SchedulerSettings
+from ..domain import SafePointType, TrainingJob, utc_now
+from ..config import SchedulerSettings
 from ..storage.sqlite_store import SQLiteStateStore
 
 

@@ -16,10 +16,11 @@ from ..model_cache.warming import select_models_to_warm
 from ..observability.events import EventLogger
 from ..observability.logging_utils import setup_scheduler_logger
 from ..observability.metrics import MetricsCollector
-from ..schemas import CombinationProfile, JobStatus, PairProfile, SoloProfile, TrainingJob, build_group_signature, utc_now
-from ..settings import SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED, SchedulerSettings
+from ..domain import BatchResolution, CombinationProfile, JobStatus, PairProfile, PreloadSource, SoloProfile, TrainingJob, build_group_signature, utc_now
+from ..config import SCHEDULER_MODE_PARALLEL_AUTO_PACK, SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED, SchedulerSettings
 from ..storage.sqlite_store import SQLiteStateStore
-from .gpu_scheduler import GpuPlacementPlanner, PlacementPlan
+from .placement_planner import PlacementPlanner
+from .planner_types import DispatchPlan
 from .policies import PriorityFifoPolicy, SchedulingPolicy
 from .queue import RunnableJobQueue
 from .recovery import reconcile_recoverable_jobs
@@ -29,6 +30,7 @@ from .telemetry import GpuTelemetrySample, GpuTelemetrySummary, NvidiaSmiTelemet
 
 @dataclass(slots=True)
 class ActiveRun:
+    group_id: str
     mode: str
     backend_name: str
     job_ids: tuple[str, ...]
@@ -39,6 +41,7 @@ class ActiveRun:
     samples: list[GpuTelemetrySample] = field(default_factory=list)
     fallback_triggered: bool = False
     fallback_reason: str | None = None
+    overlapped: bool = False
 
 
 class SchedulerService:
@@ -65,13 +68,19 @@ class SchedulerService:
             enable_priority_aging=settings.enable_priority_aging,
         )
         self.supervisor = supervisor or WorkerSupervisor(settings, store=self.store)
-        self.planner = GpuPlacementPlanner(settings, self.store, self.policy)
+        self.planner = PlacementPlanner(settings, self.store, self.policy)
         self.telemetry_sampler = telemetry_sampler or NvidiaSmiTelemetrySampler(settings.gpu_scheduler.device_index)
-        self.cache = BaselineModelCache(settings.cache_memory_budget_bytes, on_update=self._on_cache_update)
+        self.cache = BaselineModelCache(
+            settings.baseline_cache.memory_budget_bytes,
+            entry_capacity=settings.baseline_cache.entry_capacity,
+            max_ram_percent=settings.baseline_cache.max_ram_percent,
+            on_update=self._on_cache_update,
+        )
         self.cache_server = CacheServer(settings, self.cache)
         self._stop_event = Event()
         self._thread: Thread | None = None
-        self._active_run: ActiveRun | None = None
+        self._active_runs: dict[str, ActiveRun] = {}
+        self._device_samples: list[GpuTelemetrySample] = []
         self._last_telemetry_poll_at = 0.0
 
     def _persist_runtime_settings(self) -> None:
@@ -139,7 +148,7 @@ class SchedulerService:
             self._poll_telemetry()
             self._enforce_packed_safety()
             self._maybe_preempt()
-            self._dispatch_if_idle()
+            self._dispatch_pending_work()
             self._stop_event.wait(self.settings.scheduler_poll_interval_seconds)
         self._write_service_heartbeat("stopped")
         self.logger.info("Scheduler service stopped")
@@ -208,12 +217,20 @@ class SchedulerService:
         self.event_logger.emit("job_cancelled", job_id=job_id, payload={"queued": True})
 
     def _handle_preload(self, payload: dict[str, Any]) -> None:
-        model_id = payload["baseline_model_id"]
-        baseline_model_path = payload["baseline_model_path"]
-        loader_target = payload.get("loader_target")
+        target = PreloadSource(
+            model_id=payload.get("model_id") or payload["baseline_model_id"],
+            model_path=payload.get("model_path") or payload["baseline_model_path"],
+            loader_target=payload.get("loader_target"),
+        )
         pin = bool(payload.get("pin", False))
-        ok = self.cache.preload(model_id, baseline_model_path, loader_target=loader_target, pin=pin, metadata={"source": "command"})
-        self.event_logger.emit("cache_preload_requested", payload={"model_id": model_id, "ok": ok, "pin": pin})
+        ok = self.cache.preload(
+            target.model_id,
+            target.model_path,
+            loader_target=target.loader_target,
+            pin=pin,
+            metadata={"source": "command"},
+        )
+        self.event_logger.emit("cache_preload_requested", payload={"model_id": target.model_id, "ok": ok, "pin": pin})
 
     def _runnable_jobs(self) -> list[TrainingJob]:
         jobs = self.store.runnable_jobs()
@@ -221,19 +238,42 @@ class SchedulerService:
             jobs = [job for job in jobs if job.status != JobStatus.RECOVERABLE]
         return jobs
 
+    def _resolve_preload_target(self, job: TrainingJob) -> PreloadSource:
+        if job.preload_source is not None:
+            return job.preload_source
+        return PreloadSource(
+            model_id=job.baseline_model_id,
+            model_path=job.baseline_model_path,
+            loader_target=job.config.loader_target,
+        )
+
     def _warm_cache(self) -> None:
         jobs = self._runnable_jobs()
-        for model_id, baseline_model_path, loader_target in select_models_to_warm(jobs, top_k=self.settings.eager_preload_top_k):
+        cache_stats = self.cache.stats()
+        cached_model_ids = {entry["model_id"] for entry in self.cache.snapshot_entries()}
+        available_budget_bytes = None
+        if cache_stats.effective_memory_budget_bytes is not None:
+            available_budget_bytes = max(0, int(cache_stats.effective_memory_budget_bytes) - int(cache_stats.used_bytes))
+        for target in select_models_to_warm(
+            jobs,
+            top_k=self.settings.baseline_cache.warm_queue_top_k,
+            selection_policy=self.settings.baseline_cache.warm_queue_policy,
+            available_budget_bytes=available_budget_bytes,
+            cached_model_ids=cached_model_ids,
+            resolve_target=self._resolve_preload_target,
+        ):
             try:
-                self.cache.preload(model_id, baseline_model_path, loader_target=loader_target, metadata={"source": "warming"})
+                self.cache.preload(
+                    target.model_id,
+                    target.model_path,
+                    loader_target=target.loader_target,
+                    metadata={"source": "warming"},
+                )
             except Exception as exc:
-                self.logger.warning("Cache warming failed for %s: %s", model_id, exc)
-
-    def _summary_for_active_run(self) -> GpuTelemetrySummary:
-        return GpuTelemetrySummary.from_samples(self._active_run.samples if self._active_run else [])
+                self.logger.warning("Cache warming failed for %s: %s", target.model_id, exc)
 
     def _poll_telemetry(self) -> None:
-        if self._active_run is None:
+        if not self._active_runs:
             return
         interval_seconds = max(0.1, self.settings.gpu_scheduler.telemetry.device_poll_ms / 1000.0)
         now = time.monotonic()
@@ -241,98 +281,90 @@ class SchedulerService:
             return
         sample = self.telemetry_sampler.sample()
         self._last_telemetry_poll_at = now
-        if sample is not None:
-            self._active_run.samples.append(sample)
+        if sample is None:
+            return
+        self._device_samples.append(sample)
+        if len(self._active_runs) == 1:
+            only_run = next(iter(self._active_runs.values()))
+            only_run.samples.append(sample)
+        else:
+            for run in self._active_runs.values():
+                run.overlapped = True
+
+    def _pick_fallback_candidate(self) -> tuple[str, str] | None:
+        candidates: list[tuple[int, float, int, str, str]] = []
+        for group_id, run in self._active_runs.items():
+            for job_id in self._supervisor_active_job_ids_by_group().get(group_id, []):
+                job = self.store.get_job(job_id)
+                if job is None:
+                    continue
+                remaining_runtime = self.planner.predicted_remaining_runtime_seconds(job, backend_name=run.backend_name) or 0.0
+                candidates.append((job.priority, -remaining_runtime, -job.queue_sequence, group_id, job_id))
+        if not candidates:
+            return None
+        _, _, _, group_id, job_id = sorted(candidates)[0]
+        return group_id, job_id
 
     def _enforce_packed_safety(self) -> None:
-        if self._active_run is None or len(self._active_run.job_ids) < 2 or self._active_run.fallback_triggered:
+        if not self._active_runs or not self._device_samples:
             return
-        if not self._active_run.samples:
-            return
-        latest = self._active_run.samples[-1]
+        latest = self._device_samples[-1]
         if latest.memory_total_mb <= 0:
             return
         memory_fraction = latest.memory_used_mb / latest.memory_total_mb
         if memory_fraction < self.settings.gpu_scheduler.memory.hard_stop_memory_fraction:
             return
-        reason = f"packed group exceeded hard memory threshold ({memory_fraction:.2%})"
-        target_job_id = next(
-            (
-                job_id
-                for job_id in self._active_run.fallback_order
-                if job_id in self.supervisor.active_job_ids()
-            ),
-            None,
-        )
-        if target_job_id is None:
+        target = self._pick_fallback_candidate()
+        if target is None:
             return
+        group_id, target_job_id = target
+        reason = f"packed groups exceeded hard memory threshold ({memory_fraction:.2%})"
         if not self.supervisor.request_fallback_pause(target_job_id, reason=reason):
             return
         self.store.set_job_status(target_job_id, JobStatus.PAUSING, reason=reason, hold=False)
-        self._register_packed_fallback(
-            reason,
-            payload={
-                "paused_job_id": target_job_id,
-                "memory_used_mb": latest.memory_used_mb,
-                "memory_total_mb": latest.memory_total_mb,
-            },
-        )
+        run = self._active_runs.get(group_id)
+        if run is not None:
+            self._register_packed_fallback(
+                run,
+                reason,
+                payload={
+                    "paused_job_id": target_job_id,
+                    "memory_used_mb": latest.memory_used_mb,
+                    "memory_total_mb": latest.memory_total_mb,
+                },
+            )
 
     def _poll_active_workers(self) -> None:
         snapshots = self.supervisor.poll()
         if not snapshots:
             return
-
-        previous_run = self._active_run
-
         for snapshot in snapshots:
-            self._handle_worker_exit(snapshot, run_context=previous_run)
+            run = self._active_runs.get(snapshot.group_id)
+            self._handle_worker_exit(snapshot, run_context=run)
 
-        remaining_job_ids = self.supervisor.active_job_ids()
-        if previous_run is None:
-            return
-        if len(previous_run.job_ids) > 1 and len(remaining_job_ids) < len(previous_run.job_ids):
-            self._record_combination_profiles(previous_run)
-            if len(remaining_job_ids) == 1:
-                remaining_job_id = remaining_job_ids[0]
-                self._active_run = ActiveRun(
-                    mode="exclusive",
-                    backend_name=self.supervisor.active_group_backend() or previous_run.backend_name,
-                    job_ids=(remaining_job_id,),
-                    batch_overrides={
-                        remaining_job_id: previous_run.batch_overrides.get(
-                            remaining_job_id,
-                            self._resolved_batch_size_for_job_id(remaining_job_id),
-                        )
-                    },
-                    hardware_key=previous_run.hardware_key,
-                    group_signature=build_group_signature(
-                        [self.store.get_job(remaining_job_id).packing.signature or remaining_job_id]
-                        if self.store.get_job(remaining_job_id) is not None
-                        else [remaining_job_id]
-                    ),
+        remaining_by_group = self._supervisor_active_job_ids_by_group()
+        for group_id, run in list(self._active_runs.items()):
+            remaining_job_ids = remaining_by_group.get(group_id, [])
+            if len(run.job_ids) > 1 and len(remaining_job_ids) < len(run.job_ids):
+                self._record_combination_profiles(run)
+            elif len(run.job_ids) == 1 and not remaining_job_ids:
+                self._record_solo_profiles(run)
+
+            if not remaining_job_ids:
+                self._active_runs.pop(group_id, None)
+                continue
+            if tuple(remaining_job_ids) != run.job_ids:
+                if len(remaining_job_ids) == 1:
+                    run.mode = "exclusive"
+                run.job_ids = tuple(remaining_job_ids)
+                run.fallback_order = [job_id for job_id in run.fallback_order if job_id in remaining_job_ids]
+                run.group_signature = build_group_signature(
+                    [
+                        (self.store.get_job(job_id).packing.signature or job_id)
+                        for job_id in remaining_job_ids
+                        if self.store.get_job(job_id) is not None
+                    ]
                 )
-            elif remaining_job_ids:
-                self._active_run = ActiveRun(
-                    mode=self.supervisor.active_group_mode() or previous_run.mode,
-                    backend_name=self.supervisor.active_group_backend() or previous_run.backend_name,
-                    job_ids=tuple(remaining_job_ids),
-                    batch_overrides={job_id: previous_run.batch_overrides.get(job_id, self._resolved_batch_size_for_job_id(job_id)) for job_id in remaining_job_ids},
-                    fallback_order=[job_id for job_id in previous_run.fallback_order if job_id in remaining_job_ids],
-                    hardware_key=previous_run.hardware_key,
-                    group_signature=build_group_signature(
-                        [
-                            (self.store.get_job(job_id).packing.signature or job_id)
-                            for job_id in remaining_job_ids
-                            if self.store.get_job(job_id) is not None
-                        ]
-                    ),
-                )
-            else:
-                self._active_run = None
-        elif len(previous_run.job_ids) == 1 and not remaining_job_ids:
-            self._record_solo_profiles(previous_run)
-            self._active_run = None
 
     def _handle_worker_exit(self, snapshot: WorkerSnapshot, *, run_context: ActiveRun | None) -> None:
         job = self.store.get_job(snapshot.job_id)
@@ -340,7 +372,7 @@ class SchedulerService:
             return
         if snapshot.reported_by == "store":
             if run_context is not None and len(run_context.job_ids) > 1 and job.status == JobStatus.FAILED:
-                self._register_packed_fallback(job.status_reason or "stream-backed worker failed", payload={"failed_job_id": snapshot.job_id})
+                self._register_packed_fallback(run_context, job.status_reason or "stream-backed worker failed", payload={"failed_job_id": snapshot.job_id})
             return
         if snapshot.returncode == 0:
             if job.status in {JobStatus.COMPLETED, JobStatus.PAUSED, JobStatus.CANCELLED, JobStatus.READY}:
@@ -354,24 +386,26 @@ class SchedulerService:
             self.store.set_job_status(job.job_id, JobStatus.FAILED, reason=reason, hold=True)
             self.event_logger.emit("job_failed", job_id=job.job_id, payload={"returncode": snapshot.returncode})
             if run_context is not None and len(run_context.job_ids) > 1:
-                self._register_packed_fallback(reason, payload={"failed_job_id": snapshot.job_id, "returncode": snapshot.returncode})
+                self._register_packed_fallback(run_context, reason, payload={"failed_job_id": snapshot.job_id, "returncode": snapshot.returncode})
             return
 
         if run_context is not None and len(run_context.job_ids) > 1 and job.status == JobStatus.FAILED:
             reason = job.status_reason or f"worker exited with code {snapshot.returncode}"
-            self._register_packed_fallback(reason, payload={"failed_job_id": snapshot.job_id, "returncode": snapshot.returncode})
+            self._register_packed_fallback(run_context, reason, payload={"failed_job_id": snapshot.job_id, "returncode": snapshot.returncode})
 
-    def _register_packed_fallback(self, reason: str, *, payload: dict[str, Any]) -> None:
-        if self._active_run is None or len(self._active_run.job_ids) < 2 or self._active_run.fallback_triggered:
+    def _register_packed_fallback(self, run: ActiveRun, reason: str, *, payload: dict[str, Any]) -> None:
+        if len(run.job_ids) < 2 or run.fallback_triggered:
             return
-        self._active_run.fallback_triggered = True
-        self._active_run.fallback_reason = reason
+        run.fallback_triggered = True
+        run.fallback_reason = reason
         self.event_logger.emit(
             "packed_group_fallback",
-            payload={"job_ids": list(self._active_run.job_ids), "reason": reason, **payload},
+            payload={"job_ids": list(run.job_ids), "reason": reason, **payload},
         )
 
     def _record_solo_profiles(self, run: ActiveRun) -> None:
+        if run.overlapped:
+            return
         summary = GpuTelemetrySummary.from_samples(run.samples)
         for job_id in run.job_ids:
             job = self.store.get_job(job_id)
@@ -399,7 +433,7 @@ class SchedulerService:
             )
 
     def _record_combination_profiles(self, run: ActiveRun) -> None:
-        if len(run.job_ids) < 2:
+        if len(run.job_ids) < 2 or run.overlapped:
             return
         jobs = [self.store.get_job(job_id) for job_id in run.job_ids]
         if any(job is None for job in jobs):
@@ -444,6 +478,7 @@ class SchedulerService:
             self.store.mark_pair_incompatible(
                 left_job.packing.signature,
                 right_job.packing.signature,
+                backend_name=run.backend_name,
                 reason=run.fallback_reason or "packed group failed",
                 cooldown_seconds=self.settings.gpu_scheduler.fallback_cooldown_seconds,
                 peak_vram_mb=summary.peak_vram_mb,
@@ -452,11 +487,12 @@ class SchedulerService:
                 metadata={"backend_name": run.backend_name},
             )
             return
-        existing_pair = self.store.get_pair_profile(left_job.packing.signature, right_job.packing.signature)
+        existing_pair = self.store.get_pair_profile(left_job.packing.signature, right_job.packing.signature, backend_name=run.backend_name)
         self.store.upsert_pair_profile(
             PairProfile.create(
                 left_job.packing.signature,
                 right_job.packing.signature,
+                backend_name=run.backend_name,
                 hardware_key=run.hardware_key or self.store.hardware_key(),
                 compatible=True,
                 observations=(existing_pair.observations + 1) if existing_pair else 1,
@@ -478,35 +514,43 @@ class SchedulerService:
         job = self.store.get_job(job_id)
         if job is None:
             return 1
-        batch_param_name = job.batch_probe.batch_param_name or "batch_size"
-        if job.metadata.get("resolved_batch_size") is not None:
-            try:
-                return max(1, int(job.metadata["resolved_batch_size"]))
-            except (TypeError, ValueError):
-                pass
-        raw_value = job.config.runner_kwargs.get(batch_param_name)
-        try:
-            return max(1, int(raw_value))
-        except (TypeError, ValueError):
-            return 1
+        return BatchResolution.resolved_batch_size(job)
+
+    def _supervisor_active_job_ids(self) -> list[str]:
+        if hasattr(self.supervisor, "active_job_ids"):
+            return list(self.supervisor.active_job_ids())
+        active_group = getattr(self.supervisor, "active_group", lambda: None)()
+        if active_group is None:
+            return []
+        if hasattr(active_group, "active_job_ids"):
+            return list(active_group.active_job_ids())
+        workers = getattr(active_group, "workers", {}) or {}
+        return list(workers.keys())
+
+    def _supervisor_active_job_ids_by_group(self) -> dict[str, list[str]]:
+        if hasattr(self.supervisor, "active_job_ids_by_group"):
+            return {str(group_id): list(job_ids) for group_id, job_ids in self.supervisor.active_job_ids_by_group().items()}
+        active_group = getattr(self.supervisor, "active_group", lambda: None)()
+        if active_group is None:
+            return {}
+        group_id = str(getattr(active_group, "group_id", "legacy-active-group"))
+        if hasattr(active_group, "active_job_ids"):
+            return {group_id: list(active_group.active_job_ids())}
+        workers = getattr(active_group, "workers", {}) or {}
+        return {group_id: list(workers.keys())}
 
     def _apply_batch_override(self, job: TrainingJob, batch_size: int) -> TrainingJob:
-        batch_param_name = job.batch_probe.batch_param_name or "batch_size"
-        updated_job = job.copy()
-        updated_job.config.runner_kwargs[batch_param_name] = int(batch_size)
-        updated_job.metadata.update(
-            {
-                "resolved_batch_size": int(batch_size),
-                "placement_batch_param_name": batch_param_name,
-            }
-        )
+        updated_job = BatchResolution.apply(job, batch_size)
         self.store.save_job(updated_job)
         return updated_job
 
     def _maybe_preempt(self) -> None:
-        if self.supervisor.active_group_mode() != "exclusive":
+        if len(self._active_runs) != 1:
             return
-        active_job_id = self.supervisor.active_job_id()
+        active_run = next(iter(self._active_runs.values()))
+        if active_run.mode != "exclusive":
+            return
+        active_job_id = active_run.job_ids[0] if active_run.job_ids else None
         if active_job_id is None:
             return
         active_job = self.store.get_job(active_job_id)
@@ -529,27 +573,35 @@ class SchedulerService:
             )
 
     def _preload_job_baseline(self, job: TrainingJob) -> None:
+        target = self._resolve_preload_target(job)
         try:
             self.cache.preload(
-                job.baseline_model_id,
-                job.baseline_model_path,
-                loader_target=job.config.loader_target,
+                target.model_id,
+                target.model_path,
+                loader_target=target.loader_target,
                 metadata={"source": "dispatch", "job_id": job.job_id},
             )
         except Exception as exc:
-            self.logger.warning("Baseline preload failed for job %s: %s", job.job_id, exc)
+            self.logger.warning("Baseline preload failed for job %s (%s): %s", job.job_id, target.model_id, exc)
 
-    def _dispatch_if_idle(self) -> None:
-        if self.supervisor.active_group() is not None:
-            return
-        plan = self.planner.choose_plan(self._runnable_jobs(), backend_available=self.supervisor.available_backends())
-        if plan is None:
-            return
+    def _active_occupancy(self) -> tuple[float, float]:
+        active_vram_mb = 0.0
+        active_sm_utilization = 0.0
+        for group_id, run in self._active_runs.items():
+            jobs = [self.store.get_job(job_id) for job_id in self._supervisor_active_job_ids_by_group().get(group_id, [])]
+            materialized = [job for job in jobs if job is not None]
+            if not materialized:
+                continue
+            active_vram_mb += self.planner.predicted_group_vram_mb(materialized, backend_name=run.backend_name)
+            active_sm_utilization += self.planner.predicted_group_sm_utilization(materialized, backend_name=run.backend_name)
+        return active_vram_mb, active_sm_utilization
+
+    def _dispatch_plan(self, plan: DispatchPlan) -> bool:
         selected_jobs = []
         for job_id in plan.job_ids:
             job = self.store.get_job(job_id)
             if job is None:
-                return
+                return False
             selected_jobs.append(job)
         if plan.batch_overrides:
             selected_jobs = [
@@ -569,7 +621,7 @@ class SchedulerService:
             )
         except Exception as exc:
             self.logger.warning("Dispatch failed for jobs %s: %s", ",".join(plan.job_ids), exc)
-            if plan.backend_name != "exclusive" and selected_jobs:
+            if plan.backend_name != "exclusive" and selected_jobs and not self._active_runs:
                 fallback_job = selected_jobs[0]
                 self.logger.warning(
                     "Falling back to exclusive dispatch for %s after backend %s failed",
@@ -579,7 +631,9 @@ class SchedulerService:
                 try:
                     fallback_decision = self.supervisor.dispatch([fallback_job], mode="exclusive", backend_name="exclusive")
                     if fallback_decision.can_run:
-                        self._active_run = ActiveRun(
+                        group_id = fallback_decision.group_id or f"legacy-{fallback_job.job_id}-{time.monotonic_ns()}"
+                        self._active_runs[group_id] = ActiveRun(
+                            group_id=group_id,
                             mode="exclusive",
                             backend_name="exclusive",
                             job_ids=(fallback_job.job_id,),
@@ -599,17 +653,18 @@ class SchedulerService:
                                 "placement_role": "solo",
                             },
                         )
+                        return True
                 except Exception as fallback_exc:
                     self.logger.warning("Exclusive fallback dispatch also failed for %s: %s", fallback_job.job_id, fallback_exc)
-            return
+            return False
         if not dispatched.can_run:
             self.logger.info("Skipping dispatch for %s: %s", ",".join(plan.job_ids), dispatched.reason)
-            return
+            return False
+        group_id = dispatched.group_id or f"legacy-{plan.job_ids[0]}-{time.monotonic_ns()}"
 
-        signatures = []
-        for job in selected_jobs:
-            signatures.append(job.packing.signature or job.job_id)
-        self._active_run = ActiveRun(
+        signatures = [job.packing.signature or job.job_id for job in selected_jobs]
+        self._active_runs[group_id] = ActiveRun(
+            group_id=group_id,
             mode=plan.mode,
             backend_name=plan.backend_name,
             job_ids=plan.job_ids,
@@ -618,6 +673,9 @@ class SchedulerService:
             hardware_key=self.store.hardware_key(),
             group_signature=build_group_signature(signatures),
         )
+        if len(self._active_runs) > 1:
+            for run in self._active_runs.values():
+                run.overlapped = True
         self._last_telemetry_poll_at = 0.0
 
         for index, job in enumerate(selected_jobs):
@@ -637,6 +695,7 @@ class SchedulerService:
                     "placement_backend": plan.backend_name,
                     "placement_role": role,
                     "placement_batch_size": plan.batch_overrides.get(job.job_id),
+                    "placement_group_id": group_id,
                 },
             )
             self.event_logger.emit(
@@ -646,6 +705,7 @@ class SchedulerService:
                     "priority": job.priority,
                     "placement_mode": plan.mode,
                     "placement_backend": plan.backend_name,
+                    "group_id": group_id,
                     "job_ids": list(plan.job_ids),
                     "batch_overrides": dict(plan.batch_overrides),
                     "reason": plan.reason,
@@ -656,6 +716,7 @@ class SchedulerService:
                 "packed_pair_dispatched",
                 payload={
                     "job_ids": list(plan.job_ids),
+                    "group_id": group_id,
                     "backend_name": plan.backend_name,
                     "batch_overrides": dict(plan.batch_overrides),
                     "reason": plan.reason,
@@ -666,11 +727,42 @@ class SchedulerService:
                 "packed_group_dispatched",
                 payload={
                     "job_ids": list(plan.job_ids),
+                    "group_id": group_id,
                     "backend_name": plan.backend_name,
                     "batch_overrides": dict(plan.batch_overrides),
                     "reason": plan.reason,
                 },
             )
+        return True
+
+    def _dispatch_pending_work(self) -> None:
+        scheduler_mode = self.settings.gpu_scheduler.mode
+        if scheduler_mode != SCHEDULER_MODE_PARALLEL_AUTO_PACK and self._active_runs:
+            return
+
+        while True:
+            active_job_ids = set(self._supervisor_active_job_ids())
+            runnable = [job for job in self._runnable_jobs() if job.job_id not in active_job_ids]
+            if not runnable:
+                return
+            active_vram_mb, active_sm_utilization = self._active_occupancy()
+            plan = self.planner.choose_plan(
+                runnable,
+                backend_available=self.supervisor.available_backends(),
+                active_vram_mb=active_vram_mb,
+                active_sm_utilization=active_sm_utilization,
+            )
+            if plan is None:
+                return
+            if scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK and self._active_runs and plan.backend_name == "exclusive":
+                return
+            dispatched = self._dispatch_plan(plan)
+            if not dispatched or scheduler_mode != SCHEDULER_MODE_PARALLEL_AUTO_PACK:
+                return
+
+    def _dispatch_if_idle(self) -> None:
+        """Backward-compatible alias for older tests and call sites."""
+        self._dispatch_pending_work()
 
     def report(self) -> dict[str, Any]:
         return self.metrics.as_dict()

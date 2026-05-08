@@ -5,10 +5,10 @@ import tempfile
 import time
 import unittest
 
-from localml_scheduler.api import LocalMLSchedulerAPI
+from localml_scheduler.client import SchedulerClient
 from localml_scheduler.examples.toy_pytorch_runner import create_toy_baseline_checkpoint
-from localml_scheduler.settings import SchedulerSettings
-from localml_scheduler.schemas import CheckpointPolicy, TrainingJob
+from localml_scheduler.config import SchedulerSettings
+from localml_scheduler.domain import CheckpointPolicy, TrainingJob
 
 
 def wait_for(predicate, timeout: float = 20.0, interval: float = 0.1) -> None:
@@ -25,11 +25,11 @@ class CheckpointResumeIntegrationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir)
             settings = SchedulerSettings(runtime_root=runtime_root, scheduler_poll_interval_seconds=0.05)
-            api = LocalMLSchedulerAPI(settings)
-            service = api.create_scheduler_service().start(background=True)
+            api = SchedulerClient(settings)
+            service = api.create_service().start(background=True)
             try:
                 baseline = create_toy_baseline_checkpoint(runtime_root / "baselines" / "resume.pt", seed=22)
-                job = api.submit_job(
+                job = api.submit(
                     TrainingJob.create(
                         runner_target="localml_scheduler.examples.toy_pytorch_runner:run_toy_training_job",
                         baseline_model_id="resume-baseline",
@@ -41,18 +41,18 @@ class CheckpointResumeIntegrationTest(unittest.TestCase):
                     )
                 )
 
-                wait_for(lambda: api.get_job(job.job_id).status.value == "RUNNING")
-                api.pause_job(job.job_id)
-                wait_for(lambda: api.get_job(job.job_id).status.value == "PAUSED", timeout=20.0)
-                paused_job = api.get_job(job.job_id)
+                wait_for(lambda: api.inspect(job.job_id).status.value == "RUNNING")
+                api.pause(job.job_id)
+                wait_for(lambda: api.inspect(job.job_id).status.value == "PAUSED", timeout=20.0)
+                paused_job = api.inspect(job.job_id)
                 self.assertIsNotNone(paused_job.latest_checkpoint_path)
                 self.assertTrue(Path(paused_job.latest_checkpoint_path).exists())
 
                 checkpoint = service.store.latest_checkpoint(job.job_id)
                 self.assertIsNotNone(checkpoint)
 
-                api.resume_job(job.job_id)
-                wait_for(lambda: api.get_job(job.job_id).status.value == "COMPLETED", timeout=30.0)
+                api.resume(job.job_id)
+                wait_for(lambda: api.inspect(job.job_id).status.value == "COMPLETED", timeout=30.0)
             finally:
                 service.stop()
 

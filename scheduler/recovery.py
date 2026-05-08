@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..observability.events import EventLogger
-from ..schemas import JobStatus
+from ..domain import JobStatus
 from ..storage.sqlite_store import SQLiteStateStore
 
 

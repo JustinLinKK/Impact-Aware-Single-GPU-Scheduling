@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 import json
 
-from ..schemas import utc_now
+from ..domain import utc_now
 from ..storage.sqlite_store import SQLiteStateStore
 
 

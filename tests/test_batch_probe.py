@@ -7,7 +7,7 @@ import time
 import unittest
 
 from localml_scheduler.adapters.mlevolve import build_mlevolve_job
-from localml_scheduler.api import LocalMLSchedulerAPI
+from localml_scheduler.client import SchedulerClient
 from localml_scheduler.checkpointing.manager import CheckpointManager
 from localml_scheduler.execution.backends import ExclusiveBackend, MPSBackend
 from localml_scheduler.execution.control import ControlPlane, TrainingControlHook
@@ -16,7 +16,7 @@ from localml_scheduler.execution.runner_protocol import RunnerContext
 from localml_scheduler.examples.toy_pytorch_runner import create_toy_baseline_checkpoint
 from localml_scheduler.observability.events import EventLogger
 from localml_scheduler.profiling.batch_probe import BatchProbeKeyInfo, _run_probe_controller, run_batch_probe_preflight
-from localml_scheduler.schemas import (
+from localml_scheduler.domain import (
     BATCH_PROBE_SEARCH_MODE_BINARY,
     BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
     BatchProbeProfile,
@@ -30,7 +30,7 @@ from localml_scheduler.schemas import (
     build_batch_probe_shape_signature,
 )
 from localml_scheduler.scheduler.supervisor import WorkerSupervisor
-from localml_scheduler.settings import SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED, SchedulerSettings
+from localml_scheduler.config import SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED, SchedulerSettings
 from localml_scheduler.storage.sqlite_store import SQLiteStateStore
 
 
@@ -100,7 +100,7 @@ def _batch_probe_settings(runtime_root: str | Path) -> SchedulerSettings:
     )
 
 
-def _seed_solo_profile(api: LocalMLSchedulerAPI, job: TrainingJob) -> None:
+def _seed_solo_profile(api: SchedulerClient, job: TrainingJob) -> None:
     api.upsert_solo_profile(
         SoloProfile(
             signature=job.packing.signature,
@@ -316,23 +316,23 @@ class BatchProbeIntegrationTest(unittest.TestCase):
     def test_first_job_probes_and_second_job_reuses_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = _batch_probe_settings(Path(tmpdir))
-            api = LocalMLSchedulerAPI(settings)
-            service = api.create_scheduler_service(supervisor=_build_supervisor(settings, mps_available=False)).start(background=True)
+            api = SchedulerClient(settings)
+            service = api.create_service(supervisor=_build_supervisor(settings, mps_available=False)).start(background=True)
             try:
                 baseline = create_toy_baseline_checkpoint(Path(tmpdir) / "baselines" / "probe.pt", seed=100)
                 first = self._build_probe_job(baseline, batch_size=3)
                 second = self._build_probe_job(baseline, batch_size=1)
 
-                api.submit_job(first)
-                wait_for(lambda: api.get_job(first.job_id).status.is_terminal, timeout=30.0)
-                first_state = api.get_job(first.job_id)
+                api.submit(first)
+                wait_for(lambda: api.inspect(first.job_id).status.is_terminal, timeout=30.0)
+                first_state = api.inspect(first.job_id)
                 self.assertEqual(first_state.config.runner_kwargs["batch_size"], 6)
                 self.assertEqual(first_state.metadata["batch_probe_source"], "probe")
                 self.assertEqual(len(api.store.list_batch_probe_profiles()), 1)
 
-                api.submit_job(second)
-                wait_for(lambda: api.get_job(second.job_id).status.is_terminal, timeout=30.0)
-                second_state = api.get_job(second.job_id)
+                api.submit(second)
+                wait_for(lambda: api.inspect(second.job_id).status.is_terminal, timeout=30.0)
+                second_state = api.inspect(second.job_id)
                 self.assertEqual(second_state.config.runner_kwargs["batch_size"], 6)
                 self.assertEqual(second_state.metadata["batch_probe_source"], "cache")
                 self.assertEqual(len(api.store.list_events(job_id=second.job_id, event_type="batch_probe_cache_hit")), 1)
@@ -342,17 +342,17 @@ class BatchProbeIntegrationTest(unittest.TestCase):
     def test_shape_change_creates_a_new_probe_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = _batch_probe_settings(Path(tmpdir))
-            api = LocalMLSchedulerAPI(settings)
-            service = api.create_scheduler_service(supervisor=_build_supervisor(settings, mps_available=False)).start(background=True)
+            api = SchedulerClient(settings)
+            service = api.create_service(supervisor=_build_supervisor(settings, mps_available=False)).start(background=True)
             try:
                 baseline = create_toy_baseline_checkpoint(Path(tmpdir) / "baselines" / "shape.pt", seed=101)
                 first = self._build_probe_job(baseline, batch_size=3, shape_hints={"tokens": 128})
                 second = self._build_probe_job(baseline, batch_size=3, shape_hints={"tokens": 256})
 
-                api.submit_job(first)
-                wait_for(lambda: api.get_job(first.job_id).status.is_terminal, timeout=30.0)
-                api.submit_job(second)
-                wait_for(lambda: api.get_job(second.job_id).status.is_terminal, timeout=30.0)
+                api.submit(first)
+                wait_for(lambda: api.inspect(first.job_id).status.is_terminal, timeout=30.0)
+                api.submit(second)
+                wait_for(lambda: api.inspect(second.job_id).status.is_terminal, timeout=30.0)
 
                 self.assertEqual(len(api.store.list_batch_probe_profiles()), 2)
                 self.assertEqual(len(api.store.list_events(event_type="batch_probe_cache_miss")), 2)
@@ -444,18 +444,18 @@ class BatchProbeIntegrationTest(unittest.TestCase):
     def test_resume_does_not_reprobe_once_batch_size_is_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = _batch_probe_settings(Path(tmpdir))
-            api = LocalMLSchedulerAPI(settings)
-            service = api.create_scheduler_service(supervisor=_build_supervisor(settings, mps_available=False)).start(background=True)
+            api = SchedulerClient(settings)
+            service = api.create_service(supervisor=_build_supervisor(settings, mps_available=False)).start(background=True)
             try:
                 baseline = create_toy_baseline_checkpoint(Path(tmpdir) / "baselines" / "resume.pt", seed=102)
                 job = self._build_probe_job(baseline, batch_size=3, max_steps=80, epochs=8, sleep_per_step=0.02)
-                api.submit_job(job)
+                api.submit(job)
 
-                wait_for(lambda: api.get_job(job.job_id).status.name == "RUNNING", timeout=30.0)
-                api.pause_job(job.job_id)
-                wait_for(lambda: api.get_job(job.job_id).status.name == "PAUSED", timeout=30.0)
-                api.resume_job(job.job_id)
-                wait_for(lambda: api.get_job(job.job_id).status.is_terminal, timeout=30.0)
+                wait_for(lambda: api.inspect(job.job_id).status.name == "RUNNING", timeout=30.0)
+                api.pause(job.job_id)
+                wait_for(lambda: api.inspect(job.job_id).status.name == "PAUSED", timeout=30.0)
+                api.resume(job.job_id)
+                wait_for(lambda: api.inspect(job.job_id).status.is_terminal, timeout=30.0)
 
                 self.assertEqual(len(api.store.list_events(job_id=job.job_id, event_type="batch_probe_started")), 1)
             finally:
@@ -464,8 +464,8 @@ class BatchProbeIntegrationTest(unittest.TestCase):
     def test_mps_packed_jobs_skip_batch_probe(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerSettings(runtime_root=Path(tmpdir), scheduler_poll_interval_seconds=0.05)
-            api = LocalMLSchedulerAPI(settings)
-            service = api.create_scheduler_service(supervisor=_build_supervisor(settings, mps_available=True)).start(background=True)
+            api = SchedulerClient(settings)
+            service = api.create_service(supervisor=_build_supervisor(settings, mps_available=True)).start(background=True)
             try:
                 baseline = create_toy_baseline_checkpoint(Path(tmpdir) / "baselines" / "mps.pt", seed=103)
                 first = self._build_probe_job(baseline, batch_size=3, packing_eligible=True, priority=8)
@@ -473,15 +473,15 @@ class BatchProbeIntegrationTest(unittest.TestCase):
                 _seed_solo_profile(api, first)
                 _seed_solo_profile(api, second)
 
-                api.submit_job(first)
-                api.submit_job(second)
+                api.submit(first)
+                api.submit(second)
                 wait_for(
-                    lambda: api.get_job(first.job_id).status.is_terminal and api.get_job(second.job_id).status.is_terminal,
+                    lambda: api.inspect(first.job_id).status.is_terminal and api.inspect(second.job_id).status.is_terminal,
                     timeout=30.0,
                 )
 
-                self.assertEqual(api.get_job(first.job_id).metadata["placement_mode"], "packed_pair")
-                self.assertEqual(api.get_job(second.job_id).metadata["placement_mode"], "packed_pair")
+                self.assertEqual(api.inspect(first.job_id).metadata["placement_mode"], "packed_pair")
+                self.assertEqual(api.inspect(second.job_id).metadata["placement_mode"], "packed_pair")
                 self.assertEqual(api.store.list_batch_probe_profiles(), [])
                 self.assertEqual(len(api.store.list_events(event_type="batch_probe_started")), 0)
             finally:
@@ -490,15 +490,15 @@ class BatchProbeIntegrationTest(unittest.TestCase):
     def test_probe_failure_marks_job_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = _batch_probe_settings(Path(tmpdir))
-            api = LocalMLSchedulerAPI(settings)
-            service = api.create_scheduler_service(supervisor=_build_supervisor(settings, mps_available=False)).start(background=True)
+            api = SchedulerClient(settings)
+            service = api.create_service(supervisor=_build_supervisor(settings, mps_available=False)).start(background=True)
             try:
                 baseline = create_toy_baseline_checkpoint(Path(tmpdir) / "baselines" / "fail.pt", seed=104)
                 job = self._build_probe_job(baseline, batch_size=1, probe_max_batch_size=0)
-                api.submit_job(job)
-                wait_for(lambda: api.get_job(job.job_id).status.is_terminal, timeout=30.0)
+                api.submit(job)
+                wait_for(lambda: api.inspect(job.job_id).status.is_terminal, timeout=30.0)
 
-                final = api.get_job(job.job_id)
+                final = api.inspect(job.job_id)
                 self.assertEqual(final.status.name, "FAILED")
                 self.assertIn("feasible batch size", final.status_reason or "")
             finally:

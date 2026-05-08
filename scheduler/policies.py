@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
 
-from ..schemas import TrainingJob, parse_timestamp
+from ..domain import TrainingJob, parse_timestamp
 
 
 class SchedulingPolicy(Protocol):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from localml_scheduler.schemas import TrainingJob
+from localml_scheduler.domain import TrainingJob
 from localml_scheduler.scheduler.policies import PriorityFifoPolicy
 from localml_scheduler.scheduler.queue import RunnableJobQueue
 

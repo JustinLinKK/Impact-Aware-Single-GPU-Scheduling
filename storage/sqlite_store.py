@@ -8,7 +8,7 @@ from typing import Any, Iterable
 import json
 import sqlite3
 
-from ..schemas import (
+from ..domain import (
     BatchSizeObservation,
     BatchProbeProfile,
     CombinationProfile,
@@ -16,15 +16,16 @@ from ..schemas import (
     JobCommand,
     JobStatus,
     PairProfile,
+    RuntimeProfile,
     SchedulerReport,
     SoloProfile,
     TrainingJob,
-    canonical_pair_key,
+    build_backend_scoped_pair_key,
     parse_timestamp,
     utc_now,
 )
 from ..hardware import HardwareProfile, detect_hardware_profile
-from ..settings import SchedulerSettings
+from ..config import SchedulerSettings
 from .models import MIGRATION_STATEMENTS, SCHEMA_STATEMENTS
 
 
@@ -399,11 +400,12 @@ class SQLiteStateStore:
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO pair_profiles(pair_key, hardware_key, left_signature, right_signature, compatible, observations, peak_vram_mb, avg_gpu_utilization, avg_memory_utilization, slowdown_ratio, cooldown_until, last_failure_reason, updated_at, metadata_json)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO pair_profiles(pair_key, hardware_key, left_signature, right_signature, backend_name, compatible, observations, peak_vram_mb, avg_gpu_utilization, avg_memory_utilization, slowdown_ratio, cooldown_until, last_failure_reason, updated_at, metadata_json)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(pair_key, hardware_key) DO UPDATE SET
                     left_signature=excluded.left_signature,
                     right_signature=excluded.right_signature,
+                    backend_name=excluded.backend_name,
                     compatible=excluded.compatible,
                     observations=excluded.observations,
                     peak_vram_mb=excluded.peak_vram_mb,
@@ -420,6 +422,7 @@ class SQLiteStateStore:
                     profile.hardware_key,
                     profile.left_signature,
                     profile.right_signature,
+                    profile.backend_name,
                     1 if profile.compatible else 0,
                     profile.observations,
                     profile.peak_vram_mb,
@@ -435,26 +438,165 @@ class SQLiteStateStore:
             connection.commit()
         return profile
 
-    def get_pair_profile(self, left_signature: str, right_signature: str, *, hardware_key: str | None = None) -> PairProfile | None:
-        pair_key = canonical_pair_key(left_signature, right_signature)
+    def get_pair_profile(
+        self,
+        left_signature: str,
+        right_signature: str,
+        *,
+        hardware_key: str | None = None,
+        backend_name: str | None = None,
+    ) -> PairProfile | None:
+        hardware_key = hardware_key or self.hardware_key()
+        with self._connect() as connection:
+            if backend_name is None:
+                row = connection.execute(
+                    """
+                    SELECT *
+                    FROM pair_profiles
+                    WHERE hardware_key = ?
+                      AND (
+                        (left_signature = ? AND right_signature = ?)
+                        OR
+                        (left_signature = ? AND right_signature = ?)
+                      )
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    (hardware_key, left_signature, right_signature, right_signature, left_signature),
+                ).fetchone()
+            else:
+                pair_key = build_backend_scoped_pair_key(left_signature, right_signature, backend_name=backend_name)
+                row = connection.execute(
+                    "SELECT * FROM pair_profiles WHERE pair_key = ? AND hardware_key = ?",
+                    (pair_key, hardware_key),
+                ).fetchone()
+        return PairProfile.from_row(dict(row)) if row else None
+
+    def list_pair_profiles(self, *, hardware_key: str | None = None, backend_name: str | None = None) -> list[PairProfile]:
+        with self._connect() as connection:
+            query = "SELECT * FROM pair_profiles WHERE 1=1"
+            params: list[Any] = []
+            if hardware_key is not None:
+                query += " AND hardware_key = ?"
+                params.append(hardware_key)
+            if backend_name is not None:
+                query += " AND backend_name = ?"
+                params.append(backend_name)
+            query += " ORDER BY updated_at DESC"
+            rows = connection.execute(query, params).fetchall()
+        return [PairProfile.from_row(dict(row)) for row in rows]
+
+    def upsert_runtime_profile(self, profile: RuntimeProfile) -> RuntimeProfile:
+        profile.updated_at = utc_now()
+        if not profile.hardware_key:
+            profile.hardware_key = self.hardware_key()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO runtime_profiles(
+                    profile_key,
+                    signature,
+                    hardware_key,
+                    backend_name,
+                    resolved_batch_size,
+                    strategy,
+                    startup_seconds,
+                    epoch_1_seconds,
+                    steps_per_epoch,
+                    avg_step_time_ms,
+                    estimated_total_runtime_seconds,
+                    confidence,
+                    observations,
+                    last_job_id,
+                    updated_at,
+                    source,
+                    metadata_json
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile_key) DO UPDATE SET
+                    signature=excluded.signature,
+                    hardware_key=excluded.hardware_key,
+                    backend_name=excluded.backend_name,
+                    resolved_batch_size=excluded.resolved_batch_size,
+                    strategy=excluded.strategy,
+                    startup_seconds=excluded.startup_seconds,
+                    epoch_1_seconds=excluded.epoch_1_seconds,
+                    steps_per_epoch=excluded.steps_per_epoch,
+                    avg_step_time_ms=excluded.avg_step_time_ms,
+                    estimated_total_runtime_seconds=excluded.estimated_total_runtime_seconds,
+                    confidence=excluded.confidence,
+                    observations=excluded.observations,
+                    last_job_id=excluded.last_job_id,
+                    updated_at=excluded.updated_at,
+                    source=excluded.source,
+                    metadata_json=excluded.metadata_json
+                """,
+                (
+                    profile.profile_key,
+                    profile.signature,
+                    profile.hardware_key,
+                    profile.backend_name,
+                    profile.resolved_batch_size,
+                    profile.strategy,
+                    profile.startup_seconds,
+                    profile.epoch_1_seconds,
+                    profile.steps_per_epoch,
+                    profile.avg_step_time_ms,
+                    profile.estimated_total_runtime_seconds,
+                    profile.confidence,
+                    profile.observations,
+                    profile.last_job_id,
+                    profile.updated_at,
+                    profile.source,
+                    json.dumps(profile.metadata or {}, sort_keys=True),
+                ),
+            )
+            connection.commit()
+        return profile
+
+    def get_runtime_profile(
+        self,
+        signature: str,
+        *,
+        resolved_batch_size: int,
+        backend_name: str,
+        hardware_key: str | None = None,
+    ) -> RuntimeProfile | None:
         hardware_key = hardware_key or self.hardware_key()
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM pair_profiles WHERE pair_key = ? AND hardware_key = ?",
-                (pair_key, hardware_key),
+                """
+                SELECT * FROM runtime_profiles
+                WHERE signature = ? AND hardware_key = ? AND backend_name = ? AND resolved_batch_size = ?
+                ORDER BY CASE source WHEN 'probe' THEN 0 ELSE 1 END, confidence DESC, updated_at DESC
+                LIMIT 1
+                """,
+                (signature, hardware_key, backend_name, int(resolved_batch_size)),
             ).fetchone()
-        return PairProfile.from_row(dict(row)) if row else None
+        return RuntimeProfile.from_row(dict(row)) if row else None
 
-    def list_pair_profiles(self, *, hardware_key: str | None = None) -> list[PairProfile]:
+    def list_runtime_profiles(
+        self,
+        *,
+        signature: str | None = None,
+        hardware_key: str | None = None,
+        backend_name: str | None = None,
+    ) -> list[RuntimeProfile]:
+        query = "SELECT * FROM runtime_profiles WHERE 1=1"
+        params: list[Any] = []
+        if signature is not None:
+            query += " AND signature = ?"
+            params.append(signature)
+        if hardware_key is not None:
+            query += " AND hardware_key = ?"
+            params.append(hardware_key)
+        if backend_name is not None:
+            query += " AND backend_name = ?"
+            params.append(backend_name)
+        query += " ORDER BY CASE source WHEN 'probe' THEN 0 ELSE 1 END, confidence DESC, updated_at DESC"
         with self._connect() as connection:
-            if hardware_key is None:
-                rows = connection.execute("SELECT * FROM pair_profiles ORDER BY updated_at DESC").fetchall()
-            else:
-                rows = connection.execute(
-                    "SELECT * FROM pair_profiles WHERE hardware_key = ? ORDER BY updated_at DESC",
-                    (hardware_key,),
-                ).fetchall()
-        return [PairProfile.from_row(dict(row)) for row in rows]
+            rows = connection.execute(query, params).fetchall()
+        return [RuntimeProfile.from_row(dict(row)) for row in rows]
 
     def upsert_batch_probe_profile(self, profile: BatchProbeProfile) -> BatchProbeProfile:
         profile.updated_at = utc_now()
@@ -755,6 +897,7 @@ class SQLiteStateStore:
         left_signature: str,
         right_signature: str,
         *,
+        backend_name: str,
         reason: str,
         cooldown_seconds: int,
         peak_vram_mb: int | None = None,
@@ -763,13 +906,14 @@ class SQLiteStateStore:
         metadata: dict[str, Any] | None = None,
     ) -> PairProfile:
         hardware_key = self.hardware_key()
-        existing = self.get_pair_profile(left_signature, right_signature, hardware_key=hardware_key)
+        existing = self.get_pair_profile(left_signature, right_signature, hardware_key=hardware_key, backend_name=backend_name)
         cooldown_until = None
         if cooldown_seconds > 0:
             cooldown_until = (parse_timestamp(utc_now()) + timedelta(seconds=cooldown_seconds)).isoformat()
         profile = PairProfile.create(
             left_signature,
             right_signature,
+            backend_name=backend_name,
             hardware_key=hardware_key,
             compatible=False,
             observations=(existing.observations + 1) if existing else 1,

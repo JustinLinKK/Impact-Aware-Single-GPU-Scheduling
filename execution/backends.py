@@ -12,8 +12,8 @@ import shutil
 import subprocess
 import sys
 
-from ..schemas import TrainingJob
-from ..settings import SchedulerSettings
+from ..domain import TrainingJob
+from ..config import SchedulerSettings
 from .executor import SubprocessExecutor, WorkerProcessHandle
 
 
@@ -79,8 +79,8 @@ class CudaProcessBackend:
         return bool(self.settings.gpu_scheduler.cuda_process.enabled)
 
     def launch(self, jobs: list[TrainingJob]) -> list[WorkerProcessHandle]:
-        if len(jobs) < 2:
-            raise ValueError("cuda_process backend expects at least two jobs")
+        if not jobs:
+            raise ValueError("cuda_process backend expects at least one job")
         base_env = {
             "CUDA_VISIBLE_DEVICES": str(self.settings.gpu_scheduler.device_index),
             "OMP_NUM_THREADS": str(self.settings.gpu_scheduler.cuda_process.default_omp_num_threads),
@@ -126,7 +126,9 @@ class MPSBackend:
             "OMP_NUM_THREADS": str(mps_settings.default_omp_num_threads),
             "MKL_NUM_THREADS": str(mps_settings.default_mkl_num_threads),
         }
-        if len(jobs) == 2:
+        if len(jobs) == 1:
+            percentages = [100]
+        elif len(jobs) == 2:
             percentages = [
                 mps_settings.default_primary_active_thread_pct,
                 mps_settings.default_secondary_active_thread_pct,
@@ -148,8 +150,8 @@ class MPSBackend:
         subprocess.run([self.mps_binary, "-d"], check=False, capture_output=True, text=True, timeout=5.0, env=daemon_env)
 
     def launch(self, jobs: list[TrainingJob]) -> list[WorkerProcessHandle]:
-        if len(jobs) < 2:
-            raise ValueError("mps backend expects at least two jobs")
+        if not jobs:
+            raise ValueError("mps backend expects at least one job")
         self._ensure_runtime()
         job_envs = self._client_envs(jobs)
         return [self.executor.start(job, extra_env=job_env) for job, job_env in zip(jobs, job_envs, strict=True)]
@@ -165,8 +167,8 @@ class StreamBackend:
         return bool(self.settings.gpu_scheduler.stream.enabled)
 
     def launch(self, jobs: list[TrainingJob]) -> list[WorkerProcessHandle]:
-        if len(jobs) < 2:
-            raise ValueError("stream backend expects at least two jobs")
+        if not jobs:
+            raise ValueError("stream backend expects at least one job")
         stdout_path, stderr_path = _group_log_paths(self.settings, jobs, "stream_host")
         python_executable = jobs[0].config.python_executable or self.settings.python_executable or sys.executable
         env = os.environ.copy()

@@ -11,7 +11,12 @@ import torch
 from torch import nn
 
 from ..execution.runner_protocol import RunnerContext
-from ..schemas import SafePointType
+from ..profiling.runtime_probe import (
+    estimate_total_runtime_from_epoch_1,
+    estimate_total_runtime_from_step_window,
+    planned_total_steps,
+)
+from ..domain import SafePointType
 
 
 class ToyMLP(nn.Module):
@@ -237,6 +242,18 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
     )
     total_epochs = int(context.job.max_epochs or context.job.config.max_epochs or params["epochs"])
     max_steps = context.job.max_steps or context.job.config.max_steps
+    backend_name = str(context.job.metadata.get("placement_backend") or "exclusive")
+    run_started_at = time.perf_counter()
+    steps_per_epoch = len(batches)
+    runtime_profile = context.get_runtime_profile(backend_name=backend_name)
+    estimated_total_runtime_seconds = (
+        float(runtime_profile.estimated_total_runtime_seconds)
+        if runtime_profile is not None and runtime_profile.estimated_total_runtime_seconds is not None
+        else None
+    )
+    profile_ready = runtime_profile is not None
+    epoch_durations: list[float] = []
+    first_epoch_step_durations_ms: list[float] = []
 
     start_epoch = 0
     start_step_in_epoch = 0
@@ -276,12 +293,14 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
 
     last_loss = 0.0
     for epoch in range(start_epoch, total_epochs):
+        epoch_started_at = time.perf_counter()
         step_offset = start_step_in_epoch if epoch == start_epoch else 0
         for step_in_epoch, (features, labels) in enumerate(batches):
             if step_in_epoch < step_offset:
                 continue
             if max_steps is not None and global_step >= int(max_steps):
                 break
+            step_started_at = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             logits = model(features)
             loss = criterion(logits, labels)
@@ -290,24 +309,125 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
 
             last_loss = float(loss.detach().cpu().item())
             global_step += 1
+            step_elapsed_ms = (time.perf_counter() - step_started_at) * 1000.0
+            if epoch == start_epoch:
+                first_epoch_step_durations_ms.append(step_elapsed_ms)
             if float(params["sleep_per_step"]) > 0:
                 time.sleep(float(params["sleep_per_step"]))
+
+            runtime_updates: dict[str, float | int] = {}
+            if not profile_ready and max_steps is not None and int(max_steps) < max(1, steps_per_epoch):
+                measured_steps = max(1, len(first_epoch_step_durations_ms))
+                avg_step_time_ms = sum(first_epoch_step_durations_ms) / measured_steps
+                estimated_total_runtime_seconds = estimate_total_runtime_from_step_window(
+                    startup_seconds=max(0.0, epoch_started_at - run_started_at),
+                    avg_step_time_ms=avg_step_time_ms,
+                    total_steps=planned_total_steps(context.job, steps_per_epoch=steps_per_epoch),
+                )
+                context.upsert_runtime_profile(
+                    backend_name=backend_name,
+                    strategy="step_window",
+                    startup_seconds=max(0.0, epoch_started_at - run_started_at),
+                    epoch_1_seconds=None,
+                    steps_per_epoch=steps_per_epoch,
+                    avg_step_time_ms=avg_step_time_ms,
+                    estimated_total_runtime_seconds=estimated_total_runtime_seconds,
+                    confidence=0.60,
+                    source="probe",
+                    observations=1,
+                    metadata={"fallback": "max_steps_shorter_than_epoch"},
+                )
+                context.store.update_job(
+                    context.job.job_id,
+                    metadata_updates={
+                        "runtime_estimated_total_runtime_seconds": estimated_total_runtime_seconds,
+                        "runtime_profile_strategy": "step_window",
+                        "runtime_profile_confidence": 0.60,
+                    },
+                )
+                profile_ready = True
+            if profile_ready and estimated_total_runtime_seconds is not None:
+                runtime_updates = {
+                    "steps_per_epoch": steps_per_epoch,
+                    "avg_step_time_ms": sum(first_epoch_step_durations_ms) / max(1, len(first_epoch_step_durations_ms)),
+                    "estimated_total_runtime_seconds": estimated_total_runtime_seconds,
+                    "remaining_runtime_seconds": max(0.0, estimated_total_runtime_seconds - (time.perf_counter() - run_started_at)),
+                }
             context.control_hook.safe_point(
                 SafePointType.STEP,
                 epoch=epoch,
                 global_step=global_step,
                 metrics={"loss": last_loss},
                 state_factory=lambda epoch=epoch, step_in_epoch=step_in_epoch + 1, global_step=global_step: build_checkpoint_state(epoch, step_in_epoch, global_step),
+                steps_per_epoch=int(runtime_updates["steps_per_epoch"]) if runtime_updates else None,
+                avg_step_time_ms=float(runtime_updates["avg_step_time_ms"]) if runtime_updates else None,
+                estimated_total_runtime_seconds=float(runtime_updates["estimated_total_runtime_seconds"]) if runtime_updates else None,
+                remaining_runtime_seconds=float(runtime_updates["remaining_runtime_seconds"]) if runtime_updates else None,
             )
 
+        epoch_elapsed_s = time.perf_counter() - epoch_started_at
+        epoch_durations.append(epoch_elapsed_s)
+        if not profile_ready and epoch == start_epoch and global_step > 0:
+            startup_seconds = max(0.0, epoch_started_at - run_started_at)
+            avg_step_time_ms = sum(first_epoch_step_durations_ms) / max(1, len(first_epoch_step_durations_ms))
+            if max_steps is not None:
+                estimated_total_runtime_seconds = estimate_total_runtime_from_step_window(
+                    startup_seconds=startup_seconds,
+                    avg_step_time_ms=avg_step_time_ms,
+                    total_steps=planned_total_steps(context.job, steps_per_epoch=steps_per_epoch),
+                )
+                strategy = "step_window"
+                confidence = 0.75
+            else:
+                estimated_total_runtime_seconds = estimate_total_runtime_from_epoch_1(
+                    startup_seconds=startup_seconds,
+                    epoch_1_seconds=epoch_elapsed_s,
+                    total_epochs=total_epochs,
+                )
+                strategy = "epoch_1"
+                confidence = 0.90
+            context.upsert_runtime_profile(
+                backend_name=backend_name,
+                strategy=strategy,
+                startup_seconds=startup_seconds,
+                epoch_1_seconds=epoch_elapsed_s,
+                steps_per_epoch=steps_per_epoch,
+                avg_step_time_ms=avg_step_time_ms,
+                estimated_total_runtime_seconds=estimated_total_runtime_seconds,
+                confidence=confidence,
+                source="probe",
+                observations=1,
+                metadata={"epoch_index": epoch + 1},
+            )
+            context.store.update_job(
+                context.job.job_id,
+                metadata_updates={
+                    "runtime_estimated_total_runtime_seconds": estimated_total_runtime_seconds,
+                    "runtime_profile_strategy": strategy,
+                    "runtime_profile_confidence": confidence,
+                },
+            )
+            profile_ready = True
         if scheduler is not None:
             scheduler.step()
+        epoch_runtime_updates: dict[str, float | int] = {}
+        if profile_ready and estimated_total_runtime_seconds is not None:
+            epoch_runtime_updates = {
+                "steps_per_epoch": steps_per_epoch,
+                "avg_step_time_ms": sum(first_epoch_step_durations_ms) / max(1, len(first_epoch_step_durations_ms)),
+                "estimated_total_runtime_seconds": estimated_total_runtime_seconds,
+                "remaining_runtime_seconds": max(0.0, estimated_total_runtime_seconds - (time.perf_counter() - run_started_at)),
+            }
         context.control_hook.safe_point(
             SafePointType.EPOCH,
             epoch=epoch + 1,
             global_step=global_step,
             metrics={"loss": last_loss},
             state_factory=lambda epoch=epoch + 1, global_step=global_step: build_checkpoint_state(epoch, 0, global_step),
+            steps_per_epoch=int(epoch_runtime_updates["steps_per_epoch"]) if epoch_runtime_updates else None,
+            avg_step_time_ms=float(epoch_runtime_updates["avg_step_time_ms"]) if epoch_runtime_updates else None,
+            estimated_total_runtime_seconds=float(epoch_runtime_updates["estimated_total_runtime_seconds"]) if epoch_runtime_updates else None,
+            remaining_runtime_seconds=float(epoch_runtime_updates["remaining_runtime_seconds"]) if epoch_runtime_updates else None,
         )
         start_step_in_epoch = 0
         if max_steps is not None and global_step >= int(max_steps):

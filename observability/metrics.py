@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..schemas import SchedulerReport
+from ..domain import SchedulerReport
 from ..storage.sqlite_store import SQLiteStateStore
 
 

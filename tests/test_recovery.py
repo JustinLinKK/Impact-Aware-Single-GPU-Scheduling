@@ -4,13 +4,12 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from localml_scheduler.api import LocalMLSchedulerAPI
 from localml_scheduler.checkpointing.manager import CheckpointManager
 from localml_scheduler.examples.toy_pytorch_runner import create_toy_baseline_checkpoint
 from localml_scheduler.observability.events import EventLogger
-from localml_scheduler.schemas import CheckpointPolicy, JobStatus, TrainingJob
+from localml_scheduler.domain import CheckpointPolicy, JobStatus, TrainingJob
 from localml_scheduler.scheduler.service import SchedulerService
-from localml_scheduler.settings import SchedulerSettings
+from localml_scheduler.config import SchedulerSettings
 from localml_scheduler.storage.sqlite_store import SQLiteStateStore
 
 

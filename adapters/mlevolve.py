@@ -6,8 +6,8 @@ from hashlib import sha1
 from typing import Any
 import json
 
-from ..api import LocalMLSchedulerAPI
-from ..schemas import BatchProbeSpec, CheckpointPolicy, PackingSpec, ResourceRequirements, TrainingJob
+from ..client import SchedulerClient
+from ..domain import BatchProbeSpec, CheckpointPolicy, PackingSpec, PreloadSource, ResourceRequirements, RuntimeProbeSpec, TrainingJob
 
 
 def build_packing_signature(
@@ -53,8 +53,10 @@ def build_mlevolve_job(
     packing_eligible: bool = False,
     packing_max_slowdown_ratio: float | None = None,
     packing_backend_allowlist: list[str] | None = None,
+    runtime_probe: RuntimeProbeSpec | None = None,
     max_steps: int | None = None,
     max_epochs: int | None = None,
+    preload_source: PreloadSource | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> TrainingJob:
     """Build a scheduler job from an MLEvolve candidate-training request."""
@@ -69,6 +71,12 @@ def build_mlevolve_job(
             max_epochs=max_epochs,
             family=packing_family,
         )
+    default_runtime_probe = runtime_probe
+    if default_runtime_probe is None:
+        default_runtime_probe = RuntimeProbeSpec(
+            enabled=(runner_target != "localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job"),
+            strategy="epoch_1",
+        )
     return TrainingJob.create(
         runner_target=runner_target,
         baseline_model_id=baseline_model_id,
@@ -80,6 +88,7 @@ def build_mlevolve_job(
         loader_target=loader_target,
         checkpoint_policy=checkpoint_policy,
         resource_requirements=resource_requirements,
+        preload_source=preload_source,
         packing=PackingSpec(
             eligible=packing_eligible,
             signature=computed_signature,
@@ -88,13 +97,14 @@ def build_mlevolve_job(
             backend_allowlist=list(packing_backend_allowlist or []),
         ),
         batch_probe=batch_probe or BatchProbeSpec(),
+        runtime_probe=default_runtime_probe,
         max_steps=max_steps,
         max_epochs=max_epochs,
         metadata=metadata or {},
     )
 
 
-def submit_mlevolve_job(api: LocalMLSchedulerAPI, **kwargs: Any) -> TrainingJob:
+def submit_mlevolve_job(api: SchedulerClient, **kwargs: Any) -> TrainingJob:
     """Convenience wrapper for creating and submitting a job."""
     job = build_mlevolve_job(**kwargs)
-    return api.submit_job(job)
+    return api.submit(job)

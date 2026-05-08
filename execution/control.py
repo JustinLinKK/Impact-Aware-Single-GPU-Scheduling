@@ -9,8 +9,8 @@ import json
 
 from ..checkpointing.manager import CheckpointManager
 from ..observability.events import EventLogger
-from ..schemas import JobStatus, ProgressSnapshot, SafePointType, TrainingJob, utc_now
-from ..settings import SchedulerSettings
+from ..domain import JobStatus, ProgressSnapshot, SafePointType, TrainingJob, utc_now
+from ..config import SchedulerSettings
 from ..storage.sqlite_store import SQLiteStateStore
 
 
@@ -131,6 +131,10 @@ class TrainingControlHook:
         metrics: dict[str, float] | None = None,
         message: str | None = None,
         state_factory: Callable[[], dict[str, Any]] | None = None,
+        steps_per_epoch: int | None = None,
+        avg_step_time_ms: float | None = None,
+        estimated_total_runtime_seconds: float | None = None,
+        remaining_runtime_seconds: float | None = None,
     ) -> None:
         command = self.control_plane.read_command(self.job.job_id)
         snapshot = ProgressSnapshot(
@@ -141,9 +145,24 @@ class TrainingControlHook:
             metrics=metrics or {},
             last_safe_point=safe_point_type.value,
             message=message,
+            steps_per_epoch=steps_per_epoch,
+            avg_step_time_ms=avg_step_time_ms,
+            estimated_total_runtime_seconds=estimated_total_runtime_seconds,
+            remaining_runtime_seconds=remaining_runtime_seconds,
         )
         self.control_plane.write_heartbeat(snapshot)
-        self.store.update_job(self.job.job_id, last_heartbeat_at=snapshot.heartbeat_at)
+        metadata_updates: dict[str, Any] | None = None
+        if estimated_total_runtime_seconds is not None or remaining_runtime_seconds is not None:
+            metadata_updates = {}
+            if estimated_total_runtime_seconds is not None:
+                metadata_updates["runtime_estimated_total_runtime_seconds"] = float(estimated_total_runtime_seconds)
+            if remaining_runtime_seconds is not None:
+                metadata_updates["runtime_remaining_runtime_seconds"] = max(0.0, float(remaining_runtime_seconds))
+            if steps_per_epoch is not None:
+                metadata_updates["runtime_steps_per_epoch"] = int(steps_per_epoch)
+            if avg_step_time_ms is not None:
+                metadata_updates["runtime_avg_step_time_ms"] = float(avg_step_time_ms)
+        self.store.update_job(self.job.job_id, last_heartbeat_at=snapshot.heartbeat_at, metadata_updates=metadata_updates)
 
         pause_requested = command.action == "pause"
         cancel_requested = command.action == "cancel"
@@ -163,7 +182,12 @@ class TrainingControlHook:
             )
             snapshot.checkpoint_path = checkpoint_path
             self.control_plane.write_heartbeat(snapshot)
-            self.store.update_job(self.job.job_id, latest_checkpoint_path=checkpoint_path, last_heartbeat_at=snapshot.heartbeat_at)
+            self.store.update_job(
+                self.job.job_id,
+                latest_checkpoint_path=checkpoint_path,
+                last_heartbeat_at=snapshot.heartbeat_at,
+                metadata_updates=metadata_updates,
+            )
 
         if pause_requested:
             self.control_plane.clear_command(self.job.job_id)

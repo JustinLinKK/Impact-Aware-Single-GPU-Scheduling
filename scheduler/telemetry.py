@@ -7,7 +7,7 @@ from typing import Sequence
 import shutil
 import subprocess
 
-from ..schemas import utc_now
+from ..domain import utc_now
 
 
 @dataclass(slots=True)

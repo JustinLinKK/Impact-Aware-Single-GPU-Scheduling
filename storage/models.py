@@ -78,6 +78,7 @@ SCHEMA_STATEMENTS = [
         hardware_key TEXT NOT NULL DEFAULT '',
         left_signature TEXT NOT NULL,
         right_signature TEXT NOT NULL,
+        backend_name TEXT NOT NULL DEFAULT 'exclusive',
         compatible INTEGER NOT NULL DEFAULT 1,
         observations INTEGER NOT NULL DEFAULT 0,
         peak_vram_mb INTEGER,
@@ -152,6 +153,27 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS runtime_profiles (
+        profile_key TEXT PRIMARY KEY,
+        signature TEXT NOT NULL,
+        hardware_key TEXT NOT NULL,
+        backend_name TEXT NOT NULL,
+        resolved_batch_size INTEGER NOT NULL,
+        strategy TEXT NOT NULL,
+        startup_seconds REAL,
+        epoch_1_seconds REAL,
+        steps_per_epoch INTEGER,
+        avg_step_time_ms REAL,
+        estimated_total_runtime_seconds REAL,
+        confidence REAL NOT NULL DEFAULT 0.0,
+        observations INTEGER NOT NULL DEFAULT 0,
+        last_job_id TEXT,
+        updated_at TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'probe',
+        metadata_json TEXT
+    )
+    """,
+    """
     CREATE INDEX IF NOT EXISTS idx_jobs_status_priority
     ON jobs(status, priority DESC, queue_sequence ASC)
     """,
@@ -176,6 +198,10 @@ SCHEMA_STATEMENTS = [
     ON pair_profiles(left_signature, right_signature, hardware_key, updated_at DESC)
     """,
     """
+    CREATE INDEX IF NOT EXISTS idx_pair_profiles_backend_lookup
+    ON pair_profiles(left_signature, right_signature, hardware_key, backend_name, updated_at DESC)
+    """,
+    """
     CREATE INDEX IF NOT EXISTS idx_batch_probe_profiles_lookup
     ON batch_probe_profiles(model_key, device_type, updated_at DESC)
     """,
@@ -187,10 +213,15 @@ SCHEMA_STATEMENTS = [
     CREATE INDEX IF NOT EXISTS idx_combination_profiles_lookup
     ON combination_profiles(group_signature, hardware_key, backend_name, scheduler_mode, updated_at DESC)
     """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_runtime_profiles_lookup
+    ON runtime_profiles(signature, hardware_key, backend_name, resolved_batch_size, updated_at DESC)
+    """,
 ]
 
 
 MIGRATION_STATEMENTS = [
     "ALTER TABLE solo_profiles ADD COLUMN hardware_key TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE pair_profiles ADD COLUMN hardware_key TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE pair_profiles ADD COLUMN backend_name TEXT NOT NULL DEFAULT 'exclusive'",
 ]

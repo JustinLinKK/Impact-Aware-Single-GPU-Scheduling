@@ -14,6 +14,7 @@ SCHEDULER_MODE_SERIAL_BASIC = "serial_basic"
 SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED = "serial_batch_optimized"
 SCHEDULER_MODE_PARALLEL_DEFAULT = "parallel_default"
 SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED = "parallel_batch_optimized"
+SCHEDULER_MODE_PARALLEL_AUTO_PACK = "parallel_auto_pack"
 
 
 def normalize_scheduler_mode(value: str | None) -> str:
@@ -23,6 +24,7 @@ def normalize_scheduler_mode(value: str | None) -> str:
         SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED,
         SCHEDULER_MODE_PARALLEL_DEFAULT,
         SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
+        SCHEDULER_MODE_PARALLEL_AUTO_PACK,
     }
     if normalized not in allowed:
         raise ValueError(f"Unsupported scheduler mode: {value}")
@@ -168,26 +170,90 @@ class StreamSettings:
 
 
 @dataclass(slots=True)
+class AutoPackSettings:
+    target_metric: str = "vram"
+    target_vram_fraction: float = 0.97
+    target_sm_fraction: float = 0.90
+    runtime_skew_guardrail_ratio: float = 2.0
+
+    def __post_init__(self) -> None:
+        normalized = str(self.target_metric or "vram").strip().lower().replace("-", "_")
+        if normalized not in {"vram", "sm"}:
+            normalized = "vram"
+        self.target_metric = normalized
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "AutoPackSettings":
+        return cls(**(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "target_metric": self.target_metric,
+            "target_vram_fraction": self.target_vram_fraction,
+            "target_sm_fraction": self.target_sm_fraction,
+            "runtime_skew_guardrail_ratio": self.runtime_skew_guardrail_ratio,
+        }
+
+
+@dataclass(slots=True)
 class ParallelOptimizerSettings:
     batch_search_mode: str = "binary"
     target_vram_fraction: float = 0.97
     max_probe_jobs: int = 3
-    max_batch_multiplier: int = 32
-    min_batch_size: int = 1
+    binary_range_up: int = 32
+    binary_range_down: int = 1
+    power_of_two_range_up: int = 5
+    power_of_two_range_down: int = 1
+
+    def __post_init__(self) -> None:
+        self.batch_search_mode = self.batch_search_mode or "binary"
+        self.binary_range_up = max(0, int(self.binary_range_up))
+        self.binary_range_down = max(0, int(self.binary_range_down))
+        self.power_of_two_range_up = max(0, int(self.power_of_two_range_up))
+        self.power_of_two_range_down = max(0, int(self.power_of_two_range_down))
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "ParallelOptimizerSettings":
-        instance = cls(**(payload or {}))
-        instance.batch_search_mode = instance.batch_search_mode or "binary"
-        return instance
+        return cls(**(payload or {}))
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "batch_search_mode": self.batch_search_mode,
             "target_vram_fraction": self.target_vram_fraction,
             "max_probe_jobs": self.max_probe_jobs,
-            "max_batch_multiplier": self.max_batch_multiplier,
-            "min_batch_size": self.min_batch_size,
+            "binary_range_up": self.binary_range_up,
+            "binary_range_down": self.binary_range_down,
+            "power_of_two_range_up": self.power_of_two_range_up,
+            "power_of_two_range_down": self.power_of_two_range_down,
+        }
+
+
+@dataclass(slots=True)
+class BaselineCacheSettings:
+    warm_queue_policy: str = "top_k"
+    warm_queue_top_k: int | None = 2
+    entry_capacity: int | None = None
+    max_ram_percent: float | None = None
+    memory_budget_bytes: int = 2 * 1024 * 1024 * 1024
+
+    def __post_init__(self) -> None:
+        self.warm_queue_policy = str(self.warm_queue_policy or "top_k").strip().lower()
+        if self.warm_queue_policy not in {"top_k", "budget_only"}:
+            self.warm_queue_policy = "top_k"
+        if self.warm_queue_top_k is not None:
+            self.warm_queue_top_k = max(0, int(self.warm_queue_top_k))
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "BaselineCacheSettings":
+        return cls(**(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "warm_queue_policy": self.warm_queue_policy,
+            "warm_queue_top_k": self.warm_queue_top_k,
+            "entry_capacity": self.entry_capacity,
+            "max_ram_percent": self.max_ram_percent,
+            "memory_budget_bytes": self.memory_budget_bytes,
         }
 
 
@@ -206,6 +272,10 @@ class SchedulerSubmissionDefaults:
     batch_probe_poll_interval_seconds: float = 0.5
     batch_probe_max_multiplier: int = 32
     batch_probe_search_mode: str = "binary"
+    runtime_probe_enabled: bool = True
+    runtime_probe_target: str | None = None
+    runtime_probe_model_key: str | None = None
+    runtime_probe_strategy: str = "epoch_1"
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "SchedulerSubmissionDefaults":
@@ -215,6 +285,7 @@ class SchedulerSubmissionDefaults:
         else:
             instance.backend_allowlist = [str(item) for item in instance.backend_allowlist]
         instance.batch_probe_search_mode = instance.batch_probe_search_mode or "binary"
+        instance.runtime_probe_strategy = str(instance.runtime_probe_strategy or "epoch_1").strip().lower().replace("-", "_")
         return instance
 
     def to_dict(self) -> dict[str, Any]:
@@ -232,6 +303,10 @@ class SchedulerSubmissionDefaults:
             "batch_probe_poll_interval_seconds": self.batch_probe_poll_interval_seconds,
             "batch_probe_max_multiplier": self.batch_probe_max_multiplier,
             "batch_probe_search_mode": self.batch_probe_search_mode,
+            "runtime_probe_enabled": self.runtime_probe_enabled,
+            "runtime_probe_target": self.runtime_probe_target,
+            "runtime_probe_model_key": self.runtime_probe_model_key,
+            "runtime_probe_strategy": self.runtime_probe_strategy,
         }
 
 
@@ -245,6 +320,8 @@ class GpuSchedulerSettings:
     candidate_window_size: int = 8
     device_index: int = 0
     fallback_cooldown_seconds: int = 900
+    concurrent_groups_enabled: bool = False
+    concurrent_backend_allowlist: list[str] = field(default_factory=lambda: ["mps", "stream"])
     batch_probe_enabled: bool = True
     batch_probe_target_memory_fraction: float = 0.97
     batch_probe_min_batch_size: int = 1
@@ -255,6 +332,7 @@ class GpuSchedulerSettings:
     memory: GpuMemorySettings = field(default_factory=GpuMemorySettings)
     thresholds: GpuThresholdSettings = field(default_factory=GpuThresholdSettings)
     telemetry: GpuTelemetrySettings = field(default_factory=GpuTelemetrySettings)
+    auto_pack: AutoPackSettings = field(default_factory=AutoPackSettings)
     parallel_optimizer: ParallelOptimizerSettings = field(default_factory=ParallelOptimizerSettings)
     submission_defaults: SchedulerSubmissionDefaults = field(default_factory=SchedulerSubmissionDefaults)
     mps: MPSSettings = field(default_factory=MPSSettings)
@@ -267,6 +345,10 @@ class GpuSchedulerSettings:
             self.backend_priority = ["mps", "stream", "cuda_process", "exclusive"]
         else:
             self.backend_priority = [str(item) for item in self.backend_priority]
+        if self.concurrent_backend_allowlist is None:
+            self.concurrent_backend_allowlist = ["mps", "stream"]
+        else:
+            self.concurrent_backend_allowlist = [str(item) for item in self.concurrent_backend_allowlist]
         if self.profiling is None:
             self.profiling = GpuProfilingSettings()
         if isinstance(self.profiling, dict):
@@ -283,6 +365,10 @@ class GpuSchedulerSettings:
             self.telemetry = GpuTelemetrySettings()
         if isinstance(self.telemetry, dict):
             self.telemetry = GpuTelemetrySettings.from_dict(self.telemetry)
+        if self.auto_pack is None:
+            self.auto_pack = AutoPackSettings()
+        if isinstance(self.auto_pack, dict):
+            self.auto_pack = AutoPackSettings.from_dict(self.auto_pack)
         if self.parallel_optimizer is None:
             self.parallel_optimizer = ParallelOptimizerSettings()
         if isinstance(self.parallel_optimizer, dict):
@@ -318,6 +404,8 @@ class GpuSchedulerSettings:
             "candidate_window_size": self.candidate_window_size,
             "device_index": self.device_index,
             "fallback_cooldown_seconds": self.fallback_cooldown_seconds,
+            "concurrent_groups_enabled": self.concurrent_groups_enabled,
+            "concurrent_backend_allowlist": list(self.concurrent_backend_allowlist),
             "batch_probe_enabled": self.batch_probe_enabled,
             "batch_probe_target_memory_fraction": self.batch_probe_target_memory_fraction,
             "batch_probe_min_batch_size": self.batch_probe_min_batch_size,
@@ -328,6 +416,7 @@ class GpuSchedulerSettings:
             "memory": self.memory.to_dict(),
             "thresholds": self.thresholds.to_dict(),
             "telemetry": self.telemetry.to_dict(),
+            "auto_pack": self.auto_pack.to_dict(),
             "parallel_optimizer": self.parallel_optimizer.to_dict(),
             "submission_defaults": self.submission_defaults.to_dict(),
             "mps": self.mps.to_dict(),
@@ -337,7 +426,7 @@ class GpuSchedulerSettings:
 
 
 @dataclass(slots=True)
-class SchedulerSettings:
+class SchedulerConfig:
     runtime_root: Path = Path("localml_scheduler/runtime")
     scheduler_poll_interval_seconds: float = 0.5
     command_poll_limit: int = 100
@@ -345,8 +434,7 @@ class SchedulerSettings:
     aging_priority_increment: int = 1
     enable_priority_aging: bool = True
     preempt_check_interval_seconds: float = 0.5
-    eager_preload_top_k: int = 2
-    cache_memory_budget_bytes: int = 2 * 1024 * 1024 * 1024
+    baseline_cache: BaselineCacheSettings | dict[str, Any] = field(default_factory=BaselineCacheSettings)
     cache_server_host: str = "127.0.0.1"
     cache_server_port: int = 8765
     cache_socket_name: str = "cache_server.sock"
@@ -369,6 +457,10 @@ class SchedulerSettings:
     def __post_init__(self) -> None:
         if isinstance(self.gpu_scheduler, dict):
             self.gpu_scheduler = GpuSchedulerSettings.from_dict(self.gpu_scheduler)
+        if self.baseline_cache is None:
+            self.baseline_cache = BaselineCacheSettings()
+        if isinstance(self.baseline_cache, dict):
+            self.baseline_cache = BaselineCacheSettings.from_dict(self.baseline_cache)
         self.runtime_root = Path(self.runtime_root).resolve()
         self.db_dir = self.runtime_root / "db"
         self.db_path = self.db_dir / "scheduler.sqlite3"
@@ -382,7 +474,7 @@ class SchedulerSettings:
         self.service_heartbeat_path = self.runtime_root / "service_heartbeat.json"
 
     @classmethod
-    def from_file(cls, path: str | Path | None = None, **overrides: Any) -> "SchedulerSettings":
+    def from_file(cls, path: str | Path | None = None, **overrides: Any) -> "SchedulerConfig":
         payload: dict[str, Any] = {}
         if path:
             with Path(path).open("r", encoding="utf-8") as handle:
@@ -427,8 +519,7 @@ class SchedulerSettings:
             "aging_priority_increment": self.aging_priority_increment,
             "enable_priority_aging": self.enable_priority_aging,
             "preempt_check_interval_seconds": self.preempt_check_interval_seconds,
-            "eager_preload_top_k": self.eager_preload_top_k,
-            "cache_memory_budget_bytes": self.cache_memory_budget_bytes,
+            "baseline_cache": self.baseline_cache.to_dict(),
             "cache_server_host": self.cache_server_host,
             "cache_server_port": self.cache_server_port,
             "cache_socket_name": self.cache_socket_name,
@@ -437,3 +528,7 @@ class SchedulerSettings:
             "python_executable": self.python_executable,
             "sqlite_busy_timeout_ms": self.sqlite_busy_timeout_ms,
         }
+
+
+SchedulerSettings = SchedulerConfig
+

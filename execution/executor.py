@@ -8,8 +8,8 @@ import os
 import subprocess
 import sys
 
-from ..schemas import TrainingJob
-from ..settings import SchedulerSettings
+from ..domain import TrainingJob
+from ..config import SchedulerSettings
 
 
 @dataclass(slots=True)

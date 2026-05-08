@@ -8,16 +8,16 @@ import shutil
 import tempfile
 import time
 
-from ..api import LocalMLSchedulerAPI
-from ..schemas import CheckpointPolicy, TrainingJob
-from ..settings import SchedulerSettings
+from ..client import SchedulerClient
+from ..domain import CheckpointPolicy, TrainingJob
+from ..config import SchedulerSettings
 from .toy_pytorch_runner import create_toy_baseline_checkpoint
 
 
-def _wait_for_terminal(api: LocalMLSchedulerAPI, job_ids: list[str], timeout: float = 60.0) -> None:
+def _wait_for_terminal(api: SchedulerClient, job_ids: list[str], timeout: float = 60.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        jobs = [api.get_job(job_id) for job_id in job_ids]
+        jobs = [api.inspect(job_id) for job_id in job_ids]
         if all(job is not None and job.status.is_terminal for job in jobs):
             return
         time.sleep(0.2)
@@ -26,16 +26,20 @@ def _wait_for_terminal(api: LocalMLSchedulerAPI, job_ids: list[str], timeout: fl
 
 def main() -> None:
     runtime_root = Path(tempfile.mkdtemp(prefix="localml_scheduler_demo_"))
-    settings = SchedulerSettings(runtime_root=runtime_root, scheduler_poll_interval_seconds=0.1, eager_preload_top_k=2)
-    api = LocalMLSchedulerAPI(settings)
-    service = api.create_scheduler_service().start(background=True)
+    settings = SchedulerSettings(
+        runtime_root=runtime_root,
+        scheduler_poll_interval_seconds=0.1,
+        baseline_cache={"warm_queue_top_k": 2},
+    )
+    api = SchedulerClient(settings)
+    service = api.create_service().start(background=True)
 
     try:
         baseline_dir = runtime_root / "baselines"
         baseline_a = create_toy_baseline_checkpoint(baseline_dir / "baseline_a.pt", seed=11)
         baseline_b = create_toy_baseline_checkpoint(baseline_dir / "baseline_b.pt", seed=29)
 
-        low_priority = api.submit_job(
+        low_priority = api.submit(
             TrainingJob.create(
                 runner_target="localml_scheduler.examples.toy_pytorch_runner:run_toy_training_job",
                 baseline_model_id="toy-baseline-a",
@@ -47,7 +51,7 @@ def main() -> None:
                 metadata={"demo": "low_priority"},
             )
         )
-        shared_baseline = api.submit_job(
+        shared_baseline = api.submit(
             TrainingJob.create(
                 runner_target="localml_scheduler.examples.toy_pytorch_runner:run_toy_training_job",
                 baseline_model_id="toy-baseline-a",
@@ -62,7 +66,7 @@ def main() -> None:
 
         time.sleep(0.5)
 
-        urgent = api.submit_job(
+        urgent = api.submit(
             TrainingJob.create(
                 runner_target="localml_scheduler.examples.toy_pytorch_runner:run_toy_training_job",
                 baseline_model_id="toy-baseline-b",
