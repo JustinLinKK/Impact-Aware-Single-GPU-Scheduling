@@ -57,6 +57,36 @@ python -m localml_scheduler.examples.demo_submit_jobs
 python -m localml_scheduler.examples.demo_mlevolve_bridge
 ```
 
+## MCP Graph Surface
+
+`localml_scheduler.mcp_server` exposes a small stdio MCP server for graph-backed
+read/query access. The original tuning-oriented tools remain available, and the
+read-only aggregate tools below are intended to be the stable contract for
+future agent-side integration:
+
+- `search_hardware(query=None, limit=10)` for current and observed hardware inventory
+- `get_hardware_context(hardware_key="current", include_scheduler_limits=True)` for hardware, toolkit, backend, and scheduler-limit context
+- `get_job_design_context(candidate, limit=5)` for future-facing hardware/profile evidence aggregation around a proposed job design
+- `search_hardware_features(...)` for Qdrant-backed hardware capability and coding-pattern retrieval
+- `get_hardware_feature_context(...)` for a compact hardware feature brief around the current accelerator and workload
+- `get_hardware_optimization_context(candidate, limit=8)` for combined scheduler graph evidence plus hardware feature vector retrieval
+
+The new aggregate tools are read-only. They summarize graph evidence and
+config-derived scheduler limits, but they do not mutate jobs, profiles, or
+event history.
+
+The hardware feature tools use Qdrant as an external vector service. For local
+development, start Qdrant and ingest the repo-curated seed corpus:
+
+```bash
+docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant
+python -m localml_scheduler.cli hardware-features ingest --settings localml_scheduler/configs/scheduler.example.yaml
+```
+
+Use `--dry-run` to validate and summarize the seed records without writing to
+Qdrant. MCP search/context calls return empty results instead of failing the
+scheduler when the feature database is disabled or unavailable.
+
 ## Custom PyTorch Integration
 
 Point a job at a runner target in `module:function` form, for example:

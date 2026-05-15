@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from ..observability.events import EventLogger
 from ..domain import JobStatus
-from ..storage.sqlite_store import SQLiteStateStore
+from ..storage.state_store import StateStore
 
 
-def reconcile_recoverable_jobs(store: SQLiteStateStore, event_logger: EventLogger, *, auto_resume: bool) -> list[str]:
+def reconcile_recoverable_jobs(store: StateStore, event_logger: EventLogger, *, auto_resume: bool) -> list[str]:
     """Reconcile stale RUNNING/PAUSING jobs after a restart."""
     reconciled_ids: list[str] = []
     for job in store.reconcile_incomplete_jobs():

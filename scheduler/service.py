@@ -18,7 +18,8 @@ from ..observability.logging_utils import setup_scheduler_logger
 from ..observability.metrics import MetricsCollector
 from ..domain import BatchResolution, CombinationProfile, JobStatus, PairProfile, PreloadSource, SoloProfile, TrainingJob, build_group_signature, utc_now
 from ..config import SCHEDULER_MODE_PARALLEL_AUTO_PACK, SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED, SchedulerSettings
-from ..storage.sqlite_store import SQLiteStateStore
+from ..storage.log_store import SchedulerLogStore
+from ..storage.state_store import StateStore
 from .placement_planner import PlacementPlanner
 from .planner_types import DispatchPlan
 from .policies import PriorityFifoPolicy, SchedulingPolicy
@@ -34,6 +35,7 @@ class ActiveRun:
     mode: str
     backend_name: str
     job_ids: tuple[str, ...]
+    opened_at: str = field(default_factory=utc_now)
     batch_overrides: dict[str, int] = field(default_factory=dict)
     fallback_order: list[str] = field(default_factory=list)
     hardware_key: str = ""
@@ -51,16 +53,17 @@ class SchedulerService:
         self,
         settings: SchedulerSettings,
         *,
-        store: SQLiteStateStore | None = None,
+        store: StateStore | None = None,
         policy: SchedulingPolicy | None = None,
         supervisor: WorkerSupervisor | None = None,
         telemetry_sampler: NvidiaSmiTelemetrySampler | None = None,
     ):
         self.settings = settings
         self.settings.ensure_runtime_layout()
-        self.store = store or SQLiteStateStore(settings)
+        self.store = store or StateStore(settings)
         self.logger = setup_scheduler_logger(settings.scheduler_log_path)
-        self.event_logger = EventLogger(self.store, settings.events_jsonl_path)
+        self.log_store = SchedulerLogStore(settings)
+        self.event_logger = EventLogger(self.store, settings.events_jsonl_path, log_store=self.log_store)
         self.metrics = MetricsCollector(self.store)
         self.policy = policy or PriorityFifoPolicy(
             aging_interval_seconds=settings.aging_interval_seconds,
@@ -119,6 +122,14 @@ class SchedulerService:
     def start(self, *, background: bool = False) -> "SchedulerService":
         self._persist_runtime_settings()
         self._write_service_heartbeat("starting")
+        self.log_store.start_session(
+            status="starting",
+            pid=os.getpid(),
+            runtime_root=str(self.settings.runtime_root),
+            host_identity=self.store.hardware_profile().to_dict(),
+            config_json=self.settings.to_dict(),
+            started_at=utc_now(),
+        )
         self.cache_server.start()
         reconcile_recoverable_jobs(self.store, self.event_logger, auto_resume=self.settings.auto_resume_recoverable)
         if background:
@@ -137,6 +148,7 @@ class SchedulerService:
         self.supervisor.shutdown()
         self.cache_server.stop()
         self._write_service_heartbeat("stopped")
+        self.log_store.finish_session(status="stopped", stopped_at=utc_now())
 
     def run_forever(self) -> None:
         self.logger.info("Scheduler service started")
@@ -287,9 +299,31 @@ class SchedulerService:
         if len(self._active_runs) == 1:
             only_run = next(iter(self._active_runs.values()))
             only_run.samples.append(sample)
+            self.log_store.record_gpu_metric_sample(
+                group_id=only_run.group_id,
+                created_at=sample.captured_at,
+                backend_name=only_run.backend_name,
+                hardware_key=only_run.hardware_key or self.store.hardware_key(),
+                memory_used_mb=sample.memory_used_mb,
+                memory_total_mb=sample.memory_total_mb,
+                gpu_utilization=sample.gpu_utilization,
+                memory_utilization=sample.memory_utilization,
+                job_ids=list(only_run.job_ids),
+            )
         else:
             for run in self._active_runs.values():
                 run.overlapped = True
+                self.log_store.record_gpu_metric_sample(
+                    group_id=run.group_id,
+                    created_at=sample.captured_at,
+                    backend_name=run.backend_name,
+                    hardware_key=run.hardware_key or self.store.hardware_key(),
+                    memory_used_mb=sample.memory_used_mb,
+                    memory_total_mb=sample.memory_total_mb,
+                    gpu_utilization=sample.gpu_utilization,
+                    memory_utilization=sample.memory_utilization,
+                    job_ids=list(run.job_ids),
+                )
 
     def _pick_fallback_candidate(self) -> tuple[str, str] | None:
         candidates: list[tuple[int, float, int, str, str]] = []
@@ -351,9 +385,20 @@ class SchedulerService:
                 self._record_solo_profiles(run)
 
             if not remaining_job_ids:
+                self.log_store.close_run_group(
+                    group_id=group_id,
+                    closed_at=utc_now(),
+                    overlapped=run.overlapped,
+                    fallback_triggered=run.fallback_triggered,
+                    fallback_reason=run.fallback_reason,
+                    exit_reason=run.fallback_reason or "group_complete",
+                )
                 self._active_runs.pop(group_id, None)
                 continue
             if tuple(remaining_job_ids) != run.job_ids:
+                removed_job_ids = [job_id for job_id in run.job_ids if job_id not in remaining_job_ids]
+                for removed_job_id in removed_job_ids:
+                    self.log_store.mark_run_group_member_left(group_id=group_id, job_id=removed_job_id, left_at=utc_now())
                 if len(remaining_job_ids) == 1:
                     run.mode = "exclusive"
                 run.job_ids = tuple(remaining_job_ids)
@@ -641,6 +686,7 @@ class SchedulerService:
                             hardware_key=self.store.hardware_key(),
                             group_signature=build_group_signature([fallback_job.packing.signature or fallback_job.job_id]),
                         )
+                        self._log_run_group_open(self._active_runs[group_id], [fallback_job], reason="backend_fallback_dispatch")
                         self._last_telemetry_poll_at = 0.0
                         self.store.update_job(
                             fallback_job.job_id,
@@ -673,6 +719,7 @@ class SchedulerService:
             hardware_key=self.store.hardware_key(),
             group_signature=build_group_signature(signatures),
         )
+        self._log_run_group_open(self._active_runs[group_id], selected_jobs, reason=plan.reason)
         if len(self._active_runs) > 1:
             for run in self._active_runs.values():
                 run.overlapped = True
@@ -734,6 +781,36 @@ class SchedulerService:
                 },
             )
         return True
+
+    def _log_run_group_open(self, run: ActiveRun, jobs: list[TrainingJob], *, reason: str) -> None:
+        self.log_store.open_run_group(
+            group_id=run.group_id,
+            mode=run.mode,
+            backend_name=run.backend_name,
+            hardware_key=run.hardware_key or self.store.hardware_key(),
+            group_signature=run.group_signature,
+            opened_at=run.opened_at,
+            overlapped=run.overlapped,
+            metadata={"job_ids": list(run.job_ids), "reason": reason},
+        )
+        for index, job in enumerate(jobs):
+            if len(jobs) == 1:
+                role = "solo"
+            elif len(jobs) == 2:
+                role = "primary" if index == 0 else "secondary"
+            else:
+                role = f"slot-{index}"
+            self.log_store.upsert_run_group_member(
+                group_id=run.group_id,
+                job_id=job.job_id,
+                role=role,
+                batch_size=run.batch_overrides.get(job.job_id),
+                joined_at=run.opened_at,
+                metadata={
+                    "task_type": job.task_type,
+                    "probe_task": bool(job.batch_probe.enabled or job.runtime_probe.enabled),
+                },
+            )
 
     def _dispatch_pending_work(self) -> None:
         scheduler_mode = self.settings.gpu_scheduler.mode

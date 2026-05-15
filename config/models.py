@@ -258,6 +258,115 @@ class BaselineCacheSettings:
 
 
 @dataclass(slots=True)
+class GraphDBSettings:
+    enabled: bool = True
+    mode: str = "primary"
+    provider: str = "neo4j"
+    uri: str = "bolt://127.0.0.1:7687"
+    username: str = "neo4j"
+    password_env: str = "LOCALML_SCHEDULER_NEO4J_PASSWORD"
+    database: str = "neo4j"
+    bootstrap_constraints: bool = True
+    auto_import_legacy_sqlite: bool = True
+    legacy_sqlite_path: str | None = None
+    allow_legacy_fallback: bool = True
+
+    def __post_init__(self) -> None:
+        self.enabled = bool(self.enabled)
+        self.mode = str(self.mode or "primary").strip().lower().replace("-", "_")
+        if self.mode not in {"off", "mirror", "primary"}:
+            self.mode = "primary"
+        if not self.enabled:
+            self.mode = "off"
+        self.provider = str(self.provider or "neo4j").strip().lower().replace("-", "_")
+        if self.provider in {"sqlite", "legacy_sqlite"}:
+            self.provider = "sqlite_legacy"
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "GraphDBSettings":
+        return cls(**(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "mode": self.mode,
+            "provider": self.provider,
+            "uri": self.uri,
+            "username": self.username,
+            "password_env": self.password_env,
+            "database": self.database,
+            "bootstrap_constraints": self.bootstrap_constraints,
+            "auto_import_legacy_sqlite": self.auto_import_legacy_sqlite,
+            "legacy_sqlite_path": self.legacy_sqlite_path,
+            "allow_legacy_fallback": self.allow_legacy_fallback,
+        }
+
+
+@dataclass(slots=True)
+class HardwareFeatureDBSettings:
+    enabled: bool = True
+    provider: str = "qdrant"
+    url: str = "http://127.0.0.1:6333"
+    api_key_env: str = "LOCALML_SCHEDULER_QDRANT_API_KEY"
+    collection_name: str = "hardware_feature_knowledge"
+    embedding_model_type: str = "local"
+    embedding_model_name: str = "BAAI/bge-base-en-v1.5"
+    embedding_device: str = "cpu"
+    distance: str = "Cosine"
+
+    def __post_init__(self) -> None:
+        self.enabled = bool(self.enabled)
+        self.provider = str(self.provider or "qdrant").strip().lower().replace("-", "_")
+        self.url = str(self.url or "http://127.0.0.1:6333").strip()
+        self.api_key_env = str(self.api_key_env or "LOCALML_SCHEDULER_QDRANT_API_KEY").strip()
+        self.collection_name = str(self.collection_name or "hardware_feature_knowledge").strip()
+        self.embedding_model_type = str(self.embedding_model_type or "local").strip().lower()
+        self.embedding_model_name = str(self.embedding_model_name or "BAAI/bge-base-en-v1.5").strip()
+        self.embedding_device = str(self.embedding_device or "cpu").strip().lower()
+        self.distance = str(self.distance or "Cosine").strip()
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "HardwareFeatureDBSettings":
+        return cls(**(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "provider": self.provider,
+            "url": self.url,
+            "api_key_env": self.api_key_env,
+            "collection_name": self.collection_name,
+            "embedding_model_type": self.embedding_model_type,
+            "embedding_model_name": self.embedding_model_name,
+            "embedding_device": self.embedding_device,
+            "distance": self.distance,
+        }
+
+
+@dataclass(slots=True)
+class LogDBSettings:
+    provider: str = "postgres"
+    dsn_env: str = "LOCALML_SCHEDULER_LOG_DSN"
+    schema: str = "scheduler_logs"
+    enabled: bool = False
+
+    def __post_init__(self) -> None:
+        self.provider = str(self.provider or "postgres").strip().lower().replace("-", "_")
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "LogDBSettings":
+        return cls(**(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "dsn_env": self.dsn_env,
+            "schema": self.schema,
+            "enabled": self.enabled,
+        }
+
+
+@dataclass(slots=True)
 class SchedulerSubmissionDefaults:
     requires_gpu: bool = True
     estimated_vram_mb: int | None = None
@@ -440,6 +549,9 @@ class SchedulerConfig:
     cache_socket_name: str = "cache_server.sock"
     auto_resume_recoverable: bool = False
     gpu_scheduler: GpuSchedulerSettings = field(default_factory=GpuSchedulerSettings)
+    graph_db: GraphDBSettings | dict[str, Any] = field(default_factory=GraphDBSettings)
+    hardware_feature_db: HardwareFeatureDBSettings | dict[str, Any] = field(default_factory=HardwareFeatureDBSettings)
+    log_db: LogDBSettings | dict[str, Any] = field(default_factory=LogDBSettings)
     python_executable: str = field(default_factory=lambda: sys.executable)
     sqlite_busy_timeout_ms: int = 10_000
 
@@ -461,6 +573,18 @@ class SchedulerConfig:
             self.baseline_cache = BaselineCacheSettings()
         if isinstance(self.baseline_cache, dict):
             self.baseline_cache = BaselineCacheSettings.from_dict(self.baseline_cache)
+        if self.graph_db is None:
+            self.graph_db = GraphDBSettings()
+        if isinstance(self.graph_db, dict):
+            self.graph_db = GraphDBSettings.from_dict(self.graph_db)
+        if self.hardware_feature_db is None:
+            self.hardware_feature_db = HardwareFeatureDBSettings()
+        if isinstance(self.hardware_feature_db, dict):
+            self.hardware_feature_db = HardwareFeatureDBSettings.from_dict(self.hardware_feature_db)
+        if self.log_db is None:
+            self.log_db = LogDBSettings()
+        if isinstance(self.log_db, dict):
+            self.log_db = LogDBSettings.from_dict(self.log_db)
         self.runtime_root = Path(self.runtime_root).resolve()
         self.db_dir = self.runtime_root / "db"
         self.db_path = self.db_dir / "scheduler.sqlite3"
@@ -472,6 +596,8 @@ class SchedulerConfig:
         self.scheduler_log_path = self.logs_dir / "scheduler.log"
         self.cache_socket_path = self.runtime_root / self.cache_socket_name
         self.service_heartbeat_path = self.runtime_root / "service_heartbeat.json"
+        if not self.graph_db.legacy_sqlite_path:
+            self.graph_db.legacy_sqlite_path = str(self.db_path)
 
     @classmethod
     def from_file(cls, path: str | Path | None = None, **overrides: Any) -> "SchedulerConfig":
@@ -525,10 +651,12 @@ class SchedulerConfig:
             "cache_socket_name": self.cache_socket_name,
             "auto_resume_recoverable": self.auto_resume_recoverable,
             "gpu_scheduler": self.gpu_scheduler.to_dict(),
+            "graph_db": self.graph_db.to_dict(),
+            "hardware_feature_db": self.hardware_feature_db.to_dict(),
+            "log_db": self.log_db.to_dict(),
             "python_executable": self.python_executable,
             "sqlite_busy_timeout_ms": self.sqlite_busy_timeout_ms,
         }
 
 
 SchedulerSettings = SchedulerConfig
-

@@ -11,11 +11,14 @@ from .client import SchedulerClient
 from .config import SchedulerConfig
 from .dto import JobCommandRequest, PreloadRequest
 from .domain import CommandType
+from .mcp_server import run_stdio as run_mcp_stdio
 
 
 app = typer.Typer(help="Local single-GPU ML job scheduler")
 scheduler_app = typer.Typer(help="Scheduler process commands")
+hardware_features_app = typer.Typer(help="Hardware feature vector database commands")
 app.add_typer(scheduler_app, name="scheduler")
+app.add_typer(hardware_features_app, name="hardware-features")
 
 
 def _build_client(settings_path: str | None) -> SchedulerClient:
@@ -31,6 +34,23 @@ def scheduler_start(settings: str | None = typer.Option(None, "--settings", help
         engine.start(background=False)
     except KeyboardInterrupt:
         engine.stop()
+
+
+@scheduler_app.command("mcp")
+def scheduler_mcp(settings: str | None = typer.Option(None, "--settings", help="Path to scheduler YAML config")) -> None:
+    run_mcp_stdio(settings)
+
+
+@hardware_features_app.command("ingest")
+def hardware_features_ingest(
+    settings: str | None = typer.Option(None, "--settings", help="Path to scheduler YAML config"),
+    source: Path | None = typer.Option(None, "--source", help="YAML feature corpus to ingest; defaults to repo seed records"),
+    recreate: bool = typer.Option(False, "--recreate/--no-recreate", help="Recreate the Qdrant collection before ingesting"),
+    dry_run: bool = typer.Option(False, "--dry-run/--no-dry-run", help="Validate and summarize records without writing to Qdrant"),
+) -> None:
+    client = _build_client(settings)
+    result = client.ingest_hardware_features(source=source, recreate=recreate, dry_run=dry_run)
+    typer.echo(json.dumps(result, indent=2, sort_keys=True))
 
 
 @app.command("submit")

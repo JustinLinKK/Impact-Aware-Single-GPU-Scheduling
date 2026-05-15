@@ -12,13 +12,13 @@ import torch
 from ..observability.events import EventLogger
 from ..domain import SafePointType, TrainingJob, utc_now
 from ..config import SchedulerSettings
-from ..storage.sqlite_store import SQLiteStateStore
+from ..storage.state_store import StateStore
 
 
 class CheckpointManager:
     """Atomically save and restore checkpoints for scheduler-managed jobs."""
 
-    def __init__(self, settings: SchedulerSettings, store: SQLiteStateStore, event_logger: EventLogger):
+    def __init__(self, settings: SchedulerSettings, store: StateStore, event_logger: EventLogger):
         self.settings = settings
         self.store = store
         self.event_logger = event_logger

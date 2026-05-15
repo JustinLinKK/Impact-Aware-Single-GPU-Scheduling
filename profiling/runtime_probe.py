@@ -11,7 +11,7 @@ from ..domain import (
     TrainingJob,
     normalize_runtime_probe_strategy,
 )
-from ..storage.sqlite_store import SQLiteStateStore
+from ..storage.state_store import StateStore
 
 
 def resolved_batch_size(job: TrainingJob) -> int:
@@ -19,7 +19,7 @@ def resolved_batch_size(job: TrainingJob) -> int:
 
 
 def runtime_profile_for_job(
-    store: SQLiteStateStore,
+    store: StateStore,
     job: TrainingJob,
     *,
     backend_name: str | None = None,
@@ -34,7 +34,7 @@ def runtime_profile_for_job(
     )
 
 
-def runtime_ready_for_packing(store: SQLiteStateStore, job: TrainingJob, *, backend_name: str) -> bool:
+def runtime_ready_for_packing(store: StateStore, job: TrainingJob, *, backend_name: str) -> bool:
     if not job.runtime_probe.enabled:
         return False
     return runtime_profile_for_job(store, job, backend_name=backend_name) is not None

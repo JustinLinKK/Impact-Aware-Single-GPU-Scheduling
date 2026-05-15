@@ -11,7 +11,7 @@ from ..checkpointing.manager import CheckpointManager
 from ..observability.events import EventLogger
 from ..domain import JobStatus, ProgressSnapshot, SafePointType, TrainingJob, utc_now
 from ..config import SchedulerSettings
-from ..storage.sqlite_store import SQLiteStateStore
+from ..storage.state_store import StateStore
 
 
 class PauseRequested(RuntimeError):
@@ -103,7 +103,7 @@ class TrainingControlHook:
         job: TrainingJob,
         control_plane: ControlPlane,
         checkpoint_manager: CheckpointManager,
-        store: SQLiteStateStore,
+        store: StateStore,
         event_logger: EventLogger,
     ):
         self.job = job
@@ -163,6 +163,17 @@ class TrainingControlHook:
             if avg_step_time_ms is not None:
                 metadata_updates["runtime_avg_step_time_ms"] = float(avg_step_time_ms)
         self.store.update_job(self.job.job_id, last_heartbeat_at=snapshot.heartbeat_at, metadata_updates=metadata_updates)
+        if getattr(self.event_logger, "log_store", None) is not None:
+            self.event_logger.log_store.record_job_metric_sample(
+                job_id=self.job.job_id,
+                created_at=snapshot.heartbeat_at,
+                epoch=epoch,
+                global_step=global_step,
+                avg_step_time_ms=avg_step_time_ms,
+                estimated_total_runtime_seconds=estimated_total_runtime_seconds,
+                remaining_runtime_seconds=remaining_runtime_seconds,
+                metrics=snapshot.metrics,
+            )
 
         pause_requested = command.action == "pause"
         cancel_requested = command.action == "cancel"

@@ -4,37 +4,37 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .sqlite_store import SQLiteStateStore
+from .state_store import StateStore
 
 
 @dataclass(slots=True)
 class SQLiteRepositoryBundle:
-    store: SQLiteStateStore
+    store: StateStore
 
     @property
-    def jobs(self) -> SQLiteStateStore:
+    def jobs(self) -> StateStore:
         return self.store
 
     @property
-    def commands(self) -> SQLiteStateStore:
+    def commands(self) -> StateStore:
         return self.store
 
     @property
-    def checkpoints(self) -> SQLiteStateStore:
+    def checkpoints(self) -> StateStore:
         return self.store
 
     @property
-    def events(self) -> SQLiteStateStore:
+    def events(self) -> StateStore:
         return self.store
 
     @property
-    def cache(self) -> SQLiteStateStore:
+    def cache(self) -> StateStore:
         return self.store
 
     @property
-    def profiles(self) -> SQLiteStateStore:
+    def profiles(self) -> StateStore:
         return self.store
 
     @property
-    def reporting(self) -> SQLiteStateStore:
+    def reporting(self) -> StateStore:
         return self.store

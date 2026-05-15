@@ -16,7 +16,7 @@ from ..observability.events import EventLogger
 from ..profiling.runtime_probe import build_runtime_profile, runtime_profile_for_job
 from ..domain import BatchProbeTrialResult, TrainingJob
 from ..config import SchedulerSettings
-from ..storage.sqlite_store import SQLiteStateStore
+from ..storage.state_store import StateStore
 
 
 @runtime_checkable
@@ -47,7 +47,7 @@ class RunnerContext:
 
     job: TrainingJob
     settings: SchedulerSettings
-    store: SQLiteStateStore
+    store: StateStore
     event_logger: EventLogger
     control_hook: TrainingControlHook
     checkpoint_manager: CheckpointManager
@@ -122,4 +122,17 @@ class RunnerContext:
             observations=observations,
             metadata=metadata,
         )
-        return self.store.upsert_runtime_profile(profile)
+        stored = self.store.upsert_runtime_profile(profile)
+        self.event_logger.emit(
+            "runtime_probe_profiled",
+            job_id=self.job.job_id,
+            payload={
+                "profile_key": stored.profile_key,
+                "backend_name": stored.backend_name,
+                "strategy": stored.strategy,
+                "resolved_batch_size": stored.resolved_batch_size,
+                "estimated_total_runtime_seconds": stored.estimated_total_runtime_seconds,
+                "confidence": stored.confidence,
+            },
+        )
+        return stored

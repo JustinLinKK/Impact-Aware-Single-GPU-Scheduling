@@ -8,15 +8,16 @@ from ..observability.events import EventLogger
 from ..observability.logging_utils import setup_scheduler_logger
 from ..profiling.batch_probe import run_batch_probe_preflight
 from ..config import SchedulerSettings
-from ..storage.sqlite_store import SQLiteStateStore
+from ..storage.log_store import SchedulerLogStore
+from ..storage.state_store import StateStore
 from .control import CancelRequested, PauseRequested
 from .worker_runtime import create_runner_context, load_runtime_settings, mark_job_completed, mark_job_failed, mark_job_started, resolve_runner
 
 
 def _run_job(runtime_root: str, job_id: str) -> int:
     settings = load_runtime_settings(runtime_root)
-    store = SQLiteStateStore(settings)
-    event_logger = EventLogger(store, settings.events_jsonl_path)
+    store = StateStore(settings)
+    event_logger = EventLogger(store, settings.events_jsonl_path, log_store=SchedulerLogStore(settings))
     logger = setup_scheduler_logger(settings.scheduler_log_path)
     context, job = create_runner_context(settings, store, event_logger, job_id)
     if context is None or job is None:

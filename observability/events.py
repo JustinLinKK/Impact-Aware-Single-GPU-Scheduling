@@ -7,22 +7,27 @@ from typing import Any
 import json
 
 from ..domain import utc_now
-from ..storage.sqlite_store import SQLiteStateStore
+from ..storage.log_store import SchedulerLogStore
+from ..storage.state_store import StateStore
 
 
 class EventLogger:
-    """Write scheduler events to SQLite and a JSONL sidecar."""
+    """Write scheduler events to the primary store and optional sidecars."""
 
-    def __init__(self, store: SQLiteStateStore, jsonl_path: Path):
+    def __init__(self, store: StateStore, jsonl_path: Path, log_store: SchedulerLogStore | None = None):
         self.store = store
         self.jsonl_path = jsonl_path
+        self.log_store = log_store
         self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
 
     def emit(self, event_type: str, *, job_id: str | None = None, payload: dict[str, Any] | None = None) -> None:
         payload = payload or {}
+        created_at = utc_now()
         self.store.log_event(event_type, job_id=job_id, payload=payload)
+        if self.log_store is not None:
+            self.log_store.record_event(job_id=job_id, event_type=event_type, created_at=created_at, payload=payload)
         record = {
-            "created_at": utc_now(),
+            "created_at": created_at,
             "job_id": job_id,
             "event_type": event_type,
             "payload": payload,

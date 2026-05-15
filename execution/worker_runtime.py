@@ -12,7 +12,7 @@ from ..observability.events import EventLogger
 from ..observability.logging_utils import setup_scheduler_logger
 from ..domain import JobStatus, import_string
 from ..config import SchedulerSettings
-from ..storage.sqlite_store import SQLiteStateStore
+from ..storage.state_store import StateStore
 from .control import ControlPlane, TrainingControlHook
 from .runner_protocol import RunnerContext
 
@@ -29,7 +29,7 @@ def load_runtime_settings(runtime_root: str | Path) -> SchedulerSettings:
 
 def create_runner_context(
     settings: SchedulerSettings,
-    store: SQLiteStateStore,
+    store: StateStore,
     event_logger: EventLogger,
     job_id: str,
 ) -> tuple[RunnerContext | None, Any | None]:
@@ -63,7 +63,7 @@ def create_runner_context(
 
 def mark_job_started(
     settings: SchedulerSettings,
-    store: SQLiteStateStore,
+    store: StateStore,
     event_logger: EventLogger,
     job_id: str,
     *,
@@ -82,7 +82,7 @@ def mark_job_started(
 
 def mark_job_failed(
     settings: SchedulerSettings,
-    store: SQLiteStateStore,
+    store: StateStore,
     event_logger: EventLogger,
     job_id: str,
     exc: Exception,
@@ -102,7 +102,7 @@ def mark_job_failed(
 
 def mark_job_completed(
     settings: SchedulerSettings,
-    store: SQLiteStateStore,
+    store: StateStore,
     event_logger: EventLogger,
     job_id: str,
     result: dict[str, Any] | None,

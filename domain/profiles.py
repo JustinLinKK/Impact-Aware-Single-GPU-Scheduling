@@ -379,6 +379,92 @@ class RuntimeProfile:
 
 
 @dataclass(slots=True)
+class RunProfile:
+    run_profile_id: str
+    run_kind: str
+    status: str
+    job_id: str | None = None
+    probe_kind: str | None = None
+    backend_name: str | None = None
+    toolkit_name: str | None = None
+    toolkit_version: str | None = None
+    model_key: str | None = None
+    signature: str | None = None
+    shape_signature: str | None = None
+    resolved_batch_size: int | None = None
+    epochs: int | None = None
+    steps_per_epoch: int | None = None
+    total_steps: int | None = None
+    startup_seconds: float | None = None
+    epoch_time_seconds: float | None = None
+    avg_step_time_ms: float | None = None
+    estimated_total_runtime_seconds: float | None = None
+    avg_sm_utilization: float | None = None
+    avg_gpu_utilization: float | None = None
+    avg_ram_utilization: float | None = None
+    avg_memory_utilization: float | None = None
+    peak_vram_mb: int | None = None
+    memory_total_mb: int | None = None
+    target_budget_mb: int | None = None
+    slowdown_ratio: float | None = None
+    confidence: float | None = None
+    observation_count: int | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    updated_at: str = field(default_factory=utc_now)
+    source: str = "scheduler"
+    summary_text: str | None = None
+    result_payload: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "RunProfile":
+        metadata = json.loads(row["metadata_json"]) if row.get("metadata_json") else {}
+        result_payload = json.loads(row["result_payload_json"]) if row.get("result_payload_json") else {}
+        return cls(
+            run_profile_id=row["run_profile_id"],
+            run_kind=row["run_kind"],
+            status=row["status"],
+            job_id=row.get("job_id"),
+            probe_kind=row.get("probe_kind"),
+            backend_name=row.get("backend_name"),
+            toolkit_name=row.get("toolkit_name"),
+            toolkit_version=row.get("toolkit_version"),
+            model_key=row.get("model_key"),
+            signature=row.get("signature"),
+            shape_signature=row.get("shape_signature"),
+            resolved_batch_size=row.get("resolved_batch_size"),
+            epochs=row.get("epochs"),
+            steps_per_epoch=row.get("steps_per_epoch"),
+            total_steps=row.get("total_steps"),
+            startup_seconds=row.get("startup_seconds"),
+            epoch_time_seconds=row.get("epoch_time_seconds"),
+            avg_step_time_ms=row.get("avg_step_time_ms"),
+            estimated_total_runtime_seconds=row.get("estimated_total_runtime_seconds"),
+            avg_sm_utilization=row.get("avg_sm_utilization"),
+            avg_gpu_utilization=row.get("avg_gpu_utilization"),
+            avg_ram_utilization=row.get("avg_ram_utilization"),
+            avg_memory_utilization=row.get("avg_memory_utilization"),
+            peak_vram_mb=row.get("peak_vram_mb"),
+            memory_total_mb=row.get("memory_total_mb"),
+            target_budget_mb=row.get("target_budget_mb"),
+            slowdown_ratio=row.get("slowdown_ratio"),
+            confidence=row.get("confidence"),
+            observation_count=row.get("observation_count"),
+            started_at=row.get("started_at"),
+            finished_at=row.get("finished_at"),
+            updated_at=row.get("updated_at") or utc_now(),
+            source=row.get("source") or "scheduler",
+            summary_text=row.get("summary_text"),
+            result_payload=result_payload,
+            metadata=metadata,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_primitive(self)
+
+
+@dataclass(slots=True)
 class JobCommand:
     command_id: int
     command_type: CommandType
@@ -436,4 +522,3 @@ class SchedulerReport:
 
 
 DispatchResult = PlacementDecision
-

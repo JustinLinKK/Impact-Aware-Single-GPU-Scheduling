@@ -10,12 +10,13 @@ import torch
 from ..observability.events import EventLogger
 from ..observability.logging_utils import setup_scheduler_logger
 from ..config import SchedulerSettings
-from ..storage.sqlite_store import SQLiteStateStore
+from ..storage.log_store import SchedulerLogStore
+from ..storage.state_store import StateStore
 from .control import CancelRequested, PauseRequested
 from .worker_runtime import create_runner_context, load_runtime_settings, mark_job_completed, mark_job_failed, mark_job_started, resolve_runner
 
 
-def _run_job_in_thread(settings: SchedulerSettings, store: SQLiteStateStore, event_logger: EventLogger, job_id: str, results: dict[str, int]) -> None:
+def _run_job_in_thread(settings: SchedulerSettings, store: StateStore, event_logger: EventLogger, job_id: str, results: dict[str, int]) -> None:
     logger = setup_scheduler_logger(settings.scheduler_log_path)
     context, job = create_runner_context(settings, store, event_logger, job_id)
     if context is None or job is None:
@@ -56,8 +57,8 @@ def main() -> int:
     args = parser.parse_args()
 
     settings = load_runtime_settings(args.runtime_root)
-    store = SQLiteStateStore(settings)
-    event_logger = EventLogger(store, settings.events_jsonl_path)
+    store = StateStore(settings)
+    event_logger = EventLogger(store, settings.events_jsonl_path, log_store=SchedulerLogStore(settings))
     results: dict[str, int] = {}
     threads = [
         threading.Thread(

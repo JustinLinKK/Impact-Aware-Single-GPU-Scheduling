@@ -5,13 +5,13 @@ from __future__ import annotations
 from typing import Any
 
 from ..domain import SchedulerReport
-from ..storage.sqlite_store import SQLiteStateStore
+from ..storage.state_store import StateStore
 
 
 class MetricsCollector:
     """Build aggregate metrics from persisted scheduler state."""
 
-    def __init__(self, store: SQLiteStateStore):
+    def __init__(self, store: StateStore):
         self.store = store
 
     def build_report(self) -> SchedulerReport:

@@ -18,6 +18,7 @@ from .domain import (
     JobSpec,
     JobStatus,
     PairProfile,
+    RunProfile,
     RuntimeProfile,
     SchedulerReport,
     SoloProfile,
@@ -27,17 +28,24 @@ from .domain import (
     utc_now,
 )
 from .dto import JobCommandRequest, JobQuery, PreloadRequest, ReportQuery, SubmitJobRequest
+from .graph_knowledge import SchedulerKnowledgeBase
 from .model_cache.cache_server import CacheClient
 from .scheduler.service import SchedulerService
-from .storage.sqlite_store import SQLiteStateStore
+from .storage.state_store import StateStore
 
 
 class SchedulerClient:
-    """Submit work and inspect state through a small command/query surface."""
+    """Submit work and inspect state through a small command/query surface.
+
+    The new MCP-oriented aggregate queries are forwarded through this client so
+    CLI/code callers and MCP callers share the same response shapes.
+    """
 
     def __init__(self, settings: SchedulerConfig | None = None):
         self.settings = settings or SchedulerConfig()
-        self.store = SQLiteStateStore(self.settings)
+        self.store = StateStore(self.settings)
+        self.knowledge = SchedulerKnowledgeBase(self.store)
+        self._hardware_feature_store = None
 
     def create_engine(self):
         from .engine import SchedulerEngine
@@ -210,6 +218,162 @@ class SchedulerClient:
 
     def upsert_combination_profile(self, profile: CombinationProfile) -> CombinationProfile:
         return self.store.upsert_combination_profile(profile)
+
+    def list_run_profiles(self, **kwargs: Any) -> list[RunProfile]:
+        return self.knowledge.list_run_profiles(**kwargs)
+
+    def get_job_graph_context(self, job_id: str) -> dict[str, Any]:
+        return self.knowledge.get_job_graph_context(job_id)
+
+    def search_hardware(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self.knowledge.search_hardware(**kwargs)
+
+    def get_hardware_context(self, hardware_key: str = "current", include_scheduler_limits: bool = True) -> dict[str, Any]:
+        return self.knowledge.get_hardware_context(
+            hardware_key=hardware_key,
+            include_scheduler_limits=include_scheduler_limits,
+        )
+
+    def get_job_design_context(self, candidate: dict[str, Any], limit: int = 5) -> dict[str, Any]:
+        return self.knowledge.get_job_design_context(candidate=candidate, limit=limit)
+
+    def search_profiles(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self.knowledge.search_profiles(**kwargs)
+
+    def get_runtime_estimate(self, **kwargs: Any) -> dict[str, Any]:
+        return self.knowledge.get_runtime_estimate(**kwargs)
+
+    def recommend_batch_size(self, **kwargs: Any) -> dict[str, Any]:
+        return self.knowledge.recommend_batch_size(**kwargs)
+
+    def recommend_epochs(self, **kwargs: Any) -> dict[str, Any]:
+        return self.knowledge.recommend_epochs(**kwargs)
+
+    def get_packet_compatibility(self, **kwargs: Any) -> dict[str, Any]:
+        return self.knowledge.get_packet_compatibility(**kwargs)
+
+    def search_profile_summaries(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self.knowledge.search_profile_summaries(**kwargs)
+
+    def record_tuning_outcome(self, **kwargs: Any) -> dict[str, Any]:
+        return self.knowledge.record_tuning_outcome(**kwargs)
+
+    def _feature_store(self):
+        if self._hardware_feature_store is None:
+            from .hardware_features import HardwareFeatureStore
+
+            self._hardware_feature_store = HardwareFeatureStore(self.settings)
+        return self._hardware_feature_store
+
+    def ingest_hardware_features(
+        self,
+        *,
+        source: str | Path | None = None,
+        recreate: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        return self._feature_store().ingest_source(source, recreate=recreate, dry_run=dry_run)
+
+    def search_hardware_features(
+        self,
+        *,
+        query: str,
+        hardware_key: str = "current",
+        architecture: str | None = None,
+        vendor: str | None = None,
+        workload_type: str | None = None,
+        framework: str | None = "pytorch",
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        hardware_context = self.get_hardware_context(hardware_key, include_scheduler_limits=True)
+        return self._feature_store().search(
+            query=query,
+            hardware_context=hardware_context,
+            architecture=architecture,
+            vendor=vendor,
+            workload_type=workload_type,
+            framework=framework,
+            limit=limit,
+        )
+
+    def get_hardware_feature_context(
+        self,
+        *,
+        hardware_key: str = "current",
+        workload_type: str | None = None,
+        model_family: str | None = None,
+        framework: str | None = "pytorch",
+        limit: int = 8,
+    ) -> dict[str, Any]:
+        hardware_context = self.get_hardware_context(hardware_key, include_scheduler_limits=True)
+        hardware = hardware_context.get("hardware") or {}
+        query_parts = [
+            str(hardware.get("gpu_name") or "current hardware"),
+            str(hardware.get("compute_capability") or ""),
+            str(workload_type or ""),
+            str(model_family or ""),
+            str(framework or ""),
+            "training optimization precision memory dataloader checkpointing",
+        ]
+        query = " ".join(part for part in query_parts if part.strip())
+        matches = self._feature_store().search(
+            query=query,
+            hardware_context=hardware_context,
+            workload_type=workload_type,
+            framework=framework,
+            limit=limit,
+        )
+        return {
+            "found": bool(matches),
+            "hardware_context": hardware_context,
+            "query": query,
+            "matches": matches,
+            "evidence_refs": [f"hardware_feature:{match['record_id']}" for match in matches if match.get("record_id")],
+        }
+
+    def get_hardware_optimization_context(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
+        job_design_context = self.get_job_design_context(candidate, limit=limit)
+        feature_context = self.get_hardware_feature_context(
+            hardware_key="current",
+            workload_type=candidate.get("workload_type") or candidate.get("task_type"),
+            model_family=candidate.get("model_family") or candidate.get("packing_family"),
+            framework=str(candidate.get("framework") or "pytorch"),
+            limit=limit,
+        )
+        recommendations: list[str] = []
+        batch_recommendation = job_design_context.get("batch_size_recommendation") or {}
+        if batch_recommendation.get("found") and batch_recommendation.get("recommended_batch_size") is not None:
+            recommendations.append(f"Use graph-recommended batch size {batch_recommendation['recommended_batch_size']} as the starting physical batch size.")
+        epoch_recommendation = job_design_context.get("epoch_recommendation") or {}
+        if epoch_recommendation.get("found") and epoch_recommendation.get("recommended_epochs") is not None:
+            recommendations.append(f"Use historical epoch recommendation {epoch_recommendation['recommended_epochs']} as the initial epoch budget.")
+        risk_notes = list(job_design_context.get("risk_flags") or [])
+        for match in feature_context.get("matches") or []:
+            for pattern in match.get("recommended_patterns") or []:
+                if pattern not in recommendations:
+                    recommendations.append(pattern)
+            for pattern in match.get("avoid_patterns") or []:
+                if pattern not in risk_notes:
+                    risk_notes.append(pattern)
+        evidence_refs = list(job_design_context.get("evidence_refs") or [])
+        evidence_refs.extend(feature_context.get("evidence_refs") or [])
+        feature_confidences = [
+            float(match.get("confidence"))
+            for match in feature_context.get("matches") or []
+            if match.get("confidence") is not None
+        ]
+        graph_confidence = float(job_design_context.get("confidence") or 0.0)
+        feature_confidence = max(feature_confidences) if feature_confidences else 0.0
+        confidence = round(max(graph_confidence, feature_confidence), 3)
+        return {
+            "hardware_context": job_design_context.get("hardware_context"),
+            "job_design_context": job_design_context,
+            "feature_context": feature_context,
+            "combined_recommendations": recommendations[: max(1, int(limit))],
+            "risk_notes": risk_notes,
+            "evidence_refs": evidence_refs,
+            "confidence": confidence,
+        }
 
     def dump_jobs_json(self) -> str:
         return json.dumps([job.to_dict() for job in self.list_jobs()], indent=2, sort_keys=True)

@@ -15,6 +15,34 @@ cache_server_host: "127.0.0.1"
 cache_server_port: 8765
 cache_socket_name: "cache_server.sock"
 auto_resume_recoverable: false
+graph_db:
+  enabled: true
+  mode: "primary"
+  provider: "neo4j"
+  uri: "bolt://127.0.0.1:7687"
+  username: "neo4j"
+  password_env: "LOCALML_SCHEDULER_NEO4J_PASSWORD"
+  database: "neo4j"
+  bootstrap_constraints: true
+  auto_import_legacy_sqlite: true
+  legacy_sqlite_path: null
+  allow_legacy_fallback: true
+hardware_feature_db:
+  enabled: true
+  provider: "qdrant"
+  url: "http://127.0.0.1:6333"
+  api_key_env: "LOCALML_SCHEDULER_QDRANT_API_KEY"
+  collection_name: "hardware_feature_knowledge"
+  embedding_model_type: "local"
+  embedding_model_name: "BAAI/bge-base-en-v1.5"
+  embedding_device: "cpu"
+  distance: "Cosine"
+log_db:
+  provider: "postgres"
+  dsn_env: "LOCALML_SCHEDULER_LOG_DSN"
+  schema: "scheduler_logs"
+  # Analytics only. Missing or unreachable Postgres should not block the scheduler.
+  enabled: false
 gpu_scheduler:
   enabled: true
   mode: "parallel_default"

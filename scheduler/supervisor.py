@@ -12,7 +12,7 @@ from ..execution.control import ControlPlane
 from ..execution.executor import SubprocessExecutor, WorkerProcessHandle
 from ..domain import JobStatus, PlacementDecision, TrainingJob
 from ..config import SchedulerSettings, SCHEDULER_MODE_PARALLEL_AUTO_PACK
-from ..storage.sqlite_store import SQLiteStateStore
+from ..storage.state_store import StateStore
 
 
 @dataclass(slots=True)
@@ -54,11 +54,11 @@ class WorkerSupervisor:
         self,
         settings: SchedulerSettings,
         *,
-        store: SQLiteStateStore | None = None,
+        store: StateStore | None = None,
         backends: dict[str, ExecutionBackend] | None = None,
     ):
         self.settings = settings
-        self.store = store or SQLiteStateStore(settings)
+        self.store = store or StateStore(settings)
         self.control_plane = ControlPlane(settings)
         self.executor = SubprocessExecutor(settings)
         self.backend_registry = BackendRegistry(settings, self.executor, backends=backends)
