@@ -71,7 +71,13 @@ def _coerce_run_summary(profile: RunProfile) -> str:
 
 
 class Neo4jStateStore:
-    """Persist scheduler state as a property graph in Neo4j."""
+    """Persist empirical scheduler evidence as a property graph in Neo4j.
+
+    SQLite remains the live scheduler state store. The older control-plane
+    methods in this class are retained only for compatibility with historical
+    tests and migrations; StateStore now calls the record_*_evidence methods
+    for graph writes.
+    """
 
     def __init__(self, settings: SchedulerSettings):
         if GraphDatabase is None:  # pragma: no cover - exercised only when dependency missing
@@ -124,67 +130,19 @@ class Neo4jStateStore:
         with sqlite3.connect(legacy_path) as connection:
             connection.row_factory = sqlite3.Row
             for row in connection.execute("SELECT payload_json FROM jobs ORDER BY queue_sequence ASC").fetchall():
-                self.save_job(TrainingJob.from_dict(json.loads(row["payload_json"])))
-            for row in connection.execute(
-                "SELECT command_id, job_id, command_type, payload_json, created_at, processed_at FROM commands ORDER BY command_id ASC"
-            ).fetchall():
-                payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
-                self._upsert_command(
-                    command_id=int(row["command_id"]),
-                    job_id=row["job_id"],
-                    command_type=row["command_type"],
-                    payload=payload,
-                    created_at=row["created_at"],
-                    processed_at=row["processed_at"],
-                )
-            for row in connection.execute(
-                "SELECT event_id, job_id, event_type, payload_json, created_at FROM events ORDER BY event_id ASC"
-            ).fetchall():
-                payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
-                self._upsert_event(
-                    event_id=int(row["event_id"]),
-                    job_id=row["job_id"],
-                    event_type=row["event_type"],
-                    payload=payload,
-                    created_at=row["created_at"],
-                )
-            for row in connection.execute(
-                "SELECT checkpoint_id, job_id, checkpoint_path, created_at, metadata_json, is_latest FROM checkpoints ORDER BY checkpoint_id ASC"
-            ).fetchall():
-                self._upsert_checkpoint(
-                    checkpoint_id=int(row["checkpoint_id"]),
-                    job_id=row["job_id"],
-                    checkpoint_path=row["checkpoint_path"],
-                    created_at=row["created_at"],
-                    metadata=json.loads(row["metadata_json"]) if row["metadata_json"] else {},
-                    is_latest=bool(row["is_latest"]),
-                )
-            for row in connection.execute(
-                "SELECT model_id, baseline_model_path, size_bytes, pinned, hits, misses, last_loaded_at, last_accessed_at, metadata_json FROM cache_entries"
-            ).fetchall():
-                self.update_cache_metadata(
-                    row["model_id"],
-                    row["baseline_model_path"],
-                    size_bytes=int(row["size_bytes"]),
-                    pinned=bool(row["pinned"]),
-                    hits=int(row["hits"]),
-                    misses=int(row["misses"]),
-                    last_loaded_at=row["last_loaded_at"],
-                    last_accessed_at=row["last_accessed_at"],
-                    metadata=json.loads(row["metadata_json"]) if row["metadata_json"] else {},
-                )
+                self.record_scheduler_job_evidence(TrainingJob.from_dict(json.loads(row["payload_json"])))
             for row in connection.execute("SELECT * FROM solo_profiles").fetchall():
-                self.upsert_solo_profile(SoloProfile.from_row(dict(row)))
+                self.record_solo_profile_evidence(SoloProfile.from_row(dict(row)))
             for row in connection.execute("SELECT * FROM pair_profiles").fetchall():
-                self.upsert_pair_profile(PairProfile.from_row(dict(row)))
+                self.record_pair_profile_evidence(PairProfile.from_row(dict(row)))
             for row in connection.execute("SELECT * FROM runtime_profiles").fetchall():
-                self.upsert_runtime_profile(RuntimeProfile.from_row(dict(row)))
+                self.record_runtime_profile_evidence(RuntimeProfile.from_row(dict(row)))
             for row in connection.execute("SELECT * FROM batch_probe_profiles").fetchall():
-                self.upsert_batch_probe_profile(BatchProbeProfile.from_row(dict(row)))
+                self.record_batch_probe_evidence(BatchProbeProfile.from_row(dict(row)))
             for row in connection.execute("SELECT * FROM batch_size_observations").fetchall():
-                self.upsert_batch_size_observation(BatchSizeObservation.from_row(dict(row)))
+                self.record_batch_size_observation_evidence(BatchSizeObservation.from_row(dict(row)))
             for row in connection.execute("SELECT * FROM combination_profiles").fetchall():
-                self.upsert_combination_profile(CombinationProfile.from_row(dict(row)))
+                self.record_combination_profile_evidence(CombinationProfile.from_row(dict(row)))
 
     def hardware_profile(self) -> HardwareProfile:
         if self._hardware_profile is None:
@@ -196,59 +154,32 @@ class Neo4jStateStore:
 
     def _ensure_hardware_dimensions(self, profile: HardwareProfile) -> None:
         toolkit_name, toolkit_version = _toolkit_identity_from_hardware(profile)
-        accelerator_key = _accelerator_key(profile.gpu_name)
         self._run_write(
             """
-            MERGE (t:Toolkit {toolkit_key: $toolkit_key})
-            SET t.uid = $toolkit_uid,
-                t.toolkit_key = $toolkit_key,
-                t.toolkit_name = $toolkit_name,
-                t.toolkit_version = $toolkit_version,
-                t.torch_version = $torch_version,
-                t.updated_at = $updated_at
-            MERGE (a:Accelerator {accelerator_key: $accelerator_key})
-            SET a.uid = $accelerator_uid,
-                a.accelerator_key = $accelerator_key,
-                a.accelerator_name = $gpu_name,
-                a.compute_capability = $compute_capability,
-                a.total_vram_mb = $total_vram_mb,
-                a.updated_at = $updated_at
             MERGE (h:Hardware {hardware_key: $hardware_key})
-            SET h.uid = $hardware_uid,
-                h.hardware_key = $hardware_key,
-                h.os_name = $os_name,
-                h.gpu_name = $gpu_name,
+            SET h.hardware_key = $hardware_key,
+                h.hardware_kind = 'gpu',
+                h.vendor = $vendor,
+                h.product_name = $gpu_name,
                 h.total_vram_mb = $total_vram_mb,
                 h.compute_capability = $compute_capability,
                 h.toolkit_name = $toolkit_name,
                 h.toolkit_version = $toolkit_version,
                 h.torch_version = $torch_version,
                 h.device_index = $device_index,
-                h.updated_at = $updated_at,
-                h.summary_text = $hardware_summary
-            MERGE (h)-[:HAS_ACCELERATOR]->(a)
-            MERGE (h)-[:RUNS_TOOLKIT]->(t)
+                h.updated_at = $updated_at
             """,
             {
-                "toolkit_key": f"{toolkit_name}:{toolkit_version}",
-                "toolkit_uid": f"toolkit::{toolkit_name}:{toolkit_version}",
                 "toolkit_name": toolkit_name,
                 "toolkit_version": toolkit_version,
                 "torch_version": profile.torch_version,
-                "accelerator_key": accelerator_key,
-                "accelerator_uid": f"accelerator::{accelerator_key}",
                 "gpu_name": profile.gpu_name,
                 "compute_capability": profile.compute_capability,
                 "total_vram_mb": profile.total_vram_mb,
                 "hardware_key": profile.hardware_key,
-                "hardware_uid": f"hardware::{profile.hardware_key}",
-                "os_name": profile.os_name,
+                "vendor": "nvidia" if profile.compute_capability else "unknown",
                 "device_index": self.settings.gpu_scheduler.device_index,
                 "updated_at": utc_now(),
-                "hardware_summary": (
-                    f"Hardware {profile.gpu_name} on {profile.os_name} with "
-                    f"{profile.total_vram_mb or 0} MB VRAM and toolkit {toolkit_name}:{toolkit_version}."
-                ),
             },
         )
 
@@ -308,7 +239,7 @@ class Neo4jStateStore:
                 h.hardware_key AS hardware_key,
                 h.os_name AS os_name,
                 h.host_name AS host_name,
-                h.gpu_name AS gpu_name,
+                coalesce(h.gpu_name, h.product_name) AS gpu_name,
                 h.cpu_name AS cpu_name,
                 h.total_ram_mb AS total_ram_mb,
                 h.total_vram_mb AS total_vram_mb,
@@ -344,7 +275,7 @@ class Neo4jStateStore:
                 h.hardware_key AS hardware_key,
                 h.os_name AS os_name,
                 h.host_name AS host_name,
-                h.gpu_name AS gpu_name,
+                coalesce(h.gpu_name, h.product_name) AS gpu_name,
                 h.cpu_name AS cpu_name,
                 h.total_ram_mb AS total_ram_mb,
                 h.total_vram_mb AS total_vram_mb,
@@ -840,6 +771,484 @@ class Neo4jStateStore:
             """
         )
         return dict(rows[0]) if rows else {"entries": 0, "used_bytes": 0, "pinned_entries": 0, "hits": 0, "misses": 0}
+
+    def _status_to_evidence_status(self, status: str | None) -> str:
+        normalized = str(status or "").strip().lower()
+        if normalized in {"completed", "succeeded", "success", "profiled"}:
+            return "succeeded"
+        if normalized in {"cancelled", "canceled", "killed"}:
+            return "killed"
+        if "oom" in normalized:
+            return "oom"
+        if "timeout" in normalized:
+            return "timeout"
+        if normalized in {"failed", "error"}:
+            return "failed"
+        return "partial"
+
+    def _canonical_json_key(self, prefix: str, payload: dict[str, Any]) -> str:
+        digest = sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
+        return f"{prefix}:{digest}"
+
+    def _hardware_key_for_device_type(self, device_type: str | None = None) -> str:
+        profile = self.hardware_profile()
+        if not device_type or str(device_type) == profile.gpu_name:
+            return profile.hardware_key
+        return self._canonical_json_key("hardware", {"device_type": device_type})
+
+    def _merge_evidence_dimensions(
+        self,
+        *,
+        model_key: str | None,
+        model_name: str | None = None,
+        config: dict[str, Any],
+        hardware_key: str | None,
+        technology_keys: list[str] | None = None,
+    ) -> str:
+        config_key = self._canonical_json_key("config", config)
+        profile = self.hardware_profile()
+        technology_keys = [str(key) for key in (technology_keys or []) if str(key)]
+        self._run_write(
+            """
+            MERGE (c:TrainingConfig {config_key: $config_key})
+            SET c.config_key = $config_key,
+                c.input_signature = $input_signature,
+                c.batch_size = $batch_size,
+                c.effective_batch_size = $effective_batch_size,
+                c.gradient_accumulation_steps = $gradient_accumulation_steps,
+                c.epochs = $epochs,
+                c.max_steps = $max_steps,
+                c.steps_per_epoch = $steps_per_epoch,
+                c.precision = $precision,
+                c.optimizer = $optimizer,
+                c.learning_rate = $learning_rate,
+                c.hyperparams_json = $hyperparams_json,
+                c.created_at = coalesce(c.created_at, $updated_at)
+            MERGE (h:Hardware {hardware_key: $hardware_key})
+            SET h.hardware_key = $hardware_key,
+                h.hardware_kind = 'gpu',
+                h.vendor = coalesce(h.vendor, $vendor),
+                h.product_name = coalesce(h.product_name, $product_name),
+                h.total_vram_mb = coalesce(h.total_vram_mb, $total_vram_mb),
+                h.compute_capability = coalesce(h.compute_capability, $compute_capability),
+                h.toolkit_name = coalesce(h.toolkit_name, $toolkit_name),
+                h.toolkit_version = coalesce(h.toolkit_version, $toolkit_version),
+                h.technology_keys = coalesce(h.technology_keys, $hardware_technology_keys),
+                h.updated_at = $updated_at
+            """,
+            {
+                "config_key": config_key,
+                "input_signature": config.get("input_signature"),
+                "batch_size": config.get("batch_size"),
+                "effective_batch_size": config.get("effective_batch_size"),
+                "gradient_accumulation_steps": config.get("gradient_accumulation_steps"),
+                "epochs": config.get("epochs"),
+                "max_steps": config.get("max_steps"),
+                "steps_per_epoch": config.get("steps_per_epoch"),
+                "precision": config.get("precision"),
+                "optimizer": config.get("optimizer"),
+                "learning_rate": config.get("learning_rate"),
+                "hyperparams_json": _json_dumps(config.get("hyperparams") or {}),
+                "hardware_key": hardware_key or profile.hardware_key,
+                "vendor": "nvidia" if profile.compute_capability else "unknown",
+                "product_name": profile.gpu_name,
+                "total_vram_mb": profile.total_vram_mb,
+                "compute_capability": profile.compute_capability,
+                "toolkit_name": "cuda" if profile.cuda_runtime else "unknown",
+                "toolkit_version": str(profile.cuda_runtime) if profile.cuda_runtime else "unknown",
+                "hardware_technology_keys": ["cuda"] if profile.cuda_runtime else [],
+                "updated_at": utc_now(),
+            },
+        )
+        if model_key:
+            self._run_write(
+                """
+                MERGE (m:Model {model_key: $model_key})
+                SET m.model_key = $model_key,
+                    m.model_name = coalesce(m.model_name, $model_name),
+                    m.model_family = coalesce(m.model_family, $model_family),
+                    m.task_type = coalesce(m.task_type, $task_type),
+                    m.updated_at = $updated_at
+                """,
+                {
+                    "model_key": model_key,
+                    "model_name": model_name or model_key,
+                    "model_family": config.get("model_family"),
+                    "task_type": config.get("task_type"),
+                    "updated_at": utc_now(),
+                },
+            )
+        for technology_key in technology_keys:
+            self._run_write(
+                """
+                MERGE (t:Technology {technology_key: $technology_key})
+                SET t.technology_key = $technology_key,
+                    t.name = coalesce(t.name, $technology_key),
+                    t.updated_at = $updated_at
+                """,
+                {"technology_key": technology_key, "updated_at": utc_now()},
+            )
+        return config_key
+
+    def _upsert_single_job_evidence(
+        self,
+        *,
+        job_id: str,
+        purpose: str,
+        status: str,
+        model_key: str | None,
+        model_name: str | None = None,
+        hardware_key: str | None = None,
+        technology_keys: list[str] | None = None,
+        config: dict[str, Any] | None = None,
+        props: dict[str, Any] | None = None,
+    ) -> None:
+        config = config or {}
+        technology_keys = [str(key) for key in (technology_keys or []) if str(key)]
+        hardware_key = hardware_key or self.hardware_key()
+        config_key = self._merge_evidence_dimensions(
+            model_key=model_key,
+            model_name=model_name,
+            config=config,
+            hardware_key=hardware_key,
+            technology_keys=technology_keys,
+        )
+        base_props = {
+            "job_id": job_id,
+            "profile_key": self._canonical_json_key(
+                "profile",
+                {
+                    "purpose": purpose,
+                    "model_key": model_key,
+                    "hardware_key": hardware_key,
+                    "technology_keys": technology_keys,
+                    "config_key": config_key,
+                },
+            ),
+            "purpose": purpose,
+            "status": status,
+            "hardware_set_key": hardware_key,
+            "technology_keys": technology_keys,
+            "technology_set_key": self._canonical_json_key("tech", {"technology_keys": technology_keys}) if technology_keys else None,
+            "run_scope": config.get("run_scope") or "fixed_steps",
+            "confidence": props.get("confidence") if props else None,
+            "model_key": model_key,
+            "config_key": config_key,
+            "created_at": props.get("created_at") if props else None,
+            "started_at": props.get("started_at") if props else None,
+            "finished_at": props.get("finished_at") if props else None,
+        }
+        if props:
+            base_props.update({key: value for key, value in props.items() if value is not None})
+        self._run_write(
+            "MERGE (j:Job:SingleJob {job_id: $job_id}) SET j += $props",
+            {"job_id": job_id, "props": base_props},
+        )
+        self._run_write(
+            """
+            MATCH (j:Job:SingleJob {job_id: $job_id})
+            MATCH (h:Hardware {hardware_key: $hardware_key})
+            MATCH (c:TrainingConfig {config_key: $config_key})
+            MERGE (j)-[:JOB_USED_HARDWARE]->(h)
+            MERGE (j)-[:SINGLE_USES_CONFIG]->(c)
+            """,
+            {"job_id": job_id, "hardware_key": hardware_key, "config_key": config_key},
+        )
+        if model_key:
+            self._run_write(
+                """
+                MATCH (j:Job:SingleJob {job_id: $job_id})
+                MATCH (m:Model {model_key: $model_key})
+                MERGE (j)-[:SINGLE_TRAINS_MODEL]->(m)
+                """,
+                {"job_id": job_id, "model_key": model_key},
+            )
+        for technology_key in technology_keys:
+            self._run_write(
+                """
+                MATCH (j:Job:SingleJob {job_id: $job_id})
+                MATCH (t:Technology {technology_key: $technology_key})
+                MERGE (j)-[:JOB_USES_TECHNOLOGY]->(t)
+                """,
+                {"job_id": job_id, "technology_key": technology_key},
+            )
+
+    def record_scheduler_job_evidence(self, job: TrainingJob) -> None:
+        if not job.status.is_terminal:
+            return
+        model_key = str(job.batch_probe.model_key or job.baseline_model_id)
+        resolved_batch_size = job.metadata.get("resolved_batch_size")
+        technology_keys = list(job.metadata.get("technology_keys") or [])
+        if job.metadata.get("uses_amp") or job.metadata.get("amp_enabled"):
+            technology_keys.append("pytorch_amp")
+        config = {
+            "input_signature": job.packing.signature,
+            "batch_size": resolved_batch_size or job.config.runner_kwargs.get(job.batch_probe.batch_param_name),
+            "epochs": job.max_epochs or job.config.max_epochs,
+            "max_steps": job.max_steps or job.config.max_steps,
+            "run_scope": "full_training" if job.status == JobStatus.COMPLETED else "fixed_steps",
+            "model_family": job.packing.family,
+            "task_type": job.task_type,
+            "hyperparams": job.config.runner_kwargs,
+        }
+        metrics = job.metadata.get("outcome_metrics") or {}
+        self._upsert_single_job_evidence(
+            job_id=f"scheduler_job::{job.job_id}",
+            purpose="real_training",
+            status=self._status_to_evidence_status(job.status.value),
+            model_key=model_key,
+            model_name=job.baseline_model_id,
+            technology_keys=technology_keys,
+            config=config,
+            props={
+                "resolved_batch_size": resolved_batch_size,
+                "completed_full_training": job.status == JobStatus.COMPLETED,
+                "observed_steps": job.max_steps,
+                "observed_epochs": job.max_epochs,
+                "primary_metric_name": metrics.get("primary_metric_name"),
+                "primary_metric_value": metrics.get("primary_metric_value"),
+                "metrics_json": _json_dumps(metrics),
+                "error_message": job.status_reason if job.status != JobStatus.COMPLETED else None,
+                "started_at": job.started_at,
+                "finished_at": job.finished_at,
+            },
+        )
+
+    def record_batch_probe_evidence(self, profile: BatchProbeProfile) -> None:
+        self._upsert_single_job_evidence(
+            job_id=f"batch_probe::{profile.probe_key}",
+            purpose="batch_size_probe",
+            status="succeeded",
+            model_key=profile.model_key,
+            hardware_key=self._hardware_key_for_device_type(profile.device_type),
+            technology_keys=["power_of_two_batch_optimizer"] if profile.metadata.get("search_mode") == "power_of_two" else [],
+            config={
+                "input_signature": profile.shape_signature,
+                "batch_size": profile.resolved_batch_size,
+                "run_scope": "fixed_steps",
+                "hyperparams": {"batch_param_name": profile.batch_param_name},
+            },
+            props={
+                "resolved_batch_size": profile.resolved_batch_size,
+                "max_safe_batch_size": profile.resolved_batch_size,
+                "peak_vram_mb": profile.peak_vram_mb,
+                "confidence": min(1.0, 0.5 + 0.1 * float(profile.observations or 0)),
+                "measurement_window_steps": profile.metadata.get("measurement_window_steps"),
+                "finished_at": profile.updated_at,
+                "metrics_json": _json_dumps(profile.metadata),
+            },
+        )
+
+    def record_batch_size_observation_evidence(self, observation: BatchSizeObservation) -> None:
+        self._upsert_single_job_evidence(
+            job_id=f"batch_observation::{observation.observation_key}",
+            purpose="batch_size_probe",
+            status="succeeded",
+            model_key=observation.model_key,
+            hardware_key=observation.hardware_key,
+            config={
+                "input_signature": observation.shape_signature,
+                "batch_size": observation.batch_size,
+                "run_scope": "fixed_steps",
+                "hyperparams": {"batch_param_name": observation.batch_param_name},
+            },
+            props={
+                "resolved_batch_size": observation.batch_size,
+                "max_safe_batch_size": observation.batch_size,
+                "peak_vram_mb": observation.peak_vram_mb,
+                "observed_avg_step_time_ms": observation.avg_step_time_ms,
+                "avg_gpu_utilization_pct": observation.avg_gpu_utilization,
+                "avg_vram_utilization_pct": observation.avg_memory_utilization,
+                "confidence": min(1.0, 0.5 + 0.1 * float(observation.observations or 0)),
+                "finished_at": observation.updated_at,
+                "metrics_json": _json_dumps(observation.metadata),
+            },
+        )
+
+    def record_runtime_profile_evidence(self, profile: RuntimeProfile) -> None:
+        model_key = self._model_key_for_signature(profile.signature)
+        self._upsert_single_job_evidence(
+            job_id=f"runtime_profile::{profile.profile_key}",
+            purpose="runtime_probe",
+            status="succeeded",
+            model_key=model_key or profile.signature,
+            hardware_key=profile.hardware_key,
+            config={
+                "input_signature": profile.signature,
+                "batch_size": profile.resolved_batch_size,
+                "steps_per_epoch": profile.steps_per_epoch,
+                "run_scope": "full_epoch" if profile.epoch_1_seconds else "fixed_steps",
+                "hyperparams": {"strategy": profile.strategy, "backend_name": profile.backend_name},
+            },
+            props={
+                "resolved_batch_size": profile.resolved_batch_size,
+                "startup_seconds": profile.startup_seconds,
+                "observed_avg_step_time_ms": profile.avg_step_time_ms,
+                "estimated_epoch_seconds": profile.epoch_1_seconds,
+                "estimated_total_training_seconds": profile.estimated_total_runtime_seconds,
+                "estimation_method": "step_time_extrapolation" if profile.avg_step_time_ms else "partial_epoch_extrapolation",
+                "estimate_confidence": profile.confidence,
+                "confidence": profile.confidence,
+                "finished_at": profile.updated_at,
+                "metrics_json": _json_dumps(profile.metadata),
+            },
+        )
+
+    def record_solo_profile_evidence(self, profile: SoloProfile) -> None:
+        model_key = self._model_key_for_signature(profile.signature)
+        self._upsert_single_job_evidence(
+            job_id=f"solo_profile::{profile.hardware_key or self.hardware_key()}::{profile.signature}",
+            purpose="baseline_benchmark",
+            status="succeeded",
+            model_key=model_key or profile.signature,
+            hardware_key=profile.hardware_key or self.hardware_key(),
+            config={
+                "input_signature": profile.signature,
+                "run_scope": "fixed_steps",
+                "model_family": profile.family,
+            },
+            props={
+                "peak_vram_mb": profile.peak_vram_mb,
+                "avg_gpu_utilization_pct": profile.avg_gpu_utilization,
+                "avg_vram_utilization_pct": profile.avg_memory_utilization,
+                "confidence": min(1.0, 0.5 + 0.1 * float(profile.sample_count or 0)),
+                "finished_at": profile.updated_at,
+                "metrics_json": _json_dumps(profile.metadata),
+            },
+        )
+
+    def _upsert_packed_job_evidence(
+        self,
+        *,
+        job_id: str,
+        packing_group_key: str,
+        hardware_key: str,
+        backend_name: str,
+        compatible: bool,
+        member_signatures: list[str],
+        props: dict[str, Any],
+    ) -> None:
+        technology_keys = [backend_name] if backend_name else []
+        config_key = self._merge_evidence_dimensions(
+            model_key=None,
+            config={"input_signature": packing_group_key, "run_scope": "fixed_steps", "hyperparams": {"backend_name": backend_name}},
+            hardware_key=hardware_key,
+            technology_keys=technology_keys,
+        )
+        packed_props = {
+            "job_id": job_id,
+            "profile_key": self._canonical_json_key("packed_profile", {"packing_group_key": packing_group_key, "hardware_key": hardware_key, "backend_name": backend_name}),
+            "purpose": "packed_benchmark",
+            "status": "succeeded" if compatible else "failed",
+            "hardware_set_key": hardware_key,
+            "technology_keys": technology_keys,
+            "technology_set_key": self._canonical_json_key("tech", {"technology_keys": technology_keys}) if technology_keys else None,
+            "run_scope": "fixed_steps",
+            "packing_group_key": packing_group_key,
+            "packing_strategy": backend_name or "scheduler_packing",
+            "compatible": bool(compatible),
+            "config_key": config_key,
+        }
+        packed_props.update({key: value for key, value in props.items() if value is not None})
+        self._run_write(
+            "MERGE (p:Job:PackedJob {job_id: $job_id}) SET p += $props",
+            {"job_id": job_id, "props": packed_props},
+        )
+        self._run_write(
+            """
+            MATCH (p:Job:PackedJob {job_id: $job_id})
+            MATCH (h:Hardware {hardware_key: $hardware_key})
+            MERGE (p)-[:JOB_USED_HARDWARE]->(h)
+            """,
+            {"job_id": job_id, "hardware_key": hardware_key},
+        )
+        for index, signature in enumerate(member_signatures):
+            model_key = self._model_key_for_signature(signature) or signature
+            member_config_key = self._merge_evidence_dimensions(
+                model_key=model_key,
+                config={"input_signature": signature, "run_scope": "fixed_steps"},
+                hardware_key=hardware_key,
+                technology_keys=technology_keys,
+            )
+            member_id = f"{job_id}::member::{index}"
+            self._run_write(
+                """
+                MERGE (member:PackedJobMember {member_id: $member_id})
+                SET member.member_id = $member_id,
+                    member.model_key = $model_key,
+                    member.config_key = $config_key,
+                    member.status = $status,
+                    member.metrics_json = $metrics_json
+                WITH member
+                MATCH (p:Job:PackedJob {job_id: $job_id})
+                MATCH (m:Model {model_key: $model_key})
+                MATCH (c:TrainingConfig {config_key: $config_key})
+                MERGE (p)-[:HAS_PACKED_MEMBER {position: $position}]->(member)
+                MERGE (member)-[:MEMBER_TRAINS_MODEL]->(m)
+                MERGE (member)-[:MEMBER_USES_CONFIG]->(c)
+                """,
+                {
+                    "member_id": member_id,
+                    "model_key": model_key,
+                    "config_key": member_config_key,
+                    "status": "succeeded" if compatible else "failed",
+                    "metrics_json": _json_dumps({"signature": signature}),
+                    "job_id": job_id,
+                    "position": index,
+                },
+            )
+            for technology_key in technology_keys:
+                self._run_write(
+                    """
+                    MATCH (member:PackedJobMember {member_id: $member_id})
+                    MATCH (t:Technology {technology_key: $technology_key})
+                    MERGE (member)-[:MEMBER_USES_TECHNOLOGY]->(t)
+                    """,
+                    {"member_id": member_id, "technology_key": technology_key},
+                )
+
+    def record_pair_profile_evidence(self, profile: PairProfile) -> None:
+        hardware_key = profile.hardware_key or self.hardware_key()
+        self._upsert_packed_job_evidence(
+            job_id=f"pair_profile::{profile.pair_key}::{hardware_key}",
+            packing_group_key=profile.pair_key,
+            hardware_key=hardware_key,
+            backend_name=profile.backend_name,
+            compatible=profile.compatible,
+            member_signatures=[profile.left_signature, profile.right_signature],
+            props={
+                "peak_vram_mb": profile.peak_vram_mb,
+                "avg_gpu_utilization_pct": profile.avg_gpu_utilization,
+                "avg_vram_utilization_pct": profile.avg_memory_utilization,
+                "slowdown_ratio": profile.slowdown_ratio,
+                "error_message": profile.last_failure_reason,
+                "finished_at": profile.updated_at,
+                "confidence": min(1.0, 0.5 + 0.1 * float(profile.observations or 0)),
+                "metrics_json": _json_dumps(profile.metadata),
+            },
+        )
+
+    def record_combination_profile_evidence(self, profile: CombinationProfile) -> None:
+        member_signatures = list(profile.batch_vector.keys()) or [profile.group_signature]
+        self._upsert_packed_job_evidence(
+            job_id=f"combination_profile::{profile.combination_key}",
+            packing_group_key=profile.group_signature,
+            hardware_key=profile.hardware_key,
+            backend_name=profile.backend_name,
+            compatible=profile.compatible,
+            member_signatures=member_signatures,
+            props={
+                "peak_vram_mb": profile.peak_vram_mb,
+                "avg_gpu_utilization_pct": profile.avg_gpu_utilization,
+                "avg_vram_utilization_pct": profile.avg_memory_utilization,
+                "observed_avg_step_time_ms": profile.avg_step_time_ms,
+                "throughput_efficiency": profile.objective_score,
+                "error_message": profile.last_failure_reason,
+                "finished_at": profile.updated_at,
+                "confidence": min(1.0, 0.5 + 0.1 * float(profile.observations or 0)),
+                "metrics_json": _json_dumps({"batch_vector": profile.batch_vector, **profile.metadata}),
+            },
+        )
 
     def _upsert_run_profile(self, profile: RunProfile) -> RunProfile:
         profile.updated_at = utc_now()

@@ -1011,6 +1011,132 @@ class SchedulerKnowledgeBase:
             rows.append({"kind": "run_profile", "data": profile.to_dict(), "summary_text": summary_text})
         return rows[: max(1, int(limit))]
 
+    def _packed_profiles_for_candidate(self, candidate: dict[str, Any], limit: int) -> list[dict[str, Any]]:
+        current_key = self._current_hardware_key()
+        rows: list[dict[str, Any]] = []
+        if hasattr(self.store, "list_pair_profiles"):
+            for profile in self.store.list_pair_profiles(hardware_key=current_key or None):
+                left_model = self._model_key_for_signature(profile.left_signature) or profile.left_signature
+                right_model = self._model_key_for_signature(profile.right_signature) or profile.right_signature
+                model_key = str(candidate.get("model_key") or "")
+                signature = str(candidate.get("script_signature") or "")
+                packing_family = str(candidate.get("packing_family") or candidate.get("model_family") or "")
+                values = {str(left_model), str(right_model), profile.left_signature, profile.right_signature}
+                if model_key and model_key not in values and signature and signature not in values:
+                    if not packing_family:
+                        continue
+                rows.append(
+                    {
+                        "kind": "packed_pair_profile",
+                        "summary_text": (
+                            f"Packed pair {left_model} + {right_model} on {profile.hardware_key} "
+                            f"with backend {profile.backend_name}: compatible={profile.compatible}."
+                        ),
+                        "ref": f"packed_pair:{profile.pair_key}:{profile.hardware_key}",
+                        "data": profile.to_dict(),
+                    }
+                )
+        if hasattr(self.store, "list_combination_profiles"):
+            for profile in self.store.list_combination_profiles(hardware_key=current_key or None):
+                rows.append(
+                    {
+                        "kind": "packed_group_profile",
+                        "summary_text": (
+                            f"Packed group {profile.group_signature} on {profile.hardware_key} "
+                            f"with backend {profile.backend_name}: compatible={profile.compatible}."
+                        ),
+                        "ref": f"packed_group:{profile.combination_key}",
+                        "data": profile.to_dict(),
+                    }
+                )
+        return rows[: max(1, int(limit))]
+
+    def _derive_diagnosis(
+        self,
+        candidate: dict[str, Any],
+        *,
+        matched_profiles: list[dict[str, Any]],
+        risk_flags: list[str],
+    ) -> dict[str, list[str]]:
+        symptoms: list[str] = []
+        targets: list[str] = []
+
+        def add(symptom: str, *new_targets: str) -> None:
+            if symptom not in symptoms:
+                symptoms.append(symptom)
+            for target in new_targets:
+                if target not in targets:
+                    targets.append(target)
+
+        if risk_flags and any("batch_size_above" in flag for flag in risk_flags):
+            add("high_vram_pressure", "reduce_vram", "avoid_oom")
+        if not candidate.get("uses_amp"):
+            add("precision_not_optimized", "improve_precision_efficiency", "enable_tensor_core")
+            add("tensor_core_not_used", "enable_tensor_core", "improve_throughput")
+        for entry in matched_profiles:
+            data = entry.get("data") or {}
+            status = str(data.get("status") or "").lower()
+            if status == "oom" or "oom" in str(data.get("last_failure_reason") or "").lower():
+                add("oom", "reduce_vram", "avoid_oom")
+            if status == "timeout":
+                add("timeout", "reduce_step_time", "improve_throughput")
+            sm_util = data.get("avg_sm_utilization_pct")
+            if sm_util is None:
+                sm_util = data.get("avg_sm_utilization")
+            if sm_util is None:
+                sm_util = data.get("avg_gpu_utilization")
+            try:
+                sm_value = float(sm_util)
+                if sm_value <= 1.0:
+                    sm_value *= 100.0
+                if sm_value and sm_value < 45.0:
+                    add("low_sm_utilization", "improve_sm_utilization", "improve_throughput")
+            except (TypeError, ValueError):
+                pass
+            memory_util = data.get("avg_memory_utilization") or data.get("peak_vram_utilization_pct")
+            try:
+                memory_value = float(memory_util)
+                if memory_value <= 1.0:
+                    memory_value *= 100.0
+                if memory_value > 85.0:
+                    add("high_vram_pressure", "reduce_vram", "avoid_oom")
+            except (TypeError, ValueError):
+                pass
+        if not symptoms and not matched_profiles:
+            add("insufficient_graph_evidence", "improve_throughput")
+        return {"profile_symptoms": symptoms, "optimization_targets": targets}
+
+    def get_profile_evidence(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
+        design_context = self.get_job_design_context(candidate=candidate, limit=limit)
+        matched_profiles = list(design_context.get("matched_profiles") or [])
+        exact_reasons = {"signature_exact", "model_key_exact"}
+        exact_profiles = [entry for entry in matched_profiles if entry.get("match_reason") in exact_reasons]
+        similar_profiles = [entry for entry in matched_profiles if entry.get("match_reason") not in exact_reasons]
+        packed_profiles = self._packed_profiles_for_candidate(self._normalized_job_design_candidate(candidate), limit=limit)
+        evidence_refs = list(design_context.get("evidence_refs") or [])
+        evidence_refs.extend(entry["ref"] for entry in packed_profiles if entry.get("ref"))
+        return {
+            "hardware_context": design_context.get("hardware_context"),
+            "graph_evidence": {
+                "exact_profiles": exact_profiles,
+                "similar_profiles": similar_profiles,
+                "packed_profiles": packed_profiles,
+            },
+            "runtime_estimate": design_context.get("runtime_estimate"),
+            "batch_size_recommendation": design_context.get("batch_size_recommendation"),
+            "epoch_recommendation": design_context.get("epoch_recommendation"),
+            "scheduler_guidance": design_context.get("scheduler_guidance"),
+            "risk_flags": list(design_context.get("risk_flags") or []),
+            "derived_diagnosis": self._derive_diagnosis(
+                self._normalized_job_design_candidate(candidate),
+                matched_profiles=matched_profiles,
+                risk_flags=list(design_context.get("risk_flags") or []),
+            ),
+            "evidence_refs": evidence_refs,
+            "confidence": design_context.get("confidence", 0.0),
+            "legacy_job_design_context": design_context,
+        }
+
     def get_job_design_context(self, *, candidate: dict[str, Any], limit: int = 5) -> dict[str, Any]:
         # Aggregate all scheduling-relevant evidence into one response instead
         # of making future agent integrations orchestrate several low-level MCP

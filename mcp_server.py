@@ -46,6 +46,10 @@ def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
         return client.get_job_design_context(candidate=candidate, limit=limit)
 
     @server.tool()
+    def get_profile_evidence(candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
+        return client.get_profile_evidence(candidate=candidate, limit=limit)
+
+    @server.tool()
     def search_profiles(
         model_name: str | None = None,
         hardware: str | None = None,
@@ -122,6 +126,36 @@ def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
     @server.tool()
     def search_profile_summaries(query: str, limit: int = 20) -> list[dict[str, Any]]:
         return client.search_profile_summaries(query=query, limit=limit)
+
+    @server.tool()
+    def search_code_knowledge(
+        query: str,
+        filters: dict[str, Any] | None = None,
+        record_types: list[str] | None = None,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        return client.search_code_knowledge(
+            query=query,
+            filters=filters or {},
+            record_types=record_types,
+            limit=limit,
+        )
+
+    @server.tool()
+    def get_code_optimization_context(
+        candidate: dict[str, Any],
+        graph_context: dict[str, Any] | None = None,
+        limit: int = 8,
+    ) -> dict[str, Any]:
+        return client.get_code_optimization_context(
+            candidate=candidate,
+            graph_context=graph_context,
+            limit=limit,
+        )
+
+    @server.tool()
+    def get_optimization_context(candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
+        return client.get_optimization_context(candidate=candidate, limit=limit)
 
     @server.tool()
     def search_hardware_features(

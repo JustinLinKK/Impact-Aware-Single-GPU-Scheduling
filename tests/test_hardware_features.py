@@ -8,6 +8,7 @@ import unittest
 import numpy as np
 
 from localml_scheduler.config import SchedulerConfig
+from localml_scheduler.code_knowledge import CodeKnowledgeStore, convert_hardware_feature_records, validate_code_knowledge_record
 from localml_scheduler.hardware_features import load_seed_records, validate_feature_record
 from localml_scheduler.hardware_features.records import HardwareFeatureRecordError
 from localml_scheduler.hardware_features.store import HardwareFeatureStore
@@ -188,6 +189,67 @@ class HardwareFeatureStoreTest(unittest.TestCase):
         self.assertTrue(all(str(result["record_id"]).startswith("nvidia.blackwell") for result in results))
         self.assertTrue(any(result["hardware_match"]["matched"] for result in results))
         self.assertIn("recommended_patterns", results[0])
+
+
+class CodeKnowledgeStoreTest(unittest.TestCase):
+    def _store(self):
+        settings = SchedulerConfig(runtime_root=tempfile.mkdtemp())
+        fake_client = _FakeQdrantClient()
+        store = CodeKnowledgeStore(
+            settings,
+            qdrant_client=fake_client,
+            qdrant_models=_FakeModels,
+            embedding_model=_FakeEmbeddingModel(),
+        )
+        return store, fake_client
+
+    def test_hardware_feature_records_convert_to_code_knowledge(self) -> None:
+        records = convert_hardware_feature_records([load_seed_records()[0]])
+
+        self.assertGreaterEqual(len(records), 1)
+        self.assertTrue(all(record["record_type"] in {"code_doc_chunks", "optimization_recipe_chunks"} for record in records))
+        self.assertTrue(any(record["record_type"] == "code_doc_chunks" for record in records))
+
+    def test_code_knowledge_validation_accepts_recipe(self) -> None:
+        record = validate_code_knowledge_record(
+            {
+                "schema_version": "optimization_recipe_chunk_v1",
+                "recipe_id": "recipe.test.amp",
+                "title": "Use AMP for low SM utilization",
+                "problem_statement": "FP32 training has low SM utilization.",
+                "solution_summary": "Use torch.amp.autocast.",
+                "text": "Wrap forward and loss with autocast.",
+                "technology_keys": ["pytorch_amp"],
+                "hardware_feature_keys": ["tensor_core"],
+                "optimization_targets": ["improve_throughput"],
+                "profile_symptoms": ["low_sm_utilization"],
+                "recommended_patterns": ["Use torch.amp.autocast."],
+                "avoid_patterns": [],
+                "confidence": 0.8,
+            }
+        )
+
+        self.assertEqual(record["record_type"], "optimization_recipe_chunks")
+        self.assertEqual(record["record_id"], "recipe.test.amp")
+
+    def test_code_knowledge_store_uses_three_physical_collections(self) -> None:
+        store, fake_client = self._store()
+        records = convert_hardware_feature_records(load_seed_records()[:1])
+
+        ingest = store.ingest_records(records, recreate=True)
+        results = store.search(
+            query="pytorch training tensor core optimization",
+            filters={"framework": "pytorch"},
+            record_types=["code_doc_chunks", "optimization_recipe_chunks", "api_symbol_chunks"],
+            limit=8,
+        )
+
+        self.assertTrue(ingest["ok"])
+        self.assertIn("code_doc_chunks", fake_client.collections)
+        self.assertIn("optimization_recipe_chunks", fake_client.collections)
+        self.assertIn("api_symbol_chunks", fake_client.collections)
+        self.assertGreaterEqual(len(results), 1)
+        self.assertTrue(all(result["record_type"] in {"code_doc_chunks", "optimization_recipe_chunks"} for result in results))
 
 
 if __name__ == "__main__":

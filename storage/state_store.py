@@ -46,23 +46,22 @@ class _MirrorStateStore:
 
     def save_job(self, job):
         result = self._primary.save_job(job)
-        self._mirror_call("save_job", job)
+        self._mirror_call("record_scheduler_job_evidence", job)
         return result
 
     def submit_job(self, job):
         result = self._primary.submit_job(job)
-        self._mirror_call("save_job", result)
-        self._mirror_call("log_event", "job_submitted", job_id=result.job_id, payload={"priority": result.priority})
+        self._mirror_call("record_scheduler_job_evidence", result)
         return result
 
     def update_job(self, *args: Any, **kwargs: Any):
         result = self._primary.update_job(*args, **kwargs)
-        self._mirror_call("save_job", result)
+        self._mirror_call("record_scheduler_job_evidence", result)
         return result
 
     def set_job_status(self, *args: Any, **kwargs: Any):
         result = self._primary.set_job_status(*args, **kwargs)
-        self._mirror_call("save_job", result)
+        self._mirror_call("record_scheduler_job_evidence", result)
         return result
 
     def delete_job(self, job_id: str) -> None:
@@ -71,44 +70,41 @@ class _MirrorStateStore:
 
     def log_event(self, event_type: str, *, job_id: str | None = None, payload: dict[str, Any] | None = None) -> None:
         self._primary.log_event(event_type, job_id=job_id, payload=payload)
-        self._mirror_call("log_event", event_type, job_id=job_id, payload=payload)
 
     def record_checkpoint(self, job_id: str, checkpoint_path: str, metadata: dict[str, Any] | None = None) -> None:
         self._primary.record_checkpoint(job_id, checkpoint_path, metadata=metadata)
-        self._mirror_call("record_checkpoint", job_id, checkpoint_path, metadata=metadata)
 
     def update_cache_metadata(self, *args: Any, **kwargs: Any) -> None:
         self._primary.update_cache_metadata(*args, **kwargs)
-        self._mirror_call("update_cache_metadata", *args, **kwargs)
 
     def upsert_solo_profile(self, profile):
         result = self._primary.upsert_solo_profile(profile)
-        self._mirror_call("upsert_solo_profile", result)
+        self._mirror_call("record_solo_profile_evidence", result)
         return result
 
     def upsert_pair_profile(self, profile):
         result = self._primary.upsert_pair_profile(profile)
-        self._mirror_call("upsert_pair_profile", result)
+        self._mirror_call("record_pair_profile_evidence", result)
         return result
 
     def upsert_runtime_profile(self, profile):
         result = self._primary.upsert_runtime_profile(profile)
-        self._mirror_call("upsert_runtime_profile", result)
+        self._mirror_call("record_runtime_profile_evidence", result)
         return result
 
     def upsert_batch_probe_profile(self, profile):
         result = self._primary.upsert_batch_probe_profile(profile)
-        self._mirror_call("upsert_batch_probe_profile", result)
+        self._mirror_call("record_batch_probe_evidence", result)
         return result
 
     def upsert_batch_size_observation(self, observation):
         result = self._primary.upsert_batch_size_observation(observation)
-        self._mirror_call("upsert_batch_size_observation", result)
+        self._mirror_call("record_batch_size_observation_evidence", result)
         return result
 
     def upsert_combination_profile(self, profile):
         result = self._primary.upsert_combination_profile(profile)
-        self._mirror_call("upsert_combination_profile", result)
+        self._mirror_call("record_combination_profile_evidence", result)
         return result
 
     def mark_pair_incompatible(self, *args: Any, **kwargs: Any):
@@ -143,26 +139,20 @@ class StateStore:
         if mode == "off":
             return primary_sqlite
 
-        if mode == "mirror":
-            try:
-                mirror = self._build_graph_backend()
-            except Exception as exc:
-                LOGGER.warning("Graph mirror backend unavailable; continuing with SQLite primary only: %s", exc)
-                return primary_sqlite
-            if mirror is None:
-                return primary_sqlite
-            return _MirrorStateStore(primary_sqlite, mirror)
-
+        # SQLite remains the scheduler control-plane source of truth. When the
+        # graph is enabled, Neo4j is used only as a best-effort evidence mirror
+        # for measured profiles and terminal job outcomes, even if legacy
+        # configs still say graph_db.mode=primary.
         try:
-            graph_backend = self._build_graph_backend()
+            mirror = self._build_graph_backend()
         except Exception as exc:
             if not graph_settings.allow_legacy_fallback:
                 raise
-            LOGGER.warning("Graph primary backend unavailable; falling back to SQLite runtime store: %s", exc)
+            LOGGER.warning("Graph evidence mirror unavailable; continuing with SQLite primary only: %s", exc)
             return primary_sqlite
-        if graph_backend is None:
+        if mirror is None:
             return primary_sqlite
-        return graph_backend
+        return _MirrorStateStore(primary_sqlite, mirror)
 
     @property
     def backend(self):

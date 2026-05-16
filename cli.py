@@ -17,8 +17,10 @@ from .mcp_server import run_stdio as run_mcp_stdio
 app = typer.Typer(help="Local single-GPU ML job scheduler")
 scheduler_app = typer.Typer(help="Scheduler process commands")
 hardware_features_app = typer.Typer(help="Hardware feature vector database commands")
+code_knowledge_app = typer.Typer(help="Code-knowledge vector database commands")
 app.add_typer(scheduler_app, name="scheduler")
 app.add_typer(hardware_features_app, name="hardware-features")
+app.add_typer(code_knowledge_app, name="code-knowledge")
 
 
 def _build_client(settings_path: str | None) -> SchedulerClient:
@@ -41,6 +43,17 @@ def scheduler_mcp(settings: str | None = typer.Option(None, "--settings", help="
     run_mcp_stdio(settings)
 
 
+@scheduler_app.command("rebuild-evidence-graph")
+def scheduler_rebuild_evidence_graph(
+    settings: str | None = typer.Option(None, "--settings", help="Path to scheduler YAML config"),
+    dry_run: bool = typer.Option(True, "--dry-run/--execute", help="Preview writes by default; use --execute to write to Neo4j"),
+    wipe: bool = typer.Option(False, "--wipe/--no-wipe", help="Explicitly wipe Neo4j before rebuilding; ignored during dry-run"),
+) -> None:
+    client = _build_client(settings)
+    result = client.rebuild_evidence_graph(dry_run=dry_run, wipe=(wipe and not dry_run))
+    typer.echo(json.dumps(result, indent=2, sort_keys=True))
+
+
 @hardware_features_app.command("ingest")
 def hardware_features_ingest(
     settings: str | None = typer.Option(None, "--settings", help="Path to scheduler YAML config"),
@@ -50,6 +63,18 @@ def hardware_features_ingest(
 ) -> None:
     client = _build_client(settings)
     result = client.ingest_hardware_features(source=source, recreate=recreate, dry_run=dry_run)
+    typer.echo(json.dumps(result, indent=2, sort_keys=True))
+
+
+@code_knowledge_app.command("ingest")
+def code_knowledge_ingest(
+    settings: str | None = typer.Option(None, "--settings", help="Path to scheduler YAML config"),
+    source: Path | None = typer.Option(None, "--source", help="YAML code-knowledge corpus to ingest; defaults to converted hardware-feature seed records"),
+    recreate: bool = typer.Option(False, "--recreate/--no-recreate", help="Recreate Qdrant collections before ingesting"),
+    dry_run: bool = typer.Option(False, "--dry-run/--no-dry-run", help="Validate and summarize records without writing to Qdrant"),
+) -> None:
+    client = _build_client(settings)
+    result = client.ingest_code_knowledge(source=source, recreate=recreate, dry_run=dry_run)
     typer.echo(json.dumps(result, indent=2, sort_keys=True))
 
 

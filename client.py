@@ -46,6 +46,7 @@ class SchedulerClient:
         self.store = StateStore(self.settings)
         self.knowledge = SchedulerKnowledgeBase(self.store)
         self._hardware_feature_store = None
+        self._code_knowledge_store = None
 
     def create_engine(self):
         from .engine import SchedulerEngine
@@ -258,12 +259,62 @@ class SchedulerClient:
     def record_tuning_outcome(self, **kwargs: Any) -> dict[str, Any]:
         return self.knowledge.record_tuning_outcome(**kwargs)
 
+    def rebuild_evidence_graph(self, *, dry_run: bool = True, wipe: bool = False) -> dict[str, Any]:
+        jobs = [job for job in self.store.list_jobs() if job.status.is_terminal]
+        solo_profiles = list(self.store.list_solo_profiles()) if hasattr(self.store, "list_solo_profiles") else []
+        pair_profiles = list(self.store.list_pair_profiles()) if hasattr(self.store, "list_pair_profiles") else []
+        runtime_profiles = list(self.store.list_runtime_profiles()) if hasattr(self.store, "list_runtime_profiles") else []
+        batch_probe_profiles = list(self.store.list_batch_probe_profiles()) if hasattr(self.store, "list_batch_probe_profiles") else []
+        batch_size_observations = list(self.store.list_batch_size_observations()) if hasattr(self.store, "list_batch_size_observations") else []
+        combination_profiles = list(self.store.list_combination_profiles()) if hasattr(self.store, "list_combination_profiles") else []
+        counts = {
+            "terminal_jobs": len(jobs),
+            "solo_profiles": len(solo_profiles),
+            "pair_profiles": len(pair_profiles),
+            "runtime_profiles": len(runtime_profiles),
+            "batch_probe_profiles": len(batch_probe_profiles),
+            "batch_size_observations": len(batch_size_observations),
+            "combination_profiles": len(combination_profiles),
+        }
+        if dry_run:
+            return {"ok": True, "dry_run": True, "would_write": counts, "wipe": False}
+        from .storage.neo4j_store import Neo4jStateStore
+
+        target = getattr(self.store, "mirror_backend", None)
+        if target is None or not isinstance(target, Neo4jStateStore):
+            target = Neo4jStateStore(self.settings)
+        if wipe:
+            target._run_write("MATCH (n) DETACH DELETE n")
+            target._apply_constraints()
+        for job in jobs:
+            target.record_scheduler_job_evidence(job)
+        for profile in solo_profiles:
+            target.record_solo_profile_evidence(profile)
+        for profile in pair_profiles:
+            target.record_pair_profile_evidence(profile)
+        for profile in runtime_profiles:
+            target.record_runtime_profile_evidence(profile)
+        for profile in batch_probe_profiles:
+            target.record_batch_probe_evidence(profile)
+        for observation in batch_size_observations:
+            target.record_batch_size_observation_evidence(observation)
+        for profile in combination_profiles:
+            target.record_combination_profile_evidence(profile)
+        return {"ok": True, "dry_run": False, "written": counts, "wipe": bool(wipe)}
+
     def _feature_store(self):
         if self._hardware_feature_store is None:
             from .hardware_features import HardwareFeatureStore
 
             self._hardware_feature_store = HardwareFeatureStore(self.settings)
         return self._hardware_feature_store
+
+    def _code_store(self):
+        if self._code_knowledge_store is None:
+            from .code_knowledge import CodeKnowledgeStore
+
+            self._code_knowledge_store = CodeKnowledgeStore(self.settings)
+        return self._code_knowledge_store
 
     def ingest_hardware_features(
         self,
@@ -273,6 +324,153 @@ class SchedulerClient:
         dry_run: bool = False,
     ) -> dict[str, Any]:
         return self._feature_store().ingest_source(source, recreate=recreate, dry_run=dry_run)
+
+    def ingest_code_knowledge(
+        self,
+        *,
+        source: str | Path | None = None,
+        recreate: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        return self._code_store().ingest_source(source, recreate=recreate, dry_run=dry_run)
+
+    def get_profile_evidence(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
+        return self.knowledge.get_profile_evidence(candidate=candidate, limit=limit)
+
+    def search_code_knowledge(
+        self,
+        *,
+        query: str,
+        filters: dict[str, Any] | None = None,
+        record_types: list[str] | None = None,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        return self._code_store().search(
+            query=query,
+            filters=filters or {},
+            record_types=record_types,
+            limit=limit,
+        )
+
+    def _vector_filters_from_context(
+        self,
+        candidate: dict[str, Any],
+        graph_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        hardware_context = graph_context.get("hardware_context") or {}
+        hardware = hardware_context.get("hardware") or {}
+        diagnosis = graph_context.get("derived_diagnosis") or {}
+        filters: dict[str, Any] = {
+            "framework": str(candidate.get("framework") or "pytorch"),
+        }
+        if candidate.get("model_family") or candidate.get("packing_family"):
+            filters["model_families"] = candidate.get("model_family") or candidate.get("packing_family")
+        if candidate.get("workload_type") or candidate.get("task_type"):
+            filters["workload_types"] = candidate.get("workload_type") or candidate.get("task_type")
+        if diagnosis.get("profile_symptoms"):
+            filters["profile_symptoms"] = list(diagnosis["profile_symptoms"])
+        if diagnosis.get("optimization_targets"):
+            filters["optimization_targets"] = list(diagnosis["optimization_targets"])
+        hardware_features = list((hardware.get("technology_keys") or []))
+        if not hardware_features and hardware.get("compute_capability"):
+            hardware_features.append(f"cuda_capability_{str(hardware['compute_capability']).replace('.', '')}")
+        if hardware_features:
+            filters["hardware_feature_keys"] = hardware_features
+        return {key: value for key, value in filters.items() if value}
+
+    def _code_query_from_context(self, candidate: dict[str, Any], graph_context: dict[str, Any]) -> str:
+        diagnosis = graph_context.get("derived_diagnosis") or {}
+        parts = [
+            str(candidate.get("framework") or "pytorch"),
+            str(candidate.get("model_family") or candidate.get("packing_family") or ""),
+            str(candidate.get("workload_type") or candidate.get("task_type") or ""),
+            " ".join(diagnosis.get("profile_symptoms") or []),
+            " ".join(diagnosis.get("optimization_targets") or []),
+            "training optimization code batch size precision throughput vram",
+        ]
+        return " ".join(part for part in parts if part.strip())
+
+    def get_code_optimization_context(
+        self,
+        *,
+        candidate: dict[str, Any],
+        graph_context: dict[str, Any] | None = None,
+        limit: int = 8,
+    ) -> dict[str, Any]:
+        graph_context = graph_context or self.get_profile_evidence(candidate=candidate, limit=limit)
+        query = self._code_query_from_context(candidate, graph_context)
+        filters = self._vector_filters_from_context(candidate, graph_context)
+        results = self.search_code_knowledge(
+            query=query,
+            filters=filters,
+            record_types=["optimization_recipe_chunks", "code_doc_chunks", "api_symbol_chunks"],
+            limit=limit,
+        )
+        if not results and filters:
+            relaxed_filters = {"framework": filters.get("framework", "pytorch")}
+            results = self.search_code_knowledge(
+                query=query,
+                filters=relaxed_filters,
+                record_types=["optimization_recipe_chunks", "code_doc_chunks", "api_symbol_chunks"],
+                limit=limit,
+            )
+        recipes = [item for item in results if item.get("record_type") == "optimization_recipe_chunks"]
+        docs = [item for item in results if item.get("record_type") == "code_doc_chunks"]
+        api_symbols = [item for item in results if item.get("record_type") == "api_symbol_chunks"]
+        return {
+            "found": bool(results),
+            "query": query,
+            "filters": filters,
+            "vector_evidence": {
+                "recipes": recipes,
+                "docs": docs,
+                "api_symbols": api_symbols,
+            },
+            "evidence_refs": [
+                f"code_knowledge:{item.get('record_type')}:{item.get('record_id')}"
+                for item in results
+                if item.get("record_id")
+            ],
+        }
+
+    def get_optimization_context(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
+        graph_context = self.get_profile_evidence(candidate=candidate, limit=limit)
+        code_context = self.get_code_optimization_context(candidate=candidate, graph_context=graph_context, limit=limit)
+        recommendations: list[str] = []
+        risks: list[str] = list(graph_context.get("risk_flags") or [])
+        batch_recommendation = graph_context.get("batch_size_recommendation") or {}
+        if batch_recommendation.get("found") and batch_recommendation.get("recommended_batch_size") is not None:
+            recommendations.append(f"Use graph-recommended physical batch size {batch_recommendation['recommended_batch_size']} as the starting point.")
+        epoch_recommendation = graph_context.get("epoch_recommendation") or {}
+        if epoch_recommendation.get("found") and epoch_recommendation.get("recommended_epochs") is not None:
+            recommendations.append(f"Use historical epoch budget {epoch_recommendation['recommended_epochs']} unless the agent has a scoring reason to differ.")
+        vector_evidence = code_context.get("vector_evidence") or {}
+        for item in (vector_evidence.get("recipes") or []) + (vector_evidence.get("docs") or []):
+            for pattern in item.get("recommended_patterns") or []:
+                if pattern not in recommendations:
+                    recommendations.append(pattern)
+            for pattern in item.get("avoid_patterns") or []:
+                if pattern not in risks:
+                    risks.append(pattern)
+        graph_confidence = float(graph_context.get("confidence") or 0.0)
+        vector_confidences = [
+            float(item.get("confidence"))
+            for group in vector_evidence.values()
+            for item in (group or [])
+            if item.get("confidence") is not None
+        ]
+        vector_confidence = max(vector_confidences) if vector_confidences else 0.0
+        confidence = round(max(graph_confidence, vector_confidence), 3)
+        return {
+            "hardware_context": graph_context.get("hardware_context"),
+            "graph_evidence": graph_context.get("graph_evidence") or {"exact_profiles": [], "similar_profiles": [], "packed_profiles": []},
+            "derived_diagnosis": graph_context.get("derived_diagnosis") or {"profile_symptoms": [], "optimization_targets": []},
+            "vector_evidence": vector_evidence,
+            "recommendations": recommendations[: max(1, int(limit))],
+            "risk_flags": risks,
+            "evidence_refs": list(graph_context.get("evidence_refs") or []) + list(code_context.get("evidence_refs") or []),
+            "confidence": confidence,
+        }
 
     def search_hardware_features(
         self,
@@ -285,6 +483,18 @@ class SchedulerClient:
         framework: str | None = "pytorch",
         limit: int = 8,
     ) -> list[dict[str, Any]]:
+        # Deprecated compatibility wrapper. Prefer search_code_knowledge(...).
+        filters: dict[str, Any] = {"framework": framework}
+        if workload_type:
+            filters["workload_types"] = workload_type
+        matches = self.search_code_knowledge(
+            query=query,
+            filters=filters,
+            record_types=["code_doc_chunks", "optimization_recipe_chunks"],
+            limit=limit,
+        )
+        if matches:
+            return matches
         hardware_context = self.get_hardware_context(hardware_key, include_scheduler_limits=True)
         return self._feature_store().search(
             query=query,
@@ -305,6 +515,7 @@ class SchedulerClient:
         framework: str | None = "pytorch",
         limit: int = 8,
     ) -> dict[str, Any]:
+        # Deprecated compatibility wrapper. Prefer get_code_optimization_context(...).
         hardware_context = self.get_hardware_context(hardware_key, include_scheduler_limits=True)
         hardware = hardware_context.get("hardware") or {}
         query_parts = [
@@ -316,63 +527,52 @@ class SchedulerClient:
             "training optimization precision memory dataloader checkpointing",
         ]
         query = " ".join(part for part in query_parts if part.strip())
-        matches = self._feature_store().search(
+        matches = self.search_code_knowledge(
             query=query,
-            hardware_context=hardware_context,
-            workload_type=workload_type,
-            framework=framework,
+            filters={
+                "framework": framework,
+                "workload_types": workload_type,
+                "model_families": model_family,
+            },
+            record_types=["code_doc_chunks", "optimization_recipe_chunks"],
             limit=limit,
         )
+        if not matches:
+            matches = self._feature_store().search(
+                query=query,
+                hardware_context=hardware_context,
+                workload_type=workload_type,
+                framework=framework,
+                limit=limit,
+            )
         return {
             "found": bool(matches),
             "hardware_context": hardware_context,
             "query": query,
             "matches": matches,
-            "evidence_refs": [f"hardware_feature:{match['record_id']}" for match in matches if match.get("record_id")],
+            "evidence_refs": [f"code_knowledge:{match.get('record_type', 'hardware_feature')}:{match['record_id']}" for match in matches if match.get("record_id")],
         }
 
     def get_hardware_optimization_context(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
+        # Deprecated compatibility wrapper. Prefer get_optimization_context(...).
+        context = self.get_optimization_context(candidate=candidate, limit=limit)
         job_design_context = self.get_job_design_context(candidate, limit=limit)
-        feature_context = self.get_hardware_feature_context(
-            hardware_key="current",
-            workload_type=candidate.get("workload_type") or candidate.get("task_type"),
-            model_family=candidate.get("model_family") or candidate.get("packing_family"),
-            framework=str(candidate.get("framework") or "pytorch"),
-            limit=limit,
-        )
-        recommendations: list[str] = []
-        batch_recommendation = job_design_context.get("batch_size_recommendation") or {}
-        if batch_recommendation.get("found") and batch_recommendation.get("recommended_batch_size") is not None:
-            recommendations.append(f"Use graph-recommended batch size {batch_recommendation['recommended_batch_size']} as the starting physical batch size.")
-        epoch_recommendation = job_design_context.get("epoch_recommendation") or {}
-        if epoch_recommendation.get("found") and epoch_recommendation.get("recommended_epochs") is not None:
-            recommendations.append(f"Use historical epoch recommendation {epoch_recommendation['recommended_epochs']} as the initial epoch budget.")
-        risk_notes = list(job_design_context.get("risk_flags") or [])
-        for match in feature_context.get("matches") or []:
-            for pattern in match.get("recommended_patterns") or []:
-                if pattern not in recommendations:
-                    recommendations.append(pattern)
-            for pattern in match.get("avoid_patterns") or []:
-                if pattern not in risk_notes:
-                    risk_notes.append(pattern)
-        evidence_refs = list(job_design_context.get("evidence_refs") or [])
-        evidence_refs.extend(feature_context.get("evidence_refs") or [])
-        feature_confidences = [
-            float(match.get("confidence"))
-            for match in feature_context.get("matches") or []
-            if match.get("confidence") is not None
-        ]
-        graph_confidence = float(job_design_context.get("confidence") or 0.0)
-        feature_confidence = max(feature_confidences) if feature_confidences else 0.0
-        confidence = round(max(graph_confidence, feature_confidence), 3)
+        feature_context = {
+            "found": any(context.get("vector_evidence", {}).values()),
+            "matches": (
+                list(context.get("vector_evidence", {}).get("recipes") or [])
+                + list(context.get("vector_evidence", {}).get("docs") or [])
+                + list(context.get("vector_evidence", {}).get("api_symbols") or [])
+            ),
+        }
         return {
-            "hardware_context": job_design_context.get("hardware_context"),
+            "hardware_context": context.get("hardware_context"),
             "job_design_context": job_design_context,
             "feature_context": feature_context,
-            "combined_recommendations": recommendations[: max(1, int(limit))],
-            "risk_notes": risk_notes,
-            "evidence_refs": evidence_refs,
-            "confidence": confidence,
+            "combined_recommendations": context.get("recommendations", []),
+            "risk_notes": context.get("risk_flags", []),
+            "evidence_refs": context.get("evidence_refs", []),
+            "confidence": context.get("confidence", 0.0),
         }
 
     def dump_jobs_json(self) -> str:

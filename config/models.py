@@ -309,6 +309,9 @@ class HardwareFeatureDBSettings:
     url: str = "http://127.0.0.1:6333"
     api_key_env: str = "LOCALML_SCHEDULER_QDRANT_API_KEY"
     collection_name: str = "hardware_feature_knowledge"
+    code_doc_collection_name: str = "code_doc_chunks"
+    optimization_recipe_collection_name: str = "optimization_recipe_chunks"
+    api_symbol_collection_name: str = "api_symbol_chunks"
     embedding_model_type: str = "local"
     embedding_model_name: str = "BAAI/bge-base-en-v1.5"
     embedding_device: str = "cpu"
@@ -320,6 +323,9 @@ class HardwareFeatureDBSettings:
         self.url = str(self.url or "http://127.0.0.1:6333").strip()
         self.api_key_env = str(self.api_key_env or "LOCALML_SCHEDULER_QDRANT_API_KEY").strip()
         self.collection_name = str(self.collection_name or "hardware_feature_knowledge").strip()
+        self.code_doc_collection_name = str(self.code_doc_collection_name or "code_doc_chunks").strip()
+        self.optimization_recipe_collection_name = str(self.optimization_recipe_collection_name or "optimization_recipe_chunks").strip()
+        self.api_symbol_collection_name = str(self.api_symbol_collection_name or "api_symbol_chunks").strip()
         self.embedding_model_type = str(self.embedding_model_type or "local").strip().lower()
         self.embedding_model_name = str(self.embedding_model_name or "BAAI/bge-base-en-v1.5").strip()
         self.embedding_device = str(self.embedding_device or "cpu").strip().lower()
@@ -336,6 +342,9 @@ class HardwareFeatureDBSettings:
             "url": self.url,
             "api_key_env": self.api_key_env,
             "collection_name": self.collection_name,
+            "code_doc_collection_name": self.code_doc_collection_name,
+            "optimization_recipe_collection_name": self.optimization_recipe_collection_name,
+            "api_symbol_collection_name": self.api_symbol_collection_name,
             "embedding_model_type": self.embedding_model_type,
             "embedding_model_name": self.embedding_model_name,
             "embedding_device": self.embedding_device,

@@ -57,30 +57,34 @@ python -m localml_scheduler.examples.demo_submit_jobs
 python -m localml_scheduler.examples.demo_mlevolve_bridge
 ```
 
-## MCP Graph Surface
+## MCP Graph/Vector Surface
 
-`localml_scheduler.mcp_server` exposes a small stdio MCP server for graph-backed
-read/query access. The original tuning-oriented tools remain available, and the
-read-only aggregate tools below are intended to be the stable contract for
-future agent-side integration:
+`localml_scheduler.mcp_server` exposes a stdio MCP server for hardware-aware
+agent context. SQLite remains the scheduler control-plane source of truth;
+Neo4j stores measured evidence, and Qdrant stores code knowledge.
 
-- `search_hardware(query=None, limit=10)` for current and observed hardware inventory
-- `get_hardware_context(hardware_key="current", include_scheduler_limits=True)` for hardware, toolkit, backend, and scheduler-limit context
-- `get_job_design_context(candidate, limit=5)` for future-facing hardware/profile evidence aggregation around a proposed job design
-- `search_hardware_features(...)` for Qdrant-backed hardware capability and coding-pattern retrieval
-- `get_hardware_feature_context(...)` for a compact hardware feature brief around the current accelerator and workload
-- `get_hardware_optimization_context(candidate, limit=8)` for combined scheduler graph evidence plus hardware feature vector retrieval
+Preferred read-only tools for agent integration:
 
-The new aggregate tools are read-only. They summarize graph evidence and
-config-derived scheduler limits, but they do not mutate jobs, profiles, or
-event history.
+- `get_optimization_context(candidate, limit=8)` combines hardware context,
+  graph evidence, derived symptoms, vector evidence, recommendations, risks,
+  refs, and confidence.
+- `get_profile_evidence(candidate, limit=8)` returns graph-only evidence from
+  `SingleJob`, `PackedJob`, and `PackedJobMember`-style profiles.
+- `search_code_knowledge(query, filters, record_types, limit=8)` searches
+  Qdrant code docs, optimization recipes, and API-symbol chunks.
+- `get_code_optimization_context(candidate, graph_context=None, limit=8)`
+  bridges graph-derived symptoms into vector retrieval.
 
-The hardware feature tools use Qdrant as an external vector service. For local
-development, start Qdrant and ingest the repo-curated seed corpus:
+Compatibility wrappers such as `get_job_design_context(...)`,
+`search_hardware_features(...)`, `get_hardware_feature_context(...)`, and
+`get_hardware_optimization_context(...)` remain available for older callers.
+
+For local development, start Qdrant and ingest the repo-curated seed corpus as
+code knowledge:
 
 ```bash
 docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant
-python -m localml_scheduler.cli hardware-features ingest --settings localml_scheduler/configs/scheduler.example.yaml
+python -m localml_scheduler.cli code-knowledge ingest --settings localml_scheduler/configs/scheduler.example.yaml
 ```
 
 Use `--dry-run` to validate and summarize the seed records without writing to

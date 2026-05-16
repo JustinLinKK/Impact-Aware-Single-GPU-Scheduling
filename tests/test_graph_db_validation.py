@@ -380,9 +380,9 @@ class GraphDatabaseValidationTest(unittest.TestCase):
 
             self.assertIsInstance(store.backend, LegacySQLiteStateStore)
             self.assertEqual(store.get_job(submitted.job_id).job_id, submitted.job_id)
-            mirror.save_job.assert_called()
-            mirror.log_event.assert_called_once_with("job_submitted", job_id=submitted.job_id, payload={"priority": submitted.priority})
-            mirror.upsert_batch_probe_profile.assert_called_once()
+            mirror.record_scheduler_job_evidence.assert_called()
+            mirror.log_event.assert_not_called()
+            mirror.record_batch_probe_evidence.assert_called_once()
 
     def test_state_store_mirror_mode_degrades_to_sqlite_when_graph_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -393,15 +393,12 @@ class GraphDatabaseValidationTest(unittest.TestCase):
                 store = StateStore(settings)
             self.assertIsInstance(store.backend, LegacySQLiteStateStore)
 
-    def test_legacy_sqlite_import_bootstraps_graph_records(self) -> None:
+    def test_legacy_sqlite_import_bootstraps_evidence_records_only(self) -> None:
         driver = _FakeNeo4jDriver()
         graph_database = SimpleNamespace(driver=lambda uri, auth=None: driver)
         imported: dict[str, list[object]] = {
             "jobs": [],
-            "commands": [],
-            "events": [],
-            "checkpoints": [],
-            "cache": [],
+            "batch_probe": [],
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = os.path.join(tmpdir, "runtime")
@@ -465,34 +462,20 @@ class GraphDatabaseValidationTest(unittest.TestCase):
             def _record_job(self, job: TrainingJob) -> None:
                 imported["jobs"].append(job)
 
-            def _record_command(self, **kwargs) -> None:
-                imported["commands"].append(kwargs)
-
-            def _record_event(self, **kwargs) -> None:
-                imported["events"].append(kwargs)
-
-            def _record_checkpoint(self, **kwargs) -> None:
-                imported["checkpoints"].append(kwargs)
-
-            def _record_cache(self, *args, **kwargs) -> None:
-                imported["cache"].append((args, kwargs))
+            def _record_batch_probe(self, profile: BatchProbeProfile) -> None:
+                imported["batch_probe"].append(profile)
 
             with patch("localml_scheduler.storage.neo4j_store.GraphDatabase", graph_database), patch(
                 "localml_scheduler.storage.neo4j_store.detect_hardware_profile",
                 return_value=_test_hardware_profile(),
-            ), patch.object(Neo4jStateStore, "save_job", _record_job), patch.object(
-                Neo4jStateStore, "_upsert_command", _record_command
-            ), patch.object(Neo4jStateStore, "_upsert_event", _record_event), patch.object(
-                Neo4jStateStore, "_upsert_checkpoint", _record_checkpoint
-            ), patch.object(Neo4jStateStore, "update_cache_metadata", _record_cache):
+            ), patch.object(Neo4jStateStore, "record_scheduler_job_evidence", _record_job), patch.object(
+                Neo4jStateStore, "record_batch_probe_evidence", _record_batch_probe
+            ):
                 Neo4jStateStore(settings)
 
         self.assertEqual(len(imported["jobs"]), 1)
         self.assertEqual(imported["jobs"][0].baseline_model_id, "baseline-a")
-        self.assertEqual(imported["commands"][0]["command_type"], "submit")
-        self.assertEqual(imported["events"][0]["event_type"], "job_submitted")
-        self.assertEqual(imported["checkpoints"][0]["checkpoint_path"], "/tmp/checkpoint.pt")
-        self.assertEqual(imported["cache"][0][0][0], "baseline-a")
+        self.assertEqual(imported["batch_probe"], [])
 
     def test_log_store_routes_events_and_metrics_into_expected_tables(self) -> None:
         statements: list[tuple[str, object]] = []
@@ -865,6 +848,38 @@ class GraphDatabaseValidationTest(unittest.TestCase):
             self.assertEqual(context["matched_profiles"], [])
             self.assertIn("matching_profiles_exist_for_other_hardware_only", context["risk_flags"])
 
+    def test_get_optimization_context_returns_new_agent_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api = _sqlite_client_with_test_hardware(tmpdir)
+            self._seed_job_design_evidence(api)
+
+            context = api.get_optimization_context(
+                candidate={
+                    "stage": "improve",
+                    "task_type": "vision_training",
+                    "model_key": "resnet50",
+                    "model_family": "cnn",
+                    "script_signature": "sig-resnet50",
+                    "proposed_batch_size": 64,
+                    "proposed_epochs": 4,
+                    "requires_gpu": True,
+                    "uses_amp": False,
+                    "framework": "pytorch",
+                },
+                limit=5,
+            )
+
+            self.assertTrue(context["hardware_context"]["found"])
+            self.assertIn("exact_profiles", context["graph_evidence"])
+            self.assertIn("similar_profiles", context["graph_evidence"])
+            self.assertIn("packed_profiles", context["graph_evidence"])
+            self.assertIn("precision_not_optimized", context["derived_diagnosis"]["profile_symptoms"])
+            self.assertIn("enable_tensor_core", context["derived_diagnosis"]["optimization_targets"])
+            self.assertIn("recipes", context["vector_evidence"])
+            self.assertIn("recommendations", context)
+            self.assertIn("risk_flags", context)
+            self.assertGreaterEqual(context["confidence"], 0.0)
+
     def test_new_graph_queries_are_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             api = _sqlite_client_with_test_hardware(tmpdir)
@@ -876,6 +891,19 @@ class GraphDatabaseValidationTest(unittest.TestCase):
             api.get_job_design_context(
                 candidate={"model_key": "resnet50", "script_signature": "sig-resnet50", "proposed_batch_size": 32},
                 limit=5,
+            )
+            api.get_profile_evidence(
+                candidate={"model_key": "resnet50", "script_signature": "sig-resnet50", "proposed_batch_size": 32},
+                limit=5,
+            )
+            api.search_code_knowledge(query="pytorch amp", filters={"framework": "pytorch"}, limit=3)
+            api.get_code_optimization_context(
+                candidate={"model_key": "resnet50", "script_signature": "sig-resnet50", "proposed_batch_size": 32},
+                limit=3,
+            )
+            api.get_optimization_context(
+                candidate={"model_key": "resnet50", "script_signature": "sig-resnet50", "proposed_batch_size": 32},
+                limit=3,
             )
             api.search_hardware_features(query="cuda training", limit=3)
             api.get_hardware_feature_context(workload_type="vision_training", limit=3)
@@ -899,11 +927,15 @@ class GraphDatabaseValidationTest(unittest.TestCase):
                 "get_hardware_context",
                 "get_job_design_context",
                 "search_profiles",
+                "get_profile_evidence",
                 "get_runtime_estimate",
                 "recommend_batch_size",
                 "recommend_epochs",
                 "get_packet_compatibility",
                 "search_profile_summaries",
+                "search_code_knowledge",
+                "get_code_optimization_context",
+                "get_optimization_context",
                 "search_hardware_features",
                 "get_hardware_feature_context",
                 "get_hardware_optimization_context",
