@@ -313,7 +313,14 @@ class HardwareFeatureDBSettings:
     optimization_recipe_collection_name: str = "optimization_recipe_chunks"
     api_symbol_collection_name: str = "api_symbol_chunks"
     embedding_model_type: str = "local"
-    embedding_model_name: str = "BAAI/bge-base-en-v1.5"
+    embedding_model_name: str = ""
+    embedding_dimension: int | None = None
+    embedding_api_key: str = ""
+    embedding_api_key_env: str = "OPENROUTER_API_KEY"
+    embedding_base_url: str = "https://openrouter.ai/api/v1"
+    embedding_batch_size: int = 32
+    embedding_max_retries: int = 4
+    embedding_retry_delay_seconds: float = 1.0
     embedding_device: str = "cpu"
     distance: str = "Cosine"
 
@@ -327,7 +334,26 @@ class HardwareFeatureDBSettings:
         self.optimization_recipe_collection_name = str(self.optimization_recipe_collection_name or "optimization_recipe_chunks").strip()
         self.api_symbol_collection_name = str(self.api_symbol_collection_name or "api_symbol_chunks").strip()
         self.embedding_model_type = str(self.embedding_model_type or "local").strip().lower()
-        self.embedding_model_name = str(self.embedding_model_name or "BAAI/bge-base-en-v1.5").strip()
+        if self.embedding_model_type == "openrouter":
+            self.embedding_model_name = str(self.embedding_model_name or "").strip()
+            if not self.embedding_model_name or self.embedding_model_name == "BAAI/bge-base-en-v1.5":
+                raise ValueError("hardware_feature_db.embedding_model_name is required when embedding_model_type=openrouter")
+            if self.embedding_dimension is None:
+                raise ValueError("hardware_feature_db.embedding_dimension is required when embedding_model_type=openrouter")
+            self.embedding_dimension = int(self.embedding_dimension)
+        else:
+            self.embedding_model_name = str(self.embedding_model_name or "BAAI/bge-base-en-v1.5").strip()
+            if self.embedding_dimension is not None:
+                self.embedding_dimension = int(self.embedding_dimension)
+        self.embedding_api_key = str(self.embedding_api_key or "").strip()
+        self.embedding_api_key_env = str(self.embedding_api_key_env or "OPENROUTER_API_KEY").strip()
+        self.embedding_base_url = str(self.embedding_base_url or "https://openrouter.ai/api/v1").strip().rstrip("/")
+        self.embedding_batch_size = max(1, int(32 if self.embedding_batch_size is None else self.embedding_batch_size))
+        self.embedding_max_retries = max(0, int(4 if self.embedding_max_retries is None else self.embedding_max_retries))
+        self.embedding_retry_delay_seconds = max(
+            0.0,
+            float(1.0 if self.embedding_retry_delay_seconds is None else self.embedding_retry_delay_seconds),
+        )
         self.embedding_device = str(self.embedding_device or "cpu").strip().lower()
         self.distance = str(self.distance or "Cosine").strip()
 
@@ -347,6 +373,13 @@ class HardwareFeatureDBSettings:
             "api_symbol_collection_name": self.api_symbol_collection_name,
             "embedding_model_type": self.embedding_model_type,
             "embedding_model_name": self.embedding_model_name,
+            "embedding_dimension": self.embedding_dimension,
+            "embedding_api_key": "",
+            "embedding_api_key_env": self.embedding_api_key_env,
+            "embedding_base_url": self.embedding_base_url,
+            "embedding_batch_size": self.embedding_batch_size,
+            "embedding_max_retries": self.embedding_max_retries,
+            "embedding_retry_delay_seconds": self.embedding_retry_delay_seconds,
             "embedding_device": self.embedding_device,
             "distance": self.distance,
         }
@@ -609,13 +642,18 @@ class SchedulerConfig:
             self.graph_db.legacy_sqlite_path = str(self.db_path)
 
     @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None = None, **overrides: Any) -> "SchedulerConfig":
+        merged = dict(payload or {})
+        merged.update(overrides)
+        return cls(**merged)
+
+    @classmethod
     def from_file(cls, path: str | Path | None = None, **overrides: Any) -> "SchedulerConfig":
         payload: dict[str, Any] = {}
         if path:
             with Path(path).open("r", encoding="utf-8") as handle:
                 payload = yaml.safe_load(handle) or {}
-        payload.update(overrides)
-        return cls(**payload)
+        return cls.from_dict(payload, **overrides)
 
     def ensure_runtime_layout(self) -> None:
         for directory in (

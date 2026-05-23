@@ -227,10 +227,10 @@ def record_to_search_text(record: dict[str, Any]) -> str:
     return "\n".join(part for part in parts if str(part).strip())
 
 
-def load_code_knowledge_records(path: str | Path) -> list[dict[str, Any]]:
-    with Path(path).open("r", encoding="utf-8") as handle:
-        payload = yaml.safe_load(handle) or {}
-    records = payload.get("records") if isinstance(payload, dict) else payload
+def _records_from_payload(payload: Any) -> list[dict[str, Any]]:
+    records = payload.get("records") if isinstance(payload, dict) and "records" in payload else payload
+    if isinstance(records, dict):
+        records = [records]
     if not isinstance(records, list):
         raise CodeKnowledgeRecordError("code-knowledge source must be a list or contain records: []")
     normalized: list[dict[str, Any]] = []
@@ -240,3 +240,18 @@ def load_code_knowledge_records(path: str | Path) -> list[dict[str, Any]]:
         else:
             normalized.append(validate_code_knowledge_record(record))
     return normalized
+
+
+def load_code_knowledge_records(path: str | Path) -> list[dict[str, Any]]:
+    source = Path(path)
+    if source.is_dir():
+        normalized: list[dict[str, Any]] = []
+        for record_path in sorted(source.glob("*.yaml")):
+            with record_path.open("r", encoding="utf-8") as handle:
+                normalized.extend(_records_from_payload(yaml.safe_load(handle) or {}))
+        if not normalized:
+            raise CodeKnowledgeRecordError(f"code-knowledge source directory is empty: {source}")
+        return normalized
+
+    with source.open("r", encoding="utf-8") as handle:
+        return _records_from_payload(yaml.safe_load(handle) or {})

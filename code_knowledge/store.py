@@ -119,6 +119,18 @@ class CodeKnowledgeStore:
             self._embedding_model = EmbeddingModel(
                 model_type=self.config.embedding_model_type,
                 model_name=self.config.embedding_model_name,
+                api_key=(
+                    getattr(self.config, "embedding_api_key", "")
+                    or os.getenv(getattr(self.config, "embedding_api_key_env", "OPENROUTER_API_KEY") or "")
+                )
+                if getattr(self.config, "embedding_model_type", "") == "openrouter"
+                else None,
+                api_key_env=getattr(self.config, "embedding_api_key_env", "OPENROUTER_API_KEY"),
+                base_url=getattr(self.config, "embedding_base_url", None),
+                dimension=getattr(self.config, "embedding_dimension", None),
+                batch_size=getattr(self.config, "embedding_batch_size", 32),
+                max_retries=getattr(self.config, "embedding_max_retries", 4),
+                retry_delay_seconds=getattr(self.config, "embedding_retry_delay_seconds", 1.0),
                 device=self.config.embedding_device,
             )
         return self._embedding_model
@@ -145,6 +157,23 @@ class CodeKnowledgeStore:
             return True
         except Exception:
             return False
+
+    def _collection_vector_size(self, client: Any, collection_name: str) -> int | None:
+        if not hasattr(client, "get_collection"):
+            return None
+        try:
+            collection = client.get_collection(collection_name)
+        except Exception:
+            return None
+        vectors = getattr(getattr(getattr(collection, "config", None), "params", None), "vectors", None)
+        if isinstance(vectors, dict):
+            first = next(iter(vectors.values()), None)
+            return int(getattr(first, "size", 0) or 0) or None
+        size = getattr(vectors, "size", None)
+        try:
+            return int(size) if size is not None else None
+        except (TypeError, ValueError):
+            return None
 
     def _collection_for_record(self, record: dict[str, Any]) -> str:
         schema_version = str(record.get("schema_version") or "")
@@ -182,6 +211,13 @@ class CodeKnowledgeStore:
                     vectors_config=models.VectorParams(size=dimension, distance=self._distance()),
                 )
                 created.append(collection_name)
+            else:
+                existing_dimension = self._collection_vector_size(client, collection_name)
+                if existing_dimension is not None and existing_dimension != dimension:
+                    raise ValueError(
+                        f"Qdrant collection {collection_name!r} has vector size {existing_dimension}, "
+                        f"but configured embedding dimension is {dimension}. Recreate the collection or update embedding_dimension."
+                    )
         return {"ok": True, "collections": list(self.collection_names.values()), "dimension": dimension, "created": created}
 
     def ingest_records(self, records: list[dict[str, Any]], *, recreate: bool = False, dry_run: bool = False) -> dict[str, Any]:

@@ -72,6 +72,34 @@ def validate_feature_record(payload: dict[str, Any]) -> dict[str, Any]:
     """Validate and normalize one hardware feature record."""
     if not isinstance(payload, dict):
         raise HardwareFeatureRecordError("hardware feature record must be an object")
+    payload = dict(payload)
+    title = str(payload.get("title") or "").strip()
+    architectures = [str(item).strip() for item in payload.get("architectures") or [] if str(item).strip()]
+    features = [str(item).strip() for item in payload.get("features") or [] if str(item).strip()]
+    if title and not str(payload.get("summary_text") or "").strip():
+        vram_mb = payload.get("vram_MB") or payload.get("vram_mb") or payload.get("total_vram_mb")
+        bits = [title]
+        if architectures:
+            bits.append(f"architecture={', '.join(architectures)}")
+        if vram_mb:
+            bits.append(f"vram_mb={vram_mb}")
+        if features:
+            bits.append(f"features={', '.join(features[:8])}")
+        payload["summary_text"] = "; ".join(bits)
+    if title and not str(payload.get("detail_text") or "").strip():
+        detail_bits = [payload.get("summary_text") or title]
+        for key in ("vram_MB", "vram_type", "vram_clock_mhz", "sm_count"):
+            if payload.get(key) is not None:
+                detail_bits.append(f"{key}={payload[key]}")
+        payload["detail_text"] = ". ".join(str(item) for item in detail_bits if item)
+    if "recommended_patterns" not in payload:
+        payload["recommended_patterns"] = [
+            "Use configurable batch size, AMP, dataloader workers, and runtime memory logging when training on this hardware."
+        ]
+    payload.setdefault("avoid_patterns", [])
+    if "tags" not in payload:
+        payload["tags"] = list(dict.fromkeys([*architectures, *features]))
+    payload.setdefault("confidence", 0.75)
     for field in _REQUIRED_STRING_FIELDS:
         if not str(payload.get(field) or "").strip():
             raise HardwareFeatureRecordError(f"{field} is required")
@@ -125,14 +153,29 @@ def record_to_search_text(record: dict[str, Any]) -> str:
     return "\n".join(part for part in text_parts if part.strip())
 
 
-def load_feature_records(path: str | Path) -> list[dict[str, Any]]:
-    """Load and validate records from a YAML file."""
-    with Path(path).open("r", encoding="utf-8") as handle:
-        payload = yaml.safe_load(handle) or {}
-    records = payload.get("records") if isinstance(payload, dict) else payload
+def _records_from_payload(payload: Any) -> list[dict[str, Any]]:
+    records = payload.get("records") if isinstance(payload, dict) and "records" in payload else payload
+    if isinstance(records, dict):
+        records = [records]
     if not isinstance(records, list):
         raise HardwareFeatureRecordError("hardware feature source must be a list or contain records: []")
     return [validate_feature_record(record) for record in records]
+
+
+def load_feature_records(path: str | Path) -> list[dict[str, Any]]:
+    """Load and validate records from a YAML file or a directory of per-record YAML files."""
+    source = Path(path)
+    if source.is_dir():
+        records: list[dict[str, Any]] = []
+        for record_path in sorted(source.glob("*.yaml")):
+            with record_path.open("r", encoding="utf-8") as handle:
+                records.extend(_records_from_payload(yaml.safe_load(handle) or {}))
+        if not records:
+            raise HardwareFeatureRecordError(f"hardware feature source directory is empty: {source}")
+        return records
+
+    with source.open("r", encoding="utf-8") as handle:
+        return _records_from_payload(yaml.safe_load(handle) or {})
 
 
 def load_seed_records() -> list[dict[str, Any]]:

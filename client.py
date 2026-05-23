@@ -334,6 +334,69 @@ class SchedulerClient:
     ) -> dict[str, Any]:
         return self._code_store().ingest_source(source, recreate=recreate, dry_run=dry_run)
 
+    def ingest_schema_knowledge(
+        self,
+        *,
+        schema_root: str | Path = "schema",
+        recreate: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        from .code_knowledge.records import convert_hardware_feature_records, load_code_knowledge_records
+        from .hardware_features.records import load_feature_records
+
+        root = Path(schema_root)
+        hardware_path = root / "hardware_feature_records"
+        code_doc_path = root / "code_doc_chunks"
+        api_symbol_path = root / "api_symbol_chunks"
+
+        hardware_records = load_feature_records(hardware_path)
+        code_doc_records = load_code_knowledge_records(code_doc_path)
+        api_symbol_records = load_code_knowledge_records(api_symbol_path)
+        converted_records = convert_hardware_feature_records(hardware_records)
+        code_records = code_doc_records + api_symbol_records + converted_records
+
+        hardware_result = self._feature_store().ingest_records(
+            hardware_records,
+            recreate=recreate,
+            dry_run=dry_run,
+        )
+        code_result = self._code_store().ingest_records(
+            code_records,
+            recreate=recreate,
+            dry_run=dry_run,
+        )
+        return {
+            "ok": bool(hardware_result.get("ok")) and bool(code_result.get("ok")),
+            "dry_run": bool(dry_run),
+            "schema_root": str(root),
+            "collections": {
+                "hardware_feature_knowledge": {
+                    "target": self.settings.hardware_feature_db.collection_name,
+                    "record_count": len(hardware_records),
+                    "result": hardware_result,
+                },
+                "code_doc_chunks": {
+                    "target": self.settings.hardware_feature_db.code_doc_collection_name,
+                    "record_count": sum(1 for record in code_records if record.get("record_type") == "code_doc_chunks"),
+                },
+                "optimization_recipe_chunks": {
+                    "target": self.settings.hardware_feature_db.optimization_recipe_collection_name,
+                    "record_count": sum(1 for record in code_records if record.get("record_type") == "optimization_recipe_chunks"),
+                },
+                "api_symbol_chunks": {
+                    "target": self.settings.hardware_feature_db.api_symbol_collection_name,
+                    "record_count": sum(1 for record in code_records if record.get("record_type") == "api_symbol_chunks"),
+                },
+            },
+            "code_knowledge_result": code_result,
+            "source_counts": {
+                "hardware_feature_records": len(hardware_records),
+                "code_doc_chunks": len(code_doc_records),
+                "api_symbol_chunks": len(api_symbol_records),
+                "converted_from_hardware": len(converted_records),
+            },
+        }
+
     def get_profile_evidence(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
         return self.knowledge.get_profile_evidence(candidate=candidate, limit=limit)
 

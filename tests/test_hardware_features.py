@@ -4,13 +4,18 @@ from types import SimpleNamespace
 import hashlib
 import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
+import yaml
 
+from agents.memory.embedding_models import EmbeddingModel
+from localml_scheduler.client import SchedulerClient
 from localml_scheduler.config import SchedulerConfig
 from localml_scheduler.code_knowledge import CodeKnowledgeStore, convert_hardware_feature_records, validate_code_knowledge_record
+from localml_scheduler.code_knowledge.records import load_code_knowledge_records
 from localml_scheduler.hardware_features import load_seed_records, validate_feature_record
-from localml_scheduler.hardware_features.records import HardwareFeatureRecordError
+from localml_scheduler.hardware_features.records import HardwareFeatureRecordError, load_feature_records
 from localml_scheduler.hardware_features.store import HardwareFeatureStore
 
 
@@ -127,6 +132,16 @@ class HardwareFeatureRecordTest(unittest.TestCase):
 
         with self.assertRaises(HardwareFeatureRecordError):
             validate_feature_record(record)
+
+    def test_load_feature_records_accepts_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            record = load_seed_records()[0]
+            path = Path(tmp) / "record.yaml"
+            path.write_text(yaml.safe_dump(record), encoding="utf-8")
+
+            loaded = load_feature_records(tmp)
+
+        self.assertEqual([item["record_id"] for item in loaded], [record["record_id"]])
 
 
 class HardwareFeatureStoreTest(unittest.TestCase):
@@ -250,6 +265,147 @@ class CodeKnowledgeStoreTest(unittest.TestCase):
         self.assertIn("api_symbol_chunks", fake_client.collections)
         self.assertGreaterEqual(len(results), 1)
         self.assertTrue(all(result["record_type"] in {"code_doc_chunks", "optimization_recipe_chunks"} for result in results))
+
+    def test_load_code_knowledge_records_accepts_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "doc.yaml"
+            path.write_text(
+                yaml.safe_dump(
+                    {
+                        "schema_version": "code_doc_chunk_v1",
+                        "chunk_id": "doc.test.amp",
+                        "title": "AMP note",
+                        "text": "Use autocast for tensor-core-friendly training.",
+                        "technology_keys": ["pytorch_amp"],
+                        "hardware_feature_keys": ["tensor_core"],
+                        "workload_types": ["vision_training"],
+                        "confidence": 0.8,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = load_code_knowledge_records(tmp)
+
+        self.assertEqual([item["record_id"] for item in loaded], ["doc.test.amp"])
+
+
+class OpenRouterEmbeddingTest(unittest.TestCase):
+    def test_openrouter_config_requires_explicit_model_and_dimension(self) -> None:
+        with self.assertRaises(ValueError):
+            SchedulerConfig(
+                runtime_root=tempfile.mkdtemp(),
+                hardware_feature_db={
+                    "embedding_model_type": "openrouter",
+                    "embedding_dimension": 2,
+                },
+            )
+        with self.assertRaises(ValueError):
+            SchedulerConfig(
+                runtime_root=tempfile.mkdtemp(),
+                hardware_feature_db={
+                    "embedding_model_type": "openrouter",
+                    "embedding_model_name": "openai/text-embedding-3-small",
+                },
+            )
+
+    def test_openrouter_direct_api_key_is_not_serialized(self) -> None:
+        config = SchedulerConfig(
+            runtime_root=tempfile.mkdtemp(),
+            hardware_feature_db={
+                "embedding_model_type": "openrouter",
+                "embedding_model_name": "test/embed",
+                "embedding_dimension": 2,
+                "embedding_api_key": "local-secret",
+            },
+        )
+
+        self.assertEqual(config.hardware_feature_db.embedding_api_key, "local-secret")
+        self.assertEqual(config.to_dict()["hardware_feature_db"]["embedding_api_key"], "")
+
+    def test_openrouter_request_construction_and_batching(self) -> None:
+        calls = []
+        model = EmbeddingModel(
+            model_type="openrouter",
+            model_name="test/embed",
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            dimension=2,
+            batch_size=2,
+            retry_delay_seconds=0,
+        )
+
+        def fake_post(url, payload, headers):
+            calls.append((url, payload, headers))
+            return {"data": [{"embedding": [float(index), 1.0]} for index, _ in enumerate(payload["input"])]}
+
+        model._openrouter_post_json = fake_post  # type: ignore[method-assign]
+
+        result = model.encode(["a", "b", "c"])
+
+        self.assertEqual(result.shape, (3, 2))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0], "https://openrouter.ai/api/v1/embeddings")
+        self.assertEqual(calls[0][1]["model"], "test/embed")
+        self.assertEqual(calls[0][1]["encoding_format"], "float")
+        self.assertEqual(calls[0][1]["input"], ["a", "b"])
+        self.assertEqual(calls[0][2]["Authorization"], "Bearer test-key")
+
+
+class SchemaIngestionTest(unittest.TestCase):
+    def test_schema_ingestion_dry_run_counts_directory_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "schema"
+            hardware_dir = root / "hardware_feature_records"
+            code_dir = root / "code_doc_chunks"
+            api_dir = root / "api_symbol_chunks"
+            hardware_dir.mkdir(parents=True)
+            code_dir.mkdir()
+            api_dir.mkdir()
+
+            hardware_record = load_seed_records()[0]
+            (hardware_dir / "hardware.yaml").write_text(yaml.safe_dump(hardware_record), encoding="utf-8")
+            (code_dir / "doc.yaml").write_text(
+                yaml.safe_dump(
+                    {
+                        "schema_version": "code_doc_chunk_v1",
+                        "chunk_id": "doc.test",
+                        "title": "Doc",
+                        "text": "A code doc chunk.",
+                        "technology_keys": ["pytorch"],
+                        "hardware_feature_keys": ["tensor_core"],
+                        "workload_types": ["vision_training"],
+                        "confidence": 0.7,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (api_dir / "api.yaml").write_text(
+                yaml.safe_dump(
+                    {
+                        "schema_version": "api_symbol_chunk_v1",
+                        "api_symbol_id": "api.test",
+                        "api_symbol": "torch.autocast",
+                        "title": "torch.autocast",
+                        "usage_summary": "Automatic mixed precision context manager.",
+                        "text": "Use autocast around forward pass.",
+                        "api_symbols": ["torch.autocast"],
+                        "technology_keys": ["pytorch_amp"],
+                        "hardware_feature_keys": ["tensor_core"],
+                        "confidence": 0.9,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            client = SchedulerClient(SchedulerConfig(runtime_root=Path(tmp) / "runtime"))
+            result = client.ingest_schema_knowledge(schema_root=root, dry_run=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["source_counts"]["hardware_feature_records"], 1)
+        self.assertEqual(result["source_counts"]["code_doc_chunks"], 1)
+        self.assertEqual(result["source_counts"]["api_symbol_chunks"], 1)
+        self.assertGreaterEqual(result["source_counts"]["converted_from_hardware"], 1)
 
 
 if __name__ == "__main__":

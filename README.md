@@ -222,7 +222,7 @@ The hardware feature tools use Qdrant as an external vector service. For local d
 
 ```bash
 docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant
-python -m localml_scheduler.cli hardware-features ingest --settings localml_scheduler/configs/scheduler.example.yaml
+python -m localml_scheduler.cli knowledge ingest-schema --config config.yaml --schema-root schema
 ```
 
 Use `--dry-run` to validate and summarize seed records without writing to Qdrant. MCP search/context calls return empty results instead of failing the scheduler when the feature database is disabled or unavailable.
@@ -232,7 +232,7 @@ Use `--dry-run` to validate and summarize seed records without writing to Qdrant
 Start the scheduler:
 
 ```bash
-python -m localml_scheduler.cli scheduler start --settings localml_scheduler/configs/scheduler.example.yaml
+python -m localml_scheduler.cli scheduler start --config config.yaml
 ```
 
 Run the MCP stdio server:
@@ -244,7 +244,7 @@ python -m localml_scheduler.cli scheduler mcp
 Submit a job:
 
 ```bash
-python -m localml_scheduler.cli submit localml_scheduler/configs/job.example.yaml
+python -m localml_scheduler.cli submit localml_scheduler/examples/job.example.yaml --config config.yaml
 ```
 
 Inspect state:

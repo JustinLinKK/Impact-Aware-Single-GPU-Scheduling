@@ -218,6 +218,6 @@ def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
     return server
 
 
-def run_stdio(settings_path: str | None = None) -> None:
-    settings = SchedulerConfig.from_file(settings_path) if settings_path else SchedulerConfig()
+def run_stdio(settings_path: str | None = None, settings: SchedulerConfig | None = None) -> None:
+    settings = settings or (SchedulerConfig.from_file(settings_path) if settings_path else SchedulerConfig())
     build_mcp_server(settings).run("stdio")
