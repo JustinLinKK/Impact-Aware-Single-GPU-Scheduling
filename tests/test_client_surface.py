@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 import tempfile
 import unittest
 
@@ -7,6 +8,61 @@ from localml_scheduler.client import SchedulerClient
 from localml_scheduler.config import SchedulerConfig
 from localml_scheduler.domain import BatchProbeProfile, BatchResolution, JobRun, RuntimeProfile, TrainingJob
 from localml_scheduler.dto import SubmitJobRequest
+from localml_scheduler.graph_knowledge import SchedulerKnowledgeBase
+
+
+class _MemoryCache:
+    def __init__(self):
+        self.values = {}
+
+    def _key(self, namespace, payload):
+        return (namespace, repr(sorted(payload.items())))
+
+    def get(self, namespace, payload):
+        return self.values.get(self._key(namespace, payload))
+
+    def set(self, namespace, payload, value):
+        self.values[self._key(namespace, payload)] = value
+
+    def invalidate_namespace(self, namespace):
+        for key in [key for key in self.values if key[0] == namespace]:
+            self.values.pop(key, None)
+
+
+class _FakeGraphStore:
+    def __init__(self):
+        self.settings = SchedulerConfig(runtime_root=tempfile.mkdtemp())
+        self.hardware_calls = 0
+
+    def hardware_profile(self):
+        self.hardware_calls += 1
+        return SimpleNamespace(
+            hardware_key="test-hw",
+            gpu_name="Test GPU",
+            total_vram_mb=24576,
+            compute_capability="9.0",
+            cuda_runtime="12.4",
+            torch_version="2.5.0",
+        )
+
+    def list_runtime_profiles(self, **kwargs):
+        del kwargs
+        return []
+
+    def list_solo_profiles(self, **kwargs):
+        del kwargs
+        return []
+
+    def list_pair_profiles(self, **kwargs):
+        del kwargs
+        return []
+
+    def list_batch_size_observations(self, **kwargs):
+        del kwargs
+        return []
+
+    def list_batch_probe_profiles(self):
+        return []
 
 
 class SchedulerClientSurfaceTest(unittest.TestCase):
@@ -112,6 +168,18 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
             self.assertTrue(runtime_estimate["found"])
             self.assertTrue(tuning_outcome["ok"])
             self.assertEqual(len(client.list_events(job_id=job.job_id, event_type="tuning_outcome_recorded")), 1)
+
+    def test_graph_knowledge_context_uses_redis_cache_when_available(self) -> None:
+        store = _FakeGraphStore()
+        knowledge = SchedulerKnowledgeBase(store, redis_cache=_MemoryCache())
+
+        first = knowledge.get_hardware_context("current")
+        calls_after_first_read = store.hardware_calls
+        second = knowledge.get_hardware_context("current")
+
+        self.assertEqual(first, second)
+        self.assertGreater(calls_after_first_read, 0)
+        self.assertEqual(store.hardware_calls, calls_after_first_read)
 
 
 if __name__ == "__main__":

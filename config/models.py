@@ -9,6 +9,8 @@ import sys
 
 import yaml
 
+from ..redis_cache import RedisCacheSettings
+
 
 SCHEDULER_MODE_SERIAL_BASIC = "serial_basic"
 SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED = "serial_batch_optimized"
@@ -589,6 +591,7 @@ class SchedulerConfig:
     cache_server_host: str = "127.0.0.1"
     cache_server_port: int = 8765
     cache_socket_name: str = "cache_server.sock"
+    redis_cache: RedisCacheSettings | dict[str, Any] = field(default_factory=RedisCacheSettings)
     auto_resume_recoverable: bool = False
     gpu_scheduler: GpuSchedulerSettings = field(default_factory=GpuSchedulerSettings)
     graph_db: GraphDBSettings | dict[str, Any] = field(default_factory=GraphDBSettings)
@@ -615,6 +618,10 @@ class SchedulerConfig:
             self.baseline_cache = BaselineCacheSettings()
         if isinstance(self.baseline_cache, dict):
             self.baseline_cache = BaselineCacheSettings.from_dict(self.baseline_cache)
+        if self.redis_cache is None:
+            self.redis_cache = RedisCacheSettings()
+        if isinstance(self.redis_cache, dict):
+            self.redis_cache = RedisCacheSettings.from_dict(self.redis_cache)
         if self.graph_db is None:
             self.graph_db = GraphDBSettings()
         if isinstance(self.graph_db, dict):
@@ -696,6 +703,7 @@ class SchedulerConfig:
             "cache_server_host": self.cache_server_host,
             "cache_server_port": self.cache_server_port,
             "cache_socket_name": self.cache_socket_name,
+            "redis_cache": self.redis_cache.to_dict(),
             "auto_resume_recoverable": self.auto_resume_recoverable,
             "gpu_scheduler": self.gpu_scheduler.to_dict(),
             "graph_db": self.graph_db.to_dict(),

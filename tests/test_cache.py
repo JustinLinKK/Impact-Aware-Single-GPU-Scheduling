@@ -11,6 +11,48 @@ import torch
 from localml_scheduler.client import SchedulerClient
 from localml_scheduler.model_cache.baseline_cache import BaselineModelCache, _materialize_payload_bytes
 from localml_scheduler.config import SchedulerSettings
+from localml_scheduler.redis_cache import RedisCacheSettings, RedisLRUCache
+
+
+class _FakeRedis:
+    def __init__(self) -> None:
+        self.values = {}
+        self.sorted_sets = {}
+
+    def ping(self):
+        return True
+
+    def get(self, key):
+        return self.values.get(key)
+
+    def set(self, key, value, ex=None):
+        del ex
+        self.values[key] = value
+        return True
+
+    def zadd(self, key, mapping):
+        self.sorted_sets.setdefault(key, {}).update(mapping)
+
+    def zcard(self, key):
+        return len(self.sorted_sets.get(key, {}))
+
+    def zrange(self, key, start, end):
+        items = sorted(self.sorted_sets.get(key, {}).items(), key=lambda item: item[1])
+        if end == -1:
+            selected = items[start:]
+        else:
+            selected = items[start : end + 1]
+        return [item[0] for item in selected]
+
+    def zrem(self, key, *members):
+        bucket = self.sorted_sets.setdefault(key, {})
+        for member in members:
+            bucket.pop(member, None)
+
+    def delete(self, *keys):
+        for key in keys:
+            self.values.pop(key, None)
+            self.sorted_sets.pop(key, None)
 
 
 class BaselineCacheTest(unittest.TestCase):
@@ -174,6 +216,22 @@ class BaselineCacheTest(unittest.TestCase):
             self.assertIn("effective_memory_budget_bytes", stats)
             self.assertEqual(stats["entry_capacity"], 8)
             self.assertEqual(stats["max_ram_percent"], 0.2)
+
+    def test_redis_lru_cache_evicts_least_recently_used_entry(self) -> None:
+        cache = RedisLRUCache(
+            RedisCacheSettings(enabled=True, key_prefix="test", max_entries=2, ttl_seconds=60),
+            redis_client=_FakeRedis(),
+        )
+
+        with mock.patch("localml_scheduler.redis_cache.time.time", side_effect=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]):
+            cache.set("vector:test", {"id": "a"}, {"value": 1})
+            cache.set("vector:test", {"id": "b"}, {"value": 2})
+            self.assertEqual(cache.get("vector:test", {"id": "a"}), {"value": 1})
+            cache.set("vector:test", {"id": "c"}, {"value": 3})
+
+            self.assertIsNone(cache.get("vector:test", {"id": "b"}))
+            self.assertEqual(cache.get("vector:test", {"id": "a"}), {"value": 1})
+            self.assertEqual(cache.get("vector:test", {"id": "c"}), {"value": 3})
 
 
 if __name__ == "__main__":

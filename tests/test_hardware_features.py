@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-import hashlib
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -65,6 +65,7 @@ class _FakeQdrantClient:
         self.points = {}
         self.created_vector_params = None
         self.last_filter = None
+        self.query_count = 0
 
     def collection_exists(self, collection_name):
         return collection_name in self.collections
@@ -84,6 +85,7 @@ class _FakeQdrantClient:
 
     def query_points(self, collection_name, query, query_filter, limit, with_payload):
         del collection_name, query, with_payload
+        self.query_count += 1
         self.last_filter = query_filter
         rows = []
         for point in self.points.values():
@@ -103,6 +105,26 @@ class _FakeQdrantClient:
             elif payload_value != value:
                 return False
         return True
+
+
+class _MemoryCache:
+    def __init__(self):
+        self.values = {}
+        self.invalidated = []
+
+    def _key(self, namespace, payload):
+        return (namespace, repr(sorted(payload.items())))
+
+    def get(self, namespace, payload):
+        return self.values.get(self._key(namespace, payload))
+
+    def set(self, namespace, payload, value):
+        self.values[self._key(namespace, payload)] = value
+
+    def invalidate_namespace(self, namespace):
+        self.invalidated.append(namespace)
+        for key in [key for key in self.values if key[0] == namespace]:
+            self.values.pop(key, None)
 
 
 class HardwareFeatureRecordTest(unittest.TestCase):
@@ -173,7 +195,7 @@ class HardwareFeatureStoreTest(unittest.TestCase):
         first = store.ingest_records([record])
         second = store.ingest_records([record])
 
-        expected_id = hashlib.sha256(record["record_id"].encode("utf-8")).hexdigest()
+        expected_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"mlevolve:hardware_feature:{record['record_id']}"))
         self.assertTrue(first["ok"])
         self.assertTrue(second["ok"])
         self.assertEqual(list(fake_client.points.keys()), [expected_id])
@@ -265,6 +287,29 @@ class CodeKnowledgeStoreTest(unittest.TestCase):
         self.assertIn("api_symbol_chunks", fake_client.collections)
         self.assertGreaterEqual(len(results), 1)
         self.assertTrue(all(result["record_type"] in {"code_doc_chunks", "optimization_recipe_chunks"} for result in results))
+
+    def test_code_knowledge_search_uses_redis_cache_when_available(self) -> None:
+        settings = SchedulerConfig(runtime_root=tempfile.mkdtemp())
+        fake_client = _FakeQdrantClient()
+        cache = _MemoryCache()
+        store = CodeKnowledgeStore(
+            settings,
+            qdrant_client=fake_client,
+            qdrant_models=_FakeModels,
+            embedding_model=_FakeEmbeddingModel(),
+            redis_cache=cache,
+        )
+        store.ingest_records(convert_hardware_feature_records(load_seed_records()[:1]))
+        fake_client.query_count = 0
+
+        first = store.search(query="pytorch tensor core", filters={"framework": "pytorch"}, limit=4)
+        first_query_count = fake_client.query_count
+        second = store.search(query="pytorch tensor core", filters={"framework": "pytorch"}, limit=4)
+
+        self.assertEqual(first, second)
+        self.assertGreater(first_query_count, 0)
+        self.assertEqual(fake_client.query_count, first_query_count)
+        self.assertIn("vector:code_knowledge", cache.invalidated)
 
     def test_load_code_knowledge_records_accepts_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

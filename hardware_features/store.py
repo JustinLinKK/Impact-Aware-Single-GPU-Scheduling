@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import os
 from pathlib import Path
 from typing import Any, Callable
+import uuid
 
 import numpy as np
+
+from localml_scheduler.redis_cache import RedisLRUCache, vector_cache_enabled
 
 from .records import load_feature_records, load_seed_records, record_to_search_text
 
@@ -50,12 +52,15 @@ class HardwareFeatureStore:
         qdrant_client: Any | None = None,
         qdrant_models: Any | None = None,
         embedding_model: Any | None = None,
+        redis_cache: Any | None = None,
     ):
         self.settings = settings
         self.config = settings.hardware_feature_db
         self._client = qdrant_client
         self._models = qdrant_models
         self._embedding_model = embedding_model
+        self._redis_cache = redis_cache
+        self._redis_cache_checked = redis_cache is not None
 
     @property
     def enabled(self) -> bool:
@@ -75,6 +80,41 @@ class HardwareFeatureStore:
             api_key = os.getenv(self.config.api_key_env) if self.config.api_key_env else None
             self._client = QdrantClient(url=self.config.url, api_key=api_key)
         return self._client
+
+    def _cache(self) -> Any | None:
+        if self._redis_cache is not None:
+            return self._redis_cache
+        if self._redis_cache_checked or not vector_cache_enabled(self.settings):
+            return None
+        self._redis_cache_checked = True
+        self._redis_cache = RedisLRUCache.from_settings(self.settings)
+        return self._redis_cache
+
+    def _cache_payload(
+        self,
+        *,
+        query: str,
+        hardware_context: dict[str, Any] | None,
+        architecture: str | None,
+        vendor: str | None,
+        workload_type: str | None,
+        framework: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        return {
+            "store": "hardware_features",
+            "query": query,
+            "hardware_context": hardware_context or {},
+            "architecture": architecture,
+            "vendor": vendor,
+            "workload_type": workload_type,
+            "framework": framework,
+            "limit": max(1, int(limit)),
+            "collection_name": self.config.collection_name,
+            "embedding_model_type": getattr(self.config, "embedding_model_type", None),
+            "embedding_model_name": getattr(self.config, "embedding_model_name", None),
+            "embedding_dimension": getattr(self.config, "embedding_dimension", None),
+        }
 
     def _embedder(self) -> Any:
         if self._embedding_model is None:
@@ -114,7 +154,7 @@ class HardwareFeatureStore:
         return normalized
 
     def _point_id(self, record_id: str) -> str:
-        return hashlib.sha256(record_id.encode("utf-8")).hexdigest()
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"mlevolve:hardware_feature:{record_id}"))
 
     def _collection_exists(self, client: Any) -> bool:
         if hasattr(client, "collection_exists"):
@@ -166,6 +206,10 @@ class HardwareFeatureStore:
                     f"Qdrant collection {collection_name!r} has vector size {existing_dimension}, "
                     f"but configured embedding dimension is {dimension}. Recreate the collection or update embedding_dimension."
                 )
+        if recreate or created:
+            cache = self._cache()
+            if cache is not None:
+                cache.invalidate_namespace("vector:hardware_features")
         return {"ok": True, "collection_name": collection_name, "dimension": dimension, "created": created}
 
     def ingest_records(self, records: list[dict[str, Any]], *, recreate: bool = False, dry_run: bool = False) -> dict[str, Any]:
@@ -194,6 +238,9 @@ class HardwareFeatureStore:
         ]
         if points:
             client.upsert(collection_name=self.config.collection_name, points=points)
+        cache = self._cache()
+        if cache is not None:
+            cache.invalidate_namespace("vector:hardware_features")
         return {
             "ok": True,
             "dry_run": False,
@@ -287,6 +334,20 @@ class HardwareFeatureStore:
     ) -> list[dict[str, Any]]:
         if not self.enabled:
             return []
+        cache = self._cache()
+        cache_payload = self._cache_payload(
+            query=query,
+            hardware_context=hardware_context,
+            architecture=architecture,
+            vendor=vendor,
+            workload_type=workload_type,
+            framework=framework,
+            limit=limit,
+        )
+        if cache is not None:
+            cached = cache.get("vector:hardware_features", cache_payload)
+            if isinstance(cached, list):
+                return cached
         try:
             client = self._qdrant_client()
             if not self._collection_exists(client):
@@ -314,4 +375,6 @@ class HardwareFeatureStore:
                     hardware_match=self._hardware_match(payload, hardware_context),
                 ).to_public_dict()
             )
+        if cache is not None:
+            cache.set("vector:hardware_features", cache_payload, results)
         return results

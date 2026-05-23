@@ -6,6 +6,7 @@ from typing import Any
 import logging
 
 from ..config import SchedulerSettings
+from ..redis_cache import invalidate_graph_cache
 from .neo4j_store import Neo4jStateStore
 from .sqlite_store import SQLiteStateStore as LegacySQLiteStateStore
 
@@ -159,6 +160,56 @@ class StateStore:
         if hasattr(self._backend, "backend"):
             return self._backend.backend
         return self._backend
+
+    def _call_with_graph_cache_invalidation(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        result = getattr(self._backend, method_name)(*args, **kwargs)
+        invalidate_graph_cache(self.settings)
+        return result
+
+    def save_job(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call_with_graph_cache_invalidation("save_job", *args, **kwargs)
+
+    def submit_job(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call_with_graph_cache_invalidation("submit_job", *args, **kwargs)
+
+    def update_job(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call_with_graph_cache_invalidation("update_job", *args, **kwargs)
+
+    def set_job_status(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call_with_graph_cache_invalidation("set_job_status", *args, **kwargs)
+
+    def delete_job(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call_with_graph_cache_invalidation("delete_job", *args, **kwargs)
+
+    def log_event(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call_with_graph_cache_invalidation("log_event", *args, **kwargs)
+
+    def record_checkpoint(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call_with_graph_cache_invalidation("record_checkpoint", *args, **kwargs)
+
+    def update_cache_metadata(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call_with_graph_cache_invalidation("update_cache_metadata", *args, **kwargs)
+
+    def upsert_solo_profile(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call_with_graph_cache_invalidation("upsert_solo_profile", *args, **kwargs)
+
+    def upsert_pair_profile(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call_with_graph_cache_invalidation("upsert_pair_profile", *args, **kwargs)
+
+    def upsert_runtime_profile(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call_with_graph_cache_invalidation("upsert_runtime_profile", *args, **kwargs)
+
+    def upsert_batch_probe_profile(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call_with_graph_cache_invalidation("upsert_batch_probe_profile", *args, **kwargs)
+
+    def upsert_batch_size_observation(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call_with_graph_cache_invalidation("upsert_batch_size_observation", *args, **kwargs)
+
+    def upsert_combination_profile(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call_with_graph_cache_invalidation("upsert_combination_profile", *args, **kwargs)
+
+    def mark_pair_incompatible(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call_with_graph_cache_invalidation("mark_pair_incompatible", *args, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._backend, name)

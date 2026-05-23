@@ -1,7 +1,13 @@
 """Reusable local ML job scheduler with GPU-aware single-node execution."""
 
 from .client import SchedulerClient
-from .config import BaselineCacheSettings, GpuSchedulerSettings, HardwareFeatureDBSettings, SchedulerConfig
+from .config import (
+    BaselineCacheSettings,
+    GpuSchedulerSettings,
+    HardwareFeatureDBSettings,
+    RedisCacheSettings,
+    SchedulerConfig,
+)
 from .dto import JobCommandRequest, JobQuery, PreloadRequest, ReportQuery, SubmitJobRequest
 from .domain import (
     BatchProbeProfile,
@@ -46,6 +52,7 @@ __all__ = [
     "BaselineCacheSettings",
     "GpuSchedulerSettings",
     "HardwareFeatureDBSettings",
+    "RedisCacheSettings",
     "SchedulerClient",
     "SchedulerConfig",
     "SchedulerEngine",

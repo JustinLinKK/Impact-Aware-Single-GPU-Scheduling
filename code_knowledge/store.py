@@ -5,12 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-import hashlib
 import os
+import uuid
 
 import numpy as np
 
 from localml_scheduler.hardware_features.records import load_seed_records
+from localml_scheduler.redis_cache import RedisLRUCache, vector_cache_enabled
 
 from .records import (
     API_SYMBOL_SCHEMA_VERSION,
@@ -78,12 +79,15 @@ class CodeKnowledgeStore:
         qdrant_client: Any | None = None,
         qdrant_models: Any | None = None,
         embedding_model: Any | None = None,
+        redis_cache: Any | None = None,
     ):
         self.settings = settings
         self.config = settings.hardware_feature_db
         self._client = qdrant_client
         self._models = qdrant_models
         self._embedding_model = embedding_model
+        self._redis_cache = redis_cache
+        self._redis_cache_checked = redis_cache is not None
 
     @property
     def enabled(self) -> bool:
@@ -111,6 +115,35 @@ class CodeKnowledgeStore:
             api_key = os.getenv(self.config.api_key_env) if self.config.api_key_env else None
             self._client = QdrantClient(url=self.config.url, api_key=api_key)
         return self._client
+
+    def _cache(self) -> Any | None:
+        if self._redis_cache is not None:
+            return self._redis_cache
+        if self._redis_cache_checked or not vector_cache_enabled(self.settings):
+            return None
+        self._redis_cache_checked = True
+        self._redis_cache = RedisLRUCache.from_settings(self.settings)
+        return self._redis_cache
+
+    def _cache_payload(
+        self,
+        *,
+        query: str,
+        filters: dict[str, Any] | None,
+        record_types: list[str] | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        return {
+            "store": "code_knowledge",
+            "query": query,
+            "filters": filters or {},
+            "record_types": record_types or [],
+            "limit": max(1, int(limit)),
+            "collections": self.collection_names,
+            "embedding_model_type": getattr(self.config, "embedding_model_type", None),
+            "embedding_model_name": getattr(self.config, "embedding_model_name", None),
+            "embedding_dimension": getattr(self.config, "embedding_dimension", None),
+        }
 
     def _embedder(self) -> Any:
         if self._embedding_model is None:
@@ -180,7 +213,7 @@ class CodeKnowledgeStore:
         return self.collection_names[schema_version]
 
     def _point_id(self, collection_name: str, record_id: str) -> str:
-        return hashlib.sha256(f"{collection_name}:{record_id}".encode("utf-8")).hexdigest()
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"mlevolve:code_knowledge:{collection_name}:{record_id}"))
 
     def _record_types(self, record_types: list[str] | None = None) -> list[str]:
         if not record_types:
@@ -218,6 +251,10 @@ class CodeKnowledgeStore:
                         f"Qdrant collection {collection_name!r} has vector size {existing_dimension}, "
                         f"but configured embedding dimension is {dimension}. Recreate the collection or update embedding_dimension."
                     )
+        if recreate or created:
+            cache = self._cache()
+            if cache is not None:
+                cache.invalidate_namespace("vector:code_knowledge")
         return {"ok": True, "collections": list(self.collection_names.values()), "dimension": dimension, "created": created}
 
     def ingest_records(self, records: list[dict[str, Any]], *, recreate: bool = False, dry_run: bool = False) -> dict[str, Any]:
@@ -251,6 +288,9 @@ class CodeKnowledgeStore:
             ]
             if points:
                 client.upsert(collection_name=collection_name, points=points)
+        cache = self._cache()
+        if cache is not None:
+            cache.invalidate_namespace("vector:code_knowledge")
         return {
             "ok": True,
             "dry_run": False,
@@ -330,6 +370,12 @@ class CodeKnowledgeStore:
     ) -> list[dict[str, Any]]:
         if not self.enabled:
             return []
+        cache = self._cache()
+        cache_payload = self._cache_payload(query=query, filters=filters, record_types=record_types, limit=limit)
+        if cache is not None:
+            cached = cache.get("vector:code_knowledge", cache_payload)
+            if isinstance(cached, list):
+                return cached
         try:
             client = self._qdrant_client()
             schemas = self._record_types(record_types)
@@ -354,4 +400,7 @@ class CodeKnowledgeStore:
         except Exception:
             return []
         results.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-        return results[: max(1, int(limit))]
+        trimmed = results[: max(1, int(limit))]
+        if cache is not None:
+            cache.set("vector:code_knowledge", cache_payload, trimmed)
+        return trimmed

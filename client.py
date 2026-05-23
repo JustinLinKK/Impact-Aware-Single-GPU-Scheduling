@@ -30,6 +30,7 @@ from .domain import (
 from .dto import JobCommandRequest, JobQuery, PreloadRequest, ReportQuery, SubmitJobRequest
 from .graph_knowledge import SchedulerKnowledgeBase
 from .model_cache.cache_server import CacheClient
+from .redis_cache import invalidate_graph_cache
 from .scheduler.service import SchedulerService
 from .storage.state_store import StateStore
 
@@ -300,6 +301,7 @@ class SchedulerClient:
             target.record_batch_size_observation_evidence(observation)
         for profile in combination_profiles:
             target.record_combination_profile_evidence(profile)
+        invalidate_graph_cache(self.settings)
         return {"ok": True, "dry_run": False, "written": counts, "wipe": bool(wipe)}
 
     def _feature_store(self):
