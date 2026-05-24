@@ -10,6 +10,7 @@ import torch
 
 from localml_scheduler.client import SchedulerClient
 from localml_scheduler.model_cache.baseline_cache import BaselineModelCache, _materialize_payload_bytes
+from localml_scheduler.model_cache.cache_server import CacheClient, CacheServer
 from localml_scheduler.config import SchedulerSettings
 from localml_scheduler.redis_cache import RedisCacheSettings, RedisLRUCache
 
@@ -216,6 +217,24 @@ class BaselineCacheTest(unittest.TestCase):
             self.assertIn("effective_memory_budget_bytes", stats)
             self.assertEqual(stats["entry_capacity"], 8)
             self.assertEqual(stats["max_ram_percent"], 0.2)
+
+    def test_cache_server_uses_short_socket_for_deep_runtime_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            deep_root = Path(tmpdir) / ("nested" * 12) / ("workspace" * 12)
+            settings = SchedulerSettings(runtime_root=deep_root)
+            address = settings.cache_address()
+
+            self.assertIsInstance(address, str)
+            self.assertLess(len(address.encode("utf-8")), 100)
+            self.assertNotIn(str(deep_root), address)
+
+            server = CacheServer(settings, BaselineModelCache(memory_budget_bytes=1024 * 1024))
+            try:
+                server.start()
+                self.assertTrue(CacheClient(settings).ping())
+            finally:
+                server.stop()
+            self.assertFalse(Path(address).exists())
 
     def test_redis_lru_cache_evicts_least_recently_used_entry(self) -> None:
         cache = RedisLRUCache(

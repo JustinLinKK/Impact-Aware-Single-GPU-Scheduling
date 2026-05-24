@@ -501,6 +501,35 @@ def _persist_resolved_batch_size(
     return job
 
 
+def _batch_probe_profile_payload(profile: BatchProbeProfile, *, source: str) -> dict[str, Any]:
+    metadata = dict(profile.metadata or {})
+    return {
+        "profile_key": profile.probe_key,
+        "probe_key": profile.probe_key,
+        "model_key": profile.model_key,
+        "device_type": profile.device_type,
+        "shape_signature": profile.shape_signature,
+        "batch_param_name": profile.batch_param_name,
+        "resolved_batch_size": profile.resolved_batch_size,
+        "peak_vram_mb": profile.peak_vram_mb,
+        "memory_total_mb": profile.memory_total_mb,
+        "target_budget_mb": profile.target_budget_mb,
+        "observations": profile.observations,
+        "last_job_id": profile.last_job_id,
+        "updated_at": profile.updated_at,
+        "source": source,
+        "search_mode": metadata.get("search_mode"),
+        "search_method": metadata.get("search_method"),
+        "stop_reason": metadata.get("stop_reason"),
+        "failure_batch_size": metadata.get("failure_batch_size"),
+        "avg_step_time_ms": metadata.get("avg_step_time_ms"),
+        "warning_reason": metadata.get("warning_reason"),
+        "warning_message": metadata.get("warning_message"),
+        "saturated_vram": metadata.get("saturated_vram"),
+        "profile_metadata": metadata,
+    }
+
+
 def _job_has_resolved_batch_size(job: TrainingJob, key_info: BatchProbeKeyInfo) -> bool:
     batch_param_name = BatchResolution.param_name(job)
     if job.metadata.get("batch_probe_key") != key_info.probe_key:
@@ -534,15 +563,11 @@ def run_batch_probe_preflight(context: RunnerContext) -> TrainingJob:
 
     cached = context.store.get_batch_probe_profile(key_info.probe_key)
     if cached is not None:
+        cache_payload = _batch_probe_profile_payload(cached, source="cache")
         context.event_logger.emit(
             "batch_probe_cache_hit",
             job_id=context.job.job_id,
-            payload={
-                "probe_key": key_info.probe_key,
-                "device_type": key_info.device_type,
-                "search_mode": key_info.search_mode,
-                "resolved_batch_size": cached.resolved_batch_size,
-            },
+            payload={**cache_payload, "search_mode": key_info.search_mode},
         )
         logger.info(
             "[batch_probe] job=%s cache hit probe_key=%s resolved_batch_size=%s device=%s",
@@ -623,14 +648,12 @@ def run_batch_probe_preflight(context: RunnerContext) -> TrainingJob:
     context.event_logger.emit(
         "batch_probe_selected",
         job_id=context.job.job_id,
-        payload={
-            "probe_key": key_info.probe_key,
-            "device_type": key_info.device_type,
-            "search_mode": key_info.search_mode,
-            "resolved_batch_size": profile.resolved_batch_size,
-            "target_budget_mb": profile.target_budget_mb,
-            "warning_reason": (profile.metadata or {}).get("warning_reason"),
-        },
+        payload=_batch_probe_profile_payload(profile, source="probe"),
+    )
+    context.event_logger.emit(
+        "batch_probe_result",
+        job_id=context.job.job_id,
+        payload=_batch_probe_profile_payload(profile, source="probe"),
     )
     logger.info(
         "[batch_probe] job=%s selected batch_size=%s probe_key=%s target_budget_mb=%s source=probe",

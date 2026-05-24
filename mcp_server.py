@@ -158,6 +158,30 @@ def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
         return client.get_optimization_context(candidate=candidate, limit=limit)
 
     @server.tool()
+    def plan_job_packet(candidates: list[dict[str, Any]], limit: int = 8) -> dict[str, Any]:
+        return client.plan_job_packet(candidates=candidates, limit=limit)
+
+    @server.tool()
+    def optimize_job_packet(candidates: list[dict[str, Any]], limit: int = 8) -> dict[str, Any]:
+        return client.optimize_job_packet(candidates=candidates, limit=limit)
+
+    @server.tool()
+    def get_model_design_hardware_context(
+        workload_type: str | None = None,
+        task_type: str | None = None,
+        candidate_families: list[str] | None = None,
+        hardware_key: str = "current",
+        limit: int = 8,
+    ) -> dict[str, Any]:
+        return client.get_model_design_hardware_context(
+            workload_type=workload_type,
+            task_type=task_type,
+            candidate_families=candidate_families,
+            hardware_key=hardware_key,
+            limit=limit,
+        )
+
+    @server.tool()
     def search_hardware_features(
         query: str,
         hardware_key: str = "current",

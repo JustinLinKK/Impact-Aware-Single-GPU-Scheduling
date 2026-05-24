@@ -89,6 +89,85 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
             self.assertEqual(stored.metadata["source"], "client-test")
             self.assertIsNotNone(client.inspect(stored.job_id))
 
+    def test_submit_many_submits_full_round_before_polling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerConfig(runtime_root=tmpdir)
+            client = SchedulerClient(settings)
+            jobs = [
+                TrainingJob.create("module:runner", "baseline-a", "/tmp/a.pt"),
+                TrainingJob.create("module:runner", "baseline-b", "/tmp/b.pt"),
+            ]
+
+            submitted = client.submit_many(jobs)
+
+            self.assertEqual([job.job_id for job in submitted], [job.job_id for job in jobs])
+            self.assertEqual(len(client.list_jobs()), 2)
+
+    def test_plan_job_packet_returns_per_candidate_contexts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerConfig(runtime_root=tmpdir)
+            client = SchedulerClient(settings)
+            calls = []
+
+            def fake_context(*, candidate, limit):
+                calls.append((candidate, limit))
+                return {
+                    "hardware_context": {"found": True},
+                    "graph_evidence": {"exact_profiles": [], "similar_profiles": [], "packed_profiles": []},
+                    "recommendations": ["Use batch size 8."],
+                    "risk_flags": [],
+                    "evidence_refs": [f"graph:{candidate['node_id']}"],
+                    "confidence": 0.6,
+                }
+
+            client.get_optimization_context = fake_context  # type: ignore[method-assign]
+            client.get_packet_compatibility = lambda **_: {"found": False, "reason": "unit-test"}  # type: ignore[method-assign]
+
+            packet = client.plan_job_packet(
+                candidates=[
+                    {"node_id": "n1", "model_key": "m1"},
+                    {"node_id": "n2", "model_key": "m2"},
+                ],
+                limit=3,
+            )
+
+            self.assertTrue(packet["found"])
+            self.assertEqual(len(packet["jobs"]), 2)
+            self.assertEqual(len(calls), 2)
+            self.assertIn("graph:n1", packet["evidence_refs"])
+            self.assertEqual(len(packet["packet_compatibility"]), 1)
+
+    def test_model_design_hardware_context_ranks_candidate_families(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerConfig(runtime_root=tmpdir)
+            client = SchedulerClient(settings)
+            client.get_hardware_context = lambda *_, **__: {  # type: ignore[method-assign]
+                "found": True,
+                "hardware": {"gpu_name": "RTX 5090", "summary_text": "RTX 5090"},
+                "scheduler_limits": {"safe_vram_budget_mb": 24000},
+            }
+            client.search_code_knowledge = lambda **_: [  # type: ignore[method-assign]
+                {
+                    "record_id": "bf16-doc",
+                    "record_type": "code_doc_chunks",
+                    "title": "BF16 tensor core training",
+                    "summary_text": "Use bf16 tensor core paths for transformer throughput.",
+                    "recommended_patterns": ["Use bf16 autocast."],
+                    "confidence": 0.8,
+                }
+            ]
+
+            context = client.get_model_design_hardware_context(
+                workload_type="vision_training",
+                candidate_families=["vision_transformer", "convnet"],
+                limit=2,
+            )
+
+            self.assertTrue(context["found"])
+            self.assertEqual(context["model_options"][0]["model_family"], "vision_transformer")
+            self.assertIn("code_knowledge:code_doc_chunks:bf16-doc", context["evidence_refs"])
+            self.assertGreaterEqual(context["confidence"], 0.8)
+
     def test_batch_resolution_apply_updates_runner_kwargs_and_metadata(self) -> None:
         job = TrainingJob.create(
             "module:runner",

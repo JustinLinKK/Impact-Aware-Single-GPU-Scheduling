@@ -45,6 +45,24 @@ class _FakeSchedulerClient:
         self._jobs[job.job_id] = job
         return job
 
+    def submit_many(self, jobs: list[TrainingJob]) -> list[TrainingJob]:
+        submitted = []
+        for job in jobs:
+            submitted.append(self.submit(job))
+        return submitted
+
+    def plan_job_packet(self, *, candidates, limit=8):
+        return {
+            "packet_id": "packet-test",
+            "jobs": [{"candidate": candidate, "optimization_context": {"confidence": 0.0}} for candidate in candidates],
+            "evidence_refs": [],
+            "confidence": 0.0,
+        }
+
+    def record_tuning_outcome(self, **kwargs):
+        self.last_tuning_outcome = kwargs
+        return {"ok": True}
+
     def inspect(self, job_id: str) -> TrainingJob | None:
         return self._jobs.get(job_id)
 
@@ -224,6 +242,42 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertTrue(submitted.packing.eligible)
             self.assertEqual(submitted.packing.backend_allowlist, ["mps", "cuda_process"])
             self.assertIsNone(submitted.preload_source)
+
+    def test_run_many_submits_round_before_collecting_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            workdir = Path(tmpdir) / "workdir"
+            workdir.mkdir(parents=True, exist_ok=True)
+            settings = SchedulerSettings(runtime_root=runtime_root)
+            cfg = SimpleNamespace(
+                start_cpu_id=0,
+                cpu_number=2,
+                exp_id="unit-task",
+                exp_name="unit-exp",
+                experiment=SimpleNamespace(mode="hardware_aware"),
+                agent=SimpleNamespace(search=SimpleNamespace(parallel_search_num=2)),
+            )
+            interpreter = Interpreter(working_dir=workdir, timeout=10, max_parallel_run=2, cfg=cfg)
+            fake_api = _FakeSchedulerClient(settings)
+            interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
+
+            results = interpreter.run_many(
+                [
+                    ("batch_size = 2\nprint('round a')\n", "node-a"),
+                    ("batch_size = 4\nprint('round b')\n", "node-b"),
+                ],
+                working_dir=str(workdir),
+            )
+
+            self.assertEqual(set(results), {"node-a", "node-b"})
+            self.assertIsNone(results["node-a"].exc_type)
+            self.assertIsNone(results["node-b"].exc_type)
+            self.assertEqual(len(fake_api.submitted_jobs), 2)
+            self.assertEqual(
+                {job.metadata["mlevolve_node_id"] for job in fake_api.submitted_jobs},
+                {"node-a", "node-b"},
+            )
+            self.assertEqual(getattr(fake_api, "last_tuning_outcome")["recommendation_source"], "scheduler_round")
 
 
 if __name__ == "__main__":

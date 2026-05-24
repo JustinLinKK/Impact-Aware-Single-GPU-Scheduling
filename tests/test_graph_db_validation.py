@@ -516,6 +516,54 @@ class GraphDatabaseValidationTest(unittest.TestCase):
                     created_at="2026-05-11T00:00:03+00:00",
                     payload={"model_id": "baseline-a"},
                 )
+                store.record_event(
+                    job_id=None,
+                    event_type="planner_decision_trace",
+                    created_at="2026-05-11T00:00:03.100000+00:00",
+                    payload={
+                        "scheduler_mode": "parallel_auto_pack",
+                        "safe_vram_budget_mb": 28672.0,
+                        "active_gpu_occupancy": {"vram_mb": 1024.0, "sm_utilization": 0.1},
+                        "selected_plan": {
+                            "mode": "packed_pair",
+                            "backend_name": "stream",
+                            "job_ids": ["job-1", "job-2"],
+                            "reason": "auto-pack group selected",
+                            "expected_runtime_seconds": 12.0,
+                        },
+                        "candidates": [],
+                    },
+                )
+                store.record_event(
+                    job_id="job-1",
+                    event_type="runtime_probe_profiled",
+                    created_at="2026-05-11T00:00:03.200000+00:00",
+                    payload={
+                        "profile_key": "runtime-profile-1",
+                        "signature": "sig-1",
+                        "hardware_key": "hw-test-001",
+                        "backend_name": "stream",
+                        "strategy": "epoch_1",
+                        "resolved_batch_size": 8,
+                        "confidence": 0.8,
+                        "estimated_total_runtime_seconds": 48.0,
+                        "avg_step_time_ms": 12.5,
+                        "source": "probe",
+                    },
+                )
+                store.record_event(
+                    job_id="job-1",
+                    event_type="worker_launched",
+                    created_at="2026-05-11T00:00:03.300000+00:00",
+                    payload={
+                        "group_id": "group-1",
+                        "backend_name": "stream",
+                        "placement_mode": "packed_pair",
+                        "pid": 456,
+                        "stdout_path": "/tmp/stdout.log",
+                        "stderr_path": "/tmp/stderr.log",
+                    },
+                )
                 store.record_job_metric_sample(
                     job_id="job-1",
                     created_at="2026-05-11T00:00:04+00:00",
@@ -574,6 +622,9 @@ class GraphDatabaseValidationTest(unittest.TestCase):
         self.assertIn("run_groups", rendered)
         self.assertIn("run_group_members", rendered)
         self.assertIn("gpu_metric_samples", rendered)
+        self.assertIn("planner_decision_log", rendered)
+        self.assertIn("runtime_probe_summaries", rendered)
+        self.assertIn("worker_execution_log", rendered)
 
     def test_log_store_warns_but_does_not_fail_when_dsn_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -936,6 +987,9 @@ class GraphDatabaseValidationTest(unittest.TestCase):
                 "search_code_knowledge",
                 "get_code_optimization_context",
                 "get_optimization_context",
+                "plan_job_packet",
+                "optimize_job_packet",
+                "get_model_design_hardware_context",
                 "search_hardware_features",
                 "get_hardware_feature_context",
                 "get_hardware_optimization_context",

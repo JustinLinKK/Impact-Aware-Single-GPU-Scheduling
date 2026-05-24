@@ -16,6 +16,7 @@ from ..model_cache.warming import select_models_to_warm
 from ..observability.events import EventLogger
 from ..observability.logging_utils import setup_scheduler_logger
 from ..observability.metrics import MetricsCollector
+from ..profiling.runtime_probe import runtime_profile_for_job
 from ..domain import BatchResolution, CombinationProfile, JobStatus, PairProfile, PreloadSource, SoloProfile, TrainingJob, build_group_signature, utc_now
 from ..config import SCHEDULER_MODE_PARALLEL_AUTO_PACK, SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED, SchedulerSettings
 from ..storage.log_store import SchedulerLogStore
@@ -418,12 +419,15 @@ class SchedulerService:
         if snapshot.reported_by == "store":
             if run_context is not None and len(run_context.job_ids) > 1 and job.status == JobStatus.FAILED:
                 self._register_packed_fallback(run_context, job.status_reason or "stream-backed worker failed", payload={"failed_job_id": snapshot.job_id})
+            self._emit_worker_finished_event(snapshot, run_context=run_context)
             return
         if snapshot.returncode == 0:
             if job.status in {JobStatus.COMPLETED, JobStatus.PAUSED, JobStatus.CANCELLED, JobStatus.READY}:
+                self._emit_worker_finished_event(snapshot, run_context=run_context)
                 return
             self.store.set_job_status(job.job_id, JobStatus.FAILED, reason="worker exited without terminal status update", hold=True)
             self.event_logger.emit("job_failed", job_id=job.job_id, payload={"reason": "worker exited cleanly without terminal status"})
+            self._emit_worker_finished_event(snapshot, run_context=run_context)
             return
 
         if not job.status.is_terminal:
@@ -432,11 +436,13 @@ class SchedulerService:
             self.event_logger.emit("job_failed", job_id=job.job_id, payload={"returncode": snapshot.returncode})
             if run_context is not None and len(run_context.job_ids) > 1:
                 self._register_packed_fallback(run_context, reason, payload={"failed_job_id": snapshot.job_id, "returncode": snapshot.returncode})
+            self._emit_worker_finished_event(snapshot, run_context=run_context)
             return
 
         if run_context is not None and len(run_context.job_ids) > 1 and job.status == JobStatus.FAILED:
             reason = job.status_reason or f"worker exited with code {snapshot.returncode}"
             self._register_packed_fallback(run_context, reason, payload={"failed_job_id": snapshot.job_id, "returncode": snapshot.returncode})
+        self._emit_worker_finished_event(snapshot, run_context=run_context)
 
     def _register_packed_fallback(self, run: ActiveRun, reason: str, *, payload: dict[str, Any]) -> None:
         if len(run.job_ids) < 2 or run.fallback_triggered:
@@ -447,6 +453,109 @@ class SchedulerService:
             "packed_group_fallback",
             payload={"job_ids": list(run.job_ids), "reason": reason, **payload},
         )
+
+    def _batch_probe_profile_payload(self, job: TrainingJob) -> dict[str, Any] | None:
+        probe_key = job.metadata.get("batch_probe_key")
+        if not probe_key:
+            return None
+        profile = self.store.get_batch_probe_profile(str(probe_key))
+        return profile.to_dict() if profile is not None else {"probe_key": probe_key}
+
+    def _runtime_profile_payload(self, job: TrainingJob, *, backend_name: str) -> dict[str, Any] | None:
+        try:
+            profile = runtime_profile_for_job(self.store, job, backend_name=backend_name)
+        except Exception:
+            profile = None
+        return profile.to_dict() if profile is not None else None
+
+    def _artifact_paths(self, job: TrainingJob, *, stdout_path: Path | None = None, stderr_path: Path | None = None) -> dict[str, Any]:
+        runner_kwargs = dict(job.config.runner_kwargs or {})
+        paths: dict[str, Any] = {
+            "runtime_dir": str(self.settings.job_runtime_dir(job.job_id)),
+            "checkpoint_dir": str(self.settings.checkpoints_for_job(job.job_id)),
+        }
+        if stdout_path is not None:
+            paths["stdout_path"] = str(stdout_path)
+        if stderr_path is not None:
+            paths["stderr_path"] = str(stderr_path)
+        for key in ("script_path", "working_dir", "result_path"):
+            if runner_kwargs.get(key) is not None:
+                paths[key] = str(runner_kwargs[key])
+        if job.latest_checkpoint_path:
+            paths["latest_checkpoint_path"] = job.latest_checkpoint_path
+        return paths
+
+    def _last_event_payload(self, job_id: str, event_type: str) -> dict[str, Any] | None:
+        events = self.store.list_events(job_id=job_id, event_type=event_type)
+        if not events:
+            return None
+        return dict(events[-1].get("payload") or {})
+
+    def _worker_handle(self, group_id: str, job_id: str):
+        active_groups = getattr(self.supervisor, "active_groups", None)
+        if active_groups is None:
+            return None
+        group = active_groups().get(group_id)
+        if group is None:
+            return None
+        worker = group.workers.get(job_id)
+        return worker.handle if worker is not None else None
+
+    def _emit_worker_launch_events(self, *, group_id: str, run: ActiveRun, jobs: list[TrainingJob], reason: str) -> None:
+        for job in jobs:
+            handle = self._worker_handle(group_id, job.job_id)
+            stdout_path = getattr(handle, "stdout_path", None)
+            stderr_path = getattr(handle, "stderr_path", None)
+            process = getattr(handle, "process", None)
+            args = getattr(process, "args", []) if process is not None else []
+            process_command = [str(item) for item in args] if isinstance(args, (list, tuple)) else [str(args)]
+            payload = {
+                "group_id": group_id,
+                "job_ids": list(run.job_ids),
+                "backend_name": run.backend_name,
+                "placement_mode": run.mode,
+                "placement_reason": reason,
+                "placement_batch_size": run.batch_overrides.get(job.job_id),
+                "batch_overrides": dict(run.batch_overrides),
+                "fallback_order": list(run.fallback_order),
+                "pid": getattr(process, "pid", None),
+                "process_command": process_command,
+                "stdout_path": str(stdout_path) if stdout_path is not None else None,
+                "stderr_path": str(stderr_path) if stderr_path is not None else None,
+                "artifact_paths": self._artifact_paths(job, stdout_path=stdout_path, stderr_path=stderr_path),
+                "started_at": utc_now(),
+                "packing_signature": job.packing.signature,
+                "batch_probe_profile": self._batch_probe_profile_payload(job),
+                "runtime_profile": self._runtime_profile_payload(job, backend_name=run.backend_name),
+            }
+            self.event_logger.emit("worker_launched", job_id=job.job_id, payload=payload)
+
+    def _emit_worker_finished_event(self, snapshot: WorkerSnapshot, *, run_context: ActiveRun | None) -> None:
+        job = self.store.get_job(snapshot.job_id)
+        result_payload = self._last_event_payload(snapshot.job_id, "job_completed")
+        failure_payload = self._last_event_payload(snapshot.job_id, "job_failed")
+        stdout_path = snapshot.stdout_path
+        stderr_path = snapshot.stderr_path
+        payload = {
+            "group_id": snapshot.group_id,
+            "backend_name": run_context.backend_name if run_context is not None else None,
+            "placement_mode": run_context.mode if run_context is not None else None,
+            "job_ids": list(run_context.job_ids) if run_context is not None else [snapshot.job_id],
+            "pid": snapshot.pid,
+            "process_command": list(snapshot.process_command),
+            "stdout_path": str(stdout_path) if stdout_path is not None else None,
+            "stderr_path": str(stderr_path) if stderr_path is not None else None,
+            "artifact_paths": self._artifact_paths(job, stdout_path=stdout_path, stderr_path=stderr_path) if job is not None else {},
+            "ended_at": utc_now(),
+            "exit_status": snapshot.returncode,
+            "reported_by": snapshot.reported_by,
+            "job_status": job.status.value if job is not None else None,
+            "status_reason": job.status_reason if job is not None else None,
+            "traceback": (failure_payload or {}).get("traceback"),
+            "runner_result": result_payload,
+            "failure": failure_payload,
+        }
+        self.event_logger.emit("worker_finished", job_id=snapshot.job_id, payload=payload)
 
     def _record_solo_profiles(self, run: ActiveRun) -> None:
         if run.overlapped:
@@ -641,6 +750,26 @@ class SchedulerService:
             active_sm_utilization += self.planner.predicted_group_sm_utilization(materialized, backend_name=run.backend_name)
         return active_vram_mb, active_sm_utilization
 
+    def _emit_planner_decision_trace(self, plan: DispatchPlan | None) -> None:
+        raw_trace = getattr(self.planner, "last_decision_trace", None)
+        trace = dict(raw_trace) if isinstance(raw_trace, dict) else {}
+        if not trace:
+            trace = {
+                "scheduler_mode": self.settings.gpu_scheduler.mode,
+                "selected_plan": None,
+                "candidates": [],
+            }
+        if plan is not None and not trace.get("selected_plan"):
+            trace["selected_plan"] = {
+                "mode": plan.mode,
+                "backend_name": plan.backend_name,
+                "job_ids": list(plan.job_ids),
+                "reason": plan.reason,
+                "batch_overrides": dict(plan.batch_overrides),
+                "fallback_order": list(plan.fallback_order),
+            }
+        self.event_logger.emit("planner_decision_trace", payload=trace)
+
     def _dispatch_plan(self, plan: DispatchPlan) -> bool:
         selected_jobs = []
         for job_id in plan.job_ids:
@@ -687,6 +816,12 @@ class SchedulerService:
                             group_signature=build_group_signature([fallback_job.packing.signature or fallback_job.job_id]),
                         )
                         self._log_run_group_open(self._active_runs[group_id], [fallback_job], reason="backend_fallback_dispatch")
+                        self._emit_worker_launch_events(
+                            group_id=group_id,
+                            run=self._active_runs[group_id],
+                            jobs=[fallback_job],
+                            reason="backend_fallback_dispatch",
+                        )
                         self._last_telemetry_poll_at = 0.0
                         self.store.update_job(
                             fallback_job.job_id,
@@ -720,6 +855,7 @@ class SchedulerService:
             group_signature=build_group_signature(signatures),
         )
         self._log_run_group_open(self._active_runs[group_id], selected_jobs, reason=plan.reason)
+        self._emit_worker_launch_events(group_id=group_id, run=self._active_runs[group_id], jobs=selected_jobs, reason=plan.reason)
         if len(self._active_runs) > 1:
             for run in self._active_runs.values():
                 run.overlapped = True
@@ -756,6 +892,8 @@ class SchedulerService:
                     "job_ids": list(plan.job_ids),
                     "batch_overrides": dict(plan.batch_overrides),
                     "reason": plan.reason,
+                    "batch_probe_profile": self._batch_probe_profile_payload(job),
+                    "runtime_profile": self._runtime_profile_payload(job, backend_name=plan.backend_name),
                 },
             )
         if len(plan.job_ids) == 2:
@@ -767,6 +905,16 @@ class SchedulerService:
                     "backend_name": plan.backend_name,
                     "batch_overrides": dict(plan.batch_overrides),
                     "reason": plan.reason,
+                    "members": [
+                        {
+                            "job_id": job.job_id,
+                            "role": "primary" if index == 0 else "secondary",
+                            "batch_size": plan.batch_overrides.get(job.job_id),
+                            "batch_probe_profile": self._batch_probe_profile_payload(job),
+                            "runtime_profile": self._runtime_profile_payload(job, backend_name=plan.backend_name),
+                        }
+                        for index, job in enumerate(selected_jobs)
+                    ],
                 },
             )
         elif len(plan.job_ids) > 2:
@@ -778,6 +926,16 @@ class SchedulerService:
                     "backend_name": plan.backend_name,
                     "batch_overrides": dict(plan.batch_overrides),
                     "reason": plan.reason,
+                    "members": [
+                        {
+                            "job_id": job.job_id,
+                            "role": f"slot-{index}",
+                            "batch_size": plan.batch_overrides.get(job.job_id),
+                            "batch_probe_profile": self._batch_probe_profile_payload(job),
+                            "runtime_profile": self._runtime_profile_payload(job, backend_name=plan.backend_name),
+                        }
+                        for index, job in enumerate(selected_jobs)
+                    ],
                 },
             )
         return True
@@ -809,6 +967,16 @@ class SchedulerService:
                 metadata={
                     "task_type": job.task_type,
                     "probe_task": bool(job.batch_probe.enabled or job.runtime_probe.enabled),
+                    "placement_mode": run.mode,
+                    "placement_backend": run.backend_name,
+                    "placement_reason": reason,
+                    "placement_group_id": run.group_id,
+                    "placement_batch_size": run.batch_overrides.get(job.job_id),
+                    "batch_overrides": dict(run.batch_overrides),
+                    "fallback_order": list(run.fallback_order),
+                    "packing_signature": job.packing.signature,
+                    "batch_probe_profile": self._batch_probe_profile_payload(job),
+                    "runtime_profile": self._runtime_profile_payload(job, backend_name=run.backend_name),
                 },
             )
 
@@ -829,6 +997,7 @@ class SchedulerService:
                 active_vram_mb=active_vram_mb,
                 active_sm_utilization=active_sm_utilization,
             )
+            self._emit_planner_decision_trace(plan)
             if plan is None:
                 return
             if scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK and self._active_runs and plan.backend_name == "exclusive":

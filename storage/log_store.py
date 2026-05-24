@@ -190,6 +190,64 @@ class SchedulerLogStore:
                     )
                     """
                 )
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {self.schema}.planner_decision_log (
+                        decision_id BIGSERIAL PRIMARY KEY,
+                        session_id TEXT,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        scheduler_mode TEXT,
+                        selected_mode TEXT,
+                        selected_backend TEXT,
+                        selected_job_ids_json JSONB,
+                        selected_reason TEXT,
+                        expected_runtime_seconds DOUBLE PRECISION,
+                        safe_vram_budget_mb DOUBLE PRECISION,
+                        active_vram_mb DOUBLE PRECISION,
+                        active_sm_utilization DOUBLE PRECISION,
+                        payload_json JSONB
+                    )
+                    """
+                )
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {self.schema}.runtime_probe_summaries (
+                        profile_key TEXT PRIMARY KEY,
+                        session_id TEXT,
+                        job_id TEXT,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        signature TEXT,
+                        hardware_key TEXT,
+                        backend_name TEXT,
+                        strategy TEXT,
+                        resolved_batch_size INTEGER,
+                        confidence DOUBLE PRECISION,
+                        estimated_total_runtime_seconds DOUBLE PRECISION,
+                        avg_step_time_ms DOUBLE PRECISION,
+                        source TEXT,
+                        payload_json JSONB
+                    )
+                    """
+                )
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {self.schema}.worker_execution_log (
+                        execution_id BIGSERIAL PRIMARY KEY,
+                        session_id TEXT,
+                        job_id TEXT,
+                        group_id TEXT,
+                        event_type TEXT,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        backend_name TEXT,
+                        placement_mode TEXT,
+                        pid INTEGER,
+                        exit_status INTEGER,
+                        stdout_path TEXT,
+                        stderr_path TEXT,
+                        payload_json JSONB
+                    )
+                    """
+                )
 
     @property
     def current_session_id(self) -> str | None:
@@ -253,11 +311,21 @@ class SchedulerLogStore:
         self._safe(self._record_event_impl, job_id=job_id, event_type=event_type, created_at=created_at, payload=payload)
 
     def _record_event_impl(self, *, job_id: str | None, event_type: str, created_at: str, payload: dict[str, Any]) -> None:
+        if event_type.startswith("planner_decision"):
+            self._record_planner_decision_event(job_id=job_id, event_type=event_type, created_at=created_at, payload=payload)
+            return
+        if event_type == "runtime_probe_profiled":
+            self._record_runtime_probe_summary(job_id=job_id, created_at=created_at, payload=payload)
+        if event_type.startswith("worker_"):
+            self._record_worker_execution_event(job_id=job_id, event_type=event_type, created_at=created_at, payload=payload)
+            return
+
         table = "job_activity_log"
         if event_type.startswith("batch_probe") or event_type.startswith("runtime_probe"):
             table = "probe_activity_log"
         elif event_type.startswith("cache_"):
             table = "cache_activity_log"
+
         with self._connect() as conn:
             with conn.cursor() as cur:
                 if table == "cache_activity_log":
@@ -302,6 +370,123 @@ class SchedulerLogStore:
                             json.dumps(payload, sort_keys=True),
                         ),
                     )
+
+    def _record_planner_decision_event(
+        self,
+        *,
+        job_id: str | None,
+        event_type: str,
+        created_at: str,
+        payload: dict[str, Any],
+    ) -> None:
+        del job_id, event_type
+        selected = payload.get("selected_plan") if isinstance(payload.get("selected_plan"), dict) else {}
+        active = payload.get("active_gpu_occupancy") if isinstance(payload.get("active_gpu_occupancy"), dict) else {}
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {self.schema}.planner_decision_log(
+                        session_id, created_at, scheduler_mode, selected_mode,
+                        selected_backend, selected_job_ids_json, selected_reason,
+                        expected_runtime_seconds, safe_vram_budget_mb,
+                        active_vram_mb, active_sm_utilization, payload_json
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        self._current_session_id,
+                        created_at,
+                        payload.get("scheduler_mode"),
+                        selected.get("mode"),
+                        selected.get("backend_name"),
+                        json.dumps(selected.get("job_ids") or [], sort_keys=True),
+                        selected.get("reason"),
+                        selected.get("expected_runtime_seconds"),
+                        payload.get("safe_vram_budget_mb"),
+                        active.get("vram_mb"),
+                        active.get("sm_utilization"),
+                        json.dumps(payload, sort_keys=True),
+                    ),
+                )
+
+    def _record_runtime_probe_summary(self, *, job_id: str | None, created_at: str, payload: dict[str, Any]) -> None:
+        profile_key = payload.get("profile_key")
+        if not profile_key:
+            return
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {self.schema}.runtime_probe_summaries(
+                        profile_key, session_id, job_id, created_at, signature,
+                        hardware_key, backend_name, strategy, resolved_batch_size,
+                        confidence, estimated_total_runtime_seconds,
+                        avg_step_time_ms, source, payload_json
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    ON CONFLICT (profile_key) DO UPDATE
+                    SET session_id = EXCLUDED.session_id,
+                        job_id = EXCLUDED.job_id,
+                        created_at = EXCLUDED.created_at,
+                        confidence = EXCLUDED.confidence,
+                        estimated_total_runtime_seconds = EXCLUDED.estimated_total_runtime_seconds,
+                        avg_step_time_ms = EXCLUDED.avg_step_time_ms,
+                        source = EXCLUDED.source,
+                        payload_json = EXCLUDED.payload_json
+                    """,
+                    (
+                        profile_key,
+                        self._current_session_id,
+                        job_id,
+                        created_at,
+                        payload.get("signature"),
+                        payload.get("hardware_key"),
+                        payload.get("backend_name"),
+                        payload.get("strategy"),
+                        payload.get("resolved_batch_size"),
+                        payload.get("confidence"),
+                        payload.get("estimated_total_runtime_seconds"),
+                        payload.get("avg_step_time_ms"),
+                        payload.get("source"),
+                        json.dumps(payload, sort_keys=True),
+                    ),
+                )
+
+    def _record_worker_execution_event(
+        self,
+        *,
+        job_id: str | None,
+        event_type: str,
+        created_at: str,
+        payload: dict[str, Any],
+    ) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {self.schema}.worker_execution_log(
+                        session_id, job_id, group_id, event_type, created_at,
+                        backend_name, placement_mode, pid, exit_status,
+                        stdout_path, stderr_path, payload_json
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        self._current_session_id,
+                        job_id,
+                        payload.get("group_id"),
+                        event_type,
+                        created_at,
+                        payload.get("backend_name"),
+                        payload.get("placement_mode"),
+                        payload.get("pid"),
+                        payload.get("exit_status"),
+                        payload.get("stdout_path"),
+                        payload.get("stderr_path"),
+                        json.dumps(payload, sort_keys=True),
+                    ),
+                )
 
     def record_job_metric_sample(self, *, job_id: str, created_at: str, epoch: int, global_step: int, avg_step_time_ms: float | None, estimated_total_runtime_seconds: float | None, remaining_runtime_seconds: float | None, metrics: dict[str, Any]) -> None:
         self._safe(

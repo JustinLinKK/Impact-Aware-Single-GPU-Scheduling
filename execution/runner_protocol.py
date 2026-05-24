@@ -128,11 +128,21 @@ class RunnerContext:
             job_id=self.job.job_id,
             payload={
                 "profile_key": stored.profile_key,
+                "signature": stored.signature,
+                "hardware_key": stored.hardware_key,
                 "backend_name": stored.backend_name,
                 "strategy": stored.strategy,
                 "resolved_batch_size": stored.resolved_batch_size,
+                "startup_seconds": stored.startup_seconds,
+                "epoch_1_seconds": stored.epoch_1_seconds,
+                "steps_per_epoch": stored.steps_per_epoch,
+                "avg_step_time_ms": stored.avg_step_time_ms,
                 "estimated_total_runtime_seconds": stored.estimated_total_runtime_seconds,
                 "confidence": stored.confidence,
+                "observations": stored.observations,
+                "source": stored.source,
+                "metadata": dict(stored.metadata),
+                "profile": stored.to_dict(),
             },
         )
         return stored

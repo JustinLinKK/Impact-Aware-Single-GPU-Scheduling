@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Any, Iterable
 
 from ..domain import TrainingJob
 from ..config import (
@@ -42,6 +42,7 @@ class PlacementPlanner:
             self.candidate_generator,
             self.runtime_guardrail,
         )
+        self.last_decision_trace: dict[str, Any] = {}
 
     def predicted_remaining_runtime_seconds(self, job: TrainingJob, *, backend_name: str) -> float | None:
         return self.estimator.predicted_remaining_runtime_seconds(job, backend_name=backend_name)
@@ -58,6 +59,72 @@ class PlacementPlanner:
     def _candidate_batch_sizes(self, job: TrainingJob) -> list[int]:
         return self.candidate_generator.candidate_batch_sizes(job)
 
+    def _runtime_estimates(self, jobs: list[TrainingJob], *, backend_name: str) -> dict[str, float | None]:
+        return {
+            job.job_id: self.estimator.predicted_remaining_runtime_seconds(job, backend_name=backend_name)
+            for job in jobs
+        }
+
+    def _expected_runtime_seconds(self, estimates: dict[str, float | None]) -> float | None:
+        materialized = [float(value) for value in estimates.values() if value is not None]
+        return max(materialized) if materialized else None
+
+    def _candidate_trace(
+        self,
+        jobs: list[TrainingJob],
+        *,
+        backend_name: str | None,
+        status: str,
+        rejection_reason: str | None = None,
+        evaluated: EvaluatedGroup | None = None,
+    ) -> dict[str, Any]:
+        backend = backend_name or "unselected"
+        runtime_estimates = self._runtime_estimates(jobs, backend_name=backend)
+        payload: dict[str, Any] = {
+            "job_ids": [job.job_id for job in jobs],
+            "packing_signatures": [job.packing.signature for job in jobs],
+            "backend_name": backend_name,
+            "status": status,
+            "rejection_reason": rejection_reason,
+            "expected_runtime_seconds": self._expected_runtime_seconds(runtime_estimates),
+            "job_expected_runtime_seconds": runtime_estimates,
+        }
+        if evaluated is not None:
+            payload.update(
+                {
+                    "objective_score": evaluated.objective_score,
+                    "estimated_vram_mb": evaluated.estimated_vram_mb,
+                    "estimated_sm_utilization": evaluated.estimated_sm_utilization,
+                    "batch_overrides": dict(evaluated.batch_overrides),
+                    "fallback_order": list(evaluated.fallback_order),
+                    "reason": evaluated.reason,
+                }
+            )
+        return payload
+
+    def _plan_trace(self, plan: DispatchPlan | None) -> dict[str, Any] | None:
+        if plan is None:
+            return None
+        runtime_estimates: dict[str, float | None] = {}
+        get_job = getattr(self.repository, "get_job", None)
+        for job_id in plan.job_ids:
+            job = get_job(job_id) if callable(get_job) else None
+            runtime_estimates[job_id] = (
+                self.predicted_remaining_runtime_seconds(job, backend_name=plan.backend_name)
+                if job is not None
+                else None
+            )
+        return {
+            "mode": plan.mode,
+            "backend_name": plan.backend_name,
+            "job_ids": list(plan.job_ids),
+            "reason": plan.reason,
+            "batch_overrides": dict(plan.batch_overrides),
+            "fallback_order": list(plan.fallback_order),
+            "expected_runtime_seconds": self._expected_runtime_seconds(runtime_estimates),
+            "job_expected_runtime_seconds": runtime_estimates,
+        }
+
     def choose_plan(
         self,
         jobs: Iterable[TrainingJob],
@@ -67,18 +134,48 @@ class PlacementPlanner:
         active_sm_utilization: float = 0.0,
     ) -> DispatchPlan | None:
         ordered = RunnableJobQueue(policy=self.policy, jobs=list(jobs)).ordered()
+        trace: dict[str, Any] = {
+            "scheduler_mode": self.settings.gpu_scheduler.mode,
+            "backend_available": dict(backend_available),
+            "ordered_job_ids": [job.job_id for job in ordered],
+            "candidate_window_size": self.settings.gpu_scheduler.candidate_window_size,
+            "safe_vram_budget_mb": self.estimator.safe_budget_mb(),
+            "auto_pack_target_metric": self.settings.gpu_scheduler.auto_pack.target_metric,
+            "auto_pack_target_vram_mb": self.estimator.safe_budget_mb()
+            * float(self.settings.gpu_scheduler.auto_pack.target_vram_fraction),
+            "auto_pack_target_sm_utilization": self.settings.gpu_scheduler.auto_pack.target_sm_fraction,
+            "active_gpu_occupancy": {
+                "vram_mb": active_vram_mb,
+                "sm_utilization": active_sm_utilization,
+            },
+            "candidates": [],
+            "selected_plan": None,
+        }
+
+        def finish(plan: DispatchPlan | None) -> DispatchPlan | None:
+            trace["selected_plan"] = self._plan_trace(plan)
+            self.last_decision_trace = trace
+            return plan
+
         if not ordered:
-            return None
+            trace["decision_reason"] = "no runnable jobs"
+            return finish(None)
         primary = ordered[0]
         if len(ordered) == 1:
-            return DispatchPlan(mode="exclusive", backend_name="exclusive", job_ids=(primary.job_id,), reason="single runnable job")
+            plan = DispatchPlan(mode="exclusive", backend_name="exclusive", job_ids=(primary.job_id,), reason="single runnable job")
+            trace["decision_reason"] = plan.reason
+            return finish(plan)
 
         if not self.settings.gpu_scheduler.enabled:
-            return DispatchPlan(mode="exclusive", backend_name="exclusive", job_ids=(primary.job_id,), reason="gpu scheduler disabled")
+            plan = DispatchPlan(mode="exclusive", backend_name="exclusive", job_ids=(primary.job_id,), reason="gpu scheduler disabled")
+            trace["decision_reason"] = plan.reason
+            return finish(plan)
 
         scheduler_mode = self.settings.gpu_scheduler.mode
         if scheduler_mode in {SCHEDULER_MODE_SERIAL_BASIC, SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED}:
-            return DispatchPlan(mode="exclusive", backend_name="exclusive", job_ids=(primary.job_id,), reason=f"{scheduler_mode} selected")
+            plan = DispatchPlan(mode="exclusive", backend_name="exclusive", job_ids=(primary.job_id,), reason=f"{scheduler_mode} selected")
+            trace["decision_reason"] = plan.reason
+            return finish(plan)
 
         best_group: EvaluatedGroup | None = None
         packed_backend_unavailable = False
@@ -92,9 +189,25 @@ class PlacementPlanner:
             ]
             if configured_backends and not any(backend_available.get(backend_name, False) for backend_name in configured_backends):
                 packed_backend_unavailable = True
+                trace["candidates"].append(
+                    self._candidate_trace(
+                        group,
+                        backend_name=None,
+                        status="rejected",
+                        rejection_reason="packed backend unavailable",
+                    )
+                )
                 continue
             available_backends = self.candidate_generator.backend_candidates(group, backend_available=backend_available, scheduler_mode=scheduler_mode)
             if not available_backends:
+                trace["candidates"].append(
+                    self._candidate_trace(
+                        group,
+                        backend_name=None,
+                        status="rejected",
+                        rejection_reason="no backend candidate allowed by packing policy or availability",
+                    )
+                )
                 continue
             viable_backends = [
                 backend_name
@@ -103,6 +216,15 @@ class PlacementPlanner:
             ]
             if not viable_backends:
                 missing_memory_estimate = True
+                for backend_name in available_backends:
+                    trace["candidates"].append(
+                        self._candidate_trace(
+                            group,
+                            backend_name=backend_name,
+                            status="rejected",
+                            rejection_reason="solo profile or VRAM estimate unavailable",
+                        )
+                    )
                 continue
 
             for backend_name in viable_backends:
@@ -119,7 +241,16 @@ class PlacementPlanner:
                     candidate = self.objective.evaluate_fixed_group(group, backend_name)
                 if candidate is None:
                     incompatible_group = True
+                    trace["candidates"].append(
+                        self._candidate_trace(
+                            group,
+                            backend_name=backend_name,
+                            status="rejected",
+                            rejection_reason="incompatible group, over budget, or runtime guardrail rejected it",
+                        )
+                    )
                     continue
+                trace["candidates"].append(self._candidate_trace(group, backend_name=backend_name, status="accepted", evaluated=candidate))
                 if best_group is None or candidate.objective_score > best_group.objective_score:
                     best_group = candidate
 
@@ -131,10 +262,12 @@ class PlacementPlanner:
                 reason = "solo profile or VRAM estimate unavailable"
             elif incompatible_group:
                 reason = "no compatible packed group"
-            return DispatchPlan(mode="exclusive", backend_name="exclusive", job_ids=(primary.job_id,), reason=reason)
+            plan = DispatchPlan(mode="exclusive", backend_name="exclusive", job_ids=(primary.job_id,), reason=reason)
+            trace["decision_reason"] = reason
+            return finish(plan)
 
         if len(best_group.jobs) == 1:
-            return DispatchPlan(
+            plan = DispatchPlan(
                 mode="exclusive",
                 backend_name=best_group.backend_name,
                 job_ids=(best_group.jobs[0].job_id,),
@@ -142,9 +275,11 @@ class PlacementPlanner:
                 batch_overrides=best_group.batch_overrides,
                 fallback_order=best_group.fallback_order,
             )
+            trace["decision_reason"] = best_group.reason
+            return finish(plan)
 
         placement_mode = "packed_pair" if len(best_group.jobs) == 2 else "packed_group"
-        return DispatchPlan(
+        plan = DispatchPlan(
             mode=placement_mode,
             backend_name=best_group.backend_name,
             job_ids=tuple(job.job_id for job in best_group.jobs),
@@ -152,3 +287,5 @@ class PlacementPlanner:
             batch_overrides=best_group.batch_overrides,
             fallback_order=best_group.fallback_order,
         )
+        trace["decision_reason"] = best_group.reason
+        return finish(plan)

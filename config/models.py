@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import hashlib
 import sys
+import tempfile
 
 import yaml
 
@@ -17,6 +19,7 @@ SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED = "serial_batch_optimized"
 SCHEDULER_MODE_PARALLEL_DEFAULT = "parallel_default"
 SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED = "parallel_batch_optimized"
 SCHEDULER_MODE_PARALLEL_AUTO_PACK = "parallel_auto_pack"
+_UNIX_SOCKET_PATH_SAFE_BYTES = 100
 
 
 def normalize_scheduler_mode(value: str | None) -> str:
@@ -31,6 +34,16 @@ def normalize_scheduler_mode(value: str | None) -> str:
     if normalized not in allowed:
         raise ValueError(f"Unsupported scheduler mode: {value}")
     return normalized
+
+
+def _cache_socket_path(runtime_root: Path, socket_name: str) -> Path:
+    path = runtime_root / socket_name
+    if sys.platform == "win32":
+        return path
+    if len(str(path).encode("utf-8")) < _UNIX_SOCKET_PATH_SAFE_BYTES:
+        return path
+    digest = hashlib.sha1(str(runtime_root).encode("utf-8")).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"localml-{digest}.sock"
 
 
 @dataclass(slots=True)
@@ -643,7 +656,7 @@ class SchedulerConfig:
         self.logs_dir = self.runtime_root / "logs"
         self.events_jsonl_path = self.logs_dir / "events.jsonl"
         self.scheduler_log_path = self.logs_dir / "scheduler.log"
-        self.cache_socket_path = self.runtime_root / self.cache_socket_name
+        self.cache_socket_path = _cache_socket_path(self.runtime_root, self.cache_socket_name)
         self.service_heartbeat_path = self.runtime_root / "service_heartbeat.json"
         if not self.graph_db.legacy_sqlite_path:
             self.graph_db.legacy_sqlite_path = str(self.db_path)

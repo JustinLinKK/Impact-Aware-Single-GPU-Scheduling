@@ -144,6 +144,8 @@ It is packaged as a root-level module so it can be used by MLEvolve or detached 
 
 - `log_store.py`: `class SchedulerLogStore` (`log_store.py:21`) — append-only Postgres analytics for sessions, events, metrics
 
+See [`docs/scheduler_observability.md`](../docs/scheduler_observability.md) for Postgres setup, `LOCALML_SCHEDULER_LOG_DSN`, and query examples that reconstruct a scheduler run from startup through probing, planning, dispatch, and worker execution.
+
 - `repositories.py`: concrete `PlanningRepository` implementations backed by the stores above
 
 - `models.py`: shared row schemas used by the SQL backends

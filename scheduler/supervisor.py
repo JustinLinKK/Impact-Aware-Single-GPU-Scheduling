@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 import subprocess
 import uuid
 
@@ -22,6 +23,17 @@ class WorkerSnapshot:
     alive: bool
     returncode: int | None = None
     reported_by: str = "process"
+    pid: int | None = None
+    process_command: list[str] = field(default_factory=list)
+    stdout_path: Path | None = None
+    stderr_path: Path | None = None
+
+
+def _process_command(process: subprocess.Popen) -> list[str]:
+    args = process.args
+    if isinstance(args, (list, tuple)):
+        return [str(item) for item in args]
+    return [str(args)]
 
 
 @dataclass(slots=True)
@@ -289,6 +301,10 @@ class WorkerSupervisor:
                             alive=False,
                             returncode=worker.handle.process.poll(),
                             reported_by="store",
+                            pid=worker.handle.process.pid,
+                            process_command=_process_command(worker.handle.process),
+                            stdout_path=worker.handle.stdout_path,
+                            stderr_path=worker.handle.stderr_path,
                         )
                     )
                     del group.workers[job_id]
@@ -303,6 +319,10 @@ class WorkerSupervisor:
                         alive=False,
                         returncode=returncode,
                         reported_by="process",
+                        pid=worker.handle.process.pid,
+                        process_command=_process_command(worker.handle.process),
+                        stdout_path=worker.handle.stdout_path,
+                        stderr_path=worker.handle.stderr_path,
                     )
                 )
                 del group.workers[job_id]
