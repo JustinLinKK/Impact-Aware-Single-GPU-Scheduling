@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 import hashlib
+import logging
 import sys
 import tempfile
 
@@ -20,6 +21,7 @@ SCHEDULER_MODE_PARALLEL_DEFAULT = "parallel_default"
 SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED = "parallel_batch_optimized"
 SCHEDULER_MODE_PARALLEL_AUTO_PACK = "parallel_auto_pack"
 _UNIX_SOCKET_PATH_SAFE_BYTES = 100
+logger = logging.getLogger("localml_scheduler")
 
 
 def normalize_scheduler_mode(value: str | None) -> str:
@@ -68,17 +70,60 @@ class GpuProfilingSettings:
 
 @dataclass(slots=True)
 class GpuMemorySettings:
-    safe_vram_budget_gib: float = 28.0
-    hard_stop_memory_fraction: float = 0.90
+    vram_budget_fraction: float = 0.95
+    safe_vram_budget_gib: float | None = field(default=28.0, repr=False)
+    hard_stop_memory_fraction: float | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.vram_budget_fraction is None:
+            self.vram_budget_fraction = 0.95
+        try:
+            fraction = float(self.vram_budget_fraction)
+        except (TypeError, ValueError):
+            fraction = 0.95
+        self.vram_budget_fraction = min(1.0, max(0.0, fraction))
+        if self.safe_vram_budget_gib is not None:
+            try:
+                self.safe_vram_budget_gib = float(self.safe_vram_budget_gib)
+            except (TypeError, ValueError):
+                self.safe_vram_budget_gib = None
+        if self.hard_stop_memory_fraction is not None:
+            try:
+                self.hard_stop_memory_fraction = float(self.hard_stop_memory_fraction)
+            except (TypeError, ValueError):
+                self.hard_stop_memory_fraction = None
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "GpuMemorySettings":
-        return cls(**(payload or {}))
+        data = dict(payload or {})
+        if "vram_budget_fraction" not in data and "hard_stop_memory_fraction" in data:
+            data["vram_budget_fraction"] = data["hard_stop_memory_fraction"]
+            logger.warning(
+                "gpu_scheduler.memory.hard_stop_memory_fraction is deprecated; "
+                "use gpu_scheduler.memory.vram_budget_fraction."
+            )
+        if "safe_vram_budget_gib" in data:
+            logger.warning(
+                "gpu_scheduler.memory.safe_vram_budget_gib is deprecated; "
+                "safe_vram_budget_mb is now computed from detected VRAM and "
+                "gpu_scheduler.memory.vram_budget_fraction."
+            )
+        return cls(**data)
+
+    def budget_mb(self, total_vram_mb: int | float | None) -> float:
+        try:
+            total = float(total_vram_mb) if total_vram_mb is not None else 0.0
+        except (TypeError, ValueError):
+            total = 0.0
+        if total > 0:
+            return total * float(self.vram_budget_fraction)
+        if self.safe_vram_budget_gib is not None:
+            return float(self.safe_vram_budget_gib) * 1024.0
+        return 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "safe_vram_budget_gib": self.safe_vram_budget_gib,
-            "hard_stop_memory_fraction": self.hard_stop_memory_fraction,
+            "vram_budget_fraction": self.vram_budget_fraction,
         }
 
 
@@ -187,7 +232,7 @@ class StreamSettings:
 @dataclass(slots=True)
 class AutoPackSettings:
     target_metric: str = "vram"
-    target_vram_fraction: float = 0.97
+    target_vram_fraction: float | None = field(default=None, repr=False)
     target_sm_fraction: float = 0.90
     runtime_skew_guardrail_ratio: float = 2.0
 
@@ -204,7 +249,6 @@ class AutoPackSettings:
     def to_dict(self) -> dict[str, Any]:
         return {
             "target_metric": self.target_metric,
-            "target_vram_fraction": self.target_vram_fraction,
             "target_sm_fraction": self.target_sm_fraction,
             "runtime_skew_guardrail_ratio": self.runtime_skew_guardrail_ratio,
         }
@@ -213,7 +257,7 @@ class AutoPackSettings:
 @dataclass(slots=True)
 class ParallelOptimizerSettings:
     batch_search_mode: str = "binary"
-    target_vram_fraction: float = 0.97
+    target_vram_fraction: float | None = field(default=None, repr=False)
     max_probe_jobs: int = 3
     binary_range_up: int = 32
     binary_range_down: int = 1
@@ -234,7 +278,6 @@ class ParallelOptimizerSettings:
     def to_dict(self) -> dict[str, Any]:
         return {
             "batch_search_mode": self.batch_search_mode,
-            "target_vram_fraction": self.target_vram_fraction,
             "max_probe_jobs": self.max_probe_jobs,
             "binary_range_up": self.binary_range_up,
             "binary_range_down": self.binary_range_down,
@@ -489,7 +532,7 @@ class GpuSchedulerSettings:
     concurrent_groups_enabled: bool = False
     concurrent_backend_allowlist: list[str] = field(default_factory=lambda: ["mps", "stream"])
     batch_probe_enabled: bool = True
-    batch_probe_target_memory_fraction: float = 0.97
+    batch_probe_target_memory_fraction: float | None = field(default=None, repr=False)
     batch_probe_min_batch_size: int = 1
     batch_probe_max_search_rounds: int = 12
     batch_probe_max_batch_size: int | None = None
@@ -558,7 +601,23 @@ class GpuSchedulerSettings:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "GpuSchedulerSettings":
-        return cls(**(payload or {}))
+        data = dict(payload or {})
+        memory = dict(data.get("memory") or {})
+        if "vram_budget_fraction" not in memory:
+            for legacy_path, value in (
+                ("batch_probe_target_memory_fraction", data.get("batch_probe_target_memory_fraction")),
+                ("auto_pack.target_vram_fraction", (data.get("auto_pack") or {}).get("target_vram_fraction") if isinstance(data.get("auto_pack"), dict) else None),
+                ("parallel_optimizer.target_vram_fraction", (data.get("parallel_optimizer") or {}).get("target_vram_fraction") if isinstance(data.get("parallel_optimizer"), dict) else None),
+            ):
+                if value is not None:
+                    memory["vram_budget_fraction"] = value
+                    logger.warning(
+                        "gpu_scheduler.%s is deprecated; use gpu_scheduler.memory.vram_budget_fraction.",
+                        legacy_path,
+                    )
+                    break
+        data["memory"] = memory
+        return cls(**data)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -573,7 +632,6 @@ class GpuSchedulerSettings:
             "concurrent_groups_enabled": self.concurrent_groups_enabled,
             "concurrent_backend_allowlist": list(self.concurrent_backend_allowlist),
             "batch_probe_enabled": self.batch_probe_enabled,
-            "batch_probe_target_memory_fraction": self.batch_probe_target_memory_fraction,
             "batch_probe_min_batch_size": self.batch_probe_min_batch_size,
             "batch_probe_max_search_rounds": self.batch_probe_max_search_rounds,
             "batch_probe_max_batch_size": self.batch_probe_max_batch_size,

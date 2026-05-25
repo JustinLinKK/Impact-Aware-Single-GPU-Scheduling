@@ -78,7 +78,7 @@ class ObjectiveScorer:
             )
 
         per_job_candidates = [self.candidate_generator.candidate_batch_sizes(job) for job in jobs]
-        safe_budget_mb = self.estimator.safe_budget_mb() * float(self.settings.gpu_scheduler.parallel_optimizer.target_vram_fraction)
+        safe_budget_mb = self.estimator.safe_budget_mb()
         best: EvaluatedGroup | None = None
 
         if len(jobs) <= 3:
@@ -148,7 +148,7 @@ class ObjectiveScorer:
             return None
 
         target_metric = self.settings.gpu_scheduler.auto_pack.target_metric
-        target_vram_mb = self.estimator.safe_budget_mb() * float(self.settings.gpu_scheduler.auto_pack.target_vram_fraction)
+        target_vram_mb = self.estimator.safe_budget_mb()
         target_sm = float(self.settings.gpu_scheduler.auto_pack.target_sm_fraction)
         if target_metric == "sm":
             projected = active_sm_utilization + estimated_sm_utilization
@@ -173,4 +173,3 @@ class ObjectiveScorer:
             fallback_order=self.candidate_generator.fallback_order(jobs, batch_overrides, backend_name),
             reason="auto-pack group selected",
         )
-

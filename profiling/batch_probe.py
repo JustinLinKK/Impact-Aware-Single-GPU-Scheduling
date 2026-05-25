@@ -197,7 +197,6 @@ def _run_trial(
     warmup_steps: int,
     measure_steps: int,
 ) -> ProbeAttempt:
-    memory_cap_mb = int(context.settings.gpu_scheduler.memory.safe_vram_budget_gib * 1024)
     try:
         result = _coerce_trial_result(probe(context, batch_size, warmup_steps, measure_steps))
     except Exception as exc:
@@ -208,12 +207,7 @@ def _run_trial(
             message=str(exc),
         )
     device_total_mb = result.memory_total_mb or _visible_device_total_mb()
-    if device_total_mb is not None:
-        effective_budget_mb = int(
-            min(device_total_mb, memory_cap_mb) * context.settings.gpu_scheduler.batch_probe_target_memory_fraction
-        )
-    else:
-        effective_budget_mb = int(memory_cap_mb * context.settings.gpu_scheduler.batch_probe_target_memory_fraction)
+    effective_budget_mb = int(context.settings.gpu_scheduler.memory.budget_mb(device_total_mb))
     within_budget = result.peak_vram_mb is None or result.peak_vram_mb <= effective_budget_mb
     context.event_logger.emit(
         "batch_probe_trial",

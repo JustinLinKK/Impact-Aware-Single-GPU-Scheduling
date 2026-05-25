@@ -14,7 +14,8 @@ class ResourceEstimator:
         self.repository = repository
 
     def safe_budget_mb(self) -> float:
-        return self.settings.gpu_scheduler.memory.safe_vram_budget_gib * 1024.0
+        hardware = self.repository.hardware_profile()
+        return self.settings.gpu_scheduler.memory.budget_mb(hardware.total_vram_mb)
 
     def resolved_batch_size(self, job: TrainingJob) -> int:
         return BatchResolution.resolved_batch_size(job)
@@ -121,4 +122,3 @@ class ResourceEstimator:
 
     def predicted_group_sm_utilization(self, jobs: list[TrainingJob], *, backend_name: str) -> float:
         return sum(self.estimate_sm_utilization(job, self.resolved_batch_size(job), backend_name) for job in jobs)
-

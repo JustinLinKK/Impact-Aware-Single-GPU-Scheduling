@@ -279,6 +279,37 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             )
             self.assertEqual(getattr(fake_api, "last_tuning_outcome")["recommendation_source"], "scheduler_round")
 
+    def test_run_many_scheduler_packet_is_not_capped_by_local_parallelism(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            workdir = Path(tmpdir) / "workdir"
+            workdir.mkdir(parents=True, exist_ok=True)
+            settings = SchedulerSettings(runtime_root=runtime_root)
+            cfg = SimpleNamespace(
+                start_cpu_id=0,
+                cpu_number=1,
+                exp_id="unit-task",
+                exp_name="unit-exp",
+                experiment=SimpleNamespace(mode="baseline"),
+                agent=SimpleNamespace(search=SimpleNamespace(parallel_search_num=1)),
+            )
+            interpreter = Interpreter(working_dir=workdir, timeout=None, max_parallel_run=1, cfg=cfg)
+            fake_api = _FakeSchedulerClient(settings)
+            interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=None, wait_poll_interval_seconds=0.01))
+
+            results = interpreter.run_many(
+                [
+                    ("print('a')\n", "node-a"),
+                    ("print('b')\n", "node-b"),
+                    ("print('c')\n", "node-c"),
+                ],
+                working_dir=str(workdir),
+            )
+
+            self.assertEqual(set(results), {"node-a", "node-b", "node-c"})
+            self.assertEqual(len(fake_api.submitted_jobs), 3)
+            self.assertTrue(all("timeout" not in job.config.runner_kwargs for job in fake_api.submitted_jobs))
+
 
 if __name__ == "__main__":
     unittest.main()

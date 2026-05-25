@@ -88,11 +88,12 @@ class SchedulerKnowledgeBase:
         settings = self._settings()
         gpu_scheduler = getattr(settings, "gpu_scheduler", None)
         memory = getattr(gpu_scheduler, "memory", None)
-        budget_gib = getattr(memory, "safe_vram_budget_gib", None)
-        if budget_gib is None:
+        if memory is None:
             return None
         try:
-            return int(float(budget_gib) * 1024.0)
+            profile = self._current_hardware_profile()
+            total_vram_mb = getattr(profile, "total_vram_mb", None) if profile is not None else None
+            return int(memory.budget_mb(total_vram_mb))
         except (TypeError, ValueError):
             return None
 

@@ -141,8 +141,7 @@ class PlacementPlanner:
             "candidate_window_size": self.settings.gpu_scheduler.candidate_window_size,
             "safe_vram_budget_mb": self.estimator.safe_budget_mb(),
             "auto_pack_target_metric": self.settings.gpu_scheduler.auto_pack.target_metric,
-            "auto_pack_target_vram_mb": self.estimator.safe_budget_mb()
-            * float(self.settings.gpu_scheduler.auto_pack.target_vram_fraction),
+            "auto_pack_target_vram_mb": self.estimator.safe_budget_mb(),
             "auto_pack_target_sm_utilization": self.settings.gpu_scheduler.auto_pack.target_sm_fraction,
             "active_gpu_occupancy": {
                 "vram_mb": active_vram_mb,

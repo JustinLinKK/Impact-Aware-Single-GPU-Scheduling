@@ -400,7 +400,15 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
     script_path = Path(kwargs["script_path"]).resolve()
     working_dir = Path(kwargs["working_dir"]).resolve()
     result_path = Path(kwargs["result_path"]).resolve()
-    timeout = int(kwargs["timeout"])
+    raw_timeout = kwargs.get("timeout")
+    timeout = None
+    if raw_timeout is not None:
+        try:
+            parsed_timeout = float(raw_timeout)
+            if parsed_timeout > 0:
+                timeout = parsed_timeout
+        except (TypeError, ValueError):
+            timeout = None
     python_executable = context.job.config.python_executable or sys.executable
 
     instrumented = _materialize_instrumented_script(script_path, working_dir)
@@ -449,10 +457,13 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
     if output and output[-1] and not output[-1].endswith("\n"):
         output.append("\n")
 
-    if exc_type == "TimeoutError":
-        output.append(f"Execution time: TimeoutError: Execution exceeded the time limit of {humanize.naturaldelta(timeout)}")
+    if exc_type == "TimeoutError" and timeout is not None:
+        output.append(f"Execution time: TimeoutError: Execution exceeded the time limit of {humanize.naturaldelta(timeout or 0)}")
+    elif exc_type == "TimeoutError":
+        output.append(f"Execution time: TimeoutError raised after {humanize.naturaldelta(exec_time)} seconds (no time limit).")
     else:
-        output.append(f"Execution time: {humanize.naturaldelta(exec_time)} seconds (time limit is {humanize.naturaldelta(timeout)}).")
+        limit_text = "no time limit" if timeout is None else f"time limit is {humanize.naturaldelta(timeout)}"
+        output.append(f"Execution time: {humanize.naturaldelta(exec_time)} seconds ({limit_text}).")
 
     result = {
         "term_out": output,

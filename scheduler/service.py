@@ -346,14 +346,20 @@ class SchedulerService:
         latest = self._device_samples[-1]
         if latest.memory_total_mb <= 0:
             return
+        safe_budget_mb = self.settings.gpu_scheduler.memory.budget_mb(latest.memory_total_mb)
+        if safe_budget_mb <= 0:
+            return
         memory_fraction = latest.memory_used_mb / latest.memory_total_mb
-        if memory_fraction < self.settings.gpu_scheduler.memory.hard_stop_memory_fraction:
+        if latest.memory_used_mb < safe_budget_mb:
             return
         target = self._pick_fallback_candidate()
         if target is None:
             return
         group_id, target_job_id = target
-        reason = f"packed groups exceeded hard memory threshold ({memory_fraction:.2%})"
+        reason = (
+            f"packed groups exceeded VRAM budget "
+            f"({latest.memory_used_mb:.0f} MiB/{latest.memory_total_mb:.0f} MiB, {memory_fraction:.2%})"
+        )
         if not self.supervisor.request_fallback_pause(target_job_id, reason=reason):
             return
         self.store.set_job_status(target_job_id, JobStatus.PAUSING, reason=reason, hold=False)
@@ -616,7 +622,8 @@ class SchedulerService:
                 avg_gpu_utilization=summary.avg_gpu_utilization,
                 avg_memory_utilization=summary.avg_memory_utilization,
                 avg_step_time_ms=None,
-                objective_score=(summary.peak_vram_mb or 0) / max(1.0, self.settings.gpu_scheduler.memory.safe_vram_budget_gib * 1024.0),
+                objective_score=(summary.peak_vram_mb or 0)
+                / max(1.0, self.settings.gpu_scheduler.memory.budget_mb(run.samples[-1].memory_total_mb if run.samples else None)),
                 resolved_optimal=(self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED),
                 last_failure_reason=run.fallback_reason,
                 fallback_order=run.fallback_order,

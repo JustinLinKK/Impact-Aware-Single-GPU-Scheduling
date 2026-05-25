@@ -103,7 +103,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                         '  backend_priority: ["mps", "exclusive"]',
                         "  max_packed_jobs_per_gpu: 2",
                         "  memory:",
-                        "    safe_vram_budget_gib: 12.5",
+                        "    vram_budget_fraction: 0.95",
                         "  telemetry:",
                         "    device_poll_ms: 250",
                         "  mps:",
@@ -114,7 +114,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             )
             settings = SchedulerSettings.from_file(settings_path)
             self.assertTrue(settings.gpu_scheduler.enabled)
-            self.assertEqual(settings.gpu_scheduler.memory.safe_vram_budget_gib, 12.5)
+            self.assertEqual(settings.gpu_scheduler.memory.vram_budget_fraction, 0.95)
             self.assertEqual(settings.gpu_scheduler.telemetry.device_poll_ms, 250)
             self.assertEqual(settings.gpu_scheduler.mps.default_primary_active_thread_pct, 55)
 
@@ -131,7 +131,6 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                         '  backend_priority: ["stream", "cuda_process", "exclusive"]',
                         "  parallel_optimizer:",
                         '    batch_search_mode: "power_of_two"',
-                        "    target_vram_fraction: 0.9",
                         "    binary_range_up: 10",
                         "    binary_range_down: 2",
                         "    power_of_two_range_up: 4",
@@ -152,7 +151,6 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             self.assertEqual(settings.gpu_scheduler.mode, SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED)
             self.assertEqual(settings.gpu_scheduler.candidate_window_size, 12)
             self.assertEqual(settings.gpu_scheduler.parallel_optimizer.batch_search_mode, "power_of_two")
-            self.assertEqual(settings.gpu_scheduler.parallel_optimizer.target_vram_fraction, 0.9)
             self.assertEqual(settings.gpu_scheduler.parallel_optimizer.binary_range_up, 10)
             self.assertEqual(settings.gpu_scheduler.parallel_optimizer.binary_range_down, 2)
             self.assertEqual(settings.gpu_scheduler.parallel_optimizer.power_of_two_range_up, 4)
@@ -187,6 +185,35 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             self.assertIsNotNone(settings.gpu_scheduler.mps)
             self.assertIsNotNone(settings.gpu_scheduler.cuda_process)
             self.assertIsNotNone(settings.gpu_scheduler.stream)
+
+    def test_legacy_vram_budget_keys_load_into_canonical_fraction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_path = Path(tmpdir) / "scheduler.yaml"
+            settings_path.write_text(
+                "\n".join(
+                    [
+                        f'runtime_root: "{tmpdir}"',
+                        "gpu_scheduler:",
+                        "  batch_probe_target_memory_fraction: 0.91",
+                        "  auto_pack:",
+                        "    target_vram_fraction: 0.92",
+                        "  parallel_optimizer:",
+                        "    target_vram_fraction: 0.93",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            settings = SchedulerSettings.from_file(settings_path)
+            self.assertEqual(settings.gpu_scheduler.memory.vram_budget_fraction, 0.91)
+            emitted = settings.to_dict()["gpu_scheduler"]
+            self.assertNotIn("batch_probe_target_memory_fraction", emitted)
+            self.assertNotIn("target_vram_fraction", emitted["auto_pack"])
+            self.assertNotIn("target_vram_fraction", emitted["parallel_optimizer"])
+
+    def test_default_vram_budget_is_95_percent_of_detected_vram(self) -> None:
+        settings = SchedulerSettings(runtime_root=Path(tempfile.mkdtemp()))
+        self.assertEqual(settings.gpu_scheduler.memory.vram_budget_fraction, 0.95)
+        self.assertEqual(settings.gpu_scheduler.memory.budget_mb(32768), 31129.6)
 
     def test_settings_file_parses_baseline_cache_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -448,10 +475,9 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                 gpu_scheduler={
                     "mode": SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
                     "backend_priority": ["cuda_process", "exclusive"],
-                    "memory": {"safe_vram_budget_gib": 0.75},
+                    "memory": {"vram_budget_fraction": 0.03125},
                     "parallel_optimizer": {
                         "batch_search_mode": "binary",
-                        "target_vram_fraction": 1.0,
                         "binary_range_up": 3,
                         "binary_range_down": 1,
                     },
@@ -514,10 +540,9 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                 gpu_scheduler={
                     "mode": SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
                     "backend_priority": ["cuda_process", "exclusive"],
-                    "memory": {"safe_vram_budget_gib": 0.9},
+                    "memory": {"vram_budget_fraction": 0.0375},
                     "parallel_optimizer": {
                         "batch_search_mode": "power_of_two",
-                        "target_vram_fraction": 1.0,
                         "power_of_two_range_up": 2,
                         "power_of_two_range_down": 0,
                     },
