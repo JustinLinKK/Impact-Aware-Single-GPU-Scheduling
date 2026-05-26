@@ -6,10 +6,11 @@ import unittest
 from unittest import mock
 
 from localml_scheduler.adapters.mlevolve import build_mlevolve_job, build_packing_signature
-from localml_scheduler.execution.backends import MPSBackend
+from localml_scheduler.execution.backends import MPSBackend, StreamMPSBackend
 from localml_scheduler.hardware import HardwareProfile, build_hardware_key
 from localml_scheduler.domain import (
     BatchSizeObservation,
+    BatchProbeProfile,
     CombinationProfile,
     PackingSpec,
     PlacementDecision,
@@ -17,6 +18,7 @@ from localml_scheduler.domain import (
     ResourceRequirements,
     SoloProfile,
     TrainingJob,
+    build_batch_probe_key,
     build_batch_size_observation_key,
     build_group_signature,
 )
@@ -26,9 +28,12 @@ from localml_scheduler.scheduler.policies import PriorityFifoPolicy
 from localml_scheduler.scheduler.planner_types import DispatchPlan
 from localml_scheduler.scheduler.service import SchedulerService
 from localml_scheduler.config import (
+    SCHEDULER_MODE_AUTO,
     SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
+    SCHEDULER_MODE_PARALLEL_AUTO_PACK,
     SCHEDULER_MODE_PARALLEL_DEFAULT,
     SchedulerSettings,
+    effective_scheduler_mode,
 )
 from localml_scheduler.storage.sqlite_store import SQLiteStateStore
 
@@ -118,6 +123,84 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             self.assertEqual(settings.gpu_scheduler.telemetry.device_poll_ms, 250)
             self.assertEqual(settings.gpu_scheduler.mps.default_primary_active_thread_pct, 55)
 
+    def test_default_scheduler_mode_is_auto_with_stream_mps_priority(self) -> None:
+        settings = SchedulerSettings(runtime_root=Path(tempfile.mkdtemp()))
+        self.assertEqual(settings.gpu_scheduler.mode, SCHEDULER_MODE_AUTO)
+        self.assertEqual(effective_scheduler_mode(settings.gpu_scheduler.mode), SCHEDULER_MODE_PARALLEL_AUTO_PACK)
+        self.assertEqual(settings.gpu_scheduler.backend_priority, ["stream_mps", "stream", "cuda_process", "mps", "exclusive"])
+        self.assertEqual(settings.gpu_scheduler.concurrent_backend_allowlist, ["stream_mps", "stream"])
+        self.assertEqual(settings.gpu_scheduler.submission_defaults.backend_allowlist, [])
+
+    def test_auto_mode_boot_probe_resolves_backend_priority_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                gpu_scheduler={
+                    "mode": "auto",
+                    "backend_priority": ["mps", "exclusive"],
+                    "stream": {"enabled": False},
+                    "mps": {"enabled": False},
+                    "cuda_process": {"enabled": False},
+                },
+            )
+            store = SQLiteStateStore(settings)
+            supervisor = _FakeParallelSupervisor(
+                available_backends={
+                    "exclusive": True,
+                    "stream_mps": True,
+                    "stream": True,
+                    "cuda_process": True,
+                    "mps": True,
+                }
+            )
+
+            SchedulerService(settings, store=store, supervisor=supervisor)
+
+            self.assertTrue(settings.gpu_scheduler.stream.enabled)
+            self.assertTrue(settings.gpu_scheduler.mps.enabled)
+            self.assertTrue(settings.gpu_scheduler.cuda_process.enabled)
+            self.assertEqual(settings.gpu_scheduler.backend_priority, ["stream_mps", "stream", "cuda_process", "mps", "exclusive"])
+            self.assertEqual(settings.gpu_scheduler.concurrent_backend_allowlist, ["stream_mps", "stream"])
+            events = store.list_events(event_type="scheduler_auto_backend_probe")
+            self.assertEqual(len(events), 1)
+            payload = events[0]["payload"]
+            self.assertEqual(payload["configured_mode"], "auto")
+            self.assertEqual(payload["effective_scheduler_mode"], SCHEDULER_MODE_PARALLEL_AUTO_PACK)
+            self.assertEqual(payload["backend_priority"], ["stream_mps", "stream", "cuda_process", "mps", "exclusive"])
+
+    def test_explicit_scheduler_mode_preserves_configured_backend_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                gpu_scheduler={
+                    "mode": SCHEDULER_MODE_PARALLEL_DEFAULT,
+                    "backend_priority": ["cuda_process", "exclusive"],
+                    "concurrent_backend_allowlist": ["cuda_process"],
+                    "stream": {"enabled": False},
+                    "mps": {"enabled": False},
+                },
+            )
+            store = SQLiteStateStore(settings)
+            supervisor = _FakeParallelSupervisor(
+                available_backends={
+                    "exclusive": True,
+                    "stream_mps": True,
+                    "stream": True,
+                    "cuda_process": True,
+                    "mps": True,
+                }
+            )
+
+            SchedulerService(settings, store=store, supervisor=supervisor)
+
+            self.assertEqual(settings.gpu_scheduler.mode, SCHEDULER_MODE_PARALLEL_DEFAULT)
+            self.assertEqual(effective_scheduler_mode(settings.gpu_scheduler.mode), SCHEDULER_MODE_PARALLEL_DEFAULT)
+            self.assertFalse(settings.gpu_scheduler.stream.enabled)
+            self.assertFalse(settings.gpu_scheduler.mps.enabled)
+            self.assertEqual(settings.gpu_scheduler.backend_priority, ["cuda_process", "exclusive"])
+            self.assertEqual(settings.gpu_scheduler.concurrent_backend_allowlist, ["cuda_process"])
+            self.assertEqual(store.list_events(event_type="scheduler_auto_backend_probe"), [])
+
     def test_settings_file_parses_modes_optimizer_and_submission_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings_path = Path(tmpdir) / "scheduler.yaml"
@@ -180,7 +263,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             )
             settings = SchedulerSettings.from_file(settings_path)
             self.assertIsNotNone(settings.gpu_scheduler.submission_defaults)
-            self.assertEqual(settings.gpu_scheduler.submission_defaults.backend_allowlist, ["mps", "cuda_process"])
+            self.assertEqual(settings.gpu_scheduler.submission_defaults.backend_allowlist, [])
             self.assertIsNotNone(settings.gpu_scheduler.parallel_optimizer)
             self.assertIsNotNone(settings.gpu_scheduler.mps)
             self.assertIsNotNone(settings.gpu_scheduler.cuda_process)
@@ -312,9 +395,33 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             ):
                 self.assertTrue(backend.available())
 
+    def test_stream_mps_backend_availability_requires_stream_mps_binary_and_cuda(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                gpu_scheduler={
+                    "stream": {"enabled": True},
+                    "mps": {"enabled": True},
+                },
+            )
+            backend = StreamMPSBackend(settings, executor=mock.Mock(), mps_binary="/usr/bin/nvidia-cuda-mps-control")
+
+            with mock.patch("localml_scheduler.execution.backends.sys.platform", "linux"), mock.patch(
+                "localml_scheduler.execution.backends._cuda_runtime_visible",
+                return_value=True,
+            ):
+                self.assertTrue(backend.available())
+
+            settings.gpu_scheduler.stream.enabled = False
+            with mock.patch("localml_scheduler.execution.backends.sys.platform", "linux"), mock.patch(
+                "localml_scheduler.execution.backends._cuda_runtime_visible",
+                return_value=True,
+            ):
+                self.assertFalse(backend.available())
+
     def test_planner_requires_solo_profiles_and_falls_back_when_mps_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            settings = SchedulerSettings(runtime_root=tmpdir)
+            settings = SchedulerSettings(runtime_root=tmpdir, gpu_scheduler={"mode": SCHEDULER_MODE_PARALLEL_DEFAULT})
             store = SQLiteStateStore(settings)
             planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
 
@@ -358,7 +465,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
         high_score = compatibility_score(primary, partner, primary_profile, high_util, None, settings)
         self.assertGreater(low_score, high_score)
 
-    def test_planner_prefers_stream_for_structured_jobs_and_reroutes_raw_jobs_to_cuda_process(self) -> None:
+    def test_planner_honors_raw_job_backend_allowlist_from_scheduler_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerSettings(
                 runtime_root=tmpdir,
@@ -410,7 +517,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                 resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=512),
                 packing_family="mlevolve_script",
                 packing_eligible=True,
-                packing_backend_allowlist=["mps", "cuda_process"],
+                packing_backend_allowlist=["stream", "cuda_process"],
                 task_type="mlevolve_script",
             )
             raw_b = build_mlevolve_job(
@@ -422,7 +529,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                 resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=512),
                 packing_family="mlevolve_script",
                 packing_eligible=True,
-                packing_backend_allowlist=["mps", "cuda_process"],
+                packing_backend_allowlist=["stream", "cuda_process"],
                 task_type="mlevolve_script",
             )
             raw_a.queue_sequence = 1
@@ -433,7 +540,129 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                 backend_available={"exclusive": True, "stream": True, "cuda_process": True},
             )
             self.assertEqual(raw_plan.mode, "packed_pair")
-            self.assertEqual(raw_plan.backend_name, "cuda_process")
+            self.assertEqual(raw_plan.backend_name, "stream")
+
+    def test_parallel_auto_pack_uses_batch_probe_memory_without_runtime_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                gpu_scheduler={
+                    "mode": SCHEDULER_MODE_PARALLEL_AUTO_PACK,
+                    "backend_priority": ["cuda_process", "exclusive"],
+                    "memory": {"vram_budget_fraction": 0.95},
+                },
+            )
+            store, planner = _planner(settings)
+            store._hardware_profile = _fake_hardware_profile("auto-pack-probed")
+
+            jobs = []
+            for index, model_id in enumerate(["auto-probe-a", "auto-probe-b"], start=1):
+                job = build_mlevolve_job(
+                    workflow_id="wf",
+                    baseline_model_id=model_id,
+                    baseline_model_path=f"/tmp/{model_id}.py",
+                    runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                    runner_kwargs={"batch_size": 4},
+                    resource_requirements=ResourceRequirements(requires_gpu=True),
+                    packing_family="mlevolve_script",
+                    packing_eligible=True,
+                    packing_backend_allowlist=["cuda_process"],
+                    task_type="mlevolve_script",
+                )
+                job.queue_sequence = index
+                jobs.append(job)
+                shape_signature = planner._shape_signature(job)
+                probe_key = build_batch_probe_key(
+                    model_id,
+                    store.hardware_profile().gpu_name,
+                    shape_signature,
+                    search_mode=settings.gpu_scheduler.batch_probe_search_mode,
+                )
+                store.upsert_batch_probe_profile(
+                    BatchProbeProfile(
+                        probe_key=probe_key,
+                        model_key=model_id,
+                        device_type=store.hardware_profile().gpu_name,
+                        shape_signature=shape_signature,
+                        batch_param_name="batch_size",
+                        resolved_batch_size=4,
+                        peak_vram_mb=1024,
+                        memory_total_mb=24576,
+                        last_job_id=job.job_id,
+                    )
+                )
+
+            plan = planner.choose_plan(jobs, backend_available={"exclusive": True, "cuda_process": True})
+
+            self.assertEqual(plan.mode, "packed_pair")
+            self.assertEqual(plan.backend_name, "cuda_process")
+            self.assertEqual(plan.reason, "auto-pack group selected")
+
+    def test_parallel_auto_pack_missing_memory_estimates_dispatches_calibration_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                gpu_scheduler={
+                    "mode": SCHEDULER_MODE_PARALLEL_AUTO_PACK,
+                    "backend_priority": ["cuda_process", "exclusive"],
+                },
+            )
+            _store, planner = _planner(settings)
+            first = build_mlevolve_job(
+                workflow_id="wf",
+                baseline_model_id="missing-a",
+                baseline_model_path="/tmp/a.py",
+                runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                runner_kwargs={"batch_size": 4},
+                resource_requirements=ResourceRequirements(requires_gpu=True),
+                packing_family="mlevolve_script",
+                packing_eligible=True,
+                packing_backend_allowlist=["cuda_process"],
+                task_type="mlevolve_script",
+            )
+            second = build_mlevolve_job(
+                workflow_id="wf",
+                baseline_model_id="missing-b",
+                baseline_model_path="/tmp/b.py",
+                runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                runner_kwargs={"batch_size": 4},
+                resource_requirements=ResourceRequirements(requires_gpu=True),
+                packing_family="mlevolve_script",
+                packing_eligible=True,
+                packing_backend_allowlist=["cuda_process"],
+                task_type="mlevolve_script",
+            )
+            first.queue_sequence = 1
+            second.queue_sequence = 2
+
+            plan = planner.choose_plan([first, second], backend_available={"exclusive": True, "cuda_process": True})
+
+            self.assertEqual(plan.mode, "exclusive")
+            self.assertIn("calibration probe", plan.reason)
+
+    def test_raw_mlevolve_jobs_are_not_preemptible_without_checkpoint_resume_support(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(runtime_root=tmpdir)
+            service = SchedulerService(settings, store=SQLiteStateStore(settings))
+            raw = build_mlevolve_job(
+                workflow_id="wf",
+                baseline_model_id="raw",
+                baseline_model_path="/tmp/raw.py",
+                runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                runner_kwargs={"batch_size": 4},
+                task_type="mlevolve_script",
+            )
+            structured = TrainingJob.create(
+                "pkg.runner:train",
+                "structured",
+                "/tmp/structured.pt",
+                task_type="classification",
+            )
+
+            self.assertFalse(service._supports_safe_preemption(raw))
+            raw.metadata["supports_checkpoint_resume"] = True
+            self.assertTrue(service._supports_safe_preemption(raw))
+            self.assertTrue(service._supports_safe_preemption(structured))
 
     def test_parallel_default_prefers_three_way_cuda_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

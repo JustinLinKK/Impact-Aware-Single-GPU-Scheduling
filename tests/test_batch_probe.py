@@ -30,7 +30,7 @@ from localml_scheduler.domain import (
     build_batch_probe_shape_signature,
 )
 from localml_scheduler.scheduler.supervisor import WorkerSupervisor
-from localml_scheduler.config import SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED, SchedulerSettings
+from localml_scheduler.config import SCHEDULER_MODE_PARALLEL_AUTO_PACK, SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED, SchedulerSettings
 from localml_scheduler.storage.sqlite_store import SQLiteStateStore
 
 
@@ -440,6 +440,38 @@ class BatchProbeIntegrationTest(unittest.TestCase):
             self.assertEqual(resolved.metadata["batch_probe_source"], "probe")
             selected_events = context.store.list_events(job_id=job.job_id, event_type="batch_probe_selected")
             self.assertEqual(selected_events[0]["payload"]["search_mode"], BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO)
+
+    def test_parallel_auto_pack_runs_batch_probe_preflight_for_exclusive_calibration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=Path(tmpdir),
+                scheduler_poll_interval_seconds=0.05,
+                gpu_scheduler={
+                    "mode": SCHEDULER_MODE_PARALLEL_AUTO_PACK,
+                    "batch_probe_search_mode": BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
+                },
+            )
+            job = TrainingJob.create(
+                "pkg.runner:train",
+                "baseline-a",
+                "/tmp/a.pt",
+                task_type="classification",
+                runner_kwargs={"batch_size": 3, "probe_max_batch_size": 6},
+                batch_probe=BatchProbeSpec(
+                    enabled=True,
+                    probe_target="localml_scheduler.tests.test_batch_probe:fake_limit_probe",
+                ),
+                metadata={"placement_backend": "exclusive", "probe_threshold": 5},
+                resource_requirements=ResourceRequirements(requires_gpu=True),
+                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
+            )
+
+            context = _build_context(settings, job)
+            resolved = run_batch_probe_preflight(context)
+
+            self.assertEqual(resolved.config.runner_kwargs["batch_size"], 4)
+            self.assertEqual(resolved.metadata["batch_probe_source"], "probe")
+            self.assertTrue(context.store.list_batch_probe_profiles())
 
     def test_resume_does_not_reprobe_once_batch_size_is_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

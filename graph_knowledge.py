@@ -5,6 +5,7 @@ from __future__ import annotations
 from statistics import median
 from typing import Any, Callable
 
+from .config import effective_scheduler_mode
 from .domain import RunProfile
 from .redis_cache import RedisLRUCache, graph_cache_enabled
 
@@ -633,11 +634,15 @@ class SchedulerKnowledgeBase:
         memory = getattr(gpu_scheduler, "memory", None)
         thresholds = getattr(gpu_scheduler, "thresholds", None)
         submission_defaults = getattr(gpu_scheduler, "submission_defaults", None)
+        mode = getattr(gpu_scheduler, "mode", None)
         return {
             "safe_vram_budget_mb": self._safe_vram_budget_mb(),
+            "mode": mode,
+            "effective_mode": effective_scheduler_mode(mode),
             "memory": memory.to_dict() if hasattr(memory, "to_dict") else {},
             "thresholds": thresholds.to_dict() if hasattr(thresholds, "to_dict") else {},
             "backend_priority": list(getattr(gpu_scheduler, "backend_priority", []) or []),
+            "concurrent_backend_allowlist": list(getattr(gpu_scheduler, "concurrent_backend_allowlist", []) or []),
             "submission_defaults": submission_defaults.to_dict() if hasattr(submission_defaults, "to_dict") else {},
         }
 
@@ -646,16 +651,33 @@ class SchedulerKnowledgeBase:
         gpu_scheduler = getattr(settings, "gpu_scheduler", None)
         if gpu_scheduler is None:
             return {}
+        mode = getattr(gpu_scheduler, "mode", None)
+        stream_enabled = bool(getattr(getattr(gpu_scheduler, "stream", None), "enabled", False))
+        mps_enabled = bool(getattr(getattr(gpu_scheduler, "mps", None), "enabled", False))
+        cuda_process_enabled = bool(getattr(getattr(gpu_scheduler, "cuda_process", None), "enabled", False))
+        stream_mps_enabled = bool(stream_enabled and mps_enabled)
         enabled_backends = ["exclusive"]
-        if getattr(getattr(gpu_scheduler, "mps", None), "enabled", False):
-            enabled_backends.append("mps")
-        if getattr(getattr(gpu_scheduler, "cuda_process", None), "enabled", False):
-            enabled_backends.append("cuda_process")
-        if getattr(getattr(gpu_scheduler, "stream", None), "enabled", False):
+        if stream_mps_enabled:
+            enabled_backends.append("stream_mps")
+        if stream_enabled:
             enabled_backends.append("stream")
+        if cuda_process_enabled:
+            enabled_backends.append("cuda_process")
+        if mps_enabled:
+            enabled_backends.append("mps")
         return {
+            "mode": mode,
+            "effective_mode": effective_scheduler_mode(mode),
             "enabled_backends": enabled_backends,
-            "priority": list(getattr(gpu_scheduler, "backend_priority", []) or []),
+            "backend_priority": list(getattr(gpu_scheduler, "backend_priority", []) or []),
+            "stream_mps_enabled": stream_mps_enabled,
+            "stream_enabled": stream_enabled,
+            "mps_enabled": mps_enabled,
+            "cuda_process_enabled": cuda_process_enabled,
+            "stream_mps_available": stream_mps_enabled,
+            "stream_available": stream_enabled,
+            "mps_available": mps_enabled,
+            "cuda_process_available": cuda_process_enabled,
             "concurrent_groups_enabled": bool(getattr(gpu_scheduler, "concurrent_groups_enabled", False)),
             "concurrent_backend_allowlist": list(getattr(gpu_scheduler, "concurrent_backend_allowlist", []) or []),
             "max_packed_jobs_per_gpu": getattr(gpu_scheduler, "max_packed_jobs_per_gpu", None),

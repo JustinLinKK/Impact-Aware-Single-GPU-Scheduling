@@ -12,7 +12,7 @@ from ..execution.backends import ExecutionBackend
 from ..execution.control import ControlPlane
 from ..execution.executor import SubprocessExecutor, WorkerProcessHandle
 from ..domain import JobStatus, PlacementDecision, TrainingJob
-from ..config import SchedulerSettings, SCHEDULER_MODE_PARALLEL_AUTO_PACK
+from ..config import SchedulerSettings, SCHEDULER_MODE_PARALLEL_AUTO_PACK, effective_scheduler_mode
 from ..storage.state_store import StateStore
 
 
@@ -78,7 +78,7 @@ class WorkerSupervisor:
 
     def _concurrency_enabled(self) -> bool:
         return (
-            self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK
+            effective_scheduler_mode(self.settings.gpu_scheduler.mode) == SCHEDULER_MODE_PARALLEL_AUTO_PACK
             and self.settings.gpu_scheduler.concurrent_groups_enabled
         )
 

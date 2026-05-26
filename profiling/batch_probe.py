@@ -24,7 +24,7 @@ from ..domain import (
     import_string,
     normalize_batch_probe_search_mode,
 )
-from ..config import SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED
+from ..config import SCHEDULER_MODE_PARALLEL_AUTO_PACK, SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED, effective_scheduler_mode
 
 logger = logging.getLogger("localml_scheduler")
 
@@ -534,9 +534,11 @@ def _job_has_resolved_batch_size(job: TrainingJob, key_info: BatchProbeKeyInfo) 
 
 
 def run_batch_probe_preflight(context: RunnerContext) -> TrainingJob:
+    probe_modes = {SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED, SCHEDULER_MODE_PARALLEL_AUTO_PACK}
+    scheduler_mode = effective_scheduler_mode(context.settings.gpu_scheduler.mode)
     if (
         not context.settings.gpu_scheduler.batch_probe_enabled
-        or context.settings.gpu_scheduler.mode != SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED
+        or scheduler_mode not in probe_modes
         or not _requires_probe(context.job)
     ):
         return context.job

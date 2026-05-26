@@ -15,6 +15,7 @@ from .models import (
     MPSSettings,
     ParallelOptimizerSettings,
     RedisCacheSettings,
+    SCHEDULER_MODE_AUTO,
     SCHEDULER_MODE_PARALLEL_AUTO_PACK,
     SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
     SCHEDULER_MODE_PARALLEL_DEFAULT,
@@ -24,6 +25,7 @@ from .models import (
     SchedulerSettings,
     SchedulerSubmissionDefaults,
     StreamSettings,
+    effective_scheduler_mode,
     normalize_scheduler_mode,
 )
 
@@ -42,6 +44,7 @@ __all__ = [
     "MPSSettings",
     "ParallelOptimizerSettings",
     "RedisCacheSettings",
+    "SCHEDULER_MODE_AUTO",
     "SCHEDULER_MODE_PARALLEL_AUTO_PACK",
     "SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED",
     "SCHEDULER_MODE_PARALLEL_DEFAULT",
@@ -51,5 +54,6 @@ __all__ = [
     "SchedulerSettings",
     "SchedulerSubmissionDefaults",
     "StreamSettings",
+    "effective_scheduler_mode",
     "normalize_scheduler_mode",
 ]

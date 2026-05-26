@@ -18,7 +18,7 @@ from ..observability.logging_utils import setup_scheduler_logger
 from ..observability.metrics import MetricsCollector
 from ..profiling.runtime_probe import runtime_profile_for_job
 from ..domain import BatchResolution, CombinationProfile, JobStatus, PairProfile, PreloadSource, SoloProfile, TrainingJob, build_group_signature, utc_now
-from ..config import SCHEDULER_MODE_PARALLEL_AUTO_PACK, SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED, SchedulerSettings
+from ..config import SCHEDULER_MODE_AUTO, SCHEDULER_MODE_PARALLEL_AUTO_PACK, SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED, SchedulerSettings, effective_scheduler_mode
 from ..storage.log_store import SchedulerLogStore
 from ..storage.state_store import StateStore
 from .placement_planner import PlacementPlanner
@@ -28,6 +28,9 @@ from .queue import RunnableJobQueue
 from .recovery import reconcile_recoverable_jobs
 from .supervisor import WorkerSnapshot, WorkerSupervisor
 from .telemetry import GpuTelemetrySample, GpuTelemetrySummary, NvidiaSmiTelemetrySampler
+
+
+RAW_MLEVOLVE_RUNNER_TARGET = "localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job"
 
 
 @dataclass(slots=True)
@@ -72,6 +75,7 @@ class SchedulerService:
             enable_priority_aging=settings.enable_priority_aging,
         )
         self.supervisor = supervisor or WorkerSupervisor(settings, store=self.store)
+        self._configure_auto_mode_backend_policy()
         self.planner = PlacementPlanner(settings, self.store, self.policy)
         self.telemetry_sampler = telemetry_sampler or NvidiaSmiTelemetrySampler(settings.gpu_scheduler.device_index)
         self.cache = BaselineModelCache(
@@ -86,6 +90,41 @@ class SchedulerService:
         self._active_runs: dict[str, ActiveRun] = {}
         self._device_samples: list[GpuTelemetrySample] = []
         self._last_telemetry_poll_at = 0.0
+        self._idle_coalescing_started_at: float | None = None
+
+    def _configure_auto_mode_backend_policy(self) -> None:
+        if self.settings.gpu_scheduler.mode != SCHEDULER_MODE_AUTO:
+            return
+        gpu = self.settings.gpu_scheduler
+        gpu.mps.enabled = True
+        gpu.stream.enabled = True
+        gpu.cuda_process.enabled = True
+        availability = self.supervisor.available_backends()
+        priority: list[str] = [
+            backend_name
+            for backend_name in ("stream_mps", "stream", "cuda_process", "mps")
+            if availability.get(backend_name)
+        ]
+        for backend_name in gpu.backend_priority:
+            if backend_name != "exclusive" and backend_name not in priority and availability.get(backend_name):
+                priority.append(backend_name)
+        priority.append("exclusive")
+        gpu.backend_priority = priority
+        gpu.concurrent_backend_allowlist = [name for name in ("stream_mps", "stream") if name in priority]
+        event_payload = {
+            "configured_mode": gpu.mode,
+            "effective_scheduler_mode": effective_scheduler_mode(gpu.mode),
+            "backend_availability": availability,
+            "backend_priority": list(priority),
+            "concurrent_backend_allowlist": list(gpu.concurrent_backend_allowlist),
+        }
+        self.event_logger.emit("scheduler_auto_backend_probe", payload=event_payload)
+        self.logger.info(
+            "Auto scheduler backend probe resolved mode=%s priority=%s availability=%s",
+            event_payload["effective_scheduler_mode"],
+            event_payload["backend_priority"],
+            event_payload["backend_availability"],
+        )
 
     def _persist_runtime_settings(self) -> None:
         path = self.settings.runtime_root / "scheduler_settings.json"
@@ -605,7 +644,7 @@ class SchedulerService:
             group_signature=group_signature,
             hardware_key=run.hardware_key or self.store.hardware_key(),
             backend_name=run.backend_name,
-            scheduler_mode=self.settings.gpu_scheduler.mode,
+            scheduler_mode=effective_scheduler_mode(self.settings.gpu_scheduler.mode),
         )
         compatible = not run.fallback_triggered and all(job.status != JobStatus.FAILED for job in materialized_jobs)
         self.store.upsert_combination_profile(
@@ -613,7 +652,7 @@ class SchedulerService:
                 group_signature=group_signature,
                 hardware_key=run.hardware_key or self.store.hardware_key(),
                 backend_name=run.backend_name,
-                scheduler_mode=self.settings.gpu_scheduler.mode,
+                scheduler_mode=effective_scheduler_mode(self.settings.gpu_scheduler.mode),
                 batch_vector=run.batch_overrides,
                 compatible=compatible,
                 observations=(existing.observations + 1) if existing else 1,
@@ -624,7 +663,7 @@ class SchedulerService:
                 avg_step_time_ms=None,
                 objective_score=(summary.peak_vram_mb or 0)
                 / max(1.0, self.settings.gpu_scheduler.memory.budget_mb(run.samples[-1].memory_total_mb if run.samples else None)),
-                resolved_optimal=(self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED),
+                resolved_optimal=(effective_scheduler_mode(self.settings.gpu_scheduler.mode) == SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED),
                 last_failure_reason=run.fallback_reason,
                 fallback_order=run.fallback_order,
                 metadata={"backend_name": run.backend_name, "job_ids": list(run.job_ids)},
@@ -722,6 +761,8 @@ class SchedulerService:
             return
         if active_job.status != JobStatus.RUNNING:
             return
+        if not self._supports_safe_preemption(active_job) or not self._supports_safe_preemption(candidate_job):
+            return
         if not self.policy.should_preempt(active_job, candidate_job):
             return
         reason = f"preempted by higher-priority job {candidate_job.job_id}"
@@ -732,6 +773,12 @@ class SchedulerService:
                 job_id=active_job.job_id,
                 payload={"reason": reason, "preempting_job_id": candidate_job.job_id, "hold": False},
             )
+
+    def _supports_safe_preemption(self, job: TrainingJob) -> bool:
+        if job.config.runner_target == RAW_MLEVOLVE_RUNNER_TARGET or job.task_type == "mlevolve_script":
+            return bool(job.metadata.get("supports_checkpoint_resume"))
+        policy = job.checkpoint_policy
+        return bool(job.resume_from_checkpoint or job.latest_checkpoint_path or policy.save_every_epoch or policy.save_every_n_steps)
 
     def _preload_job_baseline(self, job: TrainingJob) -> None:
         target = self._resolve_preload_target(job)
@@ -988,15 +1035,31 @@ class SchedulerService:
             )
 
     def _dispatch_pending_work(self) -> None:
-        scheduler_mode = self.settings.gpu_scheduler.mode
+        scheduler_mode = effective_scheduler_mode(self.settings.gpu_scheduler.mode)
         if scheduler_mode != SCHEDULER_MODE_PARALLEL_AUTO_PACK and self._active_runs:
+            self._idle_coalescing_started_at = None
             return
 
         while True:
             active_job_ids = set(self._supervisor_active_job_ids())
             runnable = [job for job in self._runnable_jobs() if job.job_id not in active_job_ids]
             if not runnable:
+                self._idle_coalescing_started_at = None
                 return
+            if (
+                scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK
+                and not self._active_runs
+                and len(runnable) == 1
+                and float(getattr(self.settings.gpu_scheduler, "idle_coalescing_window_seconds", 0.0) or 0.0) > 0.0
+            ):
+                now = time.monotonic()
+                if self._idle_coalescing_started_at is None:
+                    self._idle_coalescing_started_at = now
+                    return
+                if (now - self._idle_coalescing_started_at) < float(self.settings.gpu_scheduler.idle_coalescing_window_seconds):
+                    return
+            else:
+                self._idle_coalescing_started_at = None
             active_vram_mb, active_sm_utilization = self._active_occupancy()
             plan = self.planner.choose_plan(
                 runnable,

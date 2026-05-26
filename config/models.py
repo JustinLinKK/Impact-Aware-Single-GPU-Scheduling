@@ -20,21 +20,30 @@ SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED = "serial_batch_optimized"
 SCHEDULER_MODE_PARALLEL_DEFAULT = "parallel_default"
 SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED = "parallel_batch_optimized"
 SCHEDULER_MODE_PARALLEL_AUTO_PACK = "parallel_auto_pack"
+SCHEDULER_MODE_AUTO = "auto"
 _UNIX_SOCKET_PATH_SAFE_BYTES = 100
 logger = logging.getLogger("localml_scheduler")
 
 
 def normalize_scheduler_mode(value: str | None) -> str:
-    normalized = str(value or SCHEDULER_MODE_PARALLEL_DEFAULT).strip().lower().replace("-", "_")
+    normalized = str(value or SCHEDULER_MODE_AUTO).strip().lower().replace("-", "_")
     allowed = {
         SCHEDULER_MODE_SERIAL_BASIC,
         SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED,
         SCHEDULER_MODE_PARALLEL_DEFAULT,
         SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
         SCHEDULER_MODE_PARALLEL_AUTO_PACK,
+        SCHEDULER_MODE_AUTO,
     }
     if normalized not in allowed:
         raise ValueError(f"Unsupported scheduler mode: {value}")
+    return normalized
+
+
+def effective_scheduler_mode(value: str | None) -> str:
+    normalized = normalize_scheduler_mode(value)
+    if normalized == SCHEDULER_MODE_AUTO:
+        return SCHEDULER_MODE_PARALLEL_AUTO_PACK
     return normalized
 
 
@@ -474,7 +483,7 @@ class SchedulerSubmissionDefaults:
     packing_eligible: bool = False
     packing_family: str = "mlevolve_script"
     packing_max_slowdown_ratio: float | None = None
-    backend_allowlist: list[str] = field(default_factory=lambda: ["mps", "cuda_process"])
+    backend_allowlist: list[str] = field(default_factory=list)
     batch_probe_enabled: bool = True
     batch_probe_model_key: str | None = None
     batch_probe_probe_timeout_seconds: int = 45
@@ -490,7 +499,7 @@ class SchedulerSubmissionDefaults:
     def from_dict(cls, payload: dict[str, Any] | None) -> "SchedulerSubmissionDefaults":
         instance = cls(**(payload or {}))
         if instance.backend_allowlist is None:
-            instance.backend_allowlist = ["mps", "cuda_process"]
+            instance.backend_allowlist = []
         else:
             instance.backend_allowlist = [str(item) for item in instance.backend_allowlist]
         instance.batch_probe_search_mode = instance.batch_probe_search_mode or "binary"
@@ -522,15 +531,16 @@ class SchedulerSubmissionDefaults:
 @dataclass(slots=True)
 class GpuSchedulerSettings:
     enabled: bool = True
-    mode: str = SCHEDULER_MODE_PARALLEL_DEFAULT
-    backend_priority: list[str] = field(default_factory=lambda: ["mps", "stream", "cuda_process", "exclusive"])
+    mode: str = SCHEDULER_MODE_AUTO
+    backend_priority: list[str] = field(default_factory=lambda: ["stream_mps", "stream", "cuda_process", "mps", "exclusive"])
     max_packed_jobs_per_gpu: int = 2
     allow_three_way_packing: bool = False
     candidate_window_size: int = 8
     device_index: int = 0
     fallback_cooldown_seconds: int = 900
     concurrent_groups_enabled: bool = False
-    concurrent_backend_allowlist: list[str] = field(default_factory=lambda: ["mps", "stream"])
+    concurrent_backend_allowlist: list[str] = field(default_factory=lambda: ["stream_mps", "stream"])
+    idle_coalescing_window_seconds: float = 2.0
     batch_probe_enabled: bool = True
     batch_probe_target_memory_fraction: float | None = field(default=None, repr=False)
     batch_probe_min_batch_size: int = 1
@@ -551,11 +561,11 @@ class GpuSchedulerSettings:
     def __post_init__(self) -> None:
         self.mode = normalize_scheduler_mode(self.mode)
         if self.backend_priority is None:
-            self.backend_priority = ["mps", "stream", "cuda_process", "exclusive"]
+            self.backend_priority = ["stream_mps", "stream", "cuda_process", "mps", "exclusive"]
         else:
             self.backend_priority = [str(item) for item in self.backend_priority]
         if self.concurrent_backend_allowlist is None:
-            self.concurrent_backend_allowlist = ["mps", "stream"]
+            self.concurrent_backend_allowlist = ["stream_mps", "stream"]
         else:
             self.concurrent_backend_allowlist = [str(item) for item in self.concurrent_backend_allowlist]
         if self.profiling is None:
@@ -631,6 +641,7 @@ class GpuSchedulerSettings:
             "fallback_cooldown_seconds": self.fallback_cooldown_seconds,
             "concurrent_groups_enabled": self.concurrent_groups_enabled,
             "concurrent_backend_allowlist": list(self.concurrent_backend_allowlist),
+            "idle_coalescing_window_seconds": self.idle_coalescing_window_seconds,
             "batch_probe_enabled": self.batch_probe_enabled,
             "batch_probe_min_batch_size": self.batch_probe_min_batch_size,
             "batch_probe_max_search_rounds": self.batch_probe_max_search_rounds,

@@ -133,10 +133,6 @@ class ObjectiveScorer:
     ) -> EvaluatedGroup | None:
         if not self.compatibility.compatible_group(jobs, backend_name=backend_name):
             return None
-        if len(jobs) > 1 and not all(self.estimator.runtime_ready(job, backend_name) for job in jobs):
-            return None
-        if len(jobs) == 1 and not jobs[0].runtime_probe.enabled and backend_name != "exclusive":
-            return None
 
         batch_overrides = {job.job_id: self.estimator.resolved_batch_size(job) for job in jobs}
         estimated_vram_mb = sum(self.estimator.estimate_peak_vram_mb(job, batch_overrides[job.job_id], backend_name) for job in jobs)

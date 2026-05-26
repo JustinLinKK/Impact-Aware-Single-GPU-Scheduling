@@ -184,7 +184,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             interpreter.cleanup_session(-1)
             self.assertFalse(fake_api.active_service)
 
-    def test_scheduler_bridge_disables_raw_packing_for_unsupported_stream_only_allowlist(self) -> None:
+    def test_scheduler_bridge_preserves_stream_allowlist_from_scheduler_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir) / "runtime"
             workdir = Path(tmpdir) / "workdir"
@@ -210,10 +210,10 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
 
             self.assertIsNone(result.exc_type)
             submitted = fake_api.submitted_jobs[0]
-            self.assertFalse(submitted.packing.eligible)
-            self.assertEqual(submitted.packing.backend_allowlist, [])
+            self.assertTrue(submitted.packing.eligible)
+            self.assertEqual(submitted.packing.backend_allowlist, ["stream"])
 
-    def test_scheduler_bridge_uses_process_backends_when_raw_allowlist_is_empty(self) -> None:
+    def test_scheduler_bridge_leaves_empty_raw_allowlist_unrestricted(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir) / "runtime"
             workdir = Path(tmpdir) / "workdir"
@@ -240,7 +240,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertIsNone(result.exc_type)
             submitted = fake_api.submitted_jobs[0]
             self.assertTrue(submitted.packing.eligible)
-            self.assertEqual(submitted.packing.backend_allowlist, ["mps", "cuda_process"])
+            self.assertEqual(submitted.packing.backend_allowlist, [])
             self.assertIsNone(submitted.preload_source)
 
     def test_run_many_submits_round_before_collecting_results(self) -> None:

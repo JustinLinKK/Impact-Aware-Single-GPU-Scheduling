@@ -164,18 +164,23 @@ class StreamBackend:
     name: str = "stream"
 
     def available(self) -> bool:
-        return bool(self.settings.gpu_scheduler.stream.enabled)
+        return bool(self.settings.gpu_scheduler.stream.enabled and _cuda_runtime_visible(self.settings.gpu_scheduler.device_index))
+
+    def _host_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        project_root = self.executor.project_root
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = str(project_root) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+        env["CUDA_VISIBLE_DEVICES"] = str(self.settings.gpu_scheduler.device_index)
+        return env
 
     def launch(self, jobs: list[TrainingJob]) -> list[WorkerProcessHandle]:
         if not jobs:
             raise ValueError("stream backend expects at least one job")
         stdout_path, stderr_path = _group_log_paths(self.settings, jobs, "stream_host")
         python_executable = jobs[0].config.python_executable or self.settings.python_executable or sys.executable
-        env = os.environ.copy()
         project_root = self.executor.project_root
-        existing_pythonpath = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = str(project_root) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
-        env["CUDA_VISIBLE_DEVICES"] = str(self.settings.gpu_scheduler.device_index)
+        env = self._host_env()
 
         with stdout_path.open("a", encoding="utf-8") as stdout_handle, stderr_path.open("a", encoding="utf-8") as stderr_handle:
             process = subprocess.Popen(
@@ -203,3 +208,48 @@ class StreamBackend:
             )
             for job in jobs
         ]
+
+
+@dataclass(slots=True)
+class StreamMPSBackend(StreamBackend):
+    mps_binary: str | None = None
+    name: str = "stream_mps"
+
+    def __post_init__(self) -> None:
+        if self.mps_binary is None:
+            self.mps_binary = shutil.which("nvidia-cuda-mps-control")
+
+    def available(self) -> bool:
+        supported_platform = sys.platform.startswith("linux") or sys.platform == "qnx"
+        return bool(
+            supported_platform
+            and self.settings.gpu_scheduler.stream.enabled
+            and self.settings.gpu_scheduler.mps.enabled
+            and self.mps_binary
+            and _cuda_runtime_visible(self.settings.gpu_scheduler.device_index)
+        )
+
+    def _ensure_mps_runtime(self) -> None:
+        if not self.available() or not self.mps_binary:
+            raise RuntimeError("stream_mps backend unavailable")
+        mps_settings = self.settings.gpu_scheduler.mps
+        daemon_env = {
+            **os.environ,
+            "CUDA_VISIBLE_DEVICES": str(self.settings.gpu_scheduler.device_index),
+            "CUDA_MPS_PIPE_DIRECTORY": mps_settings.pipe_directory,
+            "CUDA_MPS_LOG_DIRECTORY": mps_settings.log_directory,
+        }
+        Path(daemon_env["CUDA_MPS_PIPE_DIRECTORY"]).mkdir(parents=True, exist_ok=True)
+        Path(daemon_env["CUDA_MPS_LOG_DIRECTORY"]).mkdir(parents=True, exist_ok=True)
+        subprocess.run([self.mps_binary, "-d"], check=False, capture_output=True, text=True, timeout=5.0, env=daemon_env)
+
+    def _host_env(self) -> dict[str, str]:
+        env = super()._host_env()
+        mps_settings = self.settings.gpu_scheduler.mps
+        env["CUDA_MPS_PIPE_DIRECTORY"] = mps_settings.pipe_directory
+        env["CUDA_MPS_LOG_DIRECTORY"] = mps_settings.log_directory
+        return env
+
+    def launch(self, jobs: list[TrainingJob]) -> list[WorkerProcessHandle]:
+        self._ensure_mps_runtime()
+        return super().launch(jobs)

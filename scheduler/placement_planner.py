@@ -11,6 +11,7 @@ from ..config import (
     SCHEDULER_MODE_SERIAL_BASIC,
     SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED,
     SchedulerSettings,
+    effective_scheduler_mode,
 )
 from .candidate_generator import CandidateGenerator
 from .compatibility import CompatibilityEvaluator
@@ -136,6 +137,7 @@ class PlacementPlanner:
         ordered = RunnableJobQueue(policy=self.policy, jobs=list(jobs)).ordered()
         trace: dict[str, Any] = {
             "scheduler_mode": self.settings.gpu_scheduler.mode,
+            "effective_scheduler_mode": effective_scheduler_mode(self.settings.gpu_scheduler.mode),
             "backend_available": dict(backend_available),
             "ordered_job_ids": [job.job_id for job in ordered],
             "candidate_window_size": self.settings.gpu_scheduler.candidate_window_size,
@@ -160,8 +162,22 @@ class PlacementPlanner:
             trace["decision_reason"] = "no runnable jobs"
             return finish(None)
         primary = ordered[0]
+        scheduler_mode = effective_scheduler_mode(self.settings.gpu_scheduler.mode)
         if len(ordered) == 1:
-            plan = DispatchPlan(mode="exclusive", backend_name="exclusive", job_ids=(primary.job_id,), reason="single runnable job")
+            reason = "single runnable job"
+            if self.settings.gpu_scheduler.enabled and scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK:
+                backends = [
+                    backend_name
+                    for backend_name in self.candidate_generator.backend_candidates(
+                        [primary],
+                        backend_available=backend_available,
+                        scheduler_mode=scheduler_mode,
+                    )
+                    if backend_name != "exclusive"
+                ]
+                if backends and not any(self.estimator.has_memory_estimate(primary, backend_name) for backend_name in backends):
+                    reason = "VRAM estimate unavailable; dispatching exclusive calibration probe"
+            plan = DispatchPlan(mode="exclusive", backend_name="exclusive", job_ids=(primary.job_id,), reason=reason)
             trace["decision_reason"] = plan.reason
             return finish(plan)
 
@@ -170,7 +186,6 @@ class PlacementPlanner:
             trace["decision_reason"] = plan.reason
             return finish(plan)
 
-        scheduler_mode = self.settings.gpu_scheduler.mode
         if scheduler_mode in {SCHEDULER_MODE_SERIAL_BASIC, SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED}:
             plan = DispatchPlan(mode="exclusive", backend_name="exclusive", job_ids=(primary.job_id,), reason=f"{scheduler_mode} selected")
             trace["decision_reason"] = plan.reason
@@ -215,13 +230,18 @@ class PlacementPlanner:
             ]
             if not viable_backends:
                 missing_memory_estimate = True
+                memory_rejection_reason = (
+                    "VRAM estimate unavailable; exclusive calibration probe required"
+                    if scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK
+                    else "solo profile or VRAM estimate unavailable"
+                )
                 for backend_name in available_backends:
                     trace["candidates"].append(
                         self._candidate_trace(
                             group,
                             backend_name=backend_name,
                             status="rejected",
-                            rejection_reason="solo profile or VRAM estimate unavailable",
+                            rejection_reason=memory_rejection_reason,
                         )
                     )
                 continue
@@ -258,7 +278,11 @@ class PlacementPlanner:
             if packed_backend_unavailable:
                 reason = "packed backend unavailable"
             elif missing_memory_estimate:
-                reason = "solo profile or VRAM estimate unavailable"
+                reason = (
+                    "VRAM estimate unavailable; dispatching exclusive calibration probe"
+                    if scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK
+                    else "solo profile or VRAM estimate unavailable"
+                )
             elif incompatible_group:
                 reason = "no compatible packed group"
             plan = DispatchPlan(mode="exclusive", backend_name="exclusive", job_ids=(primary.job_id,), reason=reason)
@@ -266,15 +290,22 @@ class PlacementPlanner:
             return finish(plan)
 
         if len(best_group.jobs) == 1:
+            plan_reason = best_group.reason
+            if (
+                scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK
+                and missing_memory_estimate
+                and best_group.backend_name == "exclusive"
+            ):
+                plan_reason = "VRAM estimate unavailable; dispatching exclusive calibration probe"
             plan = DispatchPlan(
                 mode="exclusive",
                 backend_name=best_group.backend_name,
                 job_ids=(best_group.jobs[0].job_id,),
-                reason=best_group.reason,
+                reason=plan_reason,
                 batch_overrides=best_group.batch_overrides,
                 fallback_order=best_group.fallback_order,
             )
-            trace["decision_reason"] = best_group.reason
+            trace["decision_reason"] = plan_reason
             return finish(plan)
 
         placement_mode = "packed_pair" if len(best_group.jobs) == 2 else "packed_group"
