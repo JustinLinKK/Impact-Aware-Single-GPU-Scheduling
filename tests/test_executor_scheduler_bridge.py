@@ -24,6 +24,7 @@ class _FakeSchedulerClient:
         self._jobs: dict[str, TrainingJob] = {}
         self.active_service = active_service
         self.create_service_calls = 0
+        self.submit_many_calls = 0
 
     def submit(self, job: TrainingJob) -> TrainingJob:
         self.submitted_jobs.append(job)
@@ -46,6 +47,7 @@ class _FakeSchedulerClient:
         return job
 
     def submit_many(self, jobs: list[TrainingJob]) -> list[TrainingJob]:
+        self.submit_many_calls += 1
         submitted = []
         for job in jobs:
             submitted.append(self.submit(job))
@@ -272,12 +274,53 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertEqual(set(results), {"node-a", "node-b"})
             self.assertIsNone(results["node-a"].exc_type)
             self.assertIsNone(results["node-b"].exc_type)
+            self.assertEqual(fake_api.submit_many_calls, 1)
             self.assertEqual(len(fake_api.submitted_jobs), 2)
             self.assertEqual(
                 {job.metadata["mlevolve_node_id"] for job in fake_api.submitted_jobs},
                 {"node-a", "node-b"},
             )
+            self.assertTrue(all(job.packing.eligible for job in fake_api.submitted_jobs))
+            self.assertTrue(all(job.packing.signature for job in fake_api.submitted_jobs))
             self.assertEqual(getattr(fake_api, "last_tuning_outcome")["recommendation_source"], "scheduler_round")
+
+    def test_run_many_uses_normalized_script_signature_for_raw_packing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            workdir = Path(tmpdir) / "workdir"
+            workdir.mkdir(parents=True, exist_ok=True)
+            settings = SchedulerSettings(
+                runtime_root=runtime_root,
+                gpu_scheduler={"submission_defaults": {"backend_allowlist": ["cuda_process"]}},
+            )
+            cfg = SimpleNamespace(
+                start_cpu_id=0,
+                cpu_number=2,
+                exp_id="unit-task",
+                exp_name="unit-exp",
+                experiment=SimpleNamespace(mode="baseline"),
+                agent=SimpleNamespace(search=SimpleNamespace(parallel_search_num=2)),
+            )
+            interpreter = Interpreter(working_dir=workdir, timeout=10, max_parallel_run=2, cfg=cfg)
+            fake_api = _FakeSchedulerClient(settings)
+            interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
+
+            results = interpreter.run_many(
+                [
+                    ("batch_size = 2\nprint('same workload')\n", "node-a"),
+                    ("batch_size = 4\nprint('same workload')\n", "node-b"),
+                ],
+                working_dir=str(workdir),
+            )
+
+            self.assertEqual(set(results), {"node-a", "node-b"})
+            self.assertEqual(fake_api.submit_many_calls, 1)
+            submitted = fake_api.submitted_jobs
+            self.assertEqual(len(submitted), 2)
+            self.assertTrue(all(job.packing.eligible for job in submitted))
+            self.assertEqual(submitted[0].packing.signature, submitted[1].packing.signature)
+            self.assertEqual(submitted[0].packing.backend_allowlist, ["cuda_process"])
+            self.assertEqual(submitted[1].packing.backend_allowlist, ["cuda_process"])
 
     def test_run_many_scheduler_packet_is_not_capped_by_local_parallelism(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

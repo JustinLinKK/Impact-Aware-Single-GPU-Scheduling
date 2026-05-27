@@ -33,6 +33,7 @@ class _FakeGraphStore:
     def __init__(self):
         self.settings = SchedulerConfig(runtime_root=tempfile.mkdtemp())
         self.hardware_calls = 0
+        self.events = []
 
     def hardware_profile(self):
         self.hardware_calls += 1
@@ -63,6 +64,12 @@ class _FakeGraphStore:
 
     def list_batch_probe_profiles(self):
         return []
+
+    def list_events(self, *, job_id=None, event_type=None):
+        del job_id
+        if event_type is None:
+            return list(self.events)
+        return [event for event in self.events if event.get("event_type") == event_type]
 
 
 class SchedulerClientSurfaceTest(unittest.TestCase):
@@ -259,6 +266,29 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertGreater(calls_after_first_read, 0)
         self.assertEqual(store.hardware_calls, calls_after_first_read)
+
+    def test_graph_knowledge_preserves_empty_auto_probe_backend_lists(self) -> None:
+        store = _FakeGraphStore()
+        store.events = [
+            {
+                "event_type": "scheduler_auto_backend_probe",
+                "payload": {
+                    "configured_mode": "auto",
+                    "effective_scheduler_mode": "parallel_auto_pack",
+                    "backend_priority": [],
+                    "concurrent_backend_allowlist": [],
+                },
+            }
+        ]
+        knowledge = SchedulerKnowledgeBase(store)
+
+        limits = knowledge._scheduler_limits()
+        capabilities = knowledge._backend_capabilities()
+
+        self.assertEqual(limits["backend_priority"], [])
+        self.assertEqual(limits["concurrent_backend_allowlist"], [])
+        self.assertEqual(capabilities["backend_priority"], [])
+        self.assertEqual(capabilities["concurrent_backend_allowlist"], [])
 
 
 if __name__ == "__main__":

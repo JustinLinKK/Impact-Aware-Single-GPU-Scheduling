@@ -156,7 +156,7 @@ class ObjectiveScorer:
             if projected > target_vram_mb:
                 return None
             gap = abs(target_vram_mb - projected) / max(1.0, target_vram_mb)
-        objective = (1.0 - gap) + (0.01 * len(jobs)) - runtime_penalty
+        objective = (1.0 - gap) + (0.03 * len(jobs)) - runtime_penalty
         if backend_name != "exclusive":
             objective += 0.02
         return EvaluatedGroup(

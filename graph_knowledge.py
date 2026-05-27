@@ -631,18 +631,23 @@ class SchedulerKnowledgeBase:
         gpu_scheduler = getattr(settings, "gpu_scheduler", None)
         if gpu_scheduler is None:
             return {}
+        probe_payload = self._latest_auto_backend_probe_payload()
         memory = getattr(gpu_scheduler, "memory", None)
         thresholds = getattr(gpu_scheduler, "thresholds", None)
         submission_defaults = getattr(gpu_scheduler, "submission_defaults", None)
-        mode = getattr(gpu_scheduler, "mode", None)
+        mode = probe_payload.get("configured_mode", getattr(gpu_scheduler, "mode", None))
         return {
             "safe_vram_budget_mb": self._safe_vram_budget_mb(),
             "mode": mode,
-            "effective_mode": effective_scheduler_mode(mode),
+            "effective_mode": probe_payload.get("effective_scheduler_mode") or effective_scheduler_mode(mode),
             "memory": memory.to_dict() if hasattr(memory, "to_dict") else {},
             "thresholds": thresholds.to_dict() if hasattr(thresholds, "to_dict") else {},
-            "backend_priority": list(getattr(gpu_scheduler, "backend_priority", []) or []),
-            "concurrent_backend_allowlist": list(getattr(gpu_scheduler, "concurrent_backend_allowlist", []) or []),
+            "backend_priority": self._probe_payload_list_or_setting(probe_payload, "backend_priority", gpu_scheduler),
+            "concurrent_backend_allowlist": self._probe_payload_list_or_setting(
+                probe_payload,
+                "concurrent_backend_allowlist",
+                gpu_scheduler,
+            ),
             "submission_defaults": submission_defaults.to_dict() if hasattr(submission_defaults, "to_dict") else {},
         }
 
@@ -651,38 +656,74 @@ class SchedulerKnowledgeBase:
         gpu_scheduler = getattr(settings, "gpu_scheduler", None)
         if gpu_scheduler is None:
             return {}
-        mode = getattr(gpu_scheduler, "mode", None)
+        probe_payload = self._latest_auto_backend_probe_payload()
+        mode = probe_payload.get("configured_mode", getattr(gpu_scheduler, "mode", None))
+        backend_availability = dict(probe_payload.get("backend_availability") or {})
         stream_enabled = bool(getattr(getattr(gpu_scheduler, "stream", None), "enabled", False))
         mps_enabled = bool(getattr(getattr(gpu_scheduler, "mps", None), "enabled", False))
         cuda_process_enabled = bool(getattr(getattr(gpu_scheduler, "cuda_process", None), "enabled", False))
         stream_mps_enabled = bool(stream_enabled and mps_enabled)
         enabled_backends = ["exclusive"]
-        if stream_mps_enabled:
+        if backend_availability:
+            enabled_backends = [backend_name for backend_name, available in backend_availability.items() if available]
+            if "exclusive" not in enabled_backends:
+                enabled_backends.insert(0, "exclusive")
+        elif stream_mps_enabled:
             enabled_backends.append("stream_mps")
-        if stream_enabled:
-            enabled_backends.append("stream")
-        if cuda_process_enabled:
-            enabled_backends.append("cuda_process")
-        if mps_enabled:
-            enabled_backends.append("mps")
+            if stream_enabled:
+                enabled_backends.append("stream")
+            if cuda_process_enabled:
+                enabled_backends.append("cuda_process")
+            if mps_enabled:
+                enabled_backends.append("mps")
+        else:
+            if stream_enabled:
+                enabled_backends.append("stream")
+            if cuda_process_enabled:
+                enabled_backends.append("cuda_process")
+            if mps_enabled:
+                enabled_backends.append("mps")
         return {
             "mode": mode,
-            "effective_mode": effective_scheduler_mode(mode),
+            "effective_mode": probe_payload.get("effective_scheduler_mode") or effective_scheduler_mode(mode),
             "enabled_backends": enabled_backends,
-            "backend_priority": list(getattr(gpu_scheduler, "backend_priority", []) or []),
+            "backend_priority": self._probe_payload_list_or_setting(probe_payload, "backend_priority", gpu_scheduler),
             "stream_mps_enabled": stream_mps_enabled,
             "stream_enabled": stream_enabled,
             "mps_enabled": mps_enabled,
             "cuda_process_enabled": cuda_process_enabled,
-            "stream_mps_available": stream_mps_enabled,
-            "stream_available": stream_enabled,
-            "mps_available": mps_enabled,
-            "cuda_process_available": cuda_process_enabled,
+            "stream_mps_available": bool(backend_availability.get("stream_mps", stream_mps_enabled)),
+            "stream_available": bool(backend_availability.get("stream", stream_enabled)),
+            "mps_available": bool(backend_availability.get("mps", mps_enabled)),
+            "cuda_process_available": bool(backend_availability.get("cuda_process", cuda_process_enabled)),
             "concurrent_groups_enabled": bool(getattr(gpu_scheduler, "concurrent_groups_enabled", False)),
-            "concurrent_backend_allowlist": list(getattr(gpu_scheduler, "concurrent_backend_allowlist", []) or []),
+            "concurrent_backend_allowlist": self._probe_payload_list_or_setting(
+                probe_payload,
+                "concurrent_backend_allowlist",
+                gpu_scheduler,
+            ),
             "max_packed_jobs_per_gpu": getattr(gpu_scheduler, "max_packed_jobs_per_gpu", None),
             "allow_three_way_packing": bool(getattr(gpu_scheduler, "allow_three_way_packing", False)),
         }
+
+    @staticmethod
+    def _probe_payload_list_or_setting(probe_payload: dict[str, Any], key: str, settings: Any) -> list[Any]:
+        if probe_payload and key in probe_payload:
+            return list(probe_payload.get(key) or [])
+        return list(getattr(settings, key, []) or [])
+
+    def _latest_auto_backend_probe_payload(self) -> dict[str, Any]:
+        list_events = getattr(self.store, "list_events", None)
+        if not callable(list_events):
+            return {}
+        try:
+            events = list(list_events(event_type="scheduler_auto_backend_probe"))
+        except Exception:
+            return {}
+        if not events:
+            return {}
+        payload = events[-1].get("payload") or {}
+        return dict(payload) if isinstance(payload, dict) else {}
 
     def _scheduler_guidance(self) -> dict[str, Any]:
         settings = self._settings()

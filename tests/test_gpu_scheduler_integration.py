@@ -237,7 +237,7 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
             )
             api = SchedulerClient(settings)
             supervisor = _build_cuda_process_supervisor(settings)
-            service = api.create_service(supervisor=supervisor).start(background=True)
+            service = None
             try:
                 baseline = create_toy_baseline_checkpoint(runtime_root / "baselines" / "cuda-process-group.pt", seed=88)
                 jobs = [
@@ -247,14 +247,16 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
                 ]
                 for job in jobs:
                     _seed_solo_profile(api, job, peak_vram_mb=256)
-                    api.submit(job)
+                api.submit_many(jobs)
+                service = api.create_service(supervisor=supervisor).start(background=True)
 
                 wait_for(lambda: all(api.inspect(job.job_id).status.is_terminal for job in jobs), timeout=30.0)
                 self.assertTrue(all(api.inspect(job.job_id).metadata["placement_mode"] == "packed_group" for job in jobs))
                 self.assertTrue(all(api.inspect(job.job_id).metadata["placement_backend"] == "cuda_process" for job in jobs))
                 self.assertEqual(api.report()["packed_dispatches"], 1)
             finally:
-                service.stop()
+                if service is not None:
+                    service.stop()
 
     def test_cuda_process_failure_records_fallback_and_keeps_peer_alive(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

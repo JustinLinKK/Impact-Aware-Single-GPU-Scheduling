@@ -370,6 +370,48 @@ class GraphDBSettings:
 
 
 @dataclass(slots=True)
+class HardwareKnowledgeGraphSettings:
+    enabled: bool = True
+    provider: str = "neo4j"
+    uri: str = ""
+    username: str = ""
+    password_env: str = ""
+    database: str = ""
+
+    def __post_init__(self) -> None:
+        self.enabled = bool(self.enabled)
+        self.provider = str(self.provider or "neo4j").strip().lower().replace("-", "_")
+        self.uri = str(self.uri or "").strip()
+        self.username = str(self.username or "").strip()
+        self.password_env = str(self.password_env or "").strip()
+        self.database = str(self.database or "").strip()
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "HardwareKnowledgeGraphSettings":
+        return cls(**(payload or {}))
+
+    def inherit_from_graph_db(self, graph_db: GraphDBSettings) -> None:
+        if not self.uri:
+            self.uri = graph_db.uri
+        if not self.username:
+            self.username = graph_db.username
+        if not self.password_env:
+            self.password_env = graph_db.password_env
+        if not self.database:
+            self.database = graph_db.database
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "provider": self.provider,
+            "uri": self.uri,
+            "username": self.username,
+            "password_env": self.password_env,
+            "database": self.database,
+        }
+
+
+@dataclass(slots=True)
 class HardwareFeatureDBSettings:
     enabled: bool = True
     provider: str = "qdrant"
@@ -480,7 +522,7 @@ class SchedulerSubmissionDefaults:
     requires_gpu: bool = True
     estimated_vram_mb: int | None = None
     estimated_ram_mb: int | None = None
-    packing_eligible: bool = False
+    packing_eligible: bool = True
     packing_family: str = "mlevolve_script"
     packing_max_slowdown_ratio: float | None = None
     backend_allowlist: list[str] = field(default_factory=list)
@@ -677,6 +719,7 @@ class SchedulerConfig:
     auto_resume_recoverable: bool = False
     gpu_scheduler: GpuSchedulerSettings = field(default_factory=GpuSchedulerSettings)
     graph_db: GraphDBSettings | dict[str, Any] = field(default_factory=GraphDBSettings)
+    hardware_knowledge_graph: HardwareKnowledgeGraphSettings | dict[str, Any] = field(default_factory=HardwareKnowledgeGraphSettings)
     hardware_feature_db: HardwareFeatureDBSettings | dict[str, Any] = field(default_factory=HardwareFeatureDBSettings)
     log_db: LogDBSettings | dict[str, Any] = field(default_factory=LogDBSettings)
     python_executable: str = field(default_factory=lambda: sys.executable)
@@ -708,6 +751,11 @@ class SchedulerConfig:
             self.graph_db = GraphDBSettings()
         if isinstance(self.graph_db, dict):
             self.graph_db = GraphDBSettings.from_dict(self.graph_db)
+        if self.hardware_knowledge_graph is None:
+            self.hardware_knowledge_graph = HardwareKnowledgeGraphSettings()
+        if isinstance(self.hardware_knowledge_graph, dict):
+            self.hardware_knowledge_graph = HardwareKnowledgeGraphSettings.from_dict(self.hardware_knowledge_graph)
+        self.hardware_knowledge_graph.inherit_from_graph_db(self.graph_db)
         if self.hardware_feature_db is None:
             self.hardware_feature_db = HardwareFeatureDBSettings()
         if isinstance(self.hardware_feature_db, dict):
@@ -789,6 +837,7 @@ class SchedulerConfig:
             "auto_resume_recoverable": self.auto_resume_recoverable,
             "gpu_scheduler": self.gpu_scheduler.to_dict(),
             "graph_db": self.graph_db.to_dict(),
+            "hardware_knowledge_graph": self.hardware_knowledge_graph.to_dict(),
             "hardware_feature_db": self.hardware_feature_db.to_dict(),
             "log_db": self.log_db.to_dict(),
             "python_executable": self.python_executable,
