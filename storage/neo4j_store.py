@@ -112,7 +112,7 @@ class Neo4jStateStore:
             self._import_legacy_sqlite_if_needed()
 
     def _apply_constraints(self) -> None:
-        schema_path = Path(__file__).resolve().parents[2] / "schema" / "neo4j_constraints.cypher"
+        schema_path = Path(__file__).resolve().parents[2] / "schema" / "job_evidence" / "neo4j_constraints.cypher"
         if not schema_path.exists():
             return
         statements = [statement.strip() for statement in schema_path.read_text(encoding="utf-8").split(";") if statement.strip()]
