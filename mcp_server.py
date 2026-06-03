@@ -182,6 +182,26 @@ def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
         )
 
     @server.tool()
+    def get_hardware_feature_index(hardware_id: str = "current", limit: int = 256) -> dict[str, Any]:
+        return client.get_hardware_feature_index(hardware_id=hardware_id, limit=limit)
+
+    @server.tool()
+    def get_hardware_feature_details(
+        feature_ids: list[str],
+        hardware_id: str = "current",
+        limit: int = 64,
+    ) -> dict[str, Any]:
+        return client.get_hardware_feature_details(
+            hardware_id=hardware_id,
+            feature_ids=feature_ids,
+            limit=limit,
+        )
+
+    @server.tool()
+    def prewarm_current_hardware_neighborhood(hardware_id: str = "current", limit: int = 256) -> dict[str, Any]:
+        return client.prewarm_current_hardware_neighborhood(hardware_id=hardware_id, limit=limit)
+
+    @server.tool()
     def search_hardware_features(
         query: str,
         hardware_key: str = "current",
