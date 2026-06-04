@@ -72,6 +72,58 @@ class _FakeGraphStore:
         return [event for event in self.events if event.get("event_type") == event_type]
 
 
+class _FakeHardwareKnowledgeStore:
+    def __init__(self):
+        self.neighborhood_calls = 0
+        self.detail_calls = []
+
+    def get_feature_neighborhood(self, *, hardware_terms, limit):
+        self.neighborhood_calls += 1
+        return {
+            "found": True,
+            "hardware": {"hardware_id": "nvidia.blackwell.geforce_rtx_5090.spec", "name": "GeForce RTX 5090"},
+            "features": [
+                {
+                    "feature_id": "bf16",
+                    "feature_name": "BF16",
+                    "category": "precision_optimization",
+                    "support_level": "native",
+                    "recommended": True,
+                    "performance_impact": "high",
+                    "frameworks": ["PyTorch"],
+                    "detail_text": "Use bf16 autocast.",
+                    "recommended_patterns": ["Use torch.autocast with bf16."],
+                },
+                {
+                    "feature_id": "fp8",
+                    "feature_name": "FP8",
+                    "category": "precision_optimization",
+                    "support_level": "supported",
+                    "recommended": False,
+                    "performance_impact": "medium",
+                    "frameworks": ["PyTorch"],
+                    "detail_text": "Use only when transformer engine is available.",
+                },
+            ],
+        }
+
+    def get_feature_details(self, *, hardware_terms, feature_ids, limit):
+        self.detail_calls.append((list(hardware_terms), list(feature_ids), limit))
+        return {
+            "found": True,
+            "hardware": {"hardware_id": "nvidia.blackwell.geforce_rtx_5090.spec", "name": "GeForce RTX 5090"},
+            "features": [
+                {
+                    "feature_id": feature_id,
+                    "feature_name": feature_id.upper(),
+                    "detail_text": f"detail for {feature_id}",
+                }
+                for feature_id in feature_ids
+            ],
+            "missing_feature_ids": [],
+        }
+
+
 class SchedulerClientSurfaceTest(unittest.TestCase):
     def test_submit_job_request_accepts_split_spec_and_run_models(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -153,6 +205,7 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
                 "hardware": {"gpu_name": "RTX 5090", "summary_text": "RTX 5090"},
                 "scheduler_limits": {"safe_vram_budget_mb": 24000},
             }
+            client.get_hardware_feature_index = lambda *_, **__: {"found": False, "features": []}  # type: ignore[method-assign]
             client.search_code_knowledge = lambda **_: [  # type: ignore[method-assign]
                 {
                     "record_id": "bf16-doc",
@@ -174,6 +227,39 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
             self.assertEqual(context["model_options"][0]["model_family"], "vision_transformer")
             self.assertIn("code_knowledge:code_doc_chunks:bf16-doc", context["evidence_refs"])
             self.assertGreaterEqual(context["confidence"], 0.8)
+
+    def test_hardware_feature_index_prewarm_and_details_use_neighborhood_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerConfig(
+                runtime_root=tmpdir,
+                graph_db={"enabled": False, "mode": "off"},
+                redis_cache={"enabled": True},
+            )
+            client = SchedulerClient(settings)
+            fake_store = _FakeHardwareKnowledgeStore()
+            client._hardware_knowledge_store = fake_store
+            client._hardware_neighborhood_cache = _MemoryCache()
+            client.get_hardware_context = lambda *_, **__: {  # type: ignore[method-assign]
+                "found": True,
+                "hardware": {
+                    "hardware_key": "hw-current",
+                    "gpu_name": "NVIDIA GeForce RTX 5090",
+                    "compute_capability": "12.0",
+                },
+            }
+
+            prewarm = client.prewarm_current_hardware_neighborhood()
+            index = client.get_hardware_feature_index()
+            details = client.get_hardware_feature_details(feature_ids=["bf16"])
+
+            self.assertTrue(prewarm["ok"])
+            self.assertEqual(prewarm["feature_count"], 2)
+            self.assertEqual(index["source"], "redis")
+            self.assertEqual([item["feature_id"] for item in index["features"]], ["bf16", "fp8"])
+            self.assertEqual(details["source"], "redis")
+            self.assertEqual([item["feature_id"] for item in details["features"]], ["bf16"])
+            self.assertEqual(fake_store.neighborhood_calls, 1)
+            self.assertEqual(fake_store.detail_calls, [])
 
     def test_batch_resolution_apply_updates_runner_kwargs_and_metadata(self) -> None:
         job = TrainingJob.create(

@@ -373,10 +373,10 @@ class GraphDBSettings:
 class HardwareKnowledgeGraphSettings:
     enabled: bool = True
     provider: str = "neo4j"
-    uri: str = ""
-    username: str = ""
-    password_env: str = ""
-    database: str = ""
+    uri: str = "bolt://127.0.0.1:7688"
+    username: str = "neo4j"
+    password_env: str = "LOCALML_SCHEDULER_HARDWARE_NEO4J_PASSWORD"
+    database: str = "neo4j"
 
     def __post_init__(self) -> None:
         self.enabled = bool(self.enabled)
@@ -389,16 +389,6 @@ class HardwareKnowledgeGraphSettings:
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "HardwareKnowledgeGraphSettings":
         return cls(**(payload or {}))
-
-    def inherit_from_graph_db(self, graph_db: GraphDBSettings) -> None:
-        if not self.uri:
-            self.uri = graph_db.uri
-        if not self.username:
-            self.username = graph_db.username
-        if not self.password_env:
-            self.password_env = graph_db.password_env
-        if not self.database:
-            self.database = graph_db.database
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -755,7 +745,6 @@ class SchedulerConfig:
             self.hardware_knowledge_graph = HardwareKnowledgeGraphSettings()
         if isinstance(self.hardware_knowledge_graph, dict):
             self.hardware_knowledge_graph = HardwareKnowledgeGraphSettings.from_dict(self.hardware_knowledge_graph)
-        self.hardware_knowledge_graph.inherit_from_graph_db(self.graph_db)
         if self.hardware_feature_db is None:
             self.hardware_feature_db = HardwareFeatureDBSettings()
         if isinstance(self.hardware_feature_db, dict):

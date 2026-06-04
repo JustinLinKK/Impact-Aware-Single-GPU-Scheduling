@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import json
 import re
 
 import yaml
@@ -403,6 +404,92 @@ def convert_hardware_feature_records_to_graph(records: list[dict[str, Any]], *, 
 
 def load_hardware_knowledge_from_schema(schema_root: str | Path = "schema") -> dict[str, list[dict[str, Any]]]:
     root = Path(schema_root)
+    graph_json = root / "hardware_knowledge_graph.json"
+    if graph_json.exists():
+        return load_hardware_knowledge_from_graph_json(graph_json)
     records = load_feature_records(root / "hardware_feature_records")
     ontology = load_feature_ontology(root / "ontology" / "hardware_feature_keys.yaml")
     return convert_hardware_feature_records_to_graph(records, ontology=ontology)
+
+
+def load_hardware_knowledge_from_graph_json(path: str | Path) -> dict[str, list[dict[str, Any]]]:
+    source = Path(path)
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    nodes = list(payload.get("nodes") or [])
+    edges = list(payload.get("edges") or [])
+    hardware_by_node_id: dict[str, dict[str, Any]] = {}
+    feature_by_node_id: dict[str, dict[str, Any]] = {}
+    for node in nodes:
+        label = str(node.get("label") or "")
+        props = dict(node.get("properties") or {})
+        if label in {"Hardware", "HardwareSpec"}:
+            hardware = validate_hardware_spec(
+                {
+                    "hardware_id": props.get("hardware_id"),
+                    "name": props.get("name"),
+                    "name_key": props.get("name_key") or props.get("name"),
+                    "aliases": props.get("aliases") or [],
+                    "vendor": props.get("vendor"),
+                    "hardware_type": props.get("hardware_type") or "GPU",
+                    "architecture": props.get("architecture"),
+                    "description": props.get("description"),
+                    "memory_gb": props.get("memory_gb") or props.get("vram_gb"),
+                    "memory_type": props.get("memory_type"),
+                    "supported_precisions": props.get("supported_precisions") or props.get("precisions") or [],
+                    "software_stack": props.get("software_stack") or [],
+                    "created_at": props.get("created_at"),
+                    "updated_at": props.get("updated_at"),
+                }
+            )
+            hardware_by_node_id[str(node.get("id"))] = hardware
+        elif label == "Feature":
+            feature = validate_feature(
+                {
+                    "feature_id": props.get("feature_id"),
+                    "name": props.get("name") or props.get("feature_id"),
+                    "category": props.get("category") or _feature_category(str(props.get("feature_id") or "")),
+                    "description": props.get("description"),
+                    "how_to_use": props.get("how_to_use") or props.get("description"),
+                    "when_to_use": props.get("when_to_use"),
+                    "when_not_to_use": props.get("when_not_to_use"),
+                    "sample_code": props.get("sample_code") or props.get("example_code"),
+                    "frameworks": props.get("frameworks") or [],
+                    "maturity": props.get("maturity") or "production",
+                }
+            )
+            feature_by_node_id[str(node.get("id"))] = feature
+
+    relationships: list[dict[str, Any]] = []
+    for edge in edges:
+        if edge.get("type") != "HAS_FEATURE":
+            continue
+        hardware = hardware_by_node_id.get(str(edge.get("from")))
+        feature = feature_by_node_id.get(str(edge.get("to")))
+        if not hardware or not feature:
+            continue
+        props = dict(edge.get("properties") or {})
+        relationships.append(
+            validate_has_feature(
+                {
+                    "hardware_id": hardware["hardware_id"],
+                    "feature_id": feature["feature_id"],
+                    "support_level": props.get("support_level") or "supported",
+                    "recommended": props.get("recommended", False),
+                    "performance_impact": props.get("performance_impact") or "low",
+                    "min_driver_version": props.get("min_driver_version"),
+                    "min_framework_version": props.get("min_framework_version"),
+                    "software_requirements": props.get("software_requirements") or [],
+                    "limitations": props.get("limitations"),
+                    "hardware_specific_how_to_use": props.get("hardware_specific_how_to_use") or feature.get("how_to_use"),
+                    "hardware_specific_sample_code": props.get("hardware_specific_sample_code") or feature.get("sample_code"),
+                    "verified": props.get("verified", False),
+                    "last_verified_at": props.get("last_verified_at"),
+                }
+            )
+        )
+
+    return {
+        "hardware": list(hardware_by_node_id.values()),
+        "features": list(feature_by_node_id.values()),
+        "relationships": relationships,
+    }

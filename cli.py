@@ -19,10 +19,12 @@ from .mcp_server import run_stdio as run_mcp_stdio
 app = typer.Typer(help="Local single-GPU ML job scheduler")
 scheduler_app = typer.Typer(help="Scheduler process commands")
 hardware_features_app = typer.Typer(help="Hardware feature vector database commands")
+hardware_knowledge_app = typer.Typer(help="Static hardware knowledge graph commands")
 code_knowledge_app = typer.Typer(help="Code-knowledge vector database commands")
 knowledge_app = typer.Typer(help="Combined knowledge ingestion commands")
 app.add_typer(scheduler_app, name="scheduler")
 app.add_typer(hardware_features_app, name="hardware-features")
+app.add_typer(hardware_knowledge_app, name="hardware-knowledge")
 app.add_typer(code_knowledge_app, name="code-knowledge")
 app.add_typer(knowledge_app, name="knowledge")
 
@@ -117,6 +119,19 @@ def hardware_features_ingest(
 ) -> None:
     client = _build_client(settings, config_path)
     result = client.ingest_hardware_features(source=source, recreate=recreate, dry_run=dry_run)
+    typer.echo(json.dumps(result, indent=2, sort_keys=True))
+
+
+@hardware_knowledge_app.command("ingest")
+def hardware_knowledge_ingest(
+    settings: str | None = typer.Option(None, "--settings", help="Deprecated path to scheduler YAML config"),
+    config_path: str | None = typer.Option(None, "--config", help="Path to root MLEvolve config.yaml"),
+    schema_root: Path = typer.Option(Path("schema"), "--schema-root", help="Schema root containing hardware_knowledge_graph.json"),
+    recreate: bool = typer.Option(False, "--recreate/--no-recreate", help="Recreate hardware graph nodes before ingesting"),
+    dry_run: bool = typer.Option(False, "--dry-run/--no-dry-run", help="Validate and summarize records without writing to Neo4j"),
+) -> None:
+    client = _build_client(settings, config_path)
+    result = client.ingest_hardware_knowledge_graph(schema_root=schema_root, recreate=recreate, dry_run=dry_run)
     typer.echo(json.dumps(result, indent=2, sort_keys=True))
 
 

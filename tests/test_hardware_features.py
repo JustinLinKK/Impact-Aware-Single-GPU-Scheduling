@@ -17,6 +17,7 @@ from localml_scheduler.code_knowledge.records import load_code_knowledge_records
 from localml_scheduler.hardware_features import load_seed_records, validate_feature_record
 from localml_scheduler.hardware_features.records import HardwareFeatureRecordError, load_feature_records
 from localml_scheduler.hardware_features.store import HardwareFeatureStore
+from localml_scheduler.hardware_knowledge.records import load_hardware_knowledge_from_schema
 
 
 class _FakeEmbeddingModel:
@@ -164,6 +165,15 @@ class HardwareFeatureRecordTest(unittest.TestCase):
             loaded = load_feature_records(tmp)
 
         self.assertEqual([item["record_id"] for item in loaded], [record["record_id"]])
+
+    def test_hardware_knowledge_loader_accepts_generated_graph_json(self) -> None:
+        bundle = load_hardware_knowledge_from_schema("schema")
+
+        self.assertGreater(len(bundle["hardware"]), 0)
+        self.assertGreater(len(bundle["features"]), 0)
+        self.assertGreater(len(bundle["relationships"]), 0)
+        self.assertTrue(any(item["hardware_id"] == "nvidia.blackwell.geforce_rtx_5090.spec" for item in bundle["hardware"]))
+        self.assertTrue(any(item["feature_id"] == "bf16" for item in bundle["features"]))
 
 
 class HardwareFeatureStoreTest(unittest.TestCase):

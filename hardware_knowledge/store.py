@@ -18,9 +18,13 @@ except Exception:  # pragma: no cover - optional dependency
 _CONSTRAINTS = [
     "CREATE CONSTRAINT hardware_spec_id_unique IF NOT EXISTS FOR (n:HardwareSpec) REQUIRE n.hardware_id IS UNIQUE",
     "CREATE CONSTRAINT hardware_spec_name_key_unique IF NOT EXISTS FOR (n:HardwareSpec) REQUIRE n.name_key IS UNIQUE",
+    "CREATE CONSTRAINT hardware_id_unique IF NOT EXISTS FOR (n:Hardware) REQUIRE n.hardware_id IS UNIQUE",
+    "CREATE CONSTRAINT hardware_name_key_unique IF NOT EXISTS FOR (n:Hardware) REQUIRE n.name_key IS UNIQUE",
     "CREATE CONSTRAINT feature_id_unique IF NOT EXISTS FOR (n:Feature) REQUIRE n.feature_id IS UNIQUE",
     "CREATE INDEX hardware_spec_lookup IF NOT EXISTS FOR (n:HardwareSpec) ON (n.vendor, n.hardware_type, n.architecture, n.name_key)",
     "CREATE INDEX hardware_spec_name_lookup IF NOT EXISTS FOR (n:HardwareSpec) ON (n.name)",
+    "CREATE INDEX hardware_lookup IF NOT EXISTS FOR (n:Hardware) ON (n.vendor, n.hardware_type, n.architecture, n.name_key)",
+    "CREATE INDEX hardware_name_lookup IF NOT EXISTS FOR (n:Hardware) ON (n.name)",
     "CREATE INDEX feature_lookup IF NOT EXISTS FOR (n:Feature) ON (n.category, n.maturity, n.name)",
 ]
 
@@ -69,8 +73,8 @@ class HardwareKnowledgeGraphStore:
         return {"ok": True, "constraints": len(_CONSTRAINTS)}
 
     def _wipe(self) -> None:
-        self._run_write("MATCH (h:HardwareSpec) DETACH DELETE h")
-        self._run_write("MATCH (f:Feature) WHERE NOT (:HardwareSpec)-[:HAS_FEATURE]->(f) DELETE f")
+        self._run_write("MATCH (h) WHERE h:HardwareSpec OR h:Hardware DETACH DELETE h")
+        self._run_write("MATCH (f:Feature) WHERE NOT ()-[:HAS_FEATURE]->(f) DELETE f")
 
     def ingest_bundle(
         self,
@@ -151,7 +155,7 @@ class HardwareKnowledgeGraphStore:
         framework: str | None,
         row_limit: int,
     ) -> list[dict[str, Any]]:
-        clauses = ["MATCH (h:HardwareSpec)-[r:HAS_FEATURE]->(f:Feature)", "WHERE 1 = 1"]
+        clauses = ["MATCH (h)-[r:HAS_FEATURE]->(f:Feature)", "WHERE (h:HardwareSpec OR h:Hardware)"]
         params: dict[str, Any] = {}
         if hardware:
             clauses.append(
@@ -200,6 +204,46 @@ class HardwareKnowledgeGraphStore:
         )
         params["row_limit"] = max(1, int(row_limit))
         return self._run("\n".join(clauses), params)
+
+    def _query_neighborhood_rows(
+        self,
+        *,
+        hardware_terms: list[str],
+        feature_ids: list[str] | None = None,
+        row_limit: int = 256,
+    ) -> list[dict[str, Any]]:
+        terms = [str(term or "").strip().lower() for term in hardware_terms if str(term or "").strip()]
+        params: dict[str, Any] = {
+            "hardware_terms": terms,
+            "feature_ids": [str(item) for item in feature_ids or [] if str(item).strip()],
+            "row_limit": max(1, int(row_limit)),
+        }
+        feature_filter = "AND f.feature_id IN $feature_ids" if feature_ids else ""
+        if terms:
+            hardware_filter = """
+                AND any(term IN $hardware_terms WHERE
+                    toLower(coalesce(h.hardware_id, '')) = term
+                    OR toLower(coalesce(h.hardware_id, '')) CONTAINS term
+                    OR toLower(coalesce(h.name, '')) = term
+                    OR toLower(coalesce(h.name, '')) CONTAINS term
+                    OR toLower(coalesce(h.name_key, '')) = term
+                    OR toLower(coalesce(h.name_key, '')) CONTAINS term
+                    OR any(alias IN coalesce(h.aliases, []) WHERE toLower(alias) = term OR toLower(alias) CONTAINS term)
+                )
+            """
+        else:
+            hardware_filter = "AND false"
+        return self._run(
+            f"""
+            MATCH (h)-[r:HAS_FEATURE]->(f:Feature)
+            WHERE (h:HardwareSpec OR h:Hardware)
+            {hardware_filter}
+            {feature_filter}
+            RETURN properties(h) AS hardware, properties(f) AS feature, properties(r) AS relationship
+            LIMIT $row_limit
+            """,
+            params,
+        )
 
     @staticmethod
     def _terms(query: str | None) -> list[str]:
@@ -271,6 +315,113 @@ class HardwareKnowledgeGraphStore:
             return []
         ranked = self._rank_rows(rows, query)
         return [self._public_result(row) for row in ranked[: max(1, int(limit))]]
+
+    def get_feature_neighborhood(
+        self,
+        *,
+        hardware_terms: list[str],
+        limit: int = 256,
+    ) -> dict[str, Any]:
+        """Return one hardware node and all directly linked feature records."""
+        if not self.enabled:
+            return {"found": False, "hardware": None, "features": [], "reason": "hardware knowledge graph disabled"}
+        try:
+            rows = self._query_neighborhood_rows(hardware_terms=hardware_terms, row_limit=limit)
+        except Exception as exc:
+            return {"found": False, "hardware": None, "features": [], "reason": str(exc)}
+        if not rows:
+            return {"found": False, "hardware": None, "features": [], "reason": "hardware not found"}
+        ranked = self._rank_rows(rows, None)
+        hardware = dict((ranked[0].get("hardware") or {}))
+        features = [self._public_result(row) for row in ranked]
+        return {
+            "found": True,
+            "hardware": self._public_hardware(hardware),
+            "features": features[: max(1, int(limit))],
+        }
+
+    def get_feature_index(
+        self,
+        *,
+        hardware_terms: list[str],
+        limit: int = 256,
+    ) -> dict[str, Any]:
+        neighborhood = self.get_feature_neighborhood(hardware_terms=hardware_terms, limit=limit)
+        return {
+            "found": bool(neighborhood.get("found")),
+            "hardware": neighborhood.get("hardware"),
+            "features": [self._index_result(item) for item in neighborhood.get("features") or []],
+            "reason": neighborhood.get("reason"),
+        }
+
+    def get_feature_details(
+        self,
+        *,
+        hardware_terms: list[str],
+        feature_ids: list[str],
+        limit: int = 64,
+    ) -> dict[str, Any]:
+        requested = [str(item).strip() for item in feature_ids if str(item).strip()]
+        if not requested:
+            return {"found": False, "hardware": None, "features": [], "missing_feature_ids": []}
+        if not self.enabled:
+            return {
+                "found": False,
+                "hardware": None,
+                "features": [],
+                "missing_feature_ids": requested,
+                "reason": "hardware knowledge graph disabled",
+            }
+        try:
+            rows = self._query_neighborhood_rows(
+                hardware_terms=hardware_terms,
+                feature_ids=requested,
+                row_limit=max(int(limit), len(requested)),
+            )
+        except Exception as exc:
+            return {"found": False, "hardware": None, "features": [], "missing_feature_ids": requested, "reason": str(exc)}
+        if not rows:
+            return {"found": False, "hardware": None, "features": [], "missing_feature_ids": requested, "reason": "features not found"}
+        by_id = {str((row.get("feature") or {}).get("feature_id")): self._public_result(row) for row in rows}
+        ordered = [by_id[feature_id] for feature_id in requested if feature_id in by_id]
+        hardware = dict((rows[0].get("hardware") or {}))
+        return {
+            "found": bool(ordered),
+            "hardware": self._public_hardware(hardware),
+            "features": ordered[: max(1, int(limit))],
+            "missing_feature_ids": [feature_id for feature_id in requested if feature_id not in by_id],
+        }
+
+    @staticmethod
+    def _public_hardware(hardware: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "hardware_id": hardware.get("hardware_id"),
+            "name": hardware.get("name"),
+            "name_key": hardware.get("name_key"),
+            "aliases": list(hardware.get("aliases") or []),
+            "vendor": hardware.get("vendor"),
+            "hardware_type": hardware.get("hardware_type"),
+            "architecture": hardware.get("architecture"),
+            "description": hardware.get("description"),
+            "memory_gb": hardware.get("memory_gb"),
+            "memory_type": hardware.get("memory_type"),
+            "supported_precisions": list(hardware.get("supported_precisions") or []),
+            "software_stack": list(hardware.get("software_stack") or []),
+        }
+
+    @staticmethod
+    def _index_result(item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "feature_id": item.get("feature_id"),
+            "feature_name": item.get("feature_name") or item.get("title"),
+            "category": item.get("category"),
+            "support_level": item.get("support_level"),
+            "recommended": bool(item.get("recommended")),
+            "performance_impact": item.get("performance_impact"),
+            "frameworks": list(item.get("frameworks") or []),
+            "tags": list(item.get("tags") or []),
+            "confidence": item.get("confidence"),
+        }
 
     def _public_result(self, row: dict[str, Any]) -> dict[str, Any]:
         hardware = dict(row.get("hardware") or {})
