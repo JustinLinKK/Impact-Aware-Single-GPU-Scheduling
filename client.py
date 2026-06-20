@@ -31,7 +31,7 @@ from .domain import (
 from .dto import JobCommandRequest, JobQuery, PreloadRequest, ReportQuery, SubmitJobRequest
 from .graph_knowledge import SchedulerKnowledgeBase
 from .model_cache.cache_server import CacheClient
-from .redis_cache import invalidate_graph_cache
+from .redis_cache import RedisLRUCache, graph_cache_enabled, invalidate_graph_cache
 from .scheduler.service import SchedulerService
 from .storage.state_store import StateStore
 
@@ -48,7 +48,9 @@ class SchedulerClient:
         self.store = StateStore(self.settings)
         self.knowledge = SchedulerKnowledgeBase(self.store)
         self._hardware_feature_store = None
+        self._hardware_knowledge_store = None
         self._code_knowledge_store = None
+        self._hardware_neighborhood_cache = RedisLRUCache.from_settings(self.settings) if graph_cache_enabled(self.settings) else None
 
     def create_engine(self):
         from .engine import SchedulerEngine
@@ -319,6 +321,13 @@ class SchedulerClient:
             self._hardware_feature_store = HardwareFeatureStore(self.settings)
         return self._hardware_feature_store
 
+    def _hardware_graph_store(self):
+        if self._hardware_knowledge_store is None:
+            from .hardware_knowledge import HardwareKnowledgeGraphStore
+
+            self._hardware_knowledge_store = HardwareKnowledgeGraphStore(self.settings)
+        return self._hardware_knowledge_store
+
     def _code_store(self):
         if self._code_knowledge_store is None:
             from .code_knowledge import CodeKnowledgeStore
@@ -334,6 +343,19 @@ class SchedulerClient:
         dry_run: bool = False,
     ) -> dict[str, Any]:
         return self._feature_store().ingest_source(source, recreate=recreate, dry_run=dry_run)
+
+    def ingest_hardware_knowledge_graph(
+        self,
+        *,
+        schema_root: str | Path = "schema",
+        recreate: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        return self._hardware_graph_store().ingest_schema_root(
+            schema_root=schema_root,
+            recreate=recreate,
+            dry_run=dry_run,
+        )
 
     def ingest_code_knowledge(
         self,
@@ -359,24 +381,40 @@ class SchedulerClient:
         code_doc_path = root / "code_doc_chunks"
         api_symbol_path = root / "api_symbol_chunks"
 
-        hardware_records = load_feature_records(hardware_path)
-        code_doc_records = load_code_knowledge_records(code_doc_path)
-        api_symbol_records = load_code_knowledge_records(api_symbol_path)
-        converted_records = convert_hardware_feature_records(hardware_records)
+        hardware_records = load_feature_records(hardware_path) if hardware_path.exists() else []
+        code_doc_records = load_code_knowledge_records(code_doc_path) if code_doc_path.exists() else []
+        api_symbol_records = load_code_knowledge_records(api_symbol_path) if api_symbol_path.exists() else []
+        converted_records = convert_hardware_feature_records(hardware_records) if hardware_records else []
         code_records = code_doc_records + api_symbol_records + converted_records
 
-        hardware_result = self._feature_store().ingest_records(
-            hardware_records,
-            recreate=recreate,
-            dry_run=dry_run,
+        hardware_result = (
+            self._feature_store().ingest_records(
+                hardware_records,
+                recreate=recreate,
+                dry_run=dry_run,
+            )
+            if hardware_records
+            else {"ok": True, "skipped": True, "reason": f"missing {hardware_path}"}
         )
-        code_result = self._code_store().ingest_records(
-            code_records,
-            recreate=recreate,
-            dry_run=dry_run,
+        code_result = (
+            self._code_store().ingest_records(
+                code_records,
+                recreate=recreate,
+                dry_run=dry_run,
+            )
+            if code_records
+            else {"ok": True, "skipped": True, "reason": "no code knowledge records found"}
         )
+        try:
+            hardware_graph_result = self.ingest_hardware_knowledge_graph(
+                schema_root=root,
+                recreate=recreate,
+                dry_run=dry_run,
+            )
+        except Exception as exc:
+            hardware_graph_result = {"ok": False, "reason": str(exc)}
         return {
-            "ok": bool(hardware_result.get("ok")) and bool(code_result.get("ok")),
+            "ok": bool(hardware_result.get("ok")) and bool(code_result.get("ok")) and bool(hardware_graph_result.get("ok")),
             "dry_run": bool(dry_run),
             "schema_root": str(root),
             "collections": {
@@ -399,12 +437,204 @@ class SchedulerClient:
                 },
             },
             "code_knowledge_result": code_result,
+            "hardware_knowledge_graph_result": hardware_graph_result,
             "source_counts": {
                 "hardware_feature_records": len(hardware_records),
                 "code_doc_chunks": len(code_doc_records),
                 "api_symbol_chunks": len(api_symbol_records),
                 "converted_from_hardware": len(converted_records),
             },
+        }
+
+    def _hardware_lookup_terms(
+        self,
+        hardware_id: str,
+        hardware_context: dict[str, Any] | None = None,
+    ) -> list[str]:
+        hardware_context = hardware_context or {}
+        hardware = hardware_context.get("hardware") or {}
+        raw_terms: list[str] = []
+        if hardware_id and hardware_id != "current":
+            raw_terms.append(str(hardware_id))
+        for key in ("hardware_key", "gpu_name", "compute_capability"):
+            value = hardware.get(key)
+            if value:
+                raw_terms.append(str(value))
+        gpu_name = str(hardware.get("gpu_name") or "")
+        if gpu_name:
+            raw_terms.extend(
+                [
+                    gpu_name.replace("NVIDIA ", "").replace("nvidia ", ""),
+                    gpu_name.replace("GeForce ", "").replace("geforce ", ""),
+                    gpu_name.replace("NVIDIA GeForce ", "").replace("nvidia geforce ", ""),
+                ]
+            )
+        terms: list[str] = []
+        seen: set[str] = set()
+        for term in raw_terms:
+            cleaned = str(term or "").strip().lower()
+            if not cleaned:
+                continue
+            variants = {
+                cleaned,
+                cleaned.replace("-", " "),
+                cleaned.replace("_", " "),
+                cleaned.replace(" ", "_"),
+            }
+            for variant in variants:
+                normalized = " ".join(variant.split())
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    terms.append(normalized)
+        return terms
+
+    def _hardware_neighborhood_payload(self, hardware_id: str, hardware_context: dict[str, Any] | None) -> dict[str, Any]:
+        hardware = (hardware_context or {}).get("hardware") or {}
+        return {
+            "hardware_id": str(hardware_id or "current"),
+            "hardware_key": hardware.get("hardware_key"),
+            "gpu_name": hardware.get("gpu_name"),
+            "compute_capability": hardware.get("compute_capability"),
+        }
+
+    def _current_hardware_context_for_lookup(self, hardware_id: str) -> dict[str, Any]:
+        try:
+            return self.get_hardware_context(hardware_id or "current", include_scheduler_limits=False)
+        except Exception:
+            return {"found": False, "hardware": {}}
+
+    @staticmethod
+    def _feature_index_from_neighborhood(neighborhood: dict[str, Any]) -> list[dict[str, Any]]:
+        index: list[dict[str, Any]] = []
+        for item in neighborhood.get("features") or []:
+            index.append(
+                {
+                    "feature_id": item.get("feature_id"),
+                    "feature_name": item.get("feature_name") or item.get("title"),
+                    "category": item.get("category"),
+                    "support_level": item.get("support_level"),
+                    "recommended": bool(item.get("recommended")),
+                    "performance_impact": item.get("performance_impact"),
+                    "frameworks": list(item.get("frameworks") or []),
+                    "tags": list(item.get("tags") or []),
+                    "confidence": item.get("confidence"),
+                }
+            )
+        return index
+
+    def _load_hardware_neighborhood(
+        self,
+        hardware_id: str = "current",
+        *,
+        limit: int = 256,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        hardware_context = self._current_hardware_context_for_lookup(hardware_id)
+        payload = self._hardware_neighborhood_payload(hardware_id, hardware_context)
+        cache = self._hardware_neighborhood_cache
+        if cache is not None and not refresh:
+            cached = cache.get("hardware:neighborhood", payload)
+            if isinstance(cached, dict):
+                result = dict(cached)
+                result["source"] = "redis"
+                return result
+
+        terms = self._hardware_lookup_terms(hardware_id, hardware_context)
+        neighborhood = self._hardware_graph_store().get_feature_neighborhood(
+            hardware_terms=terms,
+            limit=limit,
+        )
+        result = dict(neighborhood)
+        result["hardware_context"] = hardware_context
+        result["lookup_terms"] = terms
+        result["source"] = "neo4j"
+        if cache is not None and result.get("found"):
+            cache.set("hardware:neighborhood", payload, result)
+        return result
+
+    def prewarm_current_hardware_neighborhood(self, hardware_id: str = "current", *, limit: int = 256) -> dict[str, Any]:
+        """Preload the active hardware node and directly linked features into Redis."""
+        result = self._load_hardware_neighborhood(hardware_id, limit=limit, refresh=True)
+        return {
+            "ok": bool(result.get("found")),
+            "hardware_id": ((result.get("hardware") or {}).get("hardware_id")),
+            "hardware_name": ((result.get("hardware") or {}).get("name")),
+            "feature_count": len(result.get("features") or []),
+            "source": result.get("source"),
+            "cache_namespace": "hardware:neighborhood" if self._hardware_neighborhood_cache is not None else None,
+            "reason": result.get("reason"),
+        }
+
+    def get_hardware_feature_index(
+        self,
+        hardware_id: str = "current",
+        *,
+        limit: int = 256,
+    ) -> dict[str, Any]:
+        """Return compact feature keys linked to a hardware node without verbose feature details."""
+        neighborhood = self._load_hardware_neighborhood(hardware_id, limit=limit)
+        features = self._feature_index_from_neighborhood(neighborhood)[: max(1, int(limit))]
+        return {
+            "found": bool(neighborhood.get("found")),
+            "hardware": neighborhood.get("hardware"),
+            "hardware_context": neighborhood.get("hardware_context"),
+            "features": features,
+            "feature_count": len(features),
+            "source": neighborhood.get("source"),
+            "reason": neighborhood.get("reason"),
+        }
+
+    def get_hardware_feature_details(
+        self,
+        hardware_id: str = "current",
+        *,
+        feature_ids: list[str],
+        limit: int = 64,
+    ) -> dict[str, Any]:
+        """Return full details only for explicitly selected feature IDs."""
+        requested = [str(feature_id).strip() for feature_id in feature_ids if str(feature_id).strip()]
+        if not requested:
+            return {
+                "found": False,
+                "hardware": None,
+                "features": [],
+                "requested_feature_ids": [],
+                "missing_feature_ids": [],
+                "source": "empty_request",
+            }
+
+        hardware_context = self._current_hardware_context_for_lookup(hardware_id)
+        payload = self._hardware_neighborhood_payload(hardware_id, hardware_context)
+        cached = self._hardware_neighborhood_cache.get("hardware:neighborhood", payload) if self._hardware_neighborhood_cache is not None else None
+        cached_features = list((cached or {}).get("features") or []) if isinstance(cached, dict) else []
+        by_id = {str(item.get("feature_id")): item for item in cached_features if item.get("feature_id")}
+        selected = [by_id[feature_id] for feature_id in requested if feature_id in by_id]
+        missing = [feature_id for feature_id in requested if feature_id not in by_id]
+        source = "redis" if cached_features else "neo4j"
+
+        if missing:
+            terms = self._hardware_lookup_terms(hardware_id, hardware_context)
+            direct = self._hardware_graph_store().get_feature_details(
+                hardware_terms=terms,
+                feature_ids=missing,
+                limit=max(int(limit), len(missing)),
+            )
+            for item in direct.get("features") or []:
+                by_id[str(item.get("feature_id"))] = item
+            selected = [by_id[feature_id] for feature_id in requested if feature_id in by_id]
+            missing = [feature_id for feature_id in requested if feature_id not in by_id]
+            if source == "redis" and direct.get("features"):
+                source = "redis+neo4j"
+
+        return {
+            "found": bool(selected),
+            "hardware": ((cached or {}).get("hardware") if isinstance(cached, dict) else None)
+            or (direct.get("hardware") if "direct" in locals() else None),
+            "hardware_context": hardware_context,
+            "features": selected[: max(1, int(limit))],
+            "requested_feature_ids": requested,
+            "missing_feature_ids": missing,
+            "source": source,
         }
 
     def get_profile_evidence(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
@@ -641,6 +871,13 @@ class SchedulerClient:
         """Rank model-family choices using hardware feature/code knowledge before draft generation."""
         workload = workload_type or task_type or "mlevolve_training"
         hardware_context = self.get_hardware_context(hardware_key, include_scheduler_limits=True)
+        try:
+            feature_index = self.get_hardware_feature_index(
+                hardware_key,
+                limit=max(16, int(limit) * 8),
+            )
+        except Exception:
+            feature_index = {"found": False, "features": []}
         families = candidate_families or self._default_model_families_for_workload(workload)
         hardware = hardware_context.get("hardware") or {}
         gpu_name = hardware.get("gpu_name") or hardware.get("hardware_key") or "current GPU"
@@ -710,6 +947,7 @@ class SchedulerClient:
         return {
             "found": bool(options),
             "hardware_context": hardware_context,
+            "hardware_feature_index": feature_index,
             "workload_type": workload,
             "model_options": options[: max(1, int(limit))],
             "recommendations": recommendations,
@@ -729,28 +967,22 @@ class SchedulerClient:
         framework: str | None = "pytorch",
         limit: int = 8,
     ) -> list[dict[str, Any]]:
-        # Deprecated compatibility wrapper. Prefer search_code_knowledge(...).
-        filters: dict[str, Any] = {"framework": framework}
-        if workload_type:
-            filters["workload_types"] = workload_type
-        matches = self.search_code_knowledge(
-            query=query,
-            filters=filters,
-            record_types=["code_doc_chunks", "optimization_recipe_chunks"],
-            limit=limit,
-        )
-        if matches:
-            return matches
+        # Compatibility alias for older MCP/tool callers. Runtime hardware
+        # feature lookup now uses the static hardware knowledge graph only.
         hardware_context = self.get_hardware_context(hardware_key, include_scheduler_limits=True)
-        return self._feature_store().search(
-            query=query,
-            hardware_context=hardware_context,
-            architecture=architecture,
-            vendor=vendor,
-            workload_type=workload_type,
-            framework=framework,
-            limit=limit,
-        )
+        hardware = hardware_context.get("hardware") or {}
+        hardware_lookup = str(hardware.get("gpu_name") or hardware.get("hardware_key") or hardware_key)
+        try:
+            return self._hardware_graph_store().search(
+                query=query,
+                hardware=hardware_lookup,
+                architecture=architecture,
+                vendor=vendor,
+                framework=framework,
+                limit=limit,
+            )
+        except Exception:
+            return []
 
     def get_hardware_feature_context(
         self,
@@ -773,24 +1005,13 @@ class SchedulerClient:
             "training optimization precision memory dataloader checkpointing",
         ]
         query = " ".join(part for part in query_parts if part.strip())
-        matches = self.search_code_knowledge(
+        matches = self.search_hardware_features(
             query=query,
-            filters={
-                "framework": framework,
-                "workload_types": workload_type,
-                "model_families": model_family,
-            },
-            record_types=["code_doc_chunks", "optimization_recipe_chunks"],
+            hardware_key=hardware_key,
+            workload_type=workload_type,
+            framework=framework,
             limit=limit,
         )
-        if not matches:
-            matches = self._feature_store().search(
-                query=query,
-                hardware_context=hardware_context,
-                workload_type=workload_type,
-                framework=framework,
-                limit=limit,
-            )
         return {
             "found": bool(matches),
             "hardware_context": hardware_context,
