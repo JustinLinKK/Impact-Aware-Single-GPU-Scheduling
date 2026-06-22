@@ -53,6 +53,12 @@ _STAGE_KEYWORDS: dict[str, list[str]] = {
     ],
 }
 
+_STAGE_DROP_FIELDS: dict[str, set[str]] = {
+    "model": {"vram_MB", "compute_capability"},
+    "datatype": {"vram_MB", "sm_count", "compute_capability"},
+    "tuning": {"datatypes", "compute_capability"},
+}
+
 _DEFAULT_GRAPH_PATH = Path(__file__).resolve().parents[2] / "schema" / "hardware_knowledge_graph.json"
 
 
@@ -93,7 +99,7 @@ def query_hardware_node(
         recommended = [p for p in recommended if any(k in p.lower() for k in keywords)]
         avoid = [p for p in avoid if any(k in p.lower() for k in keywords)]
 
-    return _compact_dict({
+    result = _compact_dict({
         "found": True,
         "node_id": node["id"],
         "gpu_name": _as_str(props.get("name")),
@@ -116,6 +122,11 @@ def query_hardware_node(
         "recommended_patterns": recommended,
         "avoid_patterns": avoid,
     })
+
+    for key in _STAGE_DROP_FIELDS.get(stage, set()):
+        result.pop(key, None)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
