@@ -80,6 +80,19 @@ def test_5090_node_exposes_direct_feature_lists():
     assert "ademamix_optimizer" in result["experimental_recipes"]
 
 
+def test_vendor_prefixed_hardware_names_resolve():
+    mod = load_filter_module()
+
+    result = mod.query_hardware_features("NVIDIA GeForce RTX 5090", "optimizer")
+    by_key = mod.query_hardware_features("nvidia.blackwell.geforce_rtx_5090.spec", "optimizer")
+
+    assert result["found"] is True
+    assert result["gpu_name"] == "GeForce RTX 5090"
+    assert "soap_optimizer" in {feature["feature_id"] for feature in result["features"]}
+    assert by_key["found"] is True
+    assert "soap_optimizer" in {feature["feature_id"] for feature in by_key["features"]}
+
+
 def test_unconfirmed_optimizers_are_experimental_for_all_hardware():
     graph_path = Path(__file__).resolve().parents[2] / "schema" / "hardware_knowledge_graph.json"
     graph = json.loads(graph_path.read_text(encoding="utf-8"))
