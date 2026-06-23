@@ -60,6 +60,9 @@ def test_5090_optimizer_filter_marks_unconfirmed_candidates():
     assert result["stage_filter"] == "optimizer"
     assert "muon_optimizer" in by_id
     assert "gram_newton_schulz_symmetric_gemm" in by_id
+    assert "ns_steps=5" in by_id["muon_optimizer"]["notes"]
+    assert "match_rms_adamw" in by_id["muon_optimizer"]["notes"]
+    assert "embedding/bias/norm/head/non-2D params" in by_id["muon_optimizer"]["notes"]
     assert by_id["soap_optimizer"]["support_level"] == "experimental"
     assert by_id["ademamix_optimizer"]["support_level"] == "experimental"
     assert by_id["soap_optimizer"]["recommended"] is False

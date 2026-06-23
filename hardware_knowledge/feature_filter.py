@@ -203,7 +203,7 @@ def query_hardware_features(
                 or feat_props.get("default_recommendation_scope")
             ),
             "limitations": edge_props.get("limitations") or feat_props.get("limitations"),
-            "notes": edge_props.get("notes") or feat_props.get("notes"),
+            "notes": _merge_text_values(edge_props.get("notes"), feat_props.get("notes")),
         }))
 
     return {
@@ -233,6 +233,15 @@ def _normalize_stage(agent_stage: str | None) -> str | None:
     if not stage or stage == "all":
         return None
     return _STAGE_ALIASES.get(stage, stage)
+
+
+def _merge_text_values(*values: Any) -> str:
+    merged: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in merged:
+            merged.append(text)
+    return "; ".join(merged)
 
 
 def _lookup_node(
