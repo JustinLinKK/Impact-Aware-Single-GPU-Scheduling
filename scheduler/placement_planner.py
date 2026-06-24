@@ -15,6 +15,7 @@ from ..config import (
 )
 from .candidate_generator import CandidateGenerator
 from .compatibility import CompatibilityEvaluator
+from .group_sizing import candidate_group_sizing
 from .objective import ObjectiveScorer
 from .planning_repository import PlanningRepository
 from .planner_types import DispatchPlan, EvaluatedGroup
@@ -135,12 +136,19 @@ class PlacementPlanner:
         active_sm_utilization: float = 0.0,
     ) -> DispatchPlan | None:
         ordered = RunnableJobQueue(policy=self.policy, jobs=list(jobs)).ordered()
+        scheduler_mode = effective_scheduler_mode(self.settings.gpu_scheduler.mode)
+        sizing = candidate_group_sizing(self.settings, scheduler_mode=scheduler_mode, queued_job_count=len(ordered))
         trace: dict[str, Any] = {
             "scheduler_mode": self.settings.gpu_scheduler.mode,
-            "effective_scheduler_mode": effective_scheduler_mode(self.settings.gpu_scheduler.mode),
+            "effective_scheduler_mode": scheduler_mode,
             "backend_available": dict(backend_available),
             "ordered_job_ids": [job.job_id for job in ordered],
             "candidate_window_size": self.settings.gpu_scheduler.candidate_window_size,
+            "candidate_group_sizing": {
+                "window_size": sizing.window_size,
+                "max_group_size": sizing.max_group_size,
+                "include_singletons": sizing.include_singletons,
+            },
             "safe_vram_budget_mb": self.estimator.safe_budget_mb(),
             "auto_pack_target_metric": self.settings.gpu_scheduler.auto_pack.target_metric,
             "auto_pack_target_vram_mb": self.estimator.safe_budget_mb(),
@@ -162,7 +170,6 @@ class PlacementPlanner:
             trace["decision_reason"] = "no runnable jobs"
             return finish(None)
         primary = ordered[0]
-        scheduler_mode = effective_scheduler_mode(self.settings.gpu_scheduler.mode)
         if len(ordered) == 1:
             reason = "single runnable job"
             if self.settings.gpu_scheduler.enabled and scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK:

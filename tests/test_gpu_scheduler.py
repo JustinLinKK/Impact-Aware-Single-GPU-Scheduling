@@ -640,6 +640,45 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             self.assertEqual(plan.mode, "exclusive")
             self.assertIn("calibration probe", plan.reason)
 
+    def test_parallel_auto_pack_group_size_uses_candidate_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                gpu_scheduler={
+                    "mode": SCHEDULER_MODE_PARALLEL_AUTO_PACK,
+                    "backend_priority": ["cuda_process", "exclusive"],
+                    "candidate_window_size": 4,
+                    "max_packed_jobs_per_gpu": 2,
+                },
+            )
+            store, planner = _planner(settings)
+            store._hardware_profile = _fake_hardware_profile("auto-pack-size")
+            jobs: list[TrainingJob] = []
+            for index in range(5):
+                job = build_mlevolve_job(
+                    workflow_id="wf",
+                    baseline_model_id=f"auto-size-{index}",
+                    baseline_model_path=f"/tmp/auto-size-{index}.pt",
+                    runner_target="pkg.runner:train",
+                    runner_kwargs={"batch_size": 4},
+                    resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=256),
+                    packing_family="toy",
+                    packing_eligible=True,
+                    packing_backend_allowlist=["cuda_process"],
+                    task_type="classification",
+                )
+                job.queue_sequence = index + 1
+                jobs.append(job)
+
+            plan = planner.choose_plan(jobs, backend_available={"exclusive": True, "cuda_process": True})
+
+            self.assertEqual(plan.mode, "packed_group")
+            self.assertEqual(len(plan.job_ids), 4)
+            self.assertEqual(
+                planner.last_decision_trace["candidate_group_sizing"],
+                {"window_size": 4, "max_group_size": 4, "include_singletons": True},
+            )
+
     def test_raw_mlevolve_jobs_are_not_preemptible_without_checkpoint_resume_support(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerSettings(runtime_root=tmpdir)
@@ -696,6 +735,45 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             self.assertEqual(plan.mode, "packed_group")
             self.assertEqual(plan.backend_name, "cuda_process")
             self.assertEqual(len(plan.job_ids), 3)
+
+    def test_parallel_default_group_size_respects_fixed_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                gpu_scheduler={
+                    "mode": SCHEDULER_MODE_PARALLEL_DEFAULT,
+                    "backend_priority": ["cuda_process", "exclusive"],
+                    "candidate_window_size": 4,
+                    "max_packed_jobs_per_gpu": 2,
+                    "allow_three_way_packing": False,
+                },
+            )
+            store, planner = _planner(settings)
+            store._hardware_profile = _fake_hardware_profile("fixed-pack-size")
+            jobs: list[TrainingJob] = []
+            for index in range(4):
+                job = build_mlevolve_job(
+                    workflow_id="wf",
+                    baseline_model_id=f"fixed-size-{index}",
+                    baseline_model_path=f"/tmp/fixed-size-{index}.pt",
+                    runner_target="pkg.runner:train",
+                    runner_kwargs={"batch_size": 4},
+                    resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=256),
+                    packing_family="toy",
+                    packing_eligible=True,
+                    task_type="classification",
+                )
+                job.queue_sequence = index + 1
+                jobs.append(job)
+
+            plan = planner.choose_plan(jobs, backend_available={"exclusive": True, "cuda_process": True})
+
+            self.assertEqual(plan.mode, "packed_pair")
+            self.assertEqual(len(plan.job_ids), 2)
+            self.assertEqual(
+                planner.last_decision_trace["candidate_group_sizing"],
+                {"window_size": 4, "max_group_size": 2, "include_singletons": False},
+            )
 
     def test_parallel_batch_optimizer_binary_finds_best_safe_batch_vector(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

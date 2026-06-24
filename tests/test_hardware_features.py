@@ -174,6 +174,8 @@ class HardwareFeatureRecordTest(unittest.TestCase):
         self.assertGreater(len(bundle["relationships"]), 0)
         self.assertTrue(any(item["hardware_id"] == "nvidia.blackwell.geforce_rtx_5090.spec" for item in bundle["hardware"]))
         self.assertTrue(any(item["feature_id"] == "bf16" for item in bundle["features"]))
+        name_keys = [item["name_key"] for item in bundle["hardware"]]
+        self.assertEqual(len(name_keys), len(set(name_keys)))
 
 
 class HardwareFeatureStoreTest(unittest.TestCase):

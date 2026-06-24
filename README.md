@@ -72,7 +72,9 @@ It is packaged as a root-level module so it can be used by MLEvolve or detached 
 
 - `placement_planner.py` `class PlacementPlanner` (`placement_planner.py:26`) composes `ResourceEstimator`, `CompatibilityEvaluator`, `RuntimeGuardrail`, `CandidateGenerator`, `ObjectiveScorer` (`placement_planner.py:33`-44). `choose_plan()` (`placement_planner.py:61`) returns a `DispatchPlan` or `None`
 
-- `candidate_generator.py` `class CandidateGenerator` (`candidate_generator.py:13`) yields candidate job groups via `candidate_groups()` (`candidate_generator.py:87`) and per-job batch-size grids via `candidate_batch_sizes()` (`candidate_generator.py:50`) — power-of-two grid path at `candidate_generator.py:56`-66, range path at `candidate_generator.py:67`-73
+- `candidate_generator.py` `class CandidateGenerator` yields candidate job groups via `candidate_groups()` and per-job batch-size grids via `candidate_batch_sizes()` — power-of-two grid path and range path are selected from `parallel_optimizer.batch_search_mode`
+
+- `group_sizing.py` resolves mode-specific candidate group width: fixed parallel modes use `max_packed_jobs_per_gpu` plus the legacy `allow_three_way_packing` widening, while `parallel_auto_pack` can size up to `candidate_window_size` and includes singleton admission candidates. The resolved policy is emitted in planner traces as `candidate_group_sizing`
 
 - `compatibility.py` `class CompatibilityEvaluator` (`compatibility.py:50`). `compatible_group()` (`compatibility.py:63`) rejects packs when any pair has `SoloProfile.avg_gpu_utilization` above `pack_reject_sm_active_ge` or when a `PairProfile` is on cooldown / over `pack_reject_max_slowdown`. Pair scoring lives in `compatibility_score()` (`compatibility.py:13`-39)
 
@@ -308,6 +310,8 @@ The pause flow is:
 - `parallel_default` and `parallel_batch_optimized` use fixed-width packed groups and fall back to exclusive execution when compatibility or memory evidence is missing
 
 - `parallel_auto_pack` ignores `max_packed_jobs_per_gpu` and keeps admitting work until the configured `auto_pack.target_metric` (`vram` or `sm`) is close to its target threshold
+
+- `planner_decision_trace.candidate_group_sizing` records the effective window size, max candidate group size, and whether singleton candidates were included for the active scheduler mode
 
 - packing is opt-in per job via `packing.eligible: true` and a stable `packing.signature`
 

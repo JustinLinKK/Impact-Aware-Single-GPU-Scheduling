@@ -17,6 +17,25 @@ def load_filter_module():
     return mod
 
 
+def _feature_keys(rows):
+    return {row[0] if isinstance(row, list) and row else row for row in rows}
+
+
+def _assert_feature_key_pairs(rows):
+    assert rows
+    for row in rows:
+        assert isinstance(row, list)
+        assert len(row) == 2
+        assert all(isinstance(value, str) for value in row)
+        assert row[0]
+        assert row[1]
+        assert "..." not in row[1]
+        assert row[1].endswith(".")
+        assert "mainly used for" in row[1]
+        assert "http://" not in row[1]
+        assert "https://" not in row[1]
+
+
 def test_pipeline_stage_categories_align_with_contract():
     mod = load_filter_module()
 
@@ -74,13 +93,54 @@ def test_5090_optimizer_filter_marks_unconfirmed_candidates():
 def test_5090_node_exposes_direct_feature_lists():
     mod = load_filter_module()
 
-    result = mod.query_hardware_node("GeForce RTX 5090", "optimizer")
+    result = mod.query_hardware_node("GeForce RTX 5090", "model")
 
-    assert result["stage_filter"] == "optimizer"
-    assert "fp8" in result["datatypes"]
-    assert "muon_optimizer" in result["recipes"]
-    assert "soap_optimizer" in result["experimental_recipes"]
-    assert "ademamix_optimizer" in result["experimental_recipes"]
+    assert result["stage_filter"] == "model"
+    assert "node_id" not in result
+    assert "source_urls" not in result
+    assert "recommended_patterns" in result
+    assert "avoid_patterns" in result
+    assert any("32GB/1.792TBps" in item for item in result["recommended_patterns"])
+    assert any("flash-attn assumption" in item for item in result["avoid_patterns"])
+    _assert_feature_key_pairs(result["stage_feature_keys"])
+    stage_keys = _feature_keys(result["stage_feature_keys"])
+    assert "tensor_cores" in stage_keys
+    assert "sm_120" in stage_keys
+    assert "tensor_cores_5gen" in stage_keys
+    assert "soap_optimizer" not in stage_keys
+    assert "http://" not in json.dumps(result)
+    assert "https://" not in json.dumps(result)
+
+
+def test_stage_two_and_three_feature_key_mapping_is_source_free():
+    mod = load_filter_module()
+
+    datatype = mod.query_hardware_node("GeForce RTX 5090", "datatype")
+    tuning = mod.query_hardware_node("GeForce RTX 5090", "tuning")
+    optimizer = mod.query_hardware_node("GeForce RTX 5090", "optimizer")
+
+    for payload in (datatype, tuning, optimizer):
+        for field in (
+            "stage_feature_keys",
+            "recommended_feature_keys",
+            "not_recommended_feature_keys",
+            "conditional_feature_keys",
+        ):
+            if payload.get(field):
+                _assert_feature_key_pairs(payload[field])
+    datatype_keys = _feature_keys(datatype["stage_feature_keys"])
+    tuning_keys = _feature_keys(tuning["stage_feature_keys"])
+    optimizer_keys = _feature_keys(optimizer["stage_feature_keys"])
+    optimizer_not_recommended = _feature_keys(optimizer["not_recommended_feature_keys"])
+    assert {"dataset_decomposition", "nvimagecodec_gpu_decode"} <= datatype_keys
+    assert "tensor_cores" not in datatype_keys
+    assert "muon_optimizer" not in datatype_keys
+    assert {"bf16", "fp8_rowwise_scaling"} <= tuning_keys
+    assert {"muon_optimizer", "gram_newton_schulz_symmetric_gemm"} <= optimizer_keys
+    assert {"soap_optimizer", "ademamix_optimizer"} <= optimizer_not_recommended
+    combined = json.dumps({"datatype": datatype, "tuning": tuning, "optimizer": optimizer})
+    assert "http://" not in combined
+    assert "https://" not in combined
 
 
 def test_vendor_prefixed_hardware_names_resolve():
@@ -91,6 +151,10 @@ def test_vendor_prefixed_hardware_names_resolve():
 
     assert result["found"] is True
     assert result["gpu_name"] == "GeForce RTX 5090"
+    assert "node_id" not in result
+    assert "source_urls" not in json.dumps(result)
+    assert "http://" not in json.dumps(result)
+    assert "https://" not in json.dumps(result)
     assert "soap_optimizer" in {feature["feature_id"] for feature in result["features"]}
     assert by_key["found"] is True
     assert "soap_optimizer" in {feature["feature_id"] for feature in by_key["features"]}
