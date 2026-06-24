@@ -203,7 +203,7 @@ def query_hardware_features(
                 or feat_props.get("default_recommendation_scope")
             ),
             "limitations": edge_props.get("limitations") or feat_props.get("limitations"),
-            "notes": _merge_text_values(edge_props.get("notes"), feat_props.get("notes")),
+            "notes": _merge_text_values(feat_props.get("notes"), edge_props.get("notes")),
         }))
 
     return {
