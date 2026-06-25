@@ -101,7 +101,7 @@ def test_5090_node_exposes_direct_feature_lists():
     assert "recommended_patterns" in result
     assert "avoid_patterns" in result
     assert any("32GB/1.792TBps" in item for item in result["recommended_patterns"])
-    assert any("flash-attn assumption" in item for item in result["avoid_patterns"])
+    assert any("sm_100 launch assumptions" in item for item in result["avoid_patterns"])
     _assert_feature_key_pairs(result["stage_feature_keys"])
     stage_keys = _feature_keys(result["stage_feature_keys"])
     assert "tensor_cores" in stage_keys
