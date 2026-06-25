@@ -24,6 +24,8 @@ from .queue import RunnableJobQueue
 from .resource_estimator import ResourceEstimator
 from .runtime_guardrail import RuntimeGuardrail
 
+_EXCLUSIVE_PROBE_TASK_TYPES = {"mlevolve_model_family_probe", "mlevolve_startpoint_probe"}
+
 
 class PlacementPlanner:
     """Select the best runnable dispatch plan for the current queue state."""
@@ -170,6 +172,15 @@ class PlacementPlanner:
             trace["decision_reason"] = "no runnable jobs"
             return finish(None)
         primary = ordered[0]
+        if primary.task_type in _EXCLUSIVE_PROBE_TASK_TYPES:
+            plan = DispatchPlan(
+                mode="exclusive",
+                backend_name="exclusive",
+                job_ids=(primary.job_id,),
+                reason=f"{primary.task_type} requires exclusive probe placement",
+            )
+            trace["decision_reason"] = plan.reason
+            return finish(plan)
         if len(ordered) == 1:
             reason = "single runnable job"
             if self.settings.gpu_scheduler.enabled and scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK:

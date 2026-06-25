@@ -6,8 +6,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 import json
+import logging
 
 from .common import parse_timestamp, stable_job_id, to_primitive, utc_now
+
+logger = logging.getLogger("localml_scheduler")
 
 
 class JobStatus(str, Enum):
@@ -49,9 +52,13 @@ RUNTIME_PROBE_STRATEGY_STEP_WINDOW = "step_window"
 
 
 def normalize_batch_probe_search_mode(value: str | None) -> str:
-    normalized = str(value or BATCH_PROBE_SEARCH_MODE_BINARY).strip().lower().replace("-", "_")
+    normalized = str(value or BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO).strip().lower().replace("-", "_")
     if normalized in {"binary", "default"}:
-        return BATCH_PROBE_SEARCH_MODE_BINARY
+        logger.warning(
+            "Batch probe search mode %r is deprecated; using power_of_two.",
+            value,
+        )
+        return BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO
     if normalized in {"power_of_two", "powers_of_two", "pow2", "2^n", "2n"}:
         return BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO
     raise ValueError(f"Unsupported batch probe search mode: {value}")
@@ -115,6 +122,9 @@ class BatchProbeSpec:
     model_key: str | None = None
     search_mode: str | None = None
     shape_hints: dict[str, Any] = field(default_factory=dict)
+    profile_key: str | None = None
+    shape_signature_override: str | None = None
+    reuse_only: bool = False
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "BatchProbeSpec":
@@ -150,6 +160,7 @@ class CheckpointPolicy:
     save_every_epoch: bool = True
     keep_last_n: int = 3
     pause_mode: SafePointType = SafePointType.STEP
+    preemptible: bool = True
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "CheckpointPolicy":
@@ -474,4 +485,3 @@ class TrainingJob:
         if reference is None or waiting_since is None:
             return 0.0
         return max(0.0, (reference - waiting_since).total_seconds())
-

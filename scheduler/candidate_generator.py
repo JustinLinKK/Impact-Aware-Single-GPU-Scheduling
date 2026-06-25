@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from itertools import combinations
 
-from ..domain import BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO, TrainingJob, normalize_batch_probe_search_mode
+from ..domain import TrainingJob, normalize_batch_probe_search_mode
 from ..config import SCHEDULER_MODE_PARALLEL_AUTO_PACK, SchedulerSettings
 from .compatibility import CompatibilityEvaluator
 from .group_sizing import candidate_group_sizing
@@ -54,24 +54,17 @@ class CandidateGenerator:
         cap = max(1, int(explicit_cap)) if explicit_cap is not None else None
         optimizer = self.settings.gpu_scheduler.parallel_optimizer
         search_mode = normalize_batch_probe_search_mode(optimizer.batch_search_mode)
-        if search_mode == BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO:
-            requested_exponent = max(0, requested.bit_length() - 1)
-            min_exponent = max(0, requested_exponent - optimizer.power_of_two_range_down)
-            max_exponent = requested_exponent + optimizer.power_of_two_range_up
-            values = [2**exponent for exponent in range(min_exponent, max_exponent + 1)]
-            if cap is not None:
-                values = [value for value in values if value <= cap]
-                if not values:
-                    fallback = 2 ** max(0, cap.bit_length() - 1)
-                    return [max(1, fallback)]
-            return values
-        min_batch = max(1, requested - optimizer.binary_range_down)
-        max_batch = requested + optimizer.binary_range_up
+        del search_mode
+        requested_exponent = max(0, requested.bit_length() - 1)
+        min_exponent = max(0, requested_exponent - optimizer.power_of_two_range_down)
+        max_exponent = requested_exponent + optimizer.power_of_two_range_up
+        values = [2**exponent for exponent in range(min_exponent, max_exponent + 1)]
         if cap is not None:
-            max_batch = min(max_batch, cap)
-        if max_batch < min_batch:
-            min_batch = max(1, max_batch)
-        return list(range(min_batch, max_batch + 1))
+            values = [value for value in values if value <= cap]
+            if not values:
+                fallback = 2 ** max(0, cap.bit_length() - 1)
+                return [max(1, fallback)]
+        return values
 
     def fallback_order(self, jobs: list[TrainingJob], batch_overrides: dict[str, int], backend_name: str) -> list[str]:
         ranked = sorted(

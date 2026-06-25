@@ -7,7 +7,8 @@ import tempfile
 import unittest
 
 from engine.executor import Interpreter
-from localml_scheduler.domain import JobStatus, TrainingJob
+from localml_scheduler.adapters.mlevolve import build_model_family_profile_key
+from localml_scheduler.domain import BatchProbeProfile, JobStatus, TrainingJob
 from localml_scheduler.config import SchedulerSettings
 
 
@@ -17,17 +18,37 @@ class _FakeStore:
 
 
 class _FakeSchedulerClient:
-    def __init__(self, settings: SchedulerSettings, *, active_service: bool = True):
+    def __init__(self, settings: SchedulerSettings, *, active_service: bool = True, create_probe_profiles: bool = True):
         self.settings = settings
         self.store = _FakeStore()
         self.submitted_jobs: list[TrainingJob] = []
         self._jobs: dict[str, TrainingJob] = {}
+        self.batch_probe_profiles: dict[str, BatchProbeProfile] = {}
         self.active_service = active_service
+        self.create_probe_profiles = create_probe_profiles
         self.create_service_calls = 0
         self.submit_many_calls = 0
 
     def submit(self, job: TrainingJob) -> TrainingJob:
         self.submitted_jobs.append(job)
+        if job.task_type == "mlevolve_model_family_probe":
+            if self.create_probe_profiles and job.batch_probe.profile_key:
+                self.batch_probe_profiles[job.batch_probe.profile_key] = BatchProbeProfile(
+                    probe_key=job.batch_probe.profile_key,
+                    model_key=job.batch_probe.model_key or job.metadata.get("model_family") or "family",
+                    device_type="test-gpu",
+                    shape_signature=job.batch_probe.shape_signature_override or "family-shape",
+                    batch_param_name=job.batch_probe.batch_param_name,
+                    resolved_batch_size=8,
+                    peak_vram_mb=1024,
+                    memory_total_mb=4096,
+                    target_budget_mb=3891,
+                )
+                job.metadata["resolved_batch_size"] = 8
+            job.mark_status(JobStatus.COMPLETED if self.create_probe_profiles else JobStatus.FAILED)
+            self._jobs[job.job_id] = job
+            return job
+
         result_path = Path(job.config.runner_kwargs["result_path"])
         result_path.parent.mkdir(parents=True, exist_ok=True)
         result_path.write_text(
@@ -64,6 +85,9 @@ class _FakeSchedulerClient:
     def record_tuning_outcome(self, **kwargs):
         self.last_tuning_outcome = kwargs
         return {"ok": True}
+
+    def get_batch_probe_profile(self, profile_key: str) -> BatchProbeProfile | None:
+        return self.batch_probe_profiles.get(profile_key)
 
     def inspect(self, job_id: str) -> TrainingJob | None:
         return self._jobs.get(job_id)
@@ -153,7 +177,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertEqual(submitted.batch_probe.search_mode, "power_of_two")
             self.assertEqual(submitted.config.runner_kwargs["probe_timeout_seconds"], 11)
             self.assertEqual(submitted.config.runner_kwargs["probe_poll_interval_seconds"], 0.25)
-            self.assertEqual(submitted.config.runner_kwargs["probe_max_batch_size"], 12)
+            self.assertEqual(submitted.config.runner_kwargs["probe_max_batch_size"], 8)
             self.assertTrue(submitted.baseline_model_id.startswith("mlevolve-script-"))
             self.assertIsNotNone(submitted.preload_source)
             self.assertEqual(submitted.preload_source.model_id, "shared-startpoint")
@@ -162,6 +186,113 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
                 submitted.preload_source.loader_target,
                 "localml_scheduler.adapters.mlevolve_runner:load_raw_file",
             )
+
+    def test_scheduler_submission_reuses_model_family_probe_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            workdir = Path(tmpdir) / "workdir"
+            workdir.mkdir(parents=True, exist_ok=True)
+            settings = SchedulerSettings(runtime_root=runtime_root)
+            interpreter = Interpreter(working_dir=workdir, timeout=10, max_parallel_run=1)
+            fake_api = _FakeSchedulerClient(settings)
+            profile_key = build_model_family_profile_key(task_id="unit-task", model_family="safe-family")
+            fake_api.batch_probe_profiles[profile_key] = BatchProbeProfile(
+                probe_key=profile_key,
+                model_key="safe-family",
+                device_type="test-gpu",
+                shape_signature="shape-safe-family",
+                batch_param_name="batch_size",
+                resolved_batch_size=8,
+                peak_vram_mb=1024,
+                memory_total_mb=4096,
+                target_budget_mb=3891,
+            )
+            cfg = SimpleNamespace(
+                start_cpu_id=0,
+                cpu_number=1,
+                exp_id="unit-task",
+                exp_name="unit-exp",
+                experiment=SimpleNamespace(mode="hardware_aware"),
+                agent=SimpleNamespace(search=SimpleNamespace(parallel_search_num=1)),
+            )
+            interpreter.cfg = cfg
+            interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
+
+            result = interpreter._run_scheduler_job(
+                code="MODEL_FAMILY = 'safe-family'\nbatch_size = 6\nprint('family reuse')\n",
+                id="node-family",
+                working_dir=str(workdir),
+            )
+
+            self.assertIsNone(result.exc_type)
+            submitted = fake_api.submitted_jobs[0]
+            self.assertEqual(submitted.batch_probe.model_key, "safe-family")
+            self.assertEqual(submitted.batch_probe.profile_key, profile_key)
+            self.assertTrue(submitted.batch_probe.reuse_only)
+            self.assertEqual(submitted.config.runner_kwargs["batch_size"], 4)
+            self.assertEqual(submitted.metadata["resolved_batch_size"], 4)
+            self.assertEqual(submitted.metadata["batch_probe_source"], "model_family_profile")
+
+    def test_scheduler_submission_probes_unseen_model_family_before_training(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            workdir = Path(tmpdir) / "workdir"
+            workdir.mkdir(parents=True, exist_ok=True)
+            settings = SchedulerSettings(runtime_root=runtime_root)
+            cfg = SimpleNamespace(
+                start_cpu_id=0,
+                cpu_number=1,
+                exp_id="unit-task",
+                exp_name="unit-exp",
+                experiment=SimpleNamespace(mode="hardware_aware"),
+                agent=SimpleNamespace(search=SimpleNamespace(parallel_search_num=1)),
+            )
+            interpreter = Interpreter(working_dir=workdir, timeout=10, max_parallel_run=1, cfg=cfg)
+            fake_api = _FakeSchedulerClient(settings)
+            interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
+
+            result = interpreter._run_scheduler_job(
+                code="MODEL_FAMILY = 'new-family'\nbatch_size = 6\nprint('new family')\n",
+                id="node-new-family",
+                working_dir=str(workdir),
+            )
+
+            self.assertIsNone(result.exc_type)
+            self.assertEqual([job.task_type for job in fake_api.submitted_jobs], ["mlevolve_model_family_probe", "mlevolve_script"])
+            probe_job, train_job = fake_api.submitted_jobs
+            self.assertFalse(probe_job.packing.eligible)
+            self.assertEqual(probe_job.packing.backend_allowlist, ["exclusive"])
+            self.assertEqual(train_job.batch_probe.profile_key, probe_job.batch_probe.profile_key)
+            self.assertTrue(train_job.batch_probe.reuse_only)
+            self.assertEqual(train_job.metadata["batch_probe_source"], "model_family_profile")
+
+    def test_scheduler_submission_blocks_training_when_model_family_probe_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            workdir = Path(tmpdir) / "workdir"
+            workdir.mkdir(parents=True, exist_ok=True)
+            settings = SchedulerSettings(runtime_root=runtime_root, gpu_scheduler={"model_family_probe_timeout_seconds": 1})
+            cfg = SimpleNamespace(
+                start_cpu_id=0,
+                cpu_number=1,
+                exp_id="unit-task",
+                exp_name="unit-exp",
+                experiment=SimpleNamespace(mode="hardware_aware"),
+                agent=SimpleNamespace(search=SimpleNamespace(parallel_search_num=1)),
+            )
+            interpreter = Interpreter(working_dir=workdir, timeout=10, max_parallel_run=1, cfg=cfg)
+            fake_api = _FakeSchedulerClient(settings, create_probe_profiles=False)
+            interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
+
+            result = interpreter._run_scheduler_job(
+                code="MODEL_FAMILY = 'blocked-family'\nbatch_size = 6\nprint('blocked')\n",
+                id="node-blocked-family",
+                working_dir=str(workdir),
+            )
+
+            self.assertEqual(result.exc_type, "RuntimeError")
+            self.assertIn("model-family probe failed", "".join(result.term_out).lower())
+            self.assertEqual([job.task_type for job in fake_api.submitted_jobs], ["mlevolve_model_family_probe"])
 
     def test_scheduler_bridge_starts_fallback_service_when_external_service_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

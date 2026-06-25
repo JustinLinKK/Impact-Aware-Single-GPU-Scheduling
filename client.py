@@ -330,12 +330,18 @@ class SchedulerClient:
         return _sanitize_agent_response(self.knowledge.search_hardware(**kwargs))
 
     def get_hardware_context(self, hardware_key: str = "current", include_scheduler_limits: bool = True) -> dict[str, Any]:
-        return _sanitize_agent_response(
+        result = _sanitize_agent_response(
             self.knowledge.get_hardware_context(
                 hardware_key=hardware_key,
                 include_scheduler_limits=include_scheduler_limits,
             )
         )
+        result.setdefault("hardware", None)
+        result.setdefault("accelerator", None)
+        result.setdefault("toolkit", None)
+        result.setdefault("backend_capabilities", {})
+        result.setdefault("scheduler_limits", {})
+        return result
 
     def get_job_design_context(self, candidate: dict[str, Any], limit: int = 5) -> dict[str, Any]:
         return self.knowledge.get_job_design_context(candidate=candidate, limit=limit)
@@ -1152,7 +1158,7 @@ class SchedulerClient:
         ]
         vector_confidence = max(vector_confidences) if vector_confidences else 0.0
         confidence = round(max(graph_confidence, vector_confidence), 3)
-        return _sanitize_agent_response({
+        result = _sanitize_agent_response({
             "hardware_context": graph_context.get("hardware_context"),
             "graph_evidence": graph_context.get("graph_evidence") or {"exact_profiles": [], "similar_profiles": [], "packed_profiles": []},
             "derived_diagnosis": graph_context.get("derived_diagnosis") or {"profile_symptoms": [], "optimization_targets": []},
@@ -1163,6 +1169,24 @@ class SchedulerClient:
             "evidence_refs": list(graph_context.get("evidence_refs") or []) + list(code_context.get("evidence_refs") or []),
             "confidence": confidence,
         })
+        graph_evidence = dict(result.get("graph_evidence") or {})
+        graph_evidence.setdefault("exact_profiles", [])
+        graph_evidence.setdefault("similar_profiles", [])
+        graph_evidence.setdefault("packed_profiles", [])
+        result["graph_evidence"] = graph_evidence
+        derived_diagnosis = dict(result.get("derived_diagnosis") or {})
+        derived_diagnosis.setdefault("profile_symptoms", [])
+        derived_diagnosis.setdefault("optimization_targets", [])
+        result["derived_diagnosis"] = derived_diagnosis
+        preserved_vector_evidence = dict(result.get("vector_evidence") or {})
+        preserved_vector_evidence.setdefault("recipes", [])
+        preserved_vector_evidence.setdefault("docs", [])
+        preserved_vector_evidence.setdefault("api_symbols", [])
+        result["vector_evidence"] = preserved_vector_evidence
+        result.setdefault("recommendations", [])
+        result.setdefault("risk_flags", [])
+        result.setdefault("evidence_refs", [])
+        return result
 
     def plan_job_packet(self, *, candidates: list[dict[str, Any]], limit: int = 8) -> dict[str, Any]:
         """Plan a round of jobs together so probes/packing evidence can be considered before dispatch."""

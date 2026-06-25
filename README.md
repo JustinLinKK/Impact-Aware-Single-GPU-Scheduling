@@ -72,7 +72,7 @@ It is packaged as a root-level module so it can be used by MLEvolve or detached 
 
 - `placement_planner.py` `class PlacementPlanner` (`placement_planner.py:26`) composes `ResourceEstimator`, `CompatibilityEvaluator`, `RuntimeGuardrail`, `CandidateGenerator`, `ObjectiveScorer` (`placement_planner.py:33`-44). `choose_plan()` (`placement_planner.py:61`) returns a `DispatchPlan` or `None`
 
-- `candidate_generator.py` `class CandidateGenerator` yields candidate job groups via `candidate_groups()` and per-job batch-size grids via `candidate_batch_sizes()` — power-of-two grid path and range path are selected from `parallel_optimizer.batch_search_mode`
+- `candidate_generator.py` `class CandidateGenerator` yields candidate job groups via `candidate_groups()` and per-job power-of-two batch-size grids via `candidate_batch_sizes()`
 
 - `group_sizing.py` resolves mode-specific candidate group width: fixed parallel modes use `max_packed_jobs_per_gpu` plus the legacy `allow_three_way_packing` widening, while `parallel_auto_pack` can size up to `candidate_window_size` and includes singleton admission candidates. The resolved policy is emitted in planner traces as `candidate_group_sizing`
 
@@ -172,7 +172,7 @@ See [`docs/scheduler_observability.md`](../docs/scheduler_observability.md) for 
 
 ## Profiling (`profiling/`)
 
-- `batch_probe.py`: `run_batch_probe_preflight(context)` (`batch_probe.py:513`) decides between cache hit / cache miss for the job's `BatchProbeProfile`. On miss it calls `_run_probe_controller()` (`batch_probe.py:285`) which drives a binary or power-of-two search via the job's runner-side probe hook. Events emitted include `batch_probe_started`, `batch_probe_cache_hit`, `batch_probe_cache_miss`, `batch_probe_trial`, `batch_probe_failed`, `batch_probe_selected`, `batch_probe_warning`
+- `batch_probe.py`: `run_batch_probe_preflight(context)` decides between cache hit / cache miss for the job's `BatchProbeProfile`. MLEvolve model-family probe jobs populate reusable profiles from real generated scripts; derivative jobs set `BatchProbeSpec.reuse_only` with that family `profile_key` and do not probe every modified model. New probes use power-of-two search only. Events emitted include `batch_probe_started`, `batch_probe_cache_hit`, `batch_probe_cache_miss`, `batch_probe_reuse_miss`, `batch_probe_trial`, `batch_probe_failed`, `batch_probe_selected`, `batch_probe_warning`
 
 - `runtime_probe.py`: `runtime_profile_for_job(store, job, backend_name)` (`runtime_probe.py:21`) looks up the persisted `RuntimeProfile` for `(packing.signature, resolved_batch_size, backend_name)`. The `RuntimeProfile` (`profiles.py:308`) stores `startup_seconds`, `epoch_1_seconds`, `steps_per_epoch`, `avg_step_time_ms`, `estimated_total_runtime_seconds`, `confidence`, `observations`, `source`
 
