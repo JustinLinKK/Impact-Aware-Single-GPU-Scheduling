@@ -37,7 +37,8 @@ from .scheduler.service import SchedulerService
 from .storage.state_store import StateStore
 
 
-_PIPELINE_HARDWARE_STAGES = ("datatype", "model", "optimizer", "tuning")
+_PIPELINE_HARDWARE_STAGES = ("model_design", "datatype_precision", "training_evaluation")
+_LEGACY_HARDWARE_STAGES = ("datatype", "model", "optimizer", "tuning")
 
 _HARDWARE_STAGE_ALIASES = {
     "data": "datatype",
@@ -45,30 +46,39 @@ _HARDWARE_STAGE_ALIASES = {
     "data_processing": "datatype",
     "data_processing_and_feature_engineering": "datatype",
     "feature_engineering": "datatype",
-    "model_design": "model",
+    "stage1": "model_design",
+    "stage_1": "model_design",
+    "stage1_candidate_construction": "model_design",
+    "candidate_construction": "model_design",
+    "model_design": "model_design",
     "model_structure": "model",
     "architecture": "model",
     "optimizer_selection": "optimizer",
     "loss": "optimizer",
-    "training": "tuning",
-    "training_evaluation": "tuning",
+    "datatype_quantization": "datatype_precision",
+    "quantization": "datatype_precision",
+    "training": "training_evaluation",
+    "training_evaluation": "training_evaluation",
     "training_parameters": "tuning",
     "training_params": "tuning",
     "precision": "tuning",
-    "pre_submit_training_review": "tuning",
+    "pre_submit_training_review": "training_evaluation",
 }
 
 _COMPOSITE_HARDWARE_STAGE_ALIASES = {
-    "stage1": ("datatype", "model"),
-    "stage_1": ("datatype", "model"),
-    "hardware_context_lookup": ("datatype", "model"),
-    "stage1_candidate_construction": ("datatype", "model"),
-    "candidate_construction": ("datatype", "model"),
-    "datatype_precision": ("datatype", "tuning"),
-    "training_evaluation": ("optimizer", "tuning"),
+    "hardware_context_lookup": ("model_design",),
+    "stage1_candidate_construction": ("model_design",),
+    "candidate_construction": ("model_design",),
+    "datatype_precision": ("datatype_precision",),
+    "datatype_quantization": ("datatype_precision",),
+    "training_evaluation": ("training_evaluation",),
 }
 
 _COMPOSITE_STAGE_FEATURE_CATEGORIES = {
+    "model_design": {
+        "datatype": {"data_pipeline"},
+        "model": {"compute_capability", "interconnect", "kernel_optimization", "tensor_core"},
+    },
     "stage1_candidate_construction": {
         "datatype": {"data_pipeline"},
         "model": {"compute_capability", "interconnect", "kernel_optimization", "tensor_core"},
@@ -78,26 +88,26 @@ _COMPOSITE_STAGE_FEATURE_CATEGORIES = {
         "model": {"compute_capability", "interconnect", "kernel_optimization", "tensor_core"},
     },
     "datatype_precision": {
-        "datatype": {"data_pipeline"},
-        "tuning": {"data_pipeline", "precision"},
+        "tuning": {"precision"},
     },
     "training_evaluation": {
         "optimizer": {"kernel_optimization", "optimizer"},
-        "tuning": {"data_pipeline", "kernel_optimization", "parallelism", "precision"},
+        "tuning": {"interconnect", "kernel_optimization", "parallelism"},
     },
 }
 
 _AGENT_STAGE_HARDWARE_STAGES = {
-    "draft": ("datatype", "model", "optimizer", "tuning"),
-    "improve": ("model", "optimizer", "tuning"),
-    "evolution": ("model", "optimizer", "tuning"),
-    "fusion": ("model", "optimizer", "tuning"),
-    "debug": ("optimizer", "tuning"),
-    "code_review": ("optimizer", "tuning"),
-    "aggregation": ("tuning",),
-    "model_design": ("model",),
-    "datatype_precision": ("datatype", "tuning"),
-    "training_evaluation": ("optimizer", "tuning"),
+    "draft": ("model_design", "datatype_precision", "training_evaluation"),
+    "improve": ("model_design", "datatype_precision", "training_evaluation"),
+    "evolution": ("model_design", "datatype_precision", "training_evaluation"),
+    "fusion": ("model_design", "datatype_precision", "training_evaluation"),
+    "debug": ("training_evaluation",),
+    "code_review": ("training_evaluation",),
+    "aggregation": ("training_evaluation",),
+    "data_processing_and_feature_engineering": ("model_design",),
+    "model_design": ("model_design",),
+    "datatype_precision": ("datatype_precision",),
+    "training_evaluation": ("training_evaluation",),
 }
 
 
@@ -668,7 +678,8 @@ class SchedulerClient:
         if not normalized or normalized == "all":
             return None
         normalized = _HARDWARE_STAGE_ALIASES.get(normalized, normalized)
-        return normalized if normalized in _PIPELINE_HARDWARE_STAGES else None
+        valid_stages = set(_PIPELINE_HARDWARE_STAGES) | set(_LEGACY_HARDWARE_STAGES)
+        return normalized if normalized in valid_stages else None
 
     @classmethod
     def _normalize_hardware_stage_list(cls, value: Any) -> list[str]:
@@ -699,8 +710,14 @@ class SchedulerClient:
 
     @staticmethod
     def _composite_stage_scope(stages: list[str]) -> str | None:
+        if stages == ["model_design"]:
+            return "model_design"
+        if stages == ["datatype_precision"]:
+            return "datatype_precision"
+        if stages == ["training_evaluation"]:
+            return "training_evaluation"
         if stages == ["datatype", "model"]:
-            return "stage1_candidate_construction"
+            return "model_design"
         if stages == ["datatype", "tuning"]:
             return "datatype_precision"
         if stages == ["optimizer", "tuning"]:
@@ -1287,7 +1304,7 @@ class SchedulerClient:
         try:
             stage_feature_context = self.get_stage_hardware_features(
                 hardware_key,
-                pipeline_stage="model",
+                pipeline_stage="model_design",
                 limit=max(16, int(limit) * 8),
             )
             if stage_feature_context.get("found"):

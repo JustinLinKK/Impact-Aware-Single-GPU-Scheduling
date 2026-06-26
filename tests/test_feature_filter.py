@@ -39,20 +39,31 @@ def _assert_feature_key_pairs(rows):
 def test_pipeline_stage_categories_align_with_contract():
     mod = load_filter_module()
 
-    assert mod.PIPELINE_STAGES == ("datatype", "model", "optimizer", "tuning")
+    assert mod.PIPELINE_STAGES == ("model_design", "datatype_precision", "training_evaluation")
 
-    datatype = mod.query_hardware_features("GeForce RTX 5090", "datatype")
-    datatype_ids = {feature["feature_id"] for feature in datatype["features"]}
-    assert datatype["stage_filter"] == "datatype"
-    assert "dataset_decomposition" in datatype_ids
-    assert "nvimagecodec_gpu_decode" in datatype_ids
-    assert "bf16" not in datatype_ids
+    model_design = mod.query_hardware_features("GeForce RTX 5090", "model_design")
+    model_design_ids = {feature["feature_id"] for feature in model_design["features"]}
+    assert model_design["stage_filter"] == "model_design"
+    assert "dataset_decomposition" in model_design_ids
+    assert "nvimagecodec_gpu_decode" in model_design_ids
+    assert "tensor_cores" in model_design_ids
+    assert "bf16" not in model_design_ids
 
-    tuning = mod.query_hardware_features("GeForce RTX 5090", "tuning")
-    tuning_ids = {feature["feature_id"] for feature in tuning["features"]}
-    assert "bf16" in tuning_ids
-    assert "fp8_rowwise_scaling" in tuning_ids
-    assert "async_tensor_parallel" in tuning_ids
+    datatype_precision = mod.query_hardware_features("GeForce RTX 5090", "datatype_precision")
+    datatype_precision_ids = {feature["feature_id"] for feature in datatype_precision["features"]}
+    assert datatype_precision["stage_filter"] == "datatype_precision"
+    assert "bf16" in datatype_precision_ids
+    assert "fp8_rowwise_scaling" in datatype_precision_ids
+    assert "async_tensor_parallel" not in datatype_precision_ids
+    assert "muon_optimizer" not in datatype_precision_ids
+
+    training = mod.query_hardware_features("GeForce RTX 5090", "training_evaluation")
+    training_ids = {feature["feature_id"] for feature in training["features"]}
+    assert training["stage_filter"] == "training_evaluation"
+    assert "muon_optimizer" in training_ids
+    assert "gram_newton_schulz_symmetric_gemm" in training_ids
+    assert "async_tensor_parallel" in training_ids
+    assert "bf16" not in training_ids
 
 
 def test_legacy_stage_aliases_still_work():
@@ -65,9 +76,13 @@ def test_legacy_stage_aliases_still_work():
         f["feature_id"] for f in model["features"]
     }
 
-    tuning = mod.query_hardware_features("GeForce RTX 5090", "training_parameters")
-    assert tuning["stage_filter"] == "tuning"
-    assert "bf16" in {feature["feature_id"] for feature in tuning["features"]}
+    training = mod.query_hardware_features("GeForce RTX 5090", "training")
+    assert training["stage_filter"] == "training_evaluation"
+    assert "muon_optimizer" in {feature["feature_id"] for feature in training["features"]}
+
+    precision = mod.query_hardware_features("GeForce RTX 5090", "datatype_quantization")
+    assert precision["stage_filter"] == "datatype_precision"
+    assert "bf16" in {feature["feature_id"] for feature in precision["features"]}
 
 
 def test_5090_optimizer_filter_marks_unconfirmed_candidates():

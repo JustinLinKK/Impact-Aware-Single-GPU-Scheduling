@@ -11,18 +11,29 @@ from typing import Any
 # Pipeline stage keyword definitions
 # ---------------------------------------------------------------------------
 
-PIPELINE_STAGES = ("datatype", "model", "optimizer", "tuning")
+PIPELINE_STAGES = ("model_design", "datatype_precision", "training_evaluation")
+LEGACY_HARDWARE_STAGES = ("datatype", "model", "optimizer", "tuning")
 
 _STAGE_ALIASES = {
     "data_type": "datatype",
     "data_processing": "datatype",
     "data_processing_and_feature_engineering": "datatype",
     "feature_engineering": "datatype",
-    "model_design": "model",
+    "stage1": "model_design",
+    "stage_1": "model_design",
+    "stage1_candidate_construction": "model_design",
+    "candidate_construction": "model_design",
+    "model-design": "model_design",
+    "model_design": "model_design",
     "model_structure": "model",
-    "datatype_precision": "tuning",
-    "training": "tuning",
-    "training_evaluation": "tuning",
+    "datatype-precision": "datatype_precision",
+    "datatype_precision": "datatype_precision",
+    "datatype_quantization": "datatype_precision",
+    "datatype-quantization": "datatype_precision",
+    "quantization": "datatype_precision",
+    "training": "training_evaluation",
+    "training-evaluation": "training_evaluation",
+    "training_evaluation": "training_evaluation",
     "training_parameters": "tuning",
     "training_params": "tuning",
     "precision": "tuning",
@@ -131,6 +142,20 @@ _STAGE_FEATURE_IDS: dict[str, set[str]] = {
     "optimizer": {"gram_newton_schulz_symmetric_gemm"},
 }
 
+_COMPOSITE_STAGE_SPECS: dict[str, tuple[tuple[str, set[str], set[str]], ...]] = {
+    "model_design": (
+        ("datatype", _STAGE_CATEGORIES["datatype"], _STAGE_FEATURE_IDS.get("datatype", set())),
+        ("model", _STAGE_CATEGORIES["model"], _STAGE_FEATURE_IDS.get("model", set())),
+    ),
+    "datatype_precision": (
+        ("tuning", {"precision"}, set()),
+    ),
+    "training_evaluation": (
+        ("optimizer", _STAGE_CATEGORIES["optimizer"], _STAGE_FEATURE_IDS.get("optimizer", set())),
+        ("tuning", {"interconnect", "kernel_optimization", "parallelism"}, set()),
+    ),
+}
+
 
 def query_hardware_features(
     hardware_name: str,
@@ -162,8 +187,7 @@ def query_hardware_features(
     }
 
     stage = _normalize_stage(agent_stage)
-    categories = _STAGE_CATEGORIES.get(stage) if stage else None
-    feature_ids = _STAGE_FEATURE_IDS.get(stage, set()) if stage else set()
+    stage_specs = _stage_specs(stage)
 
     features: list[dict[str, Any]] = []
     for edge in edges:
@@ -174,9 +198,7 @@ def query_hardware_features(
 
         category = feat_props.get("category", "")
         feature_id = feat_props.get("feature_id")
-        category_match = bool(categories and category in categories)
-        feature_match = feature_id in feature_ids
-        if (categories or feature_ids) and not (category_match or feature_match):
+        if stage_specs and not _feature_matches_stage(str(category), str(feature_id or ""), stage_specs):
             continue
 
         edge_props = edge.get("properties", {})
@@ -231,6 +253,27 @@ def _normalize_stage(agent_stage: str | None) -> str | None:
     return _STAGE_ALIASES.get(stage, stage)
 
 
+def _stage_specs(stage: str | None) -> tuple[tuple[str, set[str], set[str]], ...]:
+    if not stage:
+        return ()
+    if stage in _COMPOSITE_STAGE_SPECS:
+        return _COMPOSITE_STAGE_SPECS[stage]
+    if stage in LEGACY_HARDWARE_STAGES:
+        return ((stage, _STAGE_CATEGORIES.get(stage, set()), _STAGE_FEATURE_IDS.get(stage, set())),)
+    return ()
+
+
+def _feature_matches_stage(
+    category: str,
+    feature_id: str,
+    specs: tuple[tuple[str, set[str], set[str]], ...],
+) -> bool:
+    for _component, categories, explicit_ids in specs:
+        if category in categories or feature_id in explicit_ids:
+            return True
+    return False
+
+
 def _stage_feature_key_index(
     graph: dict[str, Any],
     edges: list[dict[str, Any]],
@@ -240,8 +283,7 @@ def _stage_feature_key_index(
         n["id"]: n.get("properties", {})
         for n in graph["nodes"] if n.get("label") == "Feature"
     }
-    categories = _STAGE_CATEGORIES.get(stage) if stage else None
-    explicit_ids = _STAGE_FEATURE_IDS.get(stage, set()) if stage else set()
+    stage_specs = _stage_specs(stage)
     all_keys: list[list[str]] = []
     recommended_keys: list[list[str]] = []
     not_recommended_keys: list[list[str]] = []
@@ -255,7 +297,7 @@ def _stage_feature_key_index(
         if not feature_id:
             continue
         category = str(feat_props.get("category") or "")
-        if (categories or explicit_ids) and category not in (categories or set()) and feature_id not in explicit_ids:
+        if stage_specs and not _feature_matches_stage(category, feature_id, stage_specs):
             continue
         edge_props = edge.get("properties") or {}
         description = _feature_short_description(feature_id, feat_props)
