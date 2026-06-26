@@ -38,6 +38,16 @@ _EPOCH_OVERRIDE_VAR = "_MLEVOLVE_PROBE_MAX_EPOCHS"
 _PROBE_MODE_VAR = "_MLEVOLVE_PROBE_MODE"
 
 
+def _request_process_stop(proc: subprocess.Popen) -> None:
+    try:
+        if os.name == "nt":
+            proc.terminate()
+        else:
+            proc.send_signal(signal.SIGINT)
+    except (OSError, ValueError):
+        proc.terminate()
+
+
 @dataclass(slots=True)
 class InstrumentedScript:
     path: Path
@@ -328,7 +338,7 @@ def _run_probe_subprocess(
         fits = proc.poll() == 0
         if proc.poll() is None:
             try:
-                proc.send_signal(signal.SIGINT)
+                _request_process_stop(proc)
                 proc.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
                 proc.kill()
@@ -439,7 +449,7 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
             exc_type, exc_info, exc_stack = _parse_exception(stderr, working_dir, executable_script)
     except subprocess.TimeoutExpired:
         try:
-            proc.send_signal(signal.SIGINT)
+            _request_process_stop(proc)
             stdout, stderr = proc.communicate(timeout=2)
         except subprocess.TimeoutExpired:
             proc.kill()

@@ -41,11 +41,11 @@ _PIPELINE_HARDWARE_STAGES = ("model_design", "datatype_precision", "training_eva
 _LEGACY_HARDWARE_STAGES = ("datatype", "model", "optimizer", "tuning")
 
 _HARDWARE_STAGE_ALIASES = {
-    "data": "datatype",
-    "data_type": "datatype",
-    "data_processing": "datatype",
-    "data_processing_and_feature_engineering": "datatype",
-    "feature_engineering": "datatype",
+    "data": "model_design",
+    "data_type": "model_design",
+    "data_processing": "model_design",
+    "data_processing_and_feature_engineering": "model_design",
+    "feature_engineering": "model_design",
     "stage1": "model_design",
     "stage_1": "model_design",
     "stage1_candidate_construction": "model_design",
@@ -77,15 +77,7 @@ _COMPOSITE_HARDWARE_STAGE_ALIASES = {
 _COMPOSITE_STAGE_FEATURE_CATEGORIES = {
     "model_design": {
         "datatype": {"data_pipeline"},
-        "model": {"compute_capability", "interconnect", "kernel_optimization", "tensor_core"},
-    },
-    "stage1_candidate_construction": {
-        "datatype": {"data_pipeline"},
-        "model": {"compute_capability", "interconnect", "kernel_optimization", "tensor_core"},
-    },
-    "candidate_construction": {
-        "datatype": {"data_pipeline"},
-        "model": {"compute_capability", "interconnect", "kernel_optimization", "tensor_core"},
+        "model": {"compute_capability", "interconnect", "tensor_core"},
     },
     "datatype_precision": {
         "tuning": {"precision"},
@@ -104,7 +96,6 @@ _AGENT_STAGE_HARDWARE_STAGES = {
     "debug": ("training_evaluation",),
     "code_review": ("training_evaluation",),
     "aggregation": ("training_evaluation",),
-    "data_processing_and_feature_engineering": ("model_design",),
     "model_design": ("model_design",),
     "datatype_precision": ("datatype_precision",),
     "training_evaluation": ("training_evaluation",),

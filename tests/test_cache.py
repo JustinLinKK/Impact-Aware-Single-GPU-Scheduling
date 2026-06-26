@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -224,9 +225,14 @@ class BaselineCacheTest(unittest.TestCase):
             settings = SchedulerSettings(runtime_root=deep_root)
             address = settings.cache_address()
 
-            self.assertIsInstance(address, str)
-            self.assertLess(len(address.encode("utf-8")), 100)
-            self.assertNotIn(str(deep_root), address)
+            if sys.platform == "win32":
+                self.assertIsInstance(address, tuple)
+                self.assertEqual(address[0], settings.cache_server_host)
+                self.assertEqual(address[1], settings.cache_server_port)
+            else:
+                self.assertIsInstance(address, str)
+                self.assertLess(len(address.encode("utf-8")), 100)
+                self.assertNotIn(str(deep_root), address)
 
             server = CacheServer(settings, BaselineModelCache(memory_budget_bytes=1024 * 1024))
             try:
@@ -234,7 +240,8 @@ class BaselineCacheTest(unittest.TestCase):
                 self.assertTrue(CacheClient(settings).ping())
             finally:
                 server.stop()
-            self.assertFalse(Path(address).exists())
+            if isinstance(address, str):
+                self.assertFalse(Path(address).exists())
 
     def test_redis_lru_cache_evicts_least_recently_used_entry(self) -> None:
         cache = RedisLRUCache(

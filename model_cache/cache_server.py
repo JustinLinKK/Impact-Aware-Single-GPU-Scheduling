@@ -30,8 +30,11 @@ def _send_message(writer, message: Any) -> None:
     writer.flush()
 
 
-class _ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-    daemon_threads = True
+if hasattr(socketserver, "UnixStreamServer"):
+    class _ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+else:  # Windows: SchedulerConfig.cache_address() uses TCP instead.
+    _ThreadingUnixServer = None  # type: ignore[assignment]
 
 
 class _ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -63,6 +66,8 @@ class CacheServer:
     def _build_server(self) -> socketserver.BaseServer:
         address = self.settings.cache_address()
         if isinstance(address, str):
+            if _ThreadingUnixServer is None:
+                raise RuntimeError("Unix-domain cache sockets are not available on this platform")
             socket_path = Path(address)
             socket_path.parent.mkdir(parents=True, exist_ok=True)
             if socket_path.exists():
@@ -139,6 +144,8 @@ class CacheClient:
     def _connect(self):
         address = self.settings.cache_address()
         if isinstance(address, str):
+            if not hasattr(socket, "AF_UNIX"):
+                raise RuntimeError("Unix-domain cache sockets are not available on this platform")
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 sock.connect(address)

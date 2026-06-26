@@ -181,7 +181,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertTrue(submitted.baseline_model_id.startswith("mlevolve-script-"))
             self.assertIsNotNone(submitted.preload_source)
             self.assertEqual(submitted.preload_source.model_id, "shared-startpoint")
-            self.assertEqual(submitted.preload_source.model_path, str(workdir / "shared-start.ckpt"))
+            self.assertTrue(Path(submitted.preload_source.model_path).samefile(workdir / "shared-start.ckpt"))
             self.assertEqual(
                 submitted.preload_source.loader_target,
                 "localml_scheduler.adapters.mlevolve_runner:load_raw_file",

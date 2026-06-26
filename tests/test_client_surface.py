@@ -309,18 +309,19 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
                 },
             }
 
-            stage1 = client.get_stage_hardware_features(
-                pipeline_stage="stage1_candidate_construction",
+            model_design = client.get_stage_hardware_features(
+                pipeline_stage="model_design",
                 limit=32,
             )
-            stage1_ids = {item["feature_id"] for item in stage1["features"]}
+            model_design_ids = {item["feature_id"] for item in model_design["features"]}
 
-            self.assertEqual(stage1["stage_filter"], "model_design")
-            self.assertIn("dataset_decomposition", stage1_ids)
-            self.assertIn("tensor_cores", stage1_ids)
-            self.assertIn("sm_120", stage1_ids)
-            self.assertNotIn("bf16", stage1_ids)
-            self.assertNotIn("muon_optimizer", stage1_ids)
+            self.assertEqual(model_design["stage_filter"], "model_design")
+            self.assertIn("dataset_decomposition", model_design_ids)
+            self.assertIn("tensor_cores", model_design_ids)
+            self.assertIn("sm_120", model_design_ids)
+            self.assertNotIn("bf16", model_design_ids)
+            self.assertNotIn("muon_optimizer", model_design_ids)
+            self.assertNotIn("gram_newton_schulz_symmetric_gemm", model_design_ids)
 
             datatype_precision = client.get_stage_hardware_features(
                 pipeline_stage="datatype_precision",

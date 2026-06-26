@@ -15,10 +15,11 @@ PIPELINE_STAGES = ("model_design", "datatype_precision", "training_evaluation")
 LEGACY_HARDWARE_STAGES = ("datatype", "model", "optimizer", "tuning")
 
 _STAGE_ALIASES = {
-    "data_type": "datatype",
-    "data_processing": "datatype",
-    "data_processing_and_feature_engineering": "datatype",
-    "feature_engineering": "datatype",
+    "data": "model_design",
+    "data_type": "model_design",
+    "data_processing": "model_design",
+    "data_processing_and_feature_engineering": "model_design",
+    "feature_engineering": "model_design",
     "stage1": "model_design",
     "stage_1": "model_design",
     "stage1_candidate_construction": "model_design",
@@ -91,8 +92,10 @@ def query_hardware_node(
     hardware_name:
         GPU name to search, e.g. ``"rtx 4090"``.
     agent_stage:
-        ``"datatype"`` / ``"model"`` / ``"optimizer"`` / ``"tuning"``
-        or ``None`` for all patterns. Legacy stage names are accepted.
+        ``"model_design"``, ``"datatype_precision"``, or
+        ``"training_evaluation"``. Low-level legacy filters
+        ``"datatype"``, ``"model"``, ``"optimizer"``, and ``"tuning"`` are
+        still accepted for manual inspection.
     """
     graph = _load_graph(graph_path)
     node, edges = _lookup_node(graph, hardware_name)
@@ -145,7 +148,11 @@ _STAGE_FEATURE_IDS: dict[str, set[str]] = {
 _COMPOSITE_STAGE_SPECS: dict[str, tuple[tuple[str, set[str], set[str]], ...]] = {
     "model_design": (
         ("datatype", _STAGE_CATEGORIES["datatype"], _STAGE_FEATURE_IDS.get("datatype", set())),
-        ("model", _STAGE_CATEGORIES["model"], _STAGE_FEATURE_IDS.get("model", set())),
+        (
+            "model",
+            {"compute_capability", "interconnect", "tensor_core"},
+            _STAGE_FEATURE_IDS.get("model", set()),
+        ),
     ),
     "datatype_precision": (
         ("tuning", {"precision"}, set()),
@@ -170,10 +177,11 @@ def query_hardware_features(
     hardware_name:
         GPU name to search, e.g. ``"rtx 4090"``.
     agent_stage:
-        ``"datatype"`` returns data-pipeline/data-shape features;
-        ``"model"`` returns architecture/kernel/tensor-core features;
-        ``"optimizer"`` returns optimizer features and optimizer-adjacent kernels;
-        ``"tuning"`` returns precision, dataloader, parallelism, and runtime features;
+        ``"model_design"`` returns data-pipeline and model-shape features;
+        ``"datatype_precision"`` returns numeric precision features;
+        ``"training_evaluation"`` returns optimizer and runtime features.
+        Low-level legacy filters (``"datatype"``, ``"model"``,
+        ``"optimizer"``, and ``"tuning"``) remain accepted for manual checks;
         ``None`` returns all features.
     """
     graph = _load_graph(graph_path)

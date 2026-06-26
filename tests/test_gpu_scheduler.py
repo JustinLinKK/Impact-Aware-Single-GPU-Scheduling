@@ -42,6 +42,10 @@ from localml_scheduler.config import (
 from localml_scheduler.storage.sqlite_store import SQLiteStateStore
 
 
+def _yaml_path(path: str | Path) -> str:
+    return str(path).replace("\\", "/")
+
+
 def _fake_hardware_profile(name: str) -> HardwareProfile:
     return HardwareProfile(
         hardware_key=build_hardware_key(
@@ -129,7 +133,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             settings_path.write_text(
                 "\n".join(
                     [
-                        f'runtime_root: "{tmpdir}"',
+                        f'runtime_root: "{_yaml_path(tmpdir)}"',
                         "gpu_scheduler:",
                         "  enabled: true",
                         '  backend_priority: ["mps", "exclusive"]',
@@ -237,7 +241,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             settings_path.write_text(
                 "\n".join(
                     [
-                        f'runtime_root: "{tmpdir}"',
+                        f'runtime_root: "{_yaml_path(tmpdir)}"',
                         "gpu_scheduler:",
                         '  mode: "parallel_batch_optimized"',
                         "  candidate_window_size: 12",
@@ -280,7 +284,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             settings_path.write_text(
                 "\n".join(
                     [
-                        f'runtime_root: "{tmpdir}"',
+                        f'runtime_root: "{_yaml_path(tmpdir)}"',
                         "gpu_scheduler:",
                         "  submission_defaults: null",
                         "  parallel_optimizer: null",
@@ -305,7 +309,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             settings_path.write_text(
                 "\n".join(
                     [
-                        f'runtime_root: "{tmpdir}"',
+                        f'runtime_root: "{_yaml_path(tmpdir)}"',
                         "gpu_scheduler:",
                         "  batch_probe_target_memory_fraction: 0.91",
                         "  auto_pack:",
@@ -334,7 +338,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             settings_path.write_text(
                 "\n".join(
                     [
-                        f'runtime_root: "{tmpdir}"',
+                        f'runtime_root: "{_yaml_path(tmpdir)}"',
                         "baseline_cache:",
                         "  warm_queue_policy: budget_only",
                         "  warm_queue_top_k: 5",
