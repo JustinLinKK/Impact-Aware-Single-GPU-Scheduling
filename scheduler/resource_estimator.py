@@ -52,6 +52,12 @@ class ResourceEstimator:
 
     def estimate_peak_vram_mb(self, job: TrainingJob, batch_size: int, backend_name: str) -> float:
         hardware = self.repository.hardware_profile()
+        if job.batch_probe.profile_key:
+            profile = self.repository.get_batch_probe_profile(str(job.batch_probe.profile_key))
+            if profile is not None and profile.peak_vram_mb is not None:
+                base_batch = max(1, int(profile.resolved_batch_size))
+                return float(profile.peak_vram_mb) * (float(batch_size) / float(base_batch))
+
         observation = self.repository.get_batch_size_observation(
             model_key=self.model_key(job),
             shape_signature=self.shape_signature(job),

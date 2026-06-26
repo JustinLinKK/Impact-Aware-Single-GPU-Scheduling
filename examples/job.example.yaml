@@ -25,7 +25,7 @@ batch_probe:
   probe_target: "localml_scheduler.examples.toy_pytorch_runner:probe_toy_training_batch_size"
   batch_param_name: "batch_size"
   model_key: null
-  search_mode: "binary"
+  search_mode: "power_of_two"
   shape_hints:
     tokens: 128
 checkpoint_policy:

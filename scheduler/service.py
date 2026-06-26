@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Thread
 from typing import Any
@@ -17,7 +18,7 @@ from ..observability.events import EventLogger
 from ..observability.logging_utils import setup_scheduler_logger
 from ..observability.metrics import MetricsCollector
 from ..profiling.runtime_probe import runtime_profile_for_job
-from ..domain import BatchResolution, CombinationProfile, JobStatus, PairProfile, PreloadSource, SoloProfile, TrainingJob, build_group_signature, utc_now
+from ..domain import BatchResolution, CombinationProfile, JobStatus, PairProfile, PreloadSource, SoloProfile, TrainingJob, build_group_signature, parse_timestamp, utc_now
 from ..config import SCHEDULER_MODE_AUTO, SCHEDULER_MODE_PARALLEL_AUTO_PACK, SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED, SchedulerSettings, effective_scheduler_mode
 from ..storage.log_store import SchedulerLogStore
 from ..storage.state_store import StateStore
@@ -31,6 +32,7 @@ from .telemetry import GpuTelemetrySample, GpuTelemetrySummary, NvidiaSmiTelemet
 
 
 RAW_MLEVOLVE_RUNNER_TARGET = "localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job"
+NON_PREEMPTIBLE_PROBE_TASK_TYPES = {"mlevolve_model_family_probe", "mlevolve_startpoint_probe"}
 
 
 @dataclass(slots=True)
@@ -461,6 +463,7 @@ class SchedulerService:
         job = self.store.get_job(snapshot.job_id)
         if job is None:
             return
+        self._finalize_scheduler_preemption_on_exit(job)
         if snapshot.reported_by == "store":
             if run_context is not None and len(run_context.job_ids) > 1 and job.status == JobStatus.FAILED:
                 self._register_packed_fallback(run_context, job.status_reason or "stream-backed worker failed", payload={"failed_job_id": snapshot.job_id})
@@ -488,6 +491,63 @@ class SchedulerService:
             reason = job.status_reason or f"worker exited with code {snapshot.returncode}"
             self._register_packed_fallback(run_context, reason, payload={"failed_job_id": snapshot.job_id, "returncode": snapshot.returncode})
         self._emit_worker_finished_event(snapshot, run_context=run_context)
+
+    def _finalize_scheduler_preemption_on_exit(self, job: TrainingJob) -> None:
+        if not bool(job.metadata.get("scheduler_preemption_pending")):
+            return
+        if job.status == JobStatus.PAUSED:
+            checkpoint_path = job.latest_checkpoint_path or self.store.latest_checkpoint(job.job_id)
+            if checkpoint_path:
+                completed_at = utc_now()
+                self.store.update_job(
+                    job.job_id,
+                    metadata_updates={
+                        "scheduler_preemption_pending": False,
+                        "scheduler_preemption_completed_at": completed_at,
+                        "scheduler_preemption_checkpoint_path": checkpoint_path,
+                    },
+                )
+                self.event_logger.emit(
+                    "scheduler_preemption_completed",
+                    job_id=job.job_id,
+                    payload={
+                        "checkpoint_path": checkpoint_path,
+                        "completed_at": completed_at,
+                        "strategy": job.metadata.get("scheduler_preemption_strategy"),
+                        "preempting_job_ids": list(job.metadata.get("scheduler_preemption_preempting_job_ids") or []),
+                    },
+                )
+                return
+            failed_at = utc_now()
+            self.store.update_job(
+                job.job_id,
+                reason="scheduler preemption paused without checkpoint",
+                hold=True,
+                metadata_updates={
+                    "scheduler_preemption_pending": False,
+                    "scheduler_preemption_failed_at": failed_at,
+                },
+            )
+            self._emit_scheduler_preemption_skipped(
+                job,
+                reason="preempted job paused without a checkpoint",
+                payload={"failed_at": failed_at},
+            )
+            return
+        if job.status in {JobStatus.FAILED, JobStatus.CANCELLED}:
+            failed_at = utc_now()
+            self.store.update_job(
+                job.job_id,
+                metadata_updates={
+                    "scheduler_preemption_pending": False,
+                    "scheduler_preemption_failed_at": failed_at,
+                },
+            )
+            self._emit_scheduler_preemption_skipped(
+                job,
+                reason=f"preempted job exited with status {job.status.value}",
+                payload={"failed_at": failed_at},
+            )
 
     def _register_packed_fallback(self, run: ActiveRun, reason: str, *, payload: dict[str, Any]) -> None:
         if len(run.job_ids) < 2 or run.fallback_triggered:
@@ -745,40 +805,380 @@ class SchedulerService:
         return updated_job
 
     def _maybe_preempt(self) -> None:
-        if len(self._active_runs) != 1:
+        if not self.settings.gpu_scheduler.checkpoint_preemption_enabled:
             return
+        self._enforce_scheduler_preemption_timeouts()
+        if self._has_pending_scheduler_preemption():
+            return
+        if self._maybe_priority_preempt():
+            return
+        self._maybe_resource_replan_preempt()
+
+    def _maybe_priority_preempt(self) -> bool:
+        if len(self._active_runs) != 1:
+            return False
         active_run = next(iter(self._active_runs.values()))
         if active_run.mode != "exclusive":
-            return
+            return False
         active_job_id = active_run.job_ids[0] if active_run.job_ids else None
         if active_job_id is None:
-            return
+            return False
         active_job = self.store.get_job(active_job_id)
         candidate_job = self._next_job()
         if active_job is None or candidate_job is None:
-            return
+            return False
         if candidate_job.job_id == active_job.job_id:
-            return
-        if active_job.status != JobStatus.RUNNING:
-            return
-        if not self._supports_safe_preemption(active_job) or not self._supports_safe_preemption(candidate_job):
-            return
+            return False
         if not self.policy.should_preempt(active_job, candidate_job):
-            return
+            return False
+        if not self._supports_safe_preemption(candidate_job):
+            return False
+        if not self._can_preempt_active_job(active_job, active_run, strategy="priority", enforce_runtime_gate=False):
+            return False
         reason = f"preempted by higher-priority job {candidate_job.job_id}"
-        if self.supervisor.request_pause(active_job.job_id, reason=reason, hold=False):
-            self.store.set_job_status(active_job.job_id, JobStatus.PAUSING, reason=reason, hold=False)
-            self.event_logger.emit(
-                "pause_requested",
-                job_id=active_job.job_id,
-                payload={"reason": reason, "preempting_job_id": candidate_job.job_id, "hold": False},
+        return self._request_scheduler_preemption(
+            active_job,
+            reason=reason,
+            strategy="priority",
+            preempting_job_ids=[candidate_job.job_id],
+            estimated_gain_seconds=None,
+        )
+
+    def _maybe_resource_replan_preempt(self) -> bool:
+        if effective_scheduler_mode(self.settings.gpu_scheduler.mode) != SCHEDULER_MODE_PARALLEL_AUTO_PACK:
+            return False
+        active_job_ids = set(self._supervisor_active_job_ids())
+        if not active_job_ids:
+            return False
+        runnable = [job for job in self._runnable_jobs() if job.job_id not in active_job_ids]
+        if len(runnable) < 2:
+            return False
+
+        best: tuple[float, TrainingJob, DispatchPlan] | None = None
+        for _group_id, active_run, active_job in self._active_job_records():
+            if not self._can_preempt_active_job(active_job, active_run, strategy="resource_replan", enforce_runtime_gate=True):
+                continue
+            active_vram_mb, active_sm_utilization = self._active_occupancy_excluding({active_job.job_id})
+            plan = self.planner.choose_plan(
+                runnable,
+                backend_available=self.supervisor.available_backends(),
+                active_vram_mb=active_vram_mb,
+                active_sm_utilization=active_sm_utilization,
             )
+            if plan is None:
+                continue
+            if self._active_jobs_remain_after_excluding({active_job.job_id}) and plan.backend_name == "exclusive":
+                continue
+            if len(plan.job_ids) < 2:
+                continue
+            estimated_gain = self._estimated_packed_runtime_gain_seconds(plan)
+            if not self._preemption_benefit_is_large_enough(
+                active_job,
+                active_run,
+                estimated_gain_seconds=estimated_gain,
+                require_known_gain=True,
+            ):
+                continue
+            score = float(estimated_gain if estimated_gain is not None else len(plan.job_ids))
+            if best is None or score > best[0]:
+                best = (score, active_job, plan)
+
+        if best is None:
+            return False
+        _score, active_job, plan = best
+        reason = f"preempted to run better packed plan {','.join(plan.job_ids)}"
+        return self._request_scheduler_preemption(
+            active_job,
+            reason=reason,
+            strategy="resource_replan",
+            preempting_job_ids=list(plan.job_ids),
+            estimated_gain_seconds=self._estimated_packed_runtime_gain_seconds(plan),
+        )
 
     def _supports_safe_preemption(self, job: TrainingJob) -> bool:
+        if not bool(getattr(job.checkpoint_policy, "preemptible", True)):
+            return False
+        if self._is_scheduler_protected_job(job):
+            return False
         if job.config.runner_target == RAW_MLEVOLVE_RUNNER_TARGET or job.task_type == "mlevolve_script":
             return bool(job.metadata.get("supports_checkpoint_resume"))
         policy = job.checkpoint_policy
         return bool(job.resume_from_checkpoint or job.latest_checkpoint_path or policy.save_every_epoch or policy.save_every_n_steps)
+
+    def _is_scheduler_protected_job(self, job: TrainingJob) -> bool:
+        kind = str(job.metadata.get("kind") or "")
+        return (
+            job.task_type in NON_PREEMPTIBLE_PROBE_TASK_TYPES
+            or job.task_type.endswith("_probe")
+            or kind.endswith("_probe")
+            or bool(job.metadata.get("exclusive_probe"))
+        )
+
+    def _active_job_records(self) -> list[tuple[str, ActiveRun, TrainingJob]]:
+        active_by_group = self._supervisor_active_job_ids_by_group()
+        records: list[tuple[str, ActiveRun, TrainingJob]] = []
+        for group_id, run in self._active_runs.items():
+            job_ids = active_by_group.get(group_id, list(run.job_ids))
+            for job_id in job_ids:
+                job = self.store.get_job(job_id)
+                if job is not None:
+                    records.append((group_id, run, job))
+        return records
+
+    def _has_pending_scheduler_preemption(self) -> bool:
+        for _group_id, _run, job in self._active_job_records():
+            if job.status == JobStatus.PAUSING or bool(job.metadata.get("scheduler_preemption_pending")):
+                return True
+        return False
+
+    def _active_jobs_remain_after_excluding(self, excluded_job_ids: set[str]) -> bool:
+        for _group_id, _run, job in self._active_job_records():
+            if job.job_id not in excluded_job_ids:
+                return True
+        return False
+
+    def _active_occupancy_excluding(self, excluded_job_ids: set[str]) -> tuple[float, float]:
+        active_vram_mb = 0.0
+        active_sm_utilization = 0.0
+        active_by_group = self._supervisor_active_job_ids_by_group()
+        for group_id, run in self._active_runs.items():
+            jobs = [
+                self.store.get_job(job_id)
+                for job_id in active_by_group.get(group_id, list(run.job_ids))
+                if job_id not in excluded_job_ids
+            ]
+            materialized = [job for job in jobs if job is not None]
+            if not materialized:
+                continue
+            active_vram_mb += self.planner.predicted_group_vram_mb(materialized, backend_name=run.backend_name)
+            active_sm_utilization += self.planner.predicted_group_sm_utilization(materialized, backend_name=run.backend_name)
+        return active_vram_mb, active_sm_utilization
+
+    def _seconds_since(self, timestamp: str | None) -> float | None:
+        parsed = parse_timestamp(timestamp)
+        if parsed is None:
+            return None
+        return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+
+    def _metadata_int(self, job: TrainingJob, key: str, default: int = 0) -> int:
+        try:
+            return int(job.metadata.get(key, default) or default)
+        except (TypeError, ValueError):
+            return default
+
+    def _metadata_float(self, job: TrainingJob, key: str, default: float | None = None) -> float | None:
+        try:
+            value = job.metadata.get(key, default)
+            return None if value is None else float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _emit_scheduler_preemption_skipped(self, job: TrainingJob, *, reason: str, payload: dict[str, Any] | None = None) -> None:
+        self.event_logger.emit(
+            "scheduler_preemption_skipped",
+            job_id=job.job_id,
+            payload={"reason": reason, **(payload or {})},
+        )
+
+    def _can_preempt_active_job(
+        self,
+        job: TrainingJob,
+        run: ActiveRun,
+        *,
+        strategy: str,
+        enforce_runtime_gate: bool,
+    ) -> bool:
+        if job.status != JobStatus.RUNNING:
+            return False
+        if not self._supports_safe_preemption(job):
+            self._emit_scheduler_preemption_skipped(job, reason="job is not checkpoint-preemptible", payload={"strategy": strategy})
+            return False
+        max_per_job = int(self.settings.gpu_scheduler.checkpoint_preemption_max_per_job)
+        count = self._metadata_int(job, "scheduler_preemption_count")
+        if max_per_job > 0 and count >= max_per_job:
+            self._emit_scheduler_preemption_skipped(
+                job,
+                reason="max scheduler preemptions reached",
+                payload={"strategy": strategy, "count": count, "max_per_job": max_per_job},
+            )
+            return False
+        cooldown_seconds = float(self.settings.gpu_scheduler.checkpoint_preemption_cooldown_seconds)
+        since_last = self._seconds_since(str(job.metadata.get("scheduler_preemption_last_at") or ""))
+        if since_last is not None and since_last < cooldown_seconds:
+            self._emit_scheduler_preemption_skipped(
+                job,
+                reason="scheduler preemption cooldown active",
+                payload={"strategy": strategy, "seconds_since_last": since_last, "cooldown_seconds": cooldown_seconds},
+            )
+            return False
+        if enforce_runtime_gate:
+            min_runtime = float(self.settings.gpu_scheduler.checkpoint_preemption_min_runtime_seconds)
+            runtime = self._seconds_since(job.last_dispatched_at or job.started_at)
+            if runtime is not None and runtime < min_runtime:
+                self._emit_scheduler_preemption_skipped(
+                    job,
+                    reason="job has not run long enough for resource-aware preemption",
+                    payload={"strategy": strategy, "runtime_seconds": runtime, "min_runtime_seconds": min_runtime},
+                )
+                return False
+        remaining = self.planner.predicted_remaining_runtime_seconds(job, backend_name=run.backend_name)
+        min_gain = float(self.settings.gpu_scheduler.checkpoint_preemption_min_estimated_gain_seconds)
+        if remaining is not None and remaining <= min_gain:
+            self._emit_scheduler_preemption_skipped(
+                job,
+                reason="job is near completion",
+                payload={"strategy": strategy, "remaining_runtime_seconds": remaining, "min_estimated_gain_seconds": min_gain},
+            )
+            return False
+        return True
+
+    def _checkpoint_overhead_seconds(self, job: TrainingJob) -> float:
+        explicit = self._metadata_float(job, "checkpoint_estimated_overhead_seconds")
+        if explicit is not None:
+            return max(0.0, explicit)
+        explicit = self._metadata_float(job, "scheduler_checkpoint_overhead_seconds")
+        if explicit is not None:
+            return max(0.0, explicit)
+        avg_step_ms = self._metadata_float(job, "runtime_avg_step_time_ms")
+        if avg_step_ms is not None:
+            return max(0.1, avg_step_ms / 1000.0)
+        return 1.0
+
+    def _preemption_benefit_is_large_enough(
+        self,
+        job: TrainingJob,
+        run: ActiveRun,
+        *,
+        estimated_gain_seconds: float | None,
+        require_known_gain: bool,
+    ) -> bool:
+        del run
+        if estimated_gain_seconds is None:
+            if require_known_gain:
+                self._emit_scheduler_preemption_skipped(job, reason="estimated gain unavailable", payload={"strategy": "resource_replan"})
+                return False
+            return True
+        threshold = max(
+            float(self.settings.gpu_scheduler.checkpoint_preemption_min_estimated_gain_seconds),
+            self._checkpoint_overhead_seconds(job) * float(self.settings.gpu_scheduler.checkpoint_preemption_overhead_multiplier),
+        )
+        if estimated_gain_seconds < threshold:
+            self._emit_scheduler_preemption_skipped(
+                job,
+                reason="estimated gain below checkpoint overhead threshold",
+                payload={
+                    "estimated_gain_seconds": estimated_gain_seconds,
+                    "required_gain_seconds": threshold,
+                },
+            )
+            return False
+        return True
+
+    def _estimated_packed_runtime_gain_seconds(self, plan: DispatchPlan) -> float | None:
+        estimates: list[float] = []
+        for job_id in plan.job_ids:
+            job = self.store.get_job(job_id)
+            if job is None:
+                return None
+            estimate = self.planner.predicted_remaining_runtime_seconds(job, backend_name=plan.backend_name)
+            if estimate is None:
+                return None
+            estimates.append(float(estimate))
+        if len(estimates) < 2:
+            return None
+        return max(0.0, sum(estimates) - max(estimates))
+
+    def _request_scheduler_preemption(
+        self,
+        job: TrainingJob,
+        *,
+        reason: str,
+        strategy: str,
+        preempting_job_ids: list[str],
+        estimated_gain_seconds: float | None,
+    ) -> bool:
+        if not self.supervisor.request_pause(job.job_id, reason=reason, hold=False):
+            self._emit_scheduler_preemption_skipped(job, reason="pause request rejected by supervisor", payload={"strategy": strategy})
+            return False
+        requested_at = utc_now()
+        count = self._metadata_int(job, "scheduler_preemption_count") + 1
+        metadata_updates = {
+            "scheduler_preemption_pending": True,
+            "scheduler_preemption_requested_at": requested_at,
+            "scheduler_preemption_last_at": requested_at,
+            "scheduler_preemption_count": count,
+            "scheduler_preemption_reason": reason,
+            "scheduler_preemption_strategy": strategy,
+            "scheduler_preemption_preempting_job_ids": list(preempting_job_ids),
+            "scheduler_preemption_estimated_gain_seconds": estimated_gain_seconds,
+            "scheduler_preemption_timeout_reported": False,
+            "scheduler_preemption_resume_emitted": False,
+        }
+        self.store.update_job(
+            job.job_id,
+            status=JobStatus.PAUSING,
+            reason=reason,
+            hold=False,
+            metadata_updates=metadata_updates,
+        )
+        payload = {
+            "reason": reason,
+            "strategy": strategy,
+            "preempting_job_ids": list(preempting_job_ids),
+            "estimated_gain_seconds": estimated_gain_seconds,
+            "count": count,
+            "hold": False,
+        }
+        self.event_logger.emit("scheduler_preemption_requested", job_id=job.job_id, payload=payload)
+        self.event_logger.emit("pause_requested", job_id=job.job_id, payload=payload)
+        return True
+
+    def _preemption_resume_updates(
+        self,
+        job: TrainingJob,
+        *,
+        group_id: str,
+        plan: DispatchPlan,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        if not job.metadata.get("scheduler_preemption_completed_at"):
+            return {}, None
+        if bool(job.metadata.get("scheduler_preemption_resume_emitted")):
+            return {}, None
+        checkpoint_path = job.latest_checkpoint_path or self.store.latest_checkpoint(job.job_id)
+        if not checkpoint_path:
+            return {}, None
+        resumed_at = utc_now()
+        updates = {
+            "scheduler_preemption_resume_emitted": True,
+            "scheduler_preemption_resumed_at": resumed_at,
+        }
+        payload = {
+            "checkpoint_path": checkpoint_path,
+            "resumed_at": resumed_at,
+            "group_id": group_id,
+            "placement_mode": plan.mode,
+            "placement_backend": plan.backend_name,
+            "preemption_reason": job.metadata.get("scheduler_preemption_reason"),
+            "preemption_strategy": job.metadata.get("scheduler_preemption_strategy"),
+        }
+        return updates, payload
+
+    def _enforce_scheduler_preemption_timeouts(self) -> None:
+        timeout_seconds = float(self.settings.gpu_scheduler.checkpoint_preemption_pause_timeout_seconds)
+        for _group_id, _run, job in self._active_job_records():
+            if not bool(job.metadata.get("scheduler_preemption_pending")):
+                continue
+            if bool(job.metadata.get("scheduler_preemption_timeout_reported")):
+                continue
+            elapsed = self._seconds_since(str(job.metadata.get("scheduler_preemption_requested_at") or ""))
+            if elapsed is None or elapsed <= timeout_seconds:
+                continue
+            self._emit_scheduler_preemption_skipped(
+                job,
+                reason="pause timeout before checkpointed safe point",
+                payload={"elapsed_seconds": elapsed, "timeout_seconds": timeout_seconds},
+            )
+            self.store.update_job(job.job_id, metadata_updates={"scheduler_preemption_timeout_reported": True})
 
     def _preload_job_baseline(self, job: TrainingJob) -> None:
         target = self._resolve_preload_target(job)
@@ -877,17 +1277,31 @@ class SchedulerService:
                             reason="backend_fallback_dispatch",
                         )
                         self._last_telemetry_poll_at = 0.0
+                        resume_updates, resume_payload = self._preemption_resume_updates(
+                            fallback_job,
+                            group_id=group_id,
+                            plan=DispatchPlan(
+                                mode="exclusive",
+                                backend_name="exclusive",
+                                job_ids=(fallback_job.job_id,),
+                                reason="backend_fallback_dispatch",
+                            ),
+                        )
+                        metadata_updates = {
+                            "placement_mode": "exclusive",
+                            "placement_backend": "exclusive",
+                            "placement_role": "solo",
+                        }
+                        metadata_updates.update(resume_updates)
                         self.store.update_job(
                             fallback_job.job_id,
                             status=JobStatus.RUNNING,
                             reason="dispatched to worker after backend fallback",
                             hold=False,
-                            metadata_updates={
-                                "placement_mode": "exclusive",
-                                "placement_backend": "exclusive",
-                                "placement_role": "solo",
-                            },
+                            metadata_updates=metadata_updates,
                         )
+                        if resume_payload is not None:
+                            self.event_logger.emit("job_resumed_from_preemption", job_id=fallback_job.job_id, payload=resume_payload)
                         return True
                 except Exception as fallback_exc:
                     self.logger.warning("Exclusive fallback dispatch also failed for %s: %s", fallback_job.job_id, fallback_exc)
@@ -922,19 +1336,24 @@ class SchedulerService:
                 role = "primary" if index == 0 else "secondary"
             else:
                 role = f"slot-{index}"
+            resume_updates, resume_payload = self._preemption_resume_updates(job, group_id=group_id, plan=plan)
+            metadata_updates = {
+                "placement_mode": plan.mode,
+                "placement_backend": plan.backend_name,
+                "placement_role": role,
+                "placement_batch_size": plan.batch_overrides.get(job.job_id),
+                "placement_group_id": group_id,
+            }
+            metadata_updates.update(resume_updates)
             self.store.update_job(
                 job.job_id,
                 status=JobStatus.RUNNING,
                 reason="dispatched to worker",
                 hold=False,
-                metadata_updates={
-                    "placement_mode": plan.mode,
-                    "placement_backend": plan.backend_name,
-                    "placement_role": role,
-                    "placement_batch_size": plan.batch_overrides.get(job.job_id),
-                    "placement_group_id": group_id,
-                },
+                metadata_updates=metadata_updates,
             )
+            if resume_payload is not None:
+                self.event_logger.emit("job_resumed_from_preemption", job_id=job.job_id, payload=resume_payload)
             self.event_logger.emit(
                 "job_dispatched",
                 job_id=job.job_id,

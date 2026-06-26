@@ -12,6 +12,7 @@ import tempfile
 
 import yaml
 
+from ..domain.jobs import BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO, normalize_batch_probe_search_mode
 from ..redis_cache import RedisCacheSettings
 
 
@@ -265,7 +266,7 @@ class AutoPackSettings:
 
 @dataclass(slots=True)
 class ParallelOptimizerSettings:
-    batch_search_mode: str = "binary"
+    batch_search_mode: str = BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO
     target_vram_fraction: float | None = field(default=None, repr=False)
     max_probe_jobs: int = 3
     binary_range_up: int = 32
@@ -274,7 +275,7 @@ class ParallelOptimizerSettings:
     power_of_two_range_down: int = 1
 
     def __post_init__(self) -> None:
-        self.batch_search_mode = self.batch_search_mode or "binary"
+        self.batch_search_mode = normalize_batch_probe_search_mode(self.batch_search_mode)
         self.binary_range_up = max(0, int(self.binary_range_up))
         self.binary_range_down = max(0, int(self.binary_range_down))
         self.power_of_two_range_up = max(0, int(self.power_of_two_range_up))
@@ -288,8 +289,6 @@ class ParallelOptimizerSettings:
         return {
             "batch_search_mode": self.batch_search_mode,
             "max_probe_jobs": self.max_probe_jobs,
-            "binary_range_up": self.binary_range_up,
-            "binary_range_down": self.binary_range_down,
             "power_of_two_range_up": self.power_of_two_range_up,
             "power_of_two_range_down": self.power_of_two_range_down,
         }
@@ -521,7 +520,7 @@ class SchedulerSubmissionDefaults:
     batch_probe_probe_timeout_seconds: int = 45
     batch_probe_poll_interval_seconds: float = 0.5
     batch_probe_max_multiplier: int = 32
-    batch_probe_search_mode: str = "binary"
+    batch_probe_search_mode: str = BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO
     runtime_probe_enabled: bool = True
     runtime_probe_target: str | None = None
     runtime_probe_model_key: str | None = None
@@ -534,7 +533,7 @@ class SchedulerSubmissionDefaults:
             instance.backend_allowlist = []
         else:
             instance.backend_allowlist = [str(item) for item in instance.backend_allowlist]
-        instance.batch_probe_search_mode = instance.batch_probe_search_mode or "binary"
+        instance.batch_probe_search_mode = normalize_batch_probe_search_mode(instance.batch_probe_search_mode)
         instance.runtime_probe_strategy = str(instance.runtime_probe_strategy or "epoch_1").strip().lower().replace("-", "_")
         return instance
 
@@ -578,7 +577,20 @@ class GpuSchedulerSettings:
     batch_probe_min_batch_size: int = 1
     batch_probe_max_search_rounds: int = 12
     batch_probe_max_batch_size: int | None = None
-    batch_probe_search_mode: str = "binary"
+    batch_probe_search_mode: str = BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO
+    model_family_probe_enabled: bool = True
+    model_family_probe_priority: int = 100
+    model_family_probe_timeout_seconds: int = 300
+    checkpoint_preemption_enabled: bool = True
+    checkpoint_preemption_cooldown_seconds: float = 60.0
+    checkpoint_preemption_min_runtime_seconds: float = 15.0
+    checkpoint_preemption_max_per_job: int = 3
+    checkpoint_preemption_min_estimated_gain_seconds: float = 15.0
+    checkpoint_preemption_overhead_multiplier: float = 2.0
+    checkpoint_preemption_pause_timeout_seconds: float = 60.0
+    startpoint_probe_enabled: bool = True
+    startpoint_probe_max_models: int | None = None
+    derivative_profile_safety_fraction: float = 0.85
     profiling: GpuProfilingSettings = field(default_factory=GpuProfilingSettings)
     memory: GpuMemorySettings = field(default_factory=GpuMemorySettings)
     thresholds: GpuThresholdSettings = field(default_factory=GpuThresholdSettings)
@@ -592,6 +604,49 @@ class GpuSchedulerSettings:
 
     def __post_init__(self) -> None:
         self.mode = normalize_scheduler_mode(self.mode)
+        self.batch_probe_search_mode = normalize_batch_probe_search_mode(self.batch_probe_search_mode)
+        self.model_family_probe_enabled = bool(self.model_family_probe_enabled)
+        try:
+            self.model_family_probe_priority = int(self.model_family_probe_priority)
+        except (TypeError, ValueError):
+            self.model_family_probe_priority = 100
+        try:
+            self.model_family_probe_timeout_seconds = max(1, int(self.model_family_probe_timeout_seconds))
+        except (TypeError, ValueError):
+            self.model_family_probe_timeout_seconds = 300
+        self.checkpoint_preemption_enabled = bool(self.checkpoint_preemption_enabled)
+        try:
+            self.checkpoint_preemption_cooldown_seconds = max(0.0, float(self.checkpoint_preemption_cooldown_seconds))
+        except (TypeError, ValueError):
+            self.checkpoint_preemption_cooldown_seconds = 60.0
+        try:
+            self.checkpoint_preemption_min_runtime_seconds = max(0.0, float(self.checkpoint_preemption_min_runtime_seconds))
+        except (TypeError, ValueError):
+            self.checkpoint_preemption_min_runtime_seconds = 15.0
+        try:
+            self.checkpoint_preemption_max_per_job = max(0, int(self.checkpoint_preemption_max_per_job))
+        except (TypeError, ValueError):
+            self.checkpoint_preemption_max_per_job = 3
+        try:
+            self.checkpoint_preemption_min_estimated_gain_seconds = max(0.0, float(self.checkpoint_preemption_min_estimated_gain_seconds))
+        except (TypeError, ValueError):
+            self.checkpoint_preemption_min_estimated_gain_seconds = 15.0
+        try:
+            self.checkpoint_preemption_overhead_multiplier = max(0.0, float(self.checkpoint_preemption_overhead_multiplier))
+        except (TypeError, ValueError):
+            self.checkpoint_preemption_overhead_multiplier = 2.0
+        try:
+            self.checkpoint_preemption_pause_timeout_seconds = max(1.0, float(self.checkpoint_preemption_pause_timeout_seconds))
+        except (TypeError, ValueError):
+            self.checkpoint_preemption_pause_timeout_seconds = 60.0
+        self.startpoint_probe_enabled = bool(self.startpoint_probe_enabled)
+        if self.startpoint_probe_max_models is not None:
+            self.startpoint_probe_max_models = max(0, int(self.startpoint_probe_max_models))
+        try:
+            self.derivative_profile_safety_fraction = float(self.derivative_profile_safety_fraction)
+        except (TypeError, ValueError):
+            self.derivative_profile_safety_fraction = 0.85
+        self.derivative_profile_safety_fraction = min(1.0, max(0.0, self.derivative_profile_safety_fraction))
         if self.backend_priority is None:
             self.backend_priority = ["stream_mps", "stream", "cuda_process", "mps", "exclusive"]
         else:
@@ -644,6 +699,8 @@ class GpuSchedulerSettings:
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "GpuSchedulerSettings":
         data = dict(payload or {})
+        if "model_family_probe_enabled" not in data and "startpoint_probe_enabled" in data:
+            data["model_family_probe_enabled"] = data.get("startpoint_probe_enabled")
         memory = dict(data.get("memory") or {})
         if "vram_budget_fraction" not in memory:
             for legacy_path, value in (
@@ -679,6 +736,17 @@ class GpuSchedulerSettings:
             "batch_probe_max_search_rounds": self.batch_probe_max_search_rounds,
             "batch_probe_max_batch_size": self.batch_probe_max_batch_size,
             "batch_probe_search_mode": self.batch_probe_search_mode,
+            "model_family_probe_enabled": self.model_family_probe_enabled,
+            "model_family_probe_priority": self.model_family_probe_priority,
+            "model_family_probe_timeout_seconds": self.model_family_probe_timeout_seconds,
+            "checkpoint_preemption_enabled": self.checkpoint_preemption_enabled,
+            "checkpoint_preemption_cooldown_seconds": self.checkpoint_preemption_cooldown_seconds,
+            "checkpoint_preemption_min_runtime_seconds": self.checkpoint_preemption_min_runtime_seconds,
+            "checkpoint_preemption_max_per_job": self.checkpoint_preemption_max_per_job,
+            "checkpoint_preemption_min_estimated_gain_seconds": self.checkpoint_preemption_min_estimated_gain_seconds,
+            "checkpoint_preemption_overhead_multiplier": self.checkpoint_preemption_overhead_multiplier,
+            "checkpoint_preemption_pause_timeout_seconds": self.checkpoint_preemption_pause_timeout_seconds,
+            "derivative_profile_safety_fraction": self.derivative_profile_safety_fraction,
             "profiling": self.profiling.to_dict(),
             "memory": self.memory.to_dict(),
             "thresholds": self.thresholds.to_dict(),

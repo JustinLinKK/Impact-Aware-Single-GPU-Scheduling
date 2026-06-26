@@ -427,7 +427,7 @@ def load_hardware_knowledge_from_graph_json(path: str | Path) -> dict[str, list[
                 {
                     "hardware_id": props.get("hardware_id"),
                     "name": props.get("name"),
-                    "name_key": props.get("name_key") or props.get("name"),
+                    "name_key": props.get("name_key") or props.get("hardware_id") or props.get("name"),
                     "aliases": props.get("aliases") or [],
                     "vendor": props.get("vendor"),
                     "hardware_type": props.get("hardware_type") or "GPU",

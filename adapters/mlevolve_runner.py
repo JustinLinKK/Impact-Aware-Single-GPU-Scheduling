@@ -480,3 +480,13 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
         "candidate_exc_type": exc_type,
         "batch_size_override": batch_size_override,
     }
+
+
+def run_mlevolve_model_family_probe_job(context: RunnerContext) -> dict[str, Any]:
+    """Complete after batch-probe preflight has written the model-family profile."""
+    return {
+        "kind": "mlevolve_model_family_probe",
+        "model_family": context.job.metadata.get("model_family"),
+        "profile_key": context.job.batch_probe.profile_key,
+        "resolved_batch_size": context.job.metadata.get("resolved_batch_size"),
+    }

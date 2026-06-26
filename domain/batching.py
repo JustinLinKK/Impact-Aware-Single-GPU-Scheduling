@@ -44,6 +44,8 @@ class BatchResolution:
 
 
 def build_batch_probe_shape_signature(job: TrainingJob) -> str:
+    if job.batch_probe.shape_signature_override:
+        return str(job.batch_probe.shape_signature_override)
     batch_param_name = BatchResolution.param_name(job)
     ignored_runner_kwargs = {
         "script_path",
@@ -67,4 +69,3 @@ def build_batch_probe_shape_signature(job: TrainingJob) -> str:
         "shape_hints": job.batch_probe.shape_hints,
     }
     return sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-
