@@ -212,7 +212,7 @@ def main():
 
     which = input("Which filter? (1 / 2): ").strip()
     gpu_name = input("Enter GPU name (e.g. rtx 4090): ").strip() or "rtx 4090"
-    stage = input("Pipeline stage (datatype / model / optimizer / tuning / all): ").strip()
+    stage = input("Pipeline stage (model_design / datatype_precision / training_evaluation / all): ").strip()
     if not stage or stage == "all":
         stage = None
 
