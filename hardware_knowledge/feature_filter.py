@@ -10,53 +10,36 @@ from typing import Any
 # Pipeline stage keyword definitions
 # ---------------------------------------------------------------------------
 
-PIPELINE_STAGES = ("datatype", "model", "optimizer", "tuning")
-
-_STAGE_ALIASES = {
-    "data_type": "datatype",
-    "model_structure": "model",
-    "training": "tuning",
-    "training_parameters": "tuning",
-    "training_params": "tuning",
-    "precision": "tuning",
-}
+PIPELINE_STAGES = ("model_structure", "datatype", "training_parameters")
 
 _STAGE_KEYWORDS: dict[str, list[str]] = {
-    "datatype": [
-        "data", "dataset", "dataloader", "modality", "shape",
-        "sequence", "packing", "bucket", "decomposition", "decode",
-        "image", "video", "wsi", "token", "tiled", "chunked",
-        "channels_last",
-    ],
-    "model": [
+    "model_structure": [
         "attention", "flash-attn", "sdpa", "channels_last", "cnn", "unet",
         "transformer", "activation checkpointing", "sequence packing",
         "kv-cache", "tiled", "chunked", "image", "video", "wsi",
         "model", "architecture", "layer", "kernel", "extension", "sm_",
         "mig", "topology", "nvlink",
     ],
-    "optimizer": [
-        "optimizer", "adamw", "muon", "soap", "ademamix", "loss",
-        "cross-entropy", "cross entropy", "learning rate", "lr",
-        "weight_decay", "momentum", "ns_steps", "nesterov",
-        "adjust_lr_fn", "scheduler",
-    ],
-    "tuning": [
+    "datatype": [
         "bf16", "fp16", "fp8", "fp4", "fp64", "tf32", "int8",
         "precision", "autocast", "mixed precision", "quantiz",
         "mxfp4", "mxfp8", "nvfp4", "gradscaler",
         "transformer engine", "tensor core",
+    ],
+    "training_parameters": [
         "batch_size", "batch size", "batch", "grad_accum",
-        "gradient accumulation", "epoch",
+        "gradient accumulation", "learning rate", "lr", "epoch",
+        "optimizer", "adamw", "muon", "weight_decay", "momentum",
+        "ns_steps", "nesterov", "adjust_lr_fn", "scheduler",
         "vram", "memory budget", "memory plan",
         "throughput", "configurable",
     ],
 }
 
 _STAGE_DROP_FIELDS: dict[str, set[str]] = {
-    "model": {"vram_MB", "compute_capability"},
+    "model_structure": {"vram_MB", "compute_capability"},
     "datatype": {"vram_MB", "sm_count", "compute_capability"},
-    "tuning": {"datatypes", "compute_capability"},
+    "training_parameters": {"supported_precisions", "compute_capability"},
 }
 
 _DEFAULT_GRAPH_PATH = Path(__file__).resolve().parents[2] / "schema" / "hardware_knowledge_graph.json"
@@ -79,8 +62,8 @@ def query_hardware_node(
     hardware_name:
         GPU name to search, e.g. ``"rtx 4090"``.
     agent_stage:
-        ``"datatype"`` / ``"model"`` / ``"optimizer"`` / ``"tuning"``
-        or ``None`` for all patterns. Legacy stage names are accepted.
+        ``"model_structure"`` / ``"datatype"`` / ``"training_parameters"``
+        or ``None`` for all patterns.
     """
     graph = _load_graph(graph_path)
     node, _edges = _lookup_node(graph, hardware_name)
@@ -108,17 +91,13 @@ def query_hardware_node(
             or props.get("architecture")
         ),
         "vram_MB": _as_int(props.get("vram_MB")),
-        "datatypes": _as_str_list(
-            props.get("datatypes")
-            or props.get("supported_precisions")
+        "supported_precisions": _as_str_list(
+            props.get("supported_precisions")
+            or props.get("datatypes")
             or props.get("precisions")
         ),
-        "software_features": _as_str_list(props.get("software_features")),
-        "recipes": _as_str_list(props.get("recipes")),
-        "experimental_recipes": _as_str_list(props.get("experimental_recipes")),
         "sm_count": _as_int(props.get("sm_count")),
         "compute_capability": raw_cap,
-        "stage_filter": stage,
         "recommended_patterns": recommended,
         "avoid_patterns": avoid,
     })
@@ -134,14 +113,9 @@ def query_hardware_node(
 # ---------------------------------------------------------------------------
 
 _STAGE_CATEGORIES: dict[str, set[str]] = {
-    "datatype": {"data_pipeline"},
-    "model": {"compute_capability", "interconnect", "kernel_optimization", "tensor_core"},
-    "optimizer": {"optimizer"},
-    "tuning": {"data_pipeline", "interconnect", "kernel_optimization", "parallelism", "precision"},
-}
-
-_STAGE_FEATURE_IDS: dict[str, set[str]] = {
-    "optimizer": {"gram_newton_schulz_symmetric_gemm"},
+    "model_structure": {"compute_capability", "interconnect", "kernel_optimization", "tensor_core"},
+    "datatype": {"precision", "data_pipeline"},
+    "training_parameters": {"optimizer", "precision", "kernel_optimization", "parallelism"},
 }
 
 
@@ -158,10 +132,9 @@ def query_hardware_features(
     hardware_name:
         GPU name to search, e.g. ``"rtx 4090"``.
     agent_stage:
-        ``"datatype"`` returns data-pipeline/data-shape features;
-        ``"model"`` returns architecture/kernel/tensor-core features;
-        ``"optimizer"`` returns optimizer features and optimizer-adjacent kernels;
-        ``"tuning"`` returns precision, dataloader, parallelism, and runtime features;
+        ``"model_structure"`` returns kernel/tensor-core/interconnect features;
+        ``"datatype"`` returns precision and data-pipeline features;
+        ``"training_parameters"`` returns optimizer/precision/parallelism features;
         ``None`` returns all features.
     """
     graph = _load_graph(graph_path)
@@ -176,7 +149,6 @@ def query_hardware_features(
 
     stage = _normalize_stage(agent_stage)
     categories = _STAGE_CATEGORIES.get(stage) if stage else None
-    feature_ids = _STAGE_FEATURE_IDS.get(stage, set()) if stage else set()
 
     features: list[dict[str, Any]] = []
     for edge in edges:
@@ -186,12 +158,10 @@ def query_hardware_features(
             continue
 
         category = feat_props.get("category", "")
-        feature_id = feat_props.get("feature_id")
-        category_match = bool(categories and category in categories)
-        feature_match = feature_id in feature_ids
-        if (categories or feature_ids) and not (category_match or feature_match):
+        if categories and category not in categories:
             continue
 
+        feature_id = feat_props.get("feature_id")
         edge_props = edge.get("properties", {})
         features.append(_compact_dict({
             "feature_id": feature_id,
@@ -221,7 +191,6 @@ def query_hardware_features(
         "found": True,
         "node_id": node["id"],
         "gpu_name": node.get("properties", {}).get("name"),
-        "stage_filter": stage,
         "feature_count": len(features),
         "features": features,
     }
@@ -243,7 +212,7 @@ def _normalize_stage(agent_stage: str | None) -> str | None:
     stage = str(agent_stage).strip().lower()
     if not stage or stage == "all":
         return None
-    return _STAGE_ALIASES.get(stage, stage)
+    return stage
 
 
 def _lookup_node(
