@@ -261,6 +261,150 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
             self.assertEqual(fake_store.neighborhood_calls, 1)
             self.assertEqual(fake_store.detail_calls, [])
 
+    def test_stage_hardware_features_use_static_pipeline_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = SchedulerClient(SchedulerConfig(runtime_root=tmpdir))
+            client.get_hardware_context = lambda *_, **__: {  # type: ignore[method-assign]
+                "found": True,
+                "hardware": {
+                    "hardware_key": "current",
+                    "gpu_name": "NVIDIA GeForce RTX 5090",
+                    "compute_capability": "12.0",
+                },
+            }
+
+            context = client.get_stage_hardware_features(pipeline_stage="training_parameters", limit=12)
+
+            self.assertTrue(context["found"])
+            self.assertEqual(context["stage_filter"], "training_parameters")
+            feature_ids = [item["feature_id"] for item in context["features"]]
+            self.assertIn("soap_optimizer", feature_ids)
+            self.assertIn("ademamix_optimizer", feature_ids)
+            self.assertIn("bf16", feature_ids)
+            node = context["stages"][0]["node"]
+            stage_keys = {item[0] for item in node["stage_feature_keys"]}
+            not_recommended_keys = {item[0] for item in node["not_recommended_feature_keys"]}
+            recommended_keys = {item[0] for item in node.get("recommended_feature_keys", [])}
+            self.assertIn("soap_optimizer", stage_keys)
+            self.assertIn("soap_optimizer", not_recommended_keys)
+            self.assertNotIn("soap_optimizer", recommended_keys)
+            for row in node["stage_feature_keys"]:
+                self.assertEqual(len(row), 2)
+                self.assertTrue(row[1])
+            self.assertNotIn("node_id", node)
+            self.assertIn("recommended_patterns", node)
+            self.assertIn("avoid_patterns", node)
+            self.assertNotIn("https://", str(node))
+            self.assertNotIn("http://", str(node))
+
+            stale = client.get_stage_hardware_features(pipeline_stage="optimizer", limit=12)
+            self.assertFalse(stale["found"])
+            self.assertIn("unsupported hardware pipeline stage", stale["reason"])
+
+    def test_stage_hardware_features_map_composite_workflow_stages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = SchedulerClient(SchedulerConfig(runtime_root=tmpdir))
+            client.get_hardware_context = lambda *_, **__: {  # type: ignore[method-assign]
+                "found": True,
+                "hardware": {
+                    "hardware_key": "current",
+                    "gpu_name": "NVIDIA GeForce RTX 5090",
+                    "compute_capability": "12.0",
+                },
+            }
+
+            stage1 = client.get_stage_hardware_features(
+                pipeline_stage="stage1_candidate_construction",
+                limit=32,
+            )
+            stage1_ids = {item["feature_id"] for item in stage1["features"]}
+
+            self.assertEqual(stage1["stage_filter"], ["datatype", "model_structure"])
+            self.assertIn("dataset_decomposition", stage1_ids)
+            self.assertIn("tensor_cores", stage1_ids)
+            self.assertIn("sm_120", stage1_ids)
+            self.assertNotIn("bf16", stage1_ids)
+            self.assertNotIn("muon_optimizer", stage1_ids)
+
+            datatype_precision = client.get_stage_hardware_features(
+                pipeline_stage="datatype_precision",
+                limit=32,
+            )
+            datatype_precision_ids = {
+                item["feature_id"] for item in datatype_precision["features"]
+            }
+
+            self.assertEqual(datatype_precision["stage_filter"], ["datatype", "training_parameters"])
+            self.assertIn("dataset_decomposition", datatype_precision_ids)
+            self.assertIn("nvimagecodec_gpu_decode", datatype_precision_ids)
+            self.assertIn("bf16", datatype_precision_ids)
+            self.assertIn("fp8_rowwise_scaling", datatype_precision_ids)
+            self.assertNotIn("tensor_cores", datatype_precision_ids)
+            self.assertNotIn("muon_optimizer", datatype_precision_ids)
+            self.assertNotIn("gram_newton_schulz_symmetric_gemm", datatype_precision_ids)
+            self.assertNotIn("async_tensor_parallel", datatype_precision_ids)
+
+            training = client.get_stage_hardware_features(
+                pipeline_stage="training_evaluation",
+                limit=32,
+            )
+            training_ids = {item["feature_id"] for item in training["features"]}
+
+            self.assertEqual(training["stage_filter"], "training_parameters")
+            self.assertIn("muon_optimizer", training_ids)
+            self.assertIn("gram_newton_schulz_symmetric_gemm", training_ids)
+            self.assertIn("bf16", training_ids)
+            self.assertIn("fp8_rowwise_scaling", training_ids)
+            self.assertIn("async_tensor_parallel", training_ids)
+
+    def test_optimization_context_attaches_candidate_stage_hardware_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = SchedulerClient(SchedulerConfig(runtime_root=tmpdir))
+            stage_calls = []
+            code_context_inputs = []
+
+            client.get_profile_evidence = lambda **_: {  # type: ignore[method-assign]
+                "hardware_context": {"found": True},
+                "graph_evidence": {"exact_profiles": [], "similar_profiles": [], "packed_profiles": []},
+                "derived_diagnosis": {"profile_symptoms": [], "optimization_targets": []},
+                "risk_flags": [],
+                "evidence_refs": [],
+                "confidence": 0.0,
+            }
+
+            def fake_stage_features(hardware_id, *, pipeline_stage, limit):
+                stage_calls.append((hardware_id, list(pipeline_stage), limit))
+                return {
+                    "found": True,
+                    "stage_filter": list(pipeline_stage),
+                    "stages": [
+                        {
+                            "stage": "training_parameters",
+                            "features": [{"feature_id": "bf16", "name": "BF16", "category": "precision"}],
+                            "feature_count": 1,
+                        }
+                    ],
+                    "features": [{"feature_id": "bf16", "name": "BF16", "category": "precision"}],
+                    "feature_count": 1,
+                    "source": "unit-test",
+                }
+
+            def fake_code_context(*, candidate, graph_context, limit):
+                code_context_inputs.append((candidate, graph_context, limit))
+                return {"vector_evidence": {}, "evidence_refs": []}
+
+            client.get_stage_hardware_features = fake_stage_features  # type: ignore[method-assign]
+            client.get_code_optimization_context = fake_code_context  # type: ignore[method-assign]
+
+            context = client.get_optimization_context(
+                candidate={"stage": "training_evaluation", "framework": "pytorch"},
+                limit=3,
+            )
+
+            self.assertEqual(stage_calls, [("current", ["training_parameters"], 3)])
+            self.assertEqual(code_context_inputs[0][1]["stage_hardware_features"]["stage_filter"], ["training_parameters"])
+            self.assertEqual(context["stage_hardware_features"]["features"][0]["feature_id"], "bf16")
+
     def test_batch_resolution_apply_updates_runner_kwargs_and_metadata(self) -> None:
         job = TrainingJob.create(
             "module:runner",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -18,28 +19,30 @@ _STAGE_KEYWORDS: dict[str, list[str]] = {
         "transformer", "activation checkpointing", "sequence packing",
         "kv-cache", "tiled", "chunked", "image", "video", "wsi",
         "model", "architecture", "layer", "kernel", "extension", "sm_",
-        "mig", "topology", "nvlink",
+        "mig", "topology", "nvlink", "tensor core",
     ],
     "datatype": [
+        "data", "dataset", "dataloader", "modality", "shape",
+        "sequence", "packing", "bucket", "decomposition", "decode",
+        "image", "video", "wsi", "token", "tiled", "chunked",
+        "channels_last",
+    ],
+    "training_parameters": [
+        "optimizer", "adamw", "muon", "soap", "ademamix", "loss",
+        "cross-entropy", "cross entropy", "learning rate", "lr",
+        "weight_decay", "momentum", "ns_steps", "nesterov",
+        "adjust_lr_fn", "scheduler",
         "bf16", "fp16", "fp8", "fp4", "fp64", "tf32", "int8",
         "precision", "autocast", "mixed precision", "quantiz",
         "mxfp4", "mxfp8", "nvfp4", "gradscaler",
         "transformer engine", "tensor core",
-    ],
-    "training_parameters": [
         "batch_size", "batch size", "batch", "grad_accum",
-        "gradient accumulation", "learning rate", "lr", "epoch",
-        "optimizer", "adamw", "muon", "weight_decay", "momentum",
-        "ns_steps", "nesterov", "adjust_lr_fn", "scheduler",
-        "vram", "memory budget", "memory plan",
-        "throughput", "configurable",
+        "gradient accumulation", "epoch", "dataloader", "num_workers",
+        "pin_memory", "persistent_workers", "checkpoint", "runtime",
+        "vram", "memory budget", "memory plan", "throughput",
+        "parallel", "tensor_parallel", "interconnect", "nvlink", "pcie",
+        "configurable",
     ],
-}
-
-_STAGE_DROP_FIELDS: dict[str, set[str]] = {
-    "model_structure": {"vram_MB", "compute_capability"},
-    "datatype": {"vram_MB", "sm_count", "compute_capability"},
-    "training_parameters": {"supported_precisions", "compute_capability"},
 }
 
 _DEFAULT_GRAPH_PATH = Path(__file__).resolve().parents[2] / "schema" / "hardware_knowledge_graph.json"
@@ -65,47 +68,38 @@ def query_hardware_node(
         ``"model_structure"`` / ``"datatype"`` / ``"training_parameters"``
         or ``None`` for all patterns.
     """
+    stage = _normalize_stage(agent_stage)
     graph = _load_graph(graph_path)
-    node, _edges = _lookup_node(graph, hardware_name)
+    node, edges = _lookup_node(graph, hardware_name)
     if node is None:
         return {"found": False, "hardware_name": hardware_name}
 
     props = node.get("properties", node)
     raw_cap = _first_list_entry(props.get("compute_capabilities"))
+    feature_index = _stage_feature_key_index(graph, edges, stage)
+    recommended = _filter_patterns_by_stage(_as_str_list(props.get("recommended_patterns")), stage)
+    avoid = _filter_patterns_by_stage(_as_str_list(props.get("avoid_patterns")), stage)
 
-    recommended = _as_str_list(props.get("recommended_patterns"))
-    avoid = _as_str_list(props.get("avoid_patterns"))
-    stage = _normalize_stage(agent_stage)
-
-    if stage:
-        keywords = _STAGE_KEYWORDS.get(stage, [])
-        recommended = [p for p in recommended if any(k in p.lower() for k in keywords)]
-        avoid = [p for p in avoid if any(k in p.lower() for k in keywords)]
-
-    result = _compact_dict({
+    return _compact_dict({
         "found": True,
-        "node_id": node["id"],
         "gpu_name": _as_str(props.get("name")),
         "architecture": _as_str(
             _first_list_entry(props.get("architectures"))
             or props.get("architecture")
         ),
         "vram_MB": _as_int(props.get("vram_MB")),
-        "supported_precisions": _as_str_list(
-            props.get("supported_precisions")
-            or props.get("datatypes")
-            or props.get("precisions")
-        ),
         "sm_count": _as_int(props.get("sm_count")),
         "compute_capability": raw_cap,
+        "stage_filter": stage,
+        **feature_index,
         "recommended_patterns": recommended,
         "avoid_patterns": avoid,
+        "feature_query": {
+            "tool": "query_hardware_features",
+            "hardware_name": _as_str(props.get("name")) or hardware_name,
+            "stage": stage or "all",
+        },
     })
-
-    for key in _STAGE_DROP_FIELDS.get(stage, set()):
-        result.pop(key, None)
-
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -114,8 +108,19 @@ def query_hardware_node(
 
 _STAGE_CATEGORIES: dict[str, set[str]] = {
     "model_structure": {"compute_capability", "interconnect", "kernel_optimization", "tensor_core"},
-    "datatype": {"precision", "data_pipeline"},
-    "training_parameters": {"optimizer", "precision", "kernel_optimization", "parallelism"},
+    "datatype": {"data_pipeline"},
+    "training_parameters": {
+        "data_pipeline",
+        "interconnect",
+        "kernel_optimization",
+        "optimizer",
+        "parallelism",
+        "precision",
+    },
+}
+
+_STAGE_FEATURE_IDS: dict[str, set[str]] = {
+    "training_parameters": {"gram_newton_schulz_symmetric_gemm"},
 }
 
 
@@ -132,11 +137,13 @@ def query_hardware_features(
     hardware_name:
         GPU name to search, e.g. ``"rtx 4090"``.
     agent_stage:
-        ``"model_structure"`` returns kernel/tensor-core/interconnect features;
-        ``"datatype"`` returns precision and data-pipeline features;
-        ``"training_parameters"`` returns optimizer/precision/parallelism features;
+        ``"model_structure"`` returns architecture/kernel/tensor-core features;
+        ``"datatype"`` returns data-pipeline/data-shape features;
+        ``"training_parameters"`` returns optimizer, precision, data-loader,
+        parallelism, runtime, and optimizer-adjacent kernel features;
         ``None`` returns all features.
     """
+    stage = _normalize_stage(agent_stage)
     graph = _load_graph(graph_path)
     node, edges = _lookup_node(graph, hardware_name)
     if node is None:
@@ -147,8 +154,8 @@ def query_hardware_features(
         for n in graph["nodes"] if n["label"] == "Feature"
     }
 
-    stage = _normalize_stage(agent_stage)
     categories = _STAGE_CATEGORIES.get(stage) if stage else None
+    feature_ids = _STAGE_FEATURE_IDS.get(stage, set()) if stage else set()
 
     features: list[dict[str, Any]] = []
     for edge in edges:
@@ -158,10 +165,12 @@ def query_hardware_features(
             continue
 
         category = feat_props.get("category", "")
-        if categories and category not in categories:
+        feature_id = feat_props.get("feature_id")
+        category_match = bool(categories and category in categories)
+        feature_match = feature_id in feature_ids
+        if (categories or feature_ids) and not (category_match or feature_match):
             continue
 
-        feature_id = feat_props.get("feature_id")
         edge_props = edge.get("properties", {})
         features.append(_compact_dict({
             "feature_id": feature_id,
@@ -170,7 +179,6 @@ def query_hardware_features(
             "description": feat_props.get("description"),
             "example_code": feat_props.get("example_code"),
             "api_symbols": feat_props.get("api_symbols", []),
-            "source_urls": _source_urls(feat_props),
             "usage": feat_props.get("usage"),
             "recommended_patterns": feat_props.get("recommended_patterns", []),
             "avoid_patterns": feat_props.get("avoid_patterns", []),
@@ -184,13 +192,13 @@ def query_hardware_features(
                 or feat_props.get("default_recommendation_scope")
             ),
             "limitations": edge_props.get("limitations") or feat_props.get("limitations"),
-            "notes": edge_props.get("notes") or feat_props.get("notes"),
+            "notes": _merge_text_values(edge_props.get("notes"), feat_props.get("notes")),
         }))
 
     return {
         "found": True,
-        "node_id": node["id"],
-        "gpu_name": node.get("properties", {}).get("name"),
+        "gpu_name": _sanitize_public_value(node.get("properties", {}).get("name")),
+        "stage_filter": stage,
         "feature_count": len(features),
         "features": features,
     }
@@ -212,7 +220,214 @@ def _normalize_stage(agent_stage: str | None) -> str | None:
     stage = str(agent_stage).strip().lower()
     if not stage or stage == "all":
         return None
+    if stage not in PIPELINE_STAGES:
+        allowed = ", ".join(PIPELINE_STAGES)
+        raise ValueError(f"unsupported hardware pipeline stage {stage!r}; expected one of: {allowed}, or all")
     return stage
+
+
+def _filter_patterns_by_stage(patterns: list[str], stage: str | None) -> list[str]:
+    if not stage:
+        return patterns
+    keywords = _STAGE_KEYWORDS.get(stage, [])
+    if not keywords:
+        return []
+    return [
+        pattern
+        for pattern in patterns
+        if any(keyword in pattern.lower() for keyword in keywords)
+    ]
+
+
+def _stage_feature_key_index(
+    graph: dict[str, Any],
+    edges: list[dict[str, Any]],
+    stage: str | None,
+) -> dict[str, Any]:
+    feat_nodes = {
+        n["id"]: n.get("properties", {})
+        for n in graph["nodes"] if n.get("label") == "Feature"
+    }
+    categories = _STAGE_CATEGORIES.get(stage) if stage else None
+    explicit_ids = _STAGE_FEATURE_IDS.get(stage, set()) if stage else set()
+    all_keys: list[list[str]] = []
+    recommended_keys: list[list[str]] = []
+    not_recommended_keys: list[list[str]] = []
+    conditional_keys: list[list[str]] = []
+
+    for edge in edges:
+        feat_props = feat_nodes.get(edge.get("to", ""))
+        if not feat_props:
+            continue
+        feature_id = _as_str(feat_props.get("feature_id"))
+        if not feature_id:
+            continue
+        category = str(feat_props.get("category") or "")
+        if (categories or explicit_ids) and category not in (categories or set()) and feature_id not in explicit_ids:
+            continue
+        edge_props = edge.get("properties") or {}
+        description = _feature_short_description(feature_id, feat_props)
+        _append_unique_feature_pair(all_keys, feature_id, description)
+        if edge_props.get("recommended") is False:
+            _append_unique_feature_pair(not_recommended_keys, feature_id, description)
+        elif edge_props.get("recommended") is True:
+            _append_unique_feature_pair(recommended_keys, feature_id, description)
+        support_level = str(edge_props.get("support_level") or "").lower()
+        if (
+            edge_props.get("recommended") is False
+            or support_level in {"experimental", "limited"}
+            or bool(edge_props.get("limitations"))
+            or bool(edge_props.get("notes"))
+            or bool(feat_props.get("limitations"))
+            or bool(feat_props.get("notes"))
+        ):
+            _append_unique_feature_pair(conditional_keys, feature_id, description)
+
+    return {
+        "stage_feature_keys": all_keys,
+        "recommended_feature_keys": recommended_keys,
+        "not_recommended_feature_keys": not_recommended_keys,
+        "conditional_feature_keys": conditional_keys,
+    }
+
+
+def _merge_text_values(*values: Any) -> str:
+    merged: list[str] = []
+    for value in values:
+        text = _strip_urls(str(value or "").strip())
+        if text and text not in merged:
+            merged.append(text)
+    return "; ".join(merged)
+
+
+def _feature_short_description(feature_id: str, feat_props: dict[str, Any]) -> str:
+    capability = _feature_capability_phrase(feature_id, feat_props)
+    usage = _feature_main_use_phrase(feature_id, feat_props)
+    sentence = f"{capability}, mainly used for {usage}."
+    sentence = re.sub(r"\s+", " ", _strip_urls(sentence)).strip()
+    return sentence.replace("..", ".")
+
+
+def _feature_capability_phrase(feature_id: str, feat_props: dict[str, Any]) -> str:
+    feature_name = _display_feature_name(feature_id, feat_props)
+    category = str(feat_props.get("category") or "").strip().lower()
+    description = _clean_feature_text(feat_props.get("description"))
+
+    special = {
+        "cut_cross_entropy": "Cut Cross-Entropy fuses the classifier projection with cross-entropy loss to avoid materializing large logits",
+        "gram_newton_schulz_symmetric_gemm": "Gram Newton-Schulz symmetric GEMM optimizes the symmetric-product kernel used by Newton-Schulz updates",
+        "tensor_cores": "Tensor Cores accelerate mixed-precision matrix and convolution operations",
+        "tensor_cores_3gen": "Third-generation Tensor Cores accelerate Ampere mixed-precision matrix operations",
+        "tensor_cores_4gen": "Fourth-generation Tensor Cores accelerate Ada/Hopper mixed-precision matrix operations",
+        "tensor_cores_5gen": "Fifth-generation Tensor Cores accelerate Blackwell mixed-precision and low-precision matrix operations",
+        "nvimagecodec_gpu_decode": "nvImageCodec GPU decode moves image decoding directly onto the GPU",
+        "dataset_decomposition": "Dataset decomposition buckets training data into curriculum-friendly chunks",
+        "async_tensor_parallel": "Asynchronous tensor parallelism overlaps distributed collectives with compute",
+        "fp8_all_gather_fsdp2": "FP8 all-gather for FSDP2 reduces distributed parameter communication volume",
+    }
+    if feature_id in special:
+        return special[feature_id]
+
+    if category == "compute_capability":
+        return f"{feature_id} identifies the GPU compute capability and kernel target"
+    if category == "precision":
+        return f"{feature_name} defines a numeric precision or scaling policy"
+    if category == "interconnect":
+        return f"{feature_name} describes the host-to-GPU interconnect capability"
+    if category == "optimizer":
+        clause = _description_action_clause(description)
+        return clause or f"{feature_name} describes a training optimizer candidate"
+    if category == "parallelism":
+        clause = _description_action_clause(description)
+        return clause or f"{feature_name} describes a distributed training parallelism feature"
+    if category == "data_pipeline":
+        clause = _description_action_clause(description)
+        return clause or f"{feature_name} describes a data loading or preprocessing feature"
+    if category == "kernel_optimization":
+        clause = _description_action_clause(description)
+        return clause or f"{feature_name} describes a kernel-level optimization"
+    if category == "tensor_core":
+        return f"{feature_name} describes Tensor Core acceleration support"
+    return f"{feature_name} describes a hardware feature"
+
+
+def _feature_main_use_phrase(feature_id: str, feat_props: dict[str, Any]) -> str:
+    category = str(feat_props.get("category") or "").strip().lower()
+    description = _clean_feature_text(feat_props.get("description")).lower()
+    usage = _clean_feature_text(feat_props.get("usage")).lower()
+    scope = _clean_feature_text(feat_props.get("default_recommendation_scope")).lower()
+
+    if feature_id == "cut_cross_entropy" or "large-vocab" in description or "large vocabulary" in description:
+        return "large-vocabulary language-model heads"
+    if feature_id == "gram_newton_schulz_symmetric_gemm" or "muon_newton_schulz" in scope:
+        return "Muon or Newton-Schulz optimizer-step hotspots"
+    if feature_id == "muon_optimizer" or "matmul_heavy_training" in scope:
+        return "matmul-heavy neural-network training"
+    if feature_id in {"soap_optimizer", "ademamix_optimizer"} or "candidate_optimizer" in scope:
+        return "optimizer experiments that are benchmarked against a stable AdamW baseline"
+    if feature_id == "nvimagecodec_gpu_decode" or "cv/imaging" in description:
+        return "computer-vision and imaging data loaders"
+    if feature_id == "dataset_decomposition":
+        return "long-context or variable-length dataset pipelines"
+    if feature_id in {"async_tensor_parallel", "fp8_all_gather_fsdp2"} or "multi-gpu" in description or "distributed" in usage:
+        return "multi-GPU distributed training"
+
+    category_usage = {
+        "compute_capability": "hardware capability checks and CUDA kernel targeting",
+        "data_pipeline": "data loading and preprocessing pipelines",
+        "interconnect": "host-to-GPU transfer and placement planning",
+        "kernel_optimization": "kernel-level training or inference bottlenecks",
+        "optimizer": "training optimizer selection",
+        "parallelism": "distributed or parallel training",
+        "precision": "datatype and mixed-precision policy",
+        "tensor_core": "mixed-precision tensor-core workloads",
+    }
+    return category_usage.get(category, "hardware-aware optimization decisions")
+
+
+def _description_action_clause(description: str) -> str | None:
+    if not description:
+        return None
+    text = re.sub(r"\([^)]*\)", "", description)
+    if ":" in text:
+        subject, rest = text.split(":", 1)
+        subject = subject.strip()
+        rest = rest.strip()
+        clause = re.split(r"[.;]", rest, maxsplit=1)[0].strip()
+        if clause and len(clause) <= 120:
+            if re.match(r"^(fuses|decodes|uses|replaces|reduces|overlaps|decomposes|accelerates)\b", clause, re.I):
+                return f"{subject} {clause}"
+    sentence = re.split(r"[.;]", text, maxsplit=1)[0].strip()
+    if sentence and len(sentence) <= 120 and not sentence.lower().startswith(("cuda c++ programming guide", "nvidia blackwell architecture")):
+        return sentence
+    return None
+
+
+def _display_feature_name(feature_id: str, feat_props: dict[str, Any]) -> str:
+    name = _as_str(feat_props.get("name"))
+    if name and name != feature_id:
+        return name
+    return _humanize_feature_key(feature_id).rstrip(".")
+
+
+def _clean_feature_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", _strip_urls(str(value or "").replace("\n", " "))).strip()
+
+
+def _humanize_feature_key(feature_id: str) -> str:
+    words = [word for word in str(feature_id or "").replace("-", "_").split("_") if word]
+    if not words:
+        return "Hardware feature."
+    text = " ".join(word.upper() if word.lower() in {"fp8", "fp4", "fp16", "bf16", "tf32", "int8"} else word for word in words)
+    return text[:1].upper() + text[1:] + "."
+
+
+def _append_unique_feature_pair(values: list[list[str]], feature_id: str, description: str) -> None:
+    if not feature_id:
+        return
+    if any(item and item[0] == feature_id for item in values):
+        return
+    values.append([feature_id, description or _humanize_feature_key(feature_id)])
 
 
 def _lookup_node(
@@ -223,8 +438,13 @@ def _lookup_node(
         if node["label"] != "Hardware":
             continue
         props = node.get("properties", {})
-        searchable = [props.get("name", "")] + list(props.get("aliases") or [])
-        if any(query in s.lower() for s in searchable):
+        searchable = [
+            node.get("id", ""),
+            props.get("hardware_id", ""),
+            props.get("name", ""),
+            props.get("name_key", ""),
+        ] + list(props.get("aliases") or [])
+        if any(query in s.lower() or s.lower() in query for s in searchable if s):
             hw_id = node["id"]
             edges = [
                 e for e in graph["edges"]
@@ -256,14 +476,6 @@ def _as_str_list(value: Any) -> list[str]:
     return [text] if text else []
 
 
-def _source_urls(feat_props: dict[str, Any]) -> list[str]:
-    urls = _as_str_list(feat_props.get("source_urls"))
-    for url in _as_str_list(feat_props.get("source_url")):
-        if url not in urls:
-            urls.append(url)
-    return urls
-
-
 def _feature_name(feat_props: dict[str, Any]) -> str | None:
     feature_id = _as_str(feat_props.get("feature_id"))
     name = _as_str(feat_props.get("name"))
@@ -273,11 +485,12 @@ def _feature_name(feat_props: dict[str, Any]) -> str | None:
 
 
 def _compact_dict(values: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in values.items()
-        if value is not None and value != "" and value != [] and value != {}
-    }
+    result: dict[str, Any] = {}
+    for key, value in values.items():
+        cleaned = _sanitize_public_value(value)
+        if cleaned not in (None, "", [], {}):
+            result[key] = cleaned
+    return result
 
 
 def _as_int(value: Any) -> int | None:
@@ -285,3 +498,27 @@ def _as_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _sanitize_public_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _strip_urls(value)
+    if isinstance(value, list):
+        cleaned = [_sanitize_public_value(item) for item in value]
+        return [item for item in cleaned if item not in (None, "", [], {})]
+    if isinstance(value, dict):
+        return {
+            key: cleaned
+            for key, item in value.items()
+            if key not in {"source_url", "source_urls"}
+            for cleaned in [_sanitize_public_value(item)]
+            if cleaned not in (None, "", [], {})
+        }
+    return value
+
+
+def _strip_urls(value: str) -> str:
+    text = re.sub(r"\s*\[[^\]]*https?://[^\]]+\]", "", str(value or ""))
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"\s+([,.;:])", r"\1", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
