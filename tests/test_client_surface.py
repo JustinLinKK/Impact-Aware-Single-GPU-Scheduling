@@ -273,13 +273,15 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
                 },
             }
 
-            context = client.get_stage_hardware_features(pipeline_stage="training_parameters", limit=12)
+            context = client.get_stage_hardware_features(pipeline_stage="training_parameters", limit=8)
 
             self.assertTrue(context["found"])
             self.assertEqual(context["stage_filter"], "training_parameters")
             feature_ids = [item["feature_id"] for item in context["features"]]
+            self.assertIn("muon_optimizer", feature_ids)
             self.assertIn("soap_optimizer", feature_ids)
             self.assertIn("ademamix_optimizer", feature_ids)
+            self.assertIn("gram_newton_schulz_symmetric_gemm", feature_ids)
             self.assertIn("bf16", feature_ids)
             node = context["stages"][0]["node"]
             stage_keys = {item[0] for item in node["stage_feature_keys"]}
@@ -343,6 +345,36 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
             self.assertNotIn("muon_optimizer", datatype_precision_ids)
             self.assertNotIn("gram_newton_schulz_symmetric_gemm", datatype_precision_ids)
             self.assertNotIn("async_tensor_parallel", datatype_precision_ids)
+
+            training_default = client.get_stage_hardware_features(
+                pipeline_stage="training_evaluation",
+                limit=8,
+            )
+            training_default_ids = {
+                item["feature_id"] for item in training_default["features"]
+            }
+
+            self.assertEqual(training_default["stage_filter"], "training_parameters")
+            self.assertGreater(len(training_default["features"]), 8)
+            self.assertIn("muon_optimizer", training_default_ids)
+            self.assertIn("soap_optimizer", training_default_ids)
+            self.assertIn("ademamix_optimizer", training_default_ids)
+            self.assertIn("gram_newton_schulz_symmetric_gemm", training_default_ids)
+            self.assertIn("bf16", training_default_ids)
+
+            model_training = client.get_stage_hardware_features(
+                pipeline_stage=("model_structure", "training_parameters"),
+                limit=8,
+            )
+            model_training_ids = {
+                item["feature_id"] for item in model_training["features"]
+            }
+
+            self.assertEqual(model_training["stage_filter"], ["model_structure", "training_parameters"])
+            self.assertIn("tensor_cores", model_training_ids)
+            self.assertIn("muon_optimizer", model_training_ids)
+            self.assertIn("soap_optimizer", model_training_ids)
+            self.assertIn("bf16", model_training_ids)
 
             training = client.get_stage_hardware_features(
                 pipeline_stage="training_evaluation",

@@ -779,6 +779,43 @@ class SchedulerClient:
             return str(value[0])
         return str(value or "")
 
+    @staticmethod
+    def _is_training_optimizer_feature(feature: dict[str, Any]) -> bool:
+        feature_id = str(feature.get("feature_id") or "").lower()
+        category = str(feature.get("category") or "").lower()
+        scope = str(feature.get("recommendation_scope") or "").lower()
+        name = str(feature.get("name") or "").lower()
+        if category == "optimizer":
+            return True
+        if feature_id in {"cut_cross_entropy", "gram_newton_schulz_symmetric_gemm"}:
+            return True
+        return any(
+            token in feature_id or token in scope or token in name
+            for token in ("optimizer", "muon", "soap", "ademamix", "newton_schulz")
+        )
+
+    @staticmethod
+    def _select_static_stage_features(
+        *,
+        stage: str,
+        scope: str | None,
+        features: list[dict[str, Any]],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        per_stage_limit = max(1, int(limit))
+        if stage == "training_parameters" and scope != "datatype_precision":
+            # training_parameters merges the former optimizer and tuning stages;
+            # keep one compact budget for each so graph order cannot hide optimizers.
+            optimizer_features: list[dict[str, Any]] = []
+            tuning_features: list[dict[str, Any]] = []
+            for feature in features:
+                if SchedulerClient._is_training_optimizer_feature(feature):
+                    optimizer_features.append(feature)
+                else:
+                    tuning_features.append(feature)
+            return optimizer_features[:per_stage_limit] + tuning_features[:per_stage_limit]
+        return features[:per_stage_limit]
+
     @classmethod
     def _hardware_stages_for_candidate(cls, candidate: dict[str, Any]) -> list[str]:
         for key in ("hardware_pipeline_stages", "hardware_pipeline_stage", "pipeline_stages", "pipeline_stage"):
@@ -851,7 +888,12 @@ class SchedulerClient:
                 }
                 hardware_payload = {key: value for key, value in hardware_payload.items() if value not in (None, "", [], {})}
 
-            stage_features = list(feature_payload.get("features") or [])[:per_stage_limit]
+            stage_features = SchedulerClient._select_static_stage_features(
+                stage=stage,
+                scope=stage_scope,
+                features=list(feature_payload.get("features") or []),
+                limit=per_stage_limit,
+            )
             for feature in stage_features:
                 feature_id = str(feature.get("feature_id") or "")
                 key = feature_id if feature_id else repr(feature)
@@ -873,7 +915,7 @@ class SchedulerClient:
             "hardware": hardware_payload,
             "stage_filter": stages[0] if len(stages) == 1 else list(stages),
             "stages": stage_payloads,
-            "features": merged_features[: max(1, int(limit)) * max(1, len(stages))],
+            "features": merged_features,
             "feature_count": sum(int(item.get("feature_count") or 0) for item in stage_payloads),
             "source": "hardware_knowledge_graph.json",
             "reason": None if stage_payloads else reason,
