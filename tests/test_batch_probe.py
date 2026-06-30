@@ -23,6 +23,7 @@ from localml_scheduler.domain import (
     BatchProbeSpec,
     BatchProbeTrialResult,
     CheckpointPolicy,
+    PackingSpec,
     ResourceRequirements,
     SafePointType,
     SoloProfile,
@@ -194,7 +195,7 @@ class BatchProbeUnitTest(unittest.TestCase):
                     search_mode=BATCH_PROBE_SEARCH_MODE_BINARY,
                 ),
             )
-            self.assertEqual(profile.resolved_batch_size, 5)
+            self.assertEqual(profile.resolved_batch_size, 4)
             self.assertEqual(profile.batch_param_name, "batch_size")
             self.assertGreater(profile.target_budget_mb, 0)
 
@@ -260,9 +261,42 @@ class BatchProbeUnitTest(unittest.TestCase):
                     search_mode=BATCH_PROBE_SEARCH_MODE_BINARY,
                 ),
             )
-            self.assertEqual(profile.resolved_batch_size, 6)
+            self.assertEqual(profile.resolved_batch_size, 4)
             self.assertEqual(profile.metadata["warning_reason"], "max_batch_size_cap")
             self.assertIn("before VRAM saturation", profile.metadata["warning_message"])
+
+    def test_reuse_only_cache_miss_skips_derivative_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(runtime_root=tmpdir)
+            job = TrainingJob.create(
+                "pkg.runner:train",
+                "baseline-a",
+                "/tmp/a.pt",
+                task_type="classification",
+                runner_kwargs={"batch_size": 3},
+                batch_probe=BatchProbeSpec(
+                    enabled=True,
+                    probe_target="localml_scheduler.tests.test_batch_probe:fake_limit_probe",
+                    profile_key="missing-startpoint-profile",
+                    reuse_only=True,
+                ),
+                packing=PackingSpec(eligible=True, signature="derivative-family", family="derivative"),
+                metadata={"placement_backend": "exclusive", "probe_threshold": 5},
+                resource_requirements=ResourceRequirements(requires_gpu=True),
+                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
+            )
+            context = _build_context(settings, job)
+
+            resolved = run_batch_probe_preflight(context)
+
+            self.assertEqual(resolved.config.runner_kwargs["batch_size"], 3)
+            self.assertFalse(resolved.packing.eligible)
+            self.assertEqual(resolved.packing.backend_allowlist, ["exclusive"])
+            self.assertEqual(resolved.metadata["batch_probe_source"], "reuse_miss")
+            self.assertEqual(resolved.metadata["placement_policy"], "exclusive_conservative")
+            self.assertEqual(context.store.list_batch_probe_profiles(), [])
+            self.assertEqual(len(context.store.list_events(job_id=job.job_id, event_type="batch_probe_reuse_miss")), 1)
+            self.assertEqual(context.store.list_events(job_id=job.job_id, event_type="batch_probe_started"), [])
 
 
 class BatchProbeIntegrationTest(unittest.TestCase):
@@ -326,14 +360,14 @@ class BatchProbeIntegrationTest(unittest.TestCase):
                 api.submit(first)
                 wait_for(lambda: api.inspect(first.job_id).status.is_terminal, timeout=30.0)
                 first_state = api.inspect(first.job_id)
-                self.assertEqual(first_state.config.runner_kwargs["batch_size"], 6)
+                self.assertEqual(first_state.config.runner_kwargs["batch_size"], 4)
                 self.assertEqual(first_state.metadata["batch_probe_source"], "probe")
                 self.assertEqual(len(api.store.list_batch_probe_profiles()), 1)
 
                 api.submit(second)
                 wait_for(lambda: api.inspect(second.job_id).status.is_terminal, timeout=30.0)
                 second_state = api.inspect(second.job_id)
-                self.assertEqual(second_state.config.runner_kwargs["batch_size"], 6)
+                self.assertEqual(second_state.config.runner_kwargs["batch_size"], 4)
                 self.assertEqual(second_state.metadata["batch_probe_source"], "cache")
                 self.assertEqual(len(api.store.list_events(job_id=second.job_id, event_type="batch_probe_cache_hit")), 1)
             finally:
@@ -359,7 +393,7 @@ class BatchProbeIntegrationTest(unittest.TestCase):
             finally:
                 service.stop()
 
-    def test_power_of_two_mode_uses_separate_cache_key(self) -> None:
+    def test_legacy_binary_mode_reuses_power_of_two_cache_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = _batch_probe_settings(Path(tmpdir))
             binary_job = TrainingJob.create(
@@ -395,19 +429,19 @@ class BatchProbeIntegrationTest(unittest.TestCase):
 
             binary_context = _build_context(settings, binary_job)
             binary_resolved = run_batch_probe_preflight(binary_context)
-            self.assertEqual(binary_resolved.config.runner_kwargs["batch_size"], 5)
+            self.assertEqual(binary_resolved.config.runner_kwargs["batch_size"], 4)
             self.assertEqual(binary_resolved.metadata["batch_probe_source"], "probe")
 
             power_of_two_context = _build_context(settings, power_of_two_job)
             power_of_two_resolved = run_batch_probe_preflight(power_of_two_context)
             self.assertEqual(power_of_two_resolved.config.runner_kwargs["batch_size"], 4)
-            self.assertEqual(power_of_two_resolved.metadata["batch_probe_source"], "probe")
-            self.assertEqual(len(power_of_two_context.store.list_batch_probe_profiles()), 2)
+            self.assertEqual(power_of_two_resolved.metadata["batch_probe_source"], "cache")
+            self.assertEqual(len(power_of_two_context.store.list_batch_probe_profiles()), 1)
             cache_hit_events = power_of_two_context.store.list_events(
                 job_id=power_of_two_job.job_id,
                 event_type="batch_probe_cache_hit",
             )
-            self.assertEqual(cache_hit_events, [])
+            self.assertEqual(len(cache_hit_events), 1)
 
     def test_scheduler_level_power_of_two_mode_applies_when_job_mode_is_unspecified(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

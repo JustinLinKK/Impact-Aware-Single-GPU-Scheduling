@@ -11,7 +11,6 @@ import torch
 
 from ..execution.runner_protocol import BatchProbeProtocol, RunnerContext
 from ..domain import (
-    BATCH_PROBE_SEARCH_MODE_BINARY,
     BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
     BatchResolution,
     BatchSizeObservation,
@@ -146,8 +145,9 @@ def _probe_key_info(job: TrainingJob, *, default_search_mode: str | None = None)
     device_type = resolve_visible_device_type()
     shape_signature = build_batch_probe_shape_signature(job)
     search_mode = normalize_batch_probe_search_mode(job.batch_probe.search_mode or default_search_mode)
+    probe_key = str(job.batch_probe.profile_key or build_batch_probe_key(model_key, device_type, shape_signature, search_mode=search_mode))
     return BatchProbeKeyInfo(
-        probe_key=build_batch_probe_key(model_key, device_type, shape_signature, search_mode=search_mode),
+        probe_key=probe_key,
         model_key=model_key,
         device_type=device_type,
         shape_signature=shape_signature,
@@ -258,9 +258,7 @@ def _normalize_candidate_bounds(
     max_batch_size: int | None,
     start_batch_size: int,
 ) -> tuple[int, int | None, int]:
-    if search_mode != BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO:
-        return min_batch_size, max_batch_size, start_batch_size
-
+    search_mode = normalize_batch_probe_search_mode(search_mode)
     normalized_min = _ceil_power_of_two(min_batch_size)
     normalized_max = None
     if max_batch_size is not None:
@@ -273,7 +271,7 @@ def _normalize_candidate_bounds(
     normalized_start = max(normalized_start, normalized_min)
     if normalized_max is not None:
         normalized_start = min(normalized_start, normalized_max)
-    return normalized_min, max_batch_size, normalized_start
+    return normalized_min, normalized_max, normalized_start
 
 
 def _run_probe_controller(context: RunnerContext, key_info: BatchProbeKeyInfo) -> BatchProbeProfile:
@@ -391,9 +389,6 @@ def _run_probe_controller(context: RunnerContext, key_info: BatchProbeKeyInfo) -
         if search_mode == BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO:
             current_batch_size = max(min_batch_size, current_batch_size // 2)
             search_method = "power_of_two_downshift"
-        else:
-            current_batch_size = max(min_batch_size, current_batch_size // 2)
-            search_method = "downshift"
 
     last_good = success
     low = success.batch_size
@@ -406,27 +401,14 @@ def _run_probe_controller(context: RunnerContext, key_info: BatchProbeKeyInfo) -
             last_good = attempt
             low = attempt.batch_size
             candidate = attempt.batch_size * 2
-            search_method = "power_of_two_expand" if search_mode == BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO else "expand"
+            search_method = "power_of_two_expand"
             stop_reason = "expand_success"
             continue
         high = attempt.batch_size
         failure = attempt
-        search_method = "power_of_two_boundary" if search_mode == BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO else "binary"
+        search_method = "power_of_two_boundary"
         stop_reason = "failure_boundary"
         break
-
-    if high is not None and search_mode == BATCH_PROBE_SEARCH_MODE_BINARY:
-        while (high - low) > 1 and rounds < max_search_rounds:
-            mid = low + ((high - low) // 2)
-            attempt = run_attempt(mid)
-            if _attempt_successful(attempt):
-                last_good = attempt
-                low = attempt.batch_size
-                stop_reason = "binary_success"
-            else:
-                failure = attempt
-                high = attempt.batch_size
-                stop_reason = "failure_boundary"
 
     if high is None:
         if rounds >= max_search_rounds:
@@ -466,6 +448,7 @@ def _run_probe_controller(context: RunnerContext, key_info: BatchProbeKeyInfo) -
             "model_key": key_info.model_key,
             "device_type": key_info.device_type,
             "shape_signature": key_info.shape_signature,
+            "profile_key": context.job.batch_probe.profile_key,
             "warning_reason": warning_reason,
             "warning_message": warning_message,
             "saturated_vram": saturated_vram,
@@ -614,6 +597,41 @@ def run_batch_probe_preflight(context: RunnerContext) -> TrainingJob:
         key_info.probe_key,
         key_info.device_type,
     )
+
+    if context.job.batch_probe.reuse_only:
+        job = context.store.get_job(context.job.job_id) or context.job
+        job.packing.eligible = False
+        job.packing.backend_allowlist = ["exclusive"]
+        job.metadata.update(
+            {
+                "batch_probe_reuse_miss": True,
+                "batch_probe_key": key_info.probe_key,
+                "batch_probe_source": "reuse_miss",
+                "placement_policy": "exclusive_conservative",
+            }
+        )
+        context.store.save_job(job)
+        context.event_logger.emit(
+            "batch_probe_reuse_miss",
+            job_id=job.job_id,
+            payload={
+                "probe_key": key_info.probe_key,
+                "model_key": key_info.model_key,
+                "device_type": key_info.device_type,
+                "shape_signature": key_info.shape_signature,
+                "search_mode": key_info.search_mode,
+                "placement_policy": "exclusive_conservative",
+                "reason": "reuse_only profile was not available",
+            },
+        )
+        logger.warning(
+            "[batch_probe] job=%s reuse-only cache miss probe_key=%s device=%s; derivative probe skipped",
+            job.job_id,
+            key_info.probe_key,
+            key_info.device_type,
+        )
+        context.job = job
+        return job
 
     try:
         profile = _run_probe_controller(context, key_info)

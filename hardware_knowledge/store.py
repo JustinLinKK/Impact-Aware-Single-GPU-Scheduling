@@ -394,7 +394,7 @@ class HardwareKnowledgeGraphStore:
 
     @staticmethod
     def _public_hardware(hardware: dict[str, Any]) -> dict[str, Any]:
-        return {
+        return _sanitize_public_payload({
             "hardware_id": hardware.get("hardware_id"),
             "name": hardware.get("name"),
             "name_key": hardware.get("name_key"),
@@ -407,7 +407,7 @@ class HardwareKnowledgeGraphStore:
             "memory_type": hardware.get("memory_type"),
             "supported_precisions": list(hardware.get("supported_precisions") or []),
             "software_stack": list(hardware.get("software_stack") or []),
-        }
+        })
 
     @staticmethod
     def _index_result(item: dict[str, Any]) -> dict[str, Any]:
@@ -431,7 +431,7 @@ class HardwareKnowledgeGraphStore:
         limitation = relationship.get("limitations") or feature.get("when_not_to_use")
         hardware_id = hardware.get("hardware_id")
         feature_id = feature.get("feature_id")
-        return {
+        return _sanitize_public_payload({
             "record_id": f"{hardware_id}:{feature_id}",
             "record_type": "hardware_knowledge_graph",
             "title": feature.get("name"),
@@ -461,4 +461,28 @@ class HardwareKnowledgeGraphStore:
             "last_verified": relationship.get("last_verified_at"),
             "confidence": 1.0 if relationship.get("verified") else 0.6,
             "evidence_ref": f"hardware_knowledge:HAS_FEATURE:{hardware_id}:{feature_id}",
+        })
+
+
+def _sanitize_public_payload(value: Any) -> Any:
+    if isinstance(value, str):
+        return _strip_public_urls(value)
+    if isinstance(value, list):
+        cleaned = [_sanitize_public_payload(item) for item in value]
+        return [item for item in cleaned if item not in (None, "", [], {})]
+    if isinstance(value, dict):
+        return {
+            key: cleaned
+            for key, item in value.items()
+            if key not in {"source_url", "source_urls"}
+            for cleaned in [_sanitize_public_payload(item)]
+            if cleaned not in (None, "", [], {})
         }
+    return value
+
+
+def _strip_public_urls(value: str) -> str:
+    text = re.sub(r"\s*\[[^\]]*https?://[^\]]+\]", "", str(value or ""))
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"\s+([,.;:])", r"\1", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
