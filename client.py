@@ -53,7 +53,6 @@ _HARDWARE_STAGE_ALIASES = {
     "training_evaluation": "training_parameters",
     "training_parameters": "training_parameters",
     "training_params": "training_parameters",
-    "precision": "training_parameters",
     "pre_submit_training_review": "training_parameters",
 }
 
@@ -64,6 +63,7 @@ _COMPOSITE_HARDWARE_STAGE_ALIASES = {
     "stage1_candidate_construction": ("datatype", "model_structure"),
     "candidate_construction": ("datatype", "model_structure"),
     "datatype_precision": ("datatype", "training_parameters"),
+    "precision": ("datatype", "training_parameters"),
     "training_evaluation": ("training_parameters",),
 }
 

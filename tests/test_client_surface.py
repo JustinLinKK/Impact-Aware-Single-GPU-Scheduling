@@ -346,6 +346,21 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
             self.assertNotIn("gram_newton_schulz_symmetric_gemm", datatype_precision_ids)
             self.assertNotIn("async_tensor_parallel", datatype_precision_ids)
 
+            precision_alias = client.get_stage_hardware_features(
+                pipeline_stage="precision",
+                limit=32,
+            )
+            precision_alias_ids = {
+                item["feature_id"] for item in precision_alias["features"]
+            }
+
+            self.assertEqual(precision_alias["stage_filter"], ["datatype", "training_parameters"])
+            self.assertEqual(precision_alias_ids, datatype_precision_ids)
+            self.assertIn("bf16", precision_alias_ids)
+            self.assertIn("fp8_rowwise_scaling", precision_alias_ids)
+            self.assertNotIn("muon_optimizer", precision_alias_ids)
+            self.assertNotIn("gram_newton_schulz_symmetric_gemm", precision_alias_ids)
+
             training_default = client.get_stage_hardware_features(
                 pipeline_stage="training_evaluation",
                 limit=8,
