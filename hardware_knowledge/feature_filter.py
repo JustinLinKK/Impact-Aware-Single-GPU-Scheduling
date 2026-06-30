@@ -232,11 +232,12 @@ def _filter_patterns_by_stage(patterns: list[str], stage: str | None) -> list[st
     keywords = _STAGE_KEYWORDS.get(stage, [])
     if not keywords:
         return []
-    return [
-        pattern
-        for pattern in patterns
-        if any(keyword in pattern.lower() for keyword in keywords)
-    ]
+    filtered: list[str] = []
+    for pattern in patterns:
+        searchable = _strip_urls(pattern).lower()
+        if any(keyword in searchable for keyword in keywords):
+            filtered.append(pattern)
+    return filtered
 
 
 def _stage_feature_key_index(
