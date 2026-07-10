@@ -205,6 +205,8 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
         "sleep_per_step": 0.0,
         "dataset_seed": 123,
         "scheduler_gamma": None,
+        "reported_loss_override": None,
+        "reported_accuracy_override": None,
     }
     params.update(context.job.config.runner_kwargs)
 
@@ -308,6 +310,14 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
             optimizer.step()
 
             last_loss = float(loss.detach().cpu().item())
+            reported_loss = (
+                float(params["reported_loss_override"])
+                if params.get("reported_loss_override") is not None
+                else last_loss
+            )
+            reported_metrics = {"loss": reported_loss, "lr": float(optimizer.param_groups[0].get("lr", params["learning_rate"]))}
+            if params.get("reported_accuracy_override") is not None:
+                reported_metrics["accuracy"] = float(params["reported_accuracy_override"])
             global_step += 1
             step_elapsed_ms = (time.perf_counter() - step_started_at) * 1000.0
             if epoch == start_epoch:
@@ -357,7 +367,7 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
                 SafePointType.STEP,
                 epoch=epoch,
                 global_step=global_step,
-                metrics={"loss": last_loss},
+                metrics=reported_metrics,
                 state_factory=lambda epoch=epoch, step_in_epoch=step_in_epoch + 1, global_step=global_step: build_checkpoint_state(epoch, step_in_epoch, global_step),
                 steps_per_epoch=int(runtime_updates["steps_per_epoch"]) if runtime_updates else None,
                 avg_step_time_ms=float(runtime_updates["avg_step_time_ms"]) if runtime_updates else None,
@@ -418,11 +428,19 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
                 "estimated_total_runtime_seconds": estimated_total_runtime_seconds,
                 "remaining_runtime_seconds": max(0.0, estimated_total_runtime_seconds - (time.perf_counter() - run_started_at)),
             }
+        reported_loss = (
+            float(params["reported_loss_override"])
+            if params.get("reported_loss_override") is not None
+            else last_loss
+        )
+        epoch_metrics = {"loss": reported_loss, "lr": float(optimizer.param_groups[0].get("lr", params["learning_rate"]))}
+        if params.get("reported_accuracy_override") is not None:
+            epoch_metrics["accuracy"] = float(params["reported_accuracy_override"])
         context.control_hook.safe_point(
             SafePointType.EPOCH,
             epoch=epoch + 1,
             global_step=global_step,
-            metrics={"loss": last_loss},
+            metrics=epoch_metrics,
             state_factory=lambda epoch=epoch + 1, global_step=global_step: build_checkpoint_state(epoch, 0, global_step),
             steps_per_epoch=int(epoch_runtime_updates["steps_per_epoch"]) if epoch_runtime_updates else None,
             avg_step_time_ms=float(epoch_runtime_updates["avg_step_time_ms"]) if epoch_runtime_updates else None,
@@ -437,7 +455,15 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
         SafePointType.EXPLICIT,
         epoch=min(total_epochs, start_epoch if total_epochs == 0 else total_epochs),
         global_step=global_step,
-        metrics={"loss": last_loss},
+        metrics={
+            "loss": float(params["reported_loss_override"]) if params.get("reported_loss_override") is not None else last_loss,
+            "lr": float(optimizer.param_groups[0].get("lr", params["learning_rate"])),
+            **(
+                {"accuracy": float(params["reported_accuracy_override"])}
+                if params.get("reported_accuracy_override") is not None
+                else {}
+            ),
+        },
         message="final checkpoint",
         state_factory=lambda: build_checkpoint_state(min(total_epochs, total_epochs), 0, global_step),
     )

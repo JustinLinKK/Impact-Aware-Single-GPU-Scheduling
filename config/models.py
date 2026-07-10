@@ -176,6 +176,56 @@ class GpuTelemetrySettings:
 
 
 @dataclass(slots=True)
+class EarlyStopSettings:
+    enabled: bool = True
+    warmup_samples: int = 5
+    patience_samples: int = 5
+    min_delta: float = 1e-4
+    min_runtime_seconds: float = 60.0
+    min_global_step: int = 10
+    metric_key: str | None = None
+    direction: str = "auto"
+    plot_enabled: bool = True
+
+    def __post_init__(self) -> None:
+        self.enabled = bool(self.enabled)
+        self.plot_enabled = bool(self.plot_enabled)
+        self.warmup_samples = max(0, int(self.warmup_samples or 0))
+        self.patience_samples = max(1, int(self.patience_samples or 1))
+        self.min_global_step = max(0, int(self.min_global_step or 0))
+        try:
+            self.min_delta = max(0.0, float(self.min_delta))
+        except (TypeError, ValueError):
+            self.min_delta = 1e-4
+        try:
+            self.min_runtime_seconds = max(0.0, float(self.min_runtime_seconds))
+        except (TypeError, ValueError):
+            self.min_runtime_seconds = 60.0
+        self.metric_key = str(self.metric_key).strip() if self.metric_key else None
+        normalized_direction = str(self.direction or "auto").strip().lower()
+        if normalized_direction not in {"auto", "maximize", "minimize"}:
+            normalized_direction = "auto"
+        self.direction = normalized_direction
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "EarlyStopSettings":
+        return cls(**(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "warmup_samples": self.warmup_samples,
+            "patience_samples": self.patience_samples,
+            "min_delta": self.min_delta,
+            "min_runtime_seconds": self.min_runtime_seconds,
+            "min_global_step": self.min_global_step,
+            "metric_key": self.metric_key,
+            "direction": self.direction,
+            "plot_enabled": self.plot_enabled,
+        }
+
+
+@dataclass(slots=True)
 class MPSSettings:
     enabled: bool = True
     compute_mode: str = "EXCLUSIVE_PROCESS"
@@ -595,6 +645,7 @@ class GpuSchedulerSettings:
     memory: GpuMemorySettings = field(default_factory=GpuMemorySettings)
     thresholds: GpuThresholdSettings = field(default_factory=GpuThresholdSettings)
     telemetry: GpuTelemetrySettings = field(default_factory=GpuTelemetrySettings)
+    early_stop: EarlyStopSettings = field(default_factory=EarlyStopSettings)
     auto_pack: AutoPackSettings = field(default_factory=AutoPackSettings)
     parallel_optimizer: ParallelOptimizerSettings = field(default_factory=ParallelOptimizerSettings)
     submission_defaults: SchedulerSubmissionDefaults = field(default_factory=SchedulerSubmissionDefaults)
@@ -671,6 +722,10 @@ class GpuSchedulerSettings:
             self.telemetry = GpuTelemetrySettings()
         if isinstance(self.telemetry, dict):
             self.telemetry = GpuTelemetrySettings.from_dict(self.telemetry)
+        if self.early_stop is None:
+            self.early_stop = EarlyStopSettings()
+        if isinstance(self.early_stop, dict):
+            self.early_stop = EarlyStopSettings.from_dict(self.early_stop)
         if self.auto_pack is None:
             self.auto_pack = AutoPackSettings()
         if isinstance(self.auto_pack, dict):
@@ -751,6 +806,7 @@ class GpuSchedulerSettings:
             "memory": self.memory.to_dict(),
             "thresholds": self.thresholds.to_dict(),
             "telemetry": self.telemetry.to_dict(),
+            "early_stop": self.early_stop.to_dict(),
             "auto_pack": self.auto_pack.to_dict(),
             "parallel_optimizer": self.parallel_optimizer.to_dict(),
             "submission_defaults": self.submission_defaults.to_dict(),
@@ -782,6 +838,7 @@ class SchedulerConfig:
     log_db: LogDBSettings | dict[str, Any] = field(default_factory=LogDBSettings)
     python_executable: str = field(default_factory=lambda: sys.executable)
     sqlite_busy_timeout_ms: int = 10_000
+    scheduler_session_id: str | None = None
 
     db_dir: Path = field(init=False)
     db_path: Path = field(init=False)
@@ -899,6 +956,7 @@ class SchedulerConfig:
             "log_db": self.log_db.to_dict(),
             "python_executable": self.python_executable,
             "sqlite_busy_timeout_ms": self.sqlite_busy_timeout_ms,
+            "scheduler_session_id": self.scheduler_session_id,
         }
 
 

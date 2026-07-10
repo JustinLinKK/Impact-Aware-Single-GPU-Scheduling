@@ -14,6 +14,7 @@ from ..domain import (
     CombinationProfile,
     CommandType,
     JobCommand,
+    JobMetricSample,
     JobStatus,
     PairProfile,
     RuntimeProfile,
@@ -280,6 +281,79 @@ class SQLiteStateStore:
             return str(row["checkpoint_path"])
         job = self.get_job(job_id)
         return job.latest_checkpoint_path if job else None
+
+    def record_job_metric_sample(
+        self,
+        *,
+        job_id: str,
+        created_at: str,
+        epoch: int,
+        global_step: int,
+        avg_step_time_ms: float | None = None,
+        estimated_total_runtime_seconds: float | None = None,
+        remaining_runtime_seconds: float | None = None,
+        metrics: dict[str, Any] | None = None,
+    ) -> JobMetricSample:
+        numeric_metrics: dict[str, float] = {}
+        for key, value in dict(metrics or {}).items():
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                numeric_metrics[str(key)] = float(value)
+                continue
+            try:
+                numeric_metrics[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO job_metric_samples(
+                    job_id, created_at, epoch, global_step, avg_step_time_ms,
+                    estimated_total_runtime_seconds, remaining_runtime_seconds, metrics_json
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    created_at,
+                    int(epoch or 0),
+                    int(global_step or 0),
+                    avg_step_time_ms,
+                    estimated_total_runtime_seconds,
+                    remaining_runtime_seconds,
+                    json.dumps(numeric_metrics, sort_keys=True),
+                ),
+            )
+            connection.commit()
+            sample_id = int(cursor.lastrowid)
+        return JobMetricSample(
+            sample_id=sample_id,
+            job_id=job_id,
+            created_at=created_at,
+            epoch=int(epoch or 0),
+            global_step=int(global_step or 0),
+            avg_step_time_ms=avg_step_time_ms,
+            estimated_total_runtime_seconds=estimated_total_runtime_seconds,
+            remaining_runtime_seconds=remaining_runtime_seconds,
+            metrics=numeric_metrics,
+        )
+
+    def list_job_metric_samples(self, job_id: str, *, limit: int | None = None) -> list[JobMetricSample]:
+        query = """
+            SELECT sample_id, job_id, created_at, epoch, global_step, avg_step_time_ms,
+                   estimated_total_runtime_seconds, remaining_runtime_seconds, metrics_json
+            FROM job_metric_samples
+            WHERE job_id = ?
+            ORDER BY created_at ASC, sample_id ASC
+        """
+        params: list[Any] = [job_id]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [JobMetricSample.from_row(dict(row)) for row in rows]
 
     def update_cache_metadata(
         self,

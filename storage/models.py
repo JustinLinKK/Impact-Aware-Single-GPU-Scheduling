@@ -45,6 +45,19 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS job_metric_samples (
+        sample_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        epoch INTEGER,
+        global_step INTEGER,
+        avg_step_time_ms REAL,
+        estimated_total_runtime_seconds REAL,
+        remaining_runtime_seconds REAL,
+        metrics_json TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS cache_entries (
         model_id TEXT PRIMARY KEY,
         baseline_model_path TEXT NOT NULL,
@@ -188,6 +201,10 @@ SCHEMA_STATEMENTS = [
     """
     CREATE INDEX IF NOT EXISTS idx_checkpoints_job_created
     ON checkpoints(job_id, created_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_job_metric_samples_job_created
+    ON job_metric_samples(job_id, created_at, sample_id)
     """,
     """
     CREATE INDEX IF NOT EXISTS idx_solo_profiles_family

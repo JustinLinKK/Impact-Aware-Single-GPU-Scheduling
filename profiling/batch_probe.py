@@ -27,6 +27,26 @@ from ..config import SCHEDULER_MODE_PARALLEL_AUTO_PACK, SCHEDULER_MODE_SERIAL_BA
 
 logger = logging.getLogger("localml_scheduler")
 
+MEMORY_PROBE_FAILURE_KINDS = {"oom"}
+NON_MEMORY_PROBE_FAILURE_KINDS = {
+    "syntax_error",
+    "import_error",
+    "invalid_model",
+    "dtype_error",
+    "timeout",
+    "script_exception",
+    "unknown",
+}
+
+
+class BatchProbeNonMemoryFailure(RuntimeError):
+    def __init__(self, attempt: "ProbeAttempt", *, probe_key: str):
+        self.attempt = attempt
+        self.failure_kind = attempt.result.failure_kind or "unknown"
+        self.probe_key = probe_key
+        detail = attempt.result.message or f"batch size {attempt.batch_size} failed"
+        super().__init__(f"{self.failure_kind}: {detail}")
+
 
 @dataclass(slots=True)
 class BatchProbeKeyInfo:
@@ -53,9 +73,21 @@ def _message_indicates_oom(message: str | None) -> bool:
 def _failure_due_to_memory(attempt: ProbeAttempt | None) -> bool:
     if attempt is None:
         return False
+    failure_kind = attempt.result.failure_kind
+    if failure_kind in MEMORY_PROBE_FAILURE_KINDS:
+        return True
+    if failure_kind in NON_MEMORY_PROBE_FAILURE_KINDS:
+        return False
     if not attempt.within_budget:
         return True
     return _message_indicates_oom(attempt.result.message)
+
+
+def _should_fail_fast(attempt: ProbeAttempt | None) -> bool:
+    if attempt is None:
+        return False
+    failure_kind = attempt.result.failure_kind
+    return bool(failure_kind and failure_kind not in MEMORY_PROBE_FAILURE_KINDS)
 
 
 def _probe_warning_details(
@@ -220,6 +252,10 @@ def _run_trial(
             "memory_total_mb": result.memory_total_mb,
             "target_budget_mb": effective_budget_mb,
             "message": result.message,
+            "failure_kind": result.failure_kind,
+            "returncode": result.returncode,
+            "stdout_excerpt": result.stdout_excerpt,
+            "stderr_excerpt": result.stderr_excerpt,
         },
     )
     message = (result.message or "").strip().replace("\n", " ")
@@ -365,6 +401,10 @@ def _run_probe_controller(context: RunnerContext, key_info: BatchProbeKeyInfo) -
                     "fits": attempt.result.fits,
                     "within_budget": attempt.within_budget,
                     "message": attempt.result.message,
+                    "failure_kind": attempt.result.failure_kind,
+                    "returncode": attempt.result.returncode,
+                    "stdout_excerpt": attempt.result.stdout_excerpt,
+                    "stderr_excerpt": attempt.result.stderr_excerpt,
                 },
             )
         )
@@ -383,6 +423,21 @@ def _run_probe_controller(context: RunnerContext, key_info: BatchProbeKeyInfo) -
             stop_reason = "initial_success"
             break
         failure = attempt
+        if _should_fail_fast(attempt):
+            context.event_logger.emit(
+                "batch_probe_preflight_failed",
+                job_id=context.job.job_id,
+                payload={
+                    "probe_key": key_info.probe_key,
+                    "batch_size": attempt.batch_size,
+                    "failure_kind": attempt.result.failure_kind,
+                    "message": attempt.result.message,
+                    "returncode": attempt.result.returncode,
+                    "stdout_excerpt": attempt.result.stdout_excerpt,
+                    "stderr_excerpt": attempt.result.stderr_excerpt,
+                },
+            )
+            raise BatchProbeNonMemoryFailure(attempt, probe_key=key_info.probe_key)
         if current_batch_size <= min_batch_size:
             reason = attempt.result.message or f"batch size {current_batch_size} did not fit"
             raise RuntimeError(f"batch probe could not find a feasible batch size: {reason}")
@@ -406,6 +461,21 @@ def _run_probe_controller(context: RunnerContext, key_info: BatchProbeKeyInfo) -
             continue
         high = attempt.batch_size
         failure = attempt
+        if _should_fail_fast(attempt):
+            context.event_logger.emit(
+                "batch_probe_preflight_failed",
+                job_id=context.job.job_id,
+                payload={
+                    "probe_key": key_info.probe_key,
+                    "batch_size": attempt.batch_size,
+                    "failure_kind": attempt.result.failure_kind,
+                    "message": attempt.result.message,
+                    "returncode": attempt.result.returncode,
+                    "stdout_excerpt": attempt.result.stdout_excerpt,
+                    "stderr_excerpt": attempt.result.stderr_excerpt,
+                },
+            )
+            raise BatchProbeNonMemoryFailure(attempt, probe_key=key_info.probe_key)
         search_method = "power_of_two_boundary"
         stop_reason = "failure_boundary"
         break
@@ -636,10 +706,44 @@ def run_batch_probe_preflight(context: RunnerContext) -> TrainingJob:
     try:
         profile = _run_probe_controller(context, key_info)
     except Exception as exc:
+        failure_kind = getattr(exc, "failure_kind", None)
+        attempt = getattr(exc, "attempt", None)
+        failure_payload = {
+            "probe_key": key_info.probe_key,
+            "device_type": key_info.device_type,
+            "reason": str(exc),
+            "failure_kind": failure_kind,
+        }
+        if attempt is not None:
+            failure_payload.update(
+                {
+                    "batch_size": attempt.batch_size,
+                    "returncode": attempt.result.returncode,
+                    "stdout_excerpt": attempt.result.stdout_excerpt,
+                    "stderr_excerpt": attempt.result.stderr_excerpt,
+                }
+            )
+        job = context.store.get_job(context.job.job_id) or context.job
+        metadata_updates = {
+            "scheduler_probe_failure_kind": failure_kind,
+            "scheduler_probe_failure_reason": str(exc),
+        }
+        if attempt is not None:
+            metadata_updates.update(
+                {
+                    "scheduler_probe_returncode": attempt.result.returncode,
+                    "scheduler_probe_stdout_excerpt": attempt.result.stdout_excerpt,
+                    "scheduler_probe_stderr_excerpt": attempt.result.stderr_excerpt,
+                }
+            )
+        context.store.update_job(
+            job.job_id,
+            metadata_updates={key: value for key, value in metadata_updates.items() if value is not None},
+        )
         context.event_logger.emit(
             "batch_probe_failed",
             job_id=context.job.job_id,
-            payload={"probe_key": key_info.probe_key, "device_type": key_info.device_type, "reason": str(exc)},
+            payload=failure_payload,
         )
         logger.error(
             "[batch_probe] job=%s failed probe_key=%s device=%s reason=%s",

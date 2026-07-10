@@ -22,6 +22,10 @@ class CancelRequested(RuntimeError):
     """Raised inside a worker when the scheduler requested cancellation."""
 
 
+class EarlyStopRequested(RuntimeError):
+    """Raised inside a worker when the scheduler stopped an unpromising run."""
+
+
 @dataclass(slots=True)
 class ControlCommand:
     action: str = "none"
@@ -82,6 +86,12 @@ class ControlPlane:
         _atomic_json_dump(
             self.settings.job_command_path(job_id),
             ControlCommand(action="cancel", requested_at=utc_now(), reason=reason, hold=True).to_dict(),
+        )
+
+    def request_early_stop(self, job_id: str, *, reason: str) -> None:
+        _atomic_json_dump(
+            self.settings.job_command_path(job_id),
+            ControlCommand(action="early_stop", requested_at=utc_now(), reason=reason, hold=True).to_dict(),
         )
 
     def write_heartbeat(self, snapshot: ProgressSnapshot) -> None:
@@ -163,6 +173,17 @@ class TrainingControlHook:
             if avg_step_time_ms is not None:
                 metadata_updates["runtime_avg_step_time_ms"] = float(avg_step_time_ms)
         self.store.update_job(self.job.job_id, last_heartbeat_at=snapshot.heartbeat_at, metadata_updates=metadata_updates)
+        if hasattr(self.store, "record_job_metric_sample"):
+            self.store.record_job_metric_sample(
+                job_id=self.job.job_id,
+                created_at=snapshot.heartbeat_at,
+                epoch=epoch,
+                global_step=global_step,
+                avg_step_time_ms=avg_step_time_ms,
+                estimated_total_runtime_seconds=estimated_total_runtime_seconds,
+                remaining_runtime_seconds=remaining_runtime_seconds,
+                metrics=snapshot.metrics,
+            )
         if getattr(self.event_logger, "log_store", None) is not None:
             self.event_logger.log_store.record_job_metric_sample(
                 job_id=self.job.job_id,
@@ -177,7 +198,12 @@ class TrainingControlHook:
 
         pause_requested = command.action == "pause"
         cancel_requested = command.action == "cancel"
-        should_checkpoint = pause_requested or self._should_checkpoint(safe_point_type, epoch=epoch, global_step=global_step)
+        early_stop_requested = command.action == "early_stop"
+        should_checkpoint = (
+            pause_requested
+            or (early_stop_requested and state_factory is not None)
+            or self._should_checkpoint(safe_point_type, epoch=epoch, global_step=global_step)
+        )
         checkpoint_path: str | None = None
 
         if should_checkpoint:
@@ -224,3 +250,34 @@ class TrainingControlHook:
                 payload={"epoch": epoch, "global_step": global_step},
             )
             raise CancelRequested(command.reason or "cancel requested")
+
+        if early_stop_requested:
+            self.control_plane.clear_command(self.job.job_id)
+            stopped_at = utc_now()
+            self.store.update_job(
+                self.job.job_id,
+                status=JobStatus.EARLY_STOPPED,
+                reason=command.reason or "early stop requested",
+                hold=True,
+                latest_checkpoint_path=checkpoint_path,
+                metadata_updates={
+                    "scheduler_early_stop_pending": False,
+                    "scheduler_early_stop_completed_at": stopped_at,
+                    "scheduler_early_stop_checkpoint_path": checkpoint_path,
+                    "scheduler_early_stop_epoch": epoch,
+                    "scheduler_early_stop_global_step": global_step,
+                    "scheduler_early_stop_metrics": snapshot.metrics,
+                },
+            )
+            self.event_logger.emit(
+                "job_early_stopped",
+                job_id=self.job.job_id,
+                payload={
+                    "checkpoint_path": checkpoint_path,
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "metrics": snapshot.metrics,
+                    "reason": command.reason,
+                },
+            )
+            raise EarlyStopRequested(command.reason or "early stop requested")

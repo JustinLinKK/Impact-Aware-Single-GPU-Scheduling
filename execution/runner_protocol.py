@@ -107,6 +107,10 @@ class RunnerContext:
         observations: int,
         metadata: dict[str, Any] | None = None,
     ):
+        profile_metadata = dict(metadata or {})
+        if self.job.metadata.get("scheduler_session_id") is not None:
+            profile_metadata.setdefault("scheduler_session_id", self.job.metadata.get("scheduler_session_id"))
+        profile_metadata.setdefault("success", True)
         profile = build_runtime_profile(
             self.job,
             hardware_key=self.store.hardware_key(),
@@ -120,7 +124,7 @@ class RunnerContext:
             confidence=confidence,
             source=source,
             observations=observations,
-            metadata=metadata,
+            metadata=profile_metadata,
         )
         stored = self.store.upsert_runtime_profile(profile)
         self.event_logger.emit(

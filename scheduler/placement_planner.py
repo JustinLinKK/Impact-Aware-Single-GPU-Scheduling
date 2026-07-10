@@ -212,6 +212,7 @@ class PlacementPlanner:
         best_group: EvaluatedGroup | None = None
         packed_backend_unavailable = False
         missing_memory_estimate = False
+        missing_runtime_profile = False
         incompatible_group = False
         for group in self.candidate_generator.candidate_groups(ordered, scheduler_mode=scheduler_mode):
             configured_backends = [
@@ -240,6 +241,28 @@ class PlacementPlanner:
                         rejection_reason="no backend candidate allowed by packing policy or availability",
                     )
                 )
+                continue
+            profile_ready_backends: list[str] = []
+            for backend_name in available_backends:
+                if backend_name == "exclusive":
+                    profile_ready_backends.append(backend_name)
+                    continue
+                missing_profiles = self.compatibility.missing_runtime_profile_jobs(group, backend_name=backend_name)
+                if not missing_profiles:
+                    profile_ready_backends.append(backend_name)
+                    continue
+                missing_runtime_profile = True
+                trace["candidates"].append(
+                    self._candidate_trace(
+                        group,
+                        backend_name=backend_name,
+                        status="rejected",
+                        rejection_reason="packing runtime profile missing",
+                    )
+                    | {"missing_runtime_profile_job_ids": [job.job_id for job in missing_profiles]}
+                )
+            available_backends = profile_ready_backends
+            if not available_backends:
                 continue
             viable_backends = [
                 backend_name
@@ -301,6 +324,8 @@ class PlacementPlanner:
                     if scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK
                     else "solo profile or VRAM estimate unavailable"
                 )
+            elif missing_runtime_profile:
+                reason = "packing runtime profile missing; dispatching exclusive calibration probe"
             elif incompatible_group:
                 reason = "no compatible packed group"
             plan = DispatchPlan(mode="exclusive", backend_name="exclusive", job_ids=(primary.job_id,), reason=reason)
@@ -315,6 +340,12 @@ class PlacementPlanner:
                 and best_group.backend_name == "exclusive"
             ):
                 plan_reason = "VRAM estimate unavailable; dispatching exclusive calibration probe"
+            elif (
+                scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK
+                and missing_runtime_profile
+                and best_group.backend_name == "exclusive"
+            ):
+                plan_reason = "packing runtime profile missing; dispatching exclusive calibration probe"
             plan = DispatchPlan(
                 mode="exclusive",
                 backend_name=best_group.backend_name,

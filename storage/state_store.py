@@ -187,6 +187,12 @@ class StateStore:
     def record_checkpoint(self, *args: Any, **kwargs: Any) -> Any:
         return self._call_with_graph_cache_invalidation("record_checkpoint", *args, **kwargs)
 
+    def record_job_metric_sample(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call_with_graph_cache_invalidation("record_job_metric_sample", *args, **kwargs)
+
+    def list_job_metric_samples(self, *args: Any, **kwargs: Any) -> Any:
+        return getattr(self._backend, "list_job_metric_samples")(*args, **kwargs)
+
     def update_cache_metadata(self, *args: Any, **kwargs: Any) -> Any:
         return self._call_with_graph_cache_invalidation("update_cache_metadata", *args, **kwargs)
 

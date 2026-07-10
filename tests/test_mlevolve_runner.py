@@ -78,6 +78,53 @@ class MLEvolveRunnerTest(unittest.TestCase):
             self.assertEqual(result["batch_size_override"], 9)
             self.assertEqual((working_dir / "batch_size.txt").read_text(encoding="utf-8"), "9")
 
+    def test_run_script_job_records_phase_timing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            working_dir = Path(tmpdir) / "workspace"
+            working_dir.mkdir(parents=True, exist_ok=True)
+            script_path = working_dir / "candidate.py"
+            script_path.write_text(
+                "\n".join(
+                    [
+                        "import time",
+                        "def train_model():",
+                        "    for epoch in range(2):",
+                        "        time.sleep(0.01)",
+                        "def generate_submission():",
+                        "    time.sleep(0.01)",
+                        "train_model()",
+                        "generate_submission()",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            result_path = working_dir / "result.json"
+            settings = SchedulerSettings(runtime_root=runtime_root)
+            job = TrainingJob.create(
+                runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                baseline_model_id="script",
+                baseline_model_path=str(script_path),
+                runner_kwargs={
+                    "script_path": str(script_path),
+                    "working_dir": str(working_dir),
+                    "result_path": str(result_path),
+                    "timeout": 30,
+                },
+                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
+                metadata={"placement_backend": "exclusive"},
+            )
+            context = _build_context(settings, job)
+
+            result = run_mlevolve_script_job(context)
+
+            self.assertEqual(result["candidate_returncode"], 0)
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertTrue(payload["instrumentation"]["phase_instrumented"])
+            durations = payload["phase_timings"]["phase_durations_seconds"]
+            self.assertGreater(durations["training"], 0)
+            self.assertGreater(durations["inference"], 0)
+
     def test_probe_script_job_runs_successfully_with_batch_rewrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir) / "runtime"
@@ -90,6 +137,49 @@ class MLEvolveRunnerTest(unittest.TestCase):
                         "import time",
                         "batch_size = 2",
                         "time.sleep(1)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            settings = SchedulerSettings(runtime_root=runtime_root)
+            job = TrainingJob.create(
+                runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                baseline_model_id="script",
+                baseline_model_path=str(script_path),
+                runner_kwargs={
+                    "script_path": str(script_path),
+                    "working_dir": str(working_dir),
+                    "result_path": str(working_dir / "result.json"),
+                    "timeout": 30,
+                    "probe_timeout_seconds": 5,
+                    "probe_poll_interval_seconds": 0.2,
+                },
+                batch_probe=BatchProbeSpec(
+                    enabled=True,
+                    probe_target="localml_scheduler.adapters.mlevolve_runner:probe_mlevolve_script_job",
+                ),
+                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
+                metadata={"placement_backend": "exclusive"},
+            )
+            context = _build_context(settings, job)
+
+            result = probe_mlevolve_script_job(context, batch_size=5, warmup_steps=1, measure_steps=1)
+
+            self.assertTrue(result.fits)
+            self.assertIn("probe", result.message or "")
+
+    def test_probe_script_job_classifies_timeout_as_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            working_dir = Path(tmpdir) / "workspace"
+            working_dir.mkdir(parents=True, exist_ok=True)
+            script_path = working_dir / "candidate.py"
+            script_path.write_text(
+                "\n".join(
+                    [
+                        "import time",
+                        "batch_size = 2",
+                        "time.sleep(3)",
                     ]
                 ),
                 encoding="utf-8",
@@ -118,8 +208,9 @@ class MLEvolveRunnerTest(unittest.TestCase):
 
             result = probe_mlevolve_script_job(context, batch_size=5, warmup_steps=1, measure_steps=1)
 
-            self.assertTrue(result.fits)
-            self.assertIn("probe", result.message or "")
+            self.assertFalse(result.fits)
+            self.assertEqual(result.failure_kind, "timeout")
+            self.assertIn("timed out", result.message or "")
 
     def test_probe_script_job_limits_epochs_and_batches(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -13,6 +13,7 @@ from ..execution.control import ControlPlane
 from ..execution.executor import SubprocessExecutor, WorkerProcessHandle
 from ..domain import JobStatus, PlacementDecision, TrainingJob
 from ..config import SchedulerSettings, SCHEDULER_MODE_PARALLEL_AUTO_PACK, effective_scheduler_mode
+from ..execution.process_utils import terminate_process_tree
 from ..storage.state_store import StateStore
 
 
@@ -292,7 +293,7 @@ class WorkerSupervisor:
             for job_id, worker in list(group.workers.items()):
                 if worker.handle.monitor_via_store:
                     job = self.store.get_job(job_id)
-                    if job is None or job.status not in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.PAUSED}:
+                    if job is None or job.status not in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.EARLY_STOPPED, JobStatus.PAUSED}:
                         continue
                     snapshots.append(
                         WorkerSnapshot(
@@ -341,6 +342,12 @@ class WorkerSupervisor:
         self.control_plane.request_cancel(job_id, reason=reason)
         return True
 
+    def request_early_stop(self, job_id: str, *, reason: str) -> bool:
+        if job_id not in self.active_job_ids():
+            return False
+        self.control_plane.request_early_stop(job_id, reason=reason)
+        return True
+
     def request_fallback_pause(self, job_id: str, *, reason: str) -> bool:
         for group in self._groups.values():
             if job_id not in group.workers:
@@ -357,12 +364,7 @@ class WorkerSupervisor:
                 if process.pid in seen_processes or process.poll() is not None:
                     continue
                 seen_processes.add(process.pid)
-                process.terminate()
-                try:
-                    process.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+                terminate_process_tree(process, timeout=2.0)
         self._groups = {}
 
     def _refresh_group_shape(self, group_id: str) -> None:

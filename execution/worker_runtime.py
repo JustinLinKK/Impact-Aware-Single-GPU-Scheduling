@@ -113,7 +113,7 @@ def mark_job_completed(
     current = store.get_job(job_id)
     if current is None:
         return 1
-    if current.status in {JobStatus.PAUSED, JobStatus.CANCELLED, JobStatus.FAILED}:
+    if current.status in {JobStatus.PAUSED, JobStatus.CANCELLED, JobStatus.EARLY_STOPPED, JobStatus.FAILED}:
         return 0
     store.set_job_status(job_id, JobStatus.COMPLETED, reason=(result or {}).get("reason"), hold=False)
     payload = dict(result or {})

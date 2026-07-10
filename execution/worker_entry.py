@@ -10,7 +10,7 @@ from ..profiling.batch_probe import run_batch_probe_preflight
 from ..config import SchedulerSettings
 from ..storage.log_store import SchedulerLogStore
 from ..storage.state_store import StateStore
-from .control import CancelRequested, PauseRequested
+from .control import CancelRequested, EarlyStopRequested, PauseRequested
 from .worker_runtime import create_runner_context, load_runtime_settings, mark_job_completed, mark_job_failed, mark_job_started, resolve_runner
 
 
@@ -32,6 +32,9 @@ def _run_job(runtime_root: str, job_id: str) -> int:
         return 0
     except CancelRequested:
         logger.info("Job %s cancelled cleanly at a safe point", job_id)
+        return 0
+    except EarlyStopRequested:
+        logger.info("Job %s early-stopped cleanly at a safe point", job_id)
         return 0
     except Exception as exc:
         return mark_job_failed(settings, store, event_logger, job_id, exc, backend_name="exclusive")

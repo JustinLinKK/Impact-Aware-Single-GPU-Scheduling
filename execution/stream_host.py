@@ -12,7 +12,7 @@ from ..observability.logging_utils import setup_scheduler_logger
 from ..config import SchedulerSettings
 from ..storage.log_store import SchedulerLogStore
 from ..storage.state_store import StateStore
-from .control import CancelRequested, PauseRequested
+from .control import CancelRequested, EarlyStopRequested, PauseRequested
 from .worker_runtime import create_runner_context, load_runtime_settings, mark_job_completed, mark_job_failed, mark_job_started, resolve_runner
 
 
@@ -41,6 +41,10 @@ def _run_job_in_thread(settings: SchedulerSettings, store: StateStore, event_log
         return
     except CancelRequested:
         logger.info("Job %s cancelled cleanly in stream host", job_id)
+        results[job_id] = 0
+        return
+    except EarlyStopRequested:
+        logger.info("Job %s early-stopped cleanly in stream host", job_id)
         results[job_id] = 0
         return
     except Exception as exc:

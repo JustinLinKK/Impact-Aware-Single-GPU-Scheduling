@@ -19,6 +19,7 @@ class JobStatus(str, Enum):
     RUNNING = "RUNNING"
     PAUSING = "PAUSING"
     PAUSED = "PAUSED"
+    EARLY_STOPPED = "EARLY_STOPPED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
@@ -26,7 +27,7 @@ class JobStatus(str, Enum):
 
     @property
     def is_terminal(self) -> bool:
-        return self in {self.COMPLETED, self.FAILED, self.CANCELLED}
+        return self in {self.EARLY_STOPPED, self.COMPLETED, self.FAILED, self.CANCELLED}
 
 
 class SafePointType(str, Enum):

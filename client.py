@@ -130,14 +130,19 @@ class SchedulerClient:
     CLI/code callers and MCP callers share the same response shapes.
     """
 
-    def __init__(self, settings: SchedulerConfig | None = None):
+    def __init__(self, settings: SchedulerConfig | None = None, *, hardware_knowledge_client: Any | None = None):
         self.settings = settings or SchedulerConfig()
         self.store = StateStore(self.settings)
         self.knowledge = SchedulerKnowledgeBase(self.store)
+        self.hardware_knowledge_client = hardware_knowledge_client
         self._hardware_feature_store = None
         self._hardware_knowledge_store = None
         self._code_knowledge_store = None
         self._hardware_neighborhood_cache = RedisLRUCache.from_settings(self.settings) if graph_cache_enabled(self.settings) else None
+
+    def _knowledge_delegate(self) -> Any | None:
+        delegate = getattr(self, "hardware_knowledge_client", None)
+        return delegate if delegate is not None and delegate is not self else None
 
     def create_engine(self):
         from .engine import SchedulerEngine
@@ -273,6 +278,9 @@ class SchedulerClient:
     def list_events(self, *, job_id: str | None = None, event_type: str | None = None) -> list[dict[str, Any]]:
         return self.store.list_events(job_id=job_id, event_type=event_type)
 
+    def list_job_metric_samples(self, job_id: str, *, limit: int | None = None):
+        return self.store.list_job_metric_samples(job_id, limit=limit)
+
     def get_solo_profile(self, signature: str) -> SoloProfile | None:
         return self.store.get_solo_profile(signature)
 
@@ -325,9 +333,16 @@ class SchedulerClient:
         return self.knowledge.get_job_graph_context(job_id)
 
     def search_hardware(self, **kwargs: Any) -> list[dict[str, Any]]:
+        if (delegate := self._knowledge_delegate()) is not None:
+            return delegate.search_hardware(**kwargs)
         return _sanitize_agent_response(self.knowledge.search_hardware(**kwargs))
 
     def get_hardware_context(self, hardware_key: str = "current", include_scheduler_limits: bool = True) -> dict[str, Any]:
+        if (delegate := self._knowledge_delegate()) is not None:
+            return delegate.get_hardware_context(
+                hardware_key=hardware_key,
+                include_scheduler_limits=include_scheduler_limits,
+            )
         result = _sanitize_agent_response(
             self.knowledge.get_hardware_context(
                 hardware_key=hardware_key,
@@ -342,6 +357,8 @@ class SchedulerClient:
         return result
 
     def get_job_design_context(self, candidate: dict[str, Any], limit: int = 5) -> dict[str, Any]:
+        if (delegate := self._knowledge_delegate()) is not None:
+            return delegate.get_job_design_context(candidate=candidate, limit=limit)
         return self.knowledge.get_job_design_context(candidate=candidate, limit=limit)
 
     def search_profiles(self, **kwargs: Any) -> list[dict[str, Any]]:
@@ -934,6 +951,12 @@ class SchedulerClient:
         filter so stage prompts do not need to load the full hardware graph or
         full feature neighborhood into the LLM context.
         """
+        if (delegate := self._knowledge_delegate()) is not None:
+            return delegate.get_stage_hardware_features(
+                hardware_id=hardware_id,
+                pipeline_stage=pipeline_stage,
+                limit=limit,
+            )
         invalid_stages = self._invalid_hardware_stage_names(pipeline_stage)
         if invalid_stages:
             return {
@@ -1000,6 +1023,8 @@ class SchedulerClient:
         limit: int = 256,
     ) -> dict[str, Any]:
         """Return compact feature keys linked to a hardware node without verbose feature details."""
+        if (delegate := self._knowledge_delegate()) is not None:
+            return delegate.get_hardware_feature_index(hardware_id=hardware_id, limit=limit)
         neighborhood = self._load_hardware_neighborhood(hardware_id, limit=limit)
         features = self._feature_index_from_neighborhood(neighborhood)[: max(1, int(limit))]
         return _sanitize_agent_response({
@@ -1020,6 +1045,12 @@ class SchedulerClient:
         limit: int = 64,
     ) -> dict[str, Any]:
         """Return full details only for explicitly selected feature IDs."""
+        if (delegate := self._knowledge_delegate()) is not None:
+            return delegate.get_hardware_feature_details(
+                hardware_id=hardware_id,
+                feature_ids=feature_ids,
+                limit=limit,
+            )
         requested = [str(feature_id).strip() for feature_id in feature_ids if str(feature_id).strip()]
         if not requested:
             return _sanitize_agent_response({
@@ -1066,6 +1097,8 @@ class SchedulerClient:
         })
 
     def get_profile_evidence(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
+        if (delegate := self._knowledge_delegate()) is not None:
+            return delegate.get_profile_evidence(candidate=candidate, limit=limit)
         return self.knowledge.get_profile_evidence(candidate=candidate, limit=limit)
 
     def search_code_knowledge(
@@ -1076,6 +1109,13 @@ class SchedulerClient:
         record_types: list[str] | None = None,
         limit: int = 8,
     ) -> list[dict[str, Any]]:
+        if (delegate := self._knowledge_delegate()) is not None:
+            return delegate.search_code_knowledge(
+                query=query,
+                filters=filters,
+                record_types=record_types,
+                limit=limit,
+            )
         return _sanitize_agent_response(
             self._code_store().search(
                 query=query,
@@ -1142,6 +1182,12 @@ class SchedulerClient:
         graph_context: dict[str, Any] | None = None,
         limit: int = 8,
     ) -> dict[str, Any]:
+        if (delegate := self._knowledge_delegate()) is not None:
+            return delegate.get_code_optimization_context(
+                candidate=candidate,
+                graph_context=graph_context,
+                limit=limit,
+            )
         graph_context = graph_context or self.get_profile_evidence(candidate=candidate, limit=limit)
         if not (graph_context.get("stage_hardware_features") or {}).get("found"):
             pipeline_stages = self._hardware_stages_for_candidate(candidate)
@@ -1191,6 +1237,8 @@ class SchedulerClient:
         })
 
     def get_optimization_context(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
+        if (delegate := self._knowledge_delegate()) is not None:
+            return delegate.get_optimization_context(candidate=candidate, limit=limit)
         graph_context = self.get_profile_evidence(candidate=candidate, limit=limit)
         stage_hardware_features = {}
         pipeline_stages = self._hardware_stages_for_candidate(candidate)
@@ -1361,6 +1409,14 @@ class SchedulerClient:
         limit: int = 8,
     ) -> dict[str, Any]:
         """Rank model-family choices using hardware feature/code knowledge before draft generation."""
+        if (delegate := self._knowledge_delegate()) is not None:
+            return delegate.get_model_design_hardware_context(
+                workload_type=workload_type,
+                task_type=task_type,
+                candidate_families=candidate_families,
+                hardware_key=hardware_key,
+                limit=limit,
+            )
         workload = workload_type or task_type or "mlevolve_training"
         hardware_context = self.get_hardware_context(hardware_key, include_scheduler_limits=True)
         try:
@@ -1474,6 +1530,16 @@ class SchedulerClient:
         framework: str | None = "pytorch",
         limit: int = 8,
     ) -> list[dict[str, Any]]:
+        if (delegate := self._knowledge_delegate()) is not None:
+            return delegate.search_hardware_features(
+                query=query,
+                hardware_key=hardware_key,
+                architecture=architecture,
+                vendor=vendor,
+                workload_type=workload_type,
+                framework=framework,
+                limit=limit,
+            )
         # Compatibility alias for older MCP/tool callers. Runtime hardware
         # feature lookup now uses the static hardware knowledge graph only.
         hardware_context = self.get_hardware_context(hardware_key, include_scheduler_limits=True)
@@ -1502,6 +1568,14 @@ class SchedulerClient:
         framework: str | None = "pytorch",
         limit: int = 8,
     ) -> dict[str, Any]:
+        if (delegate := self._knowledge_delegate()) is not None:
+            return delegate.get_hardware_feature_context(
+                hardware_key=hardware_key,
+                workload_type=workload_type,
+                model_family=model_family,
+                framework=framework,
+                limit=limit,
+            )
         # Deprecated compatibility wrapper. Prefer get_code_optimization_context(...).
         hardware_context = self.get_hardware_context(hardware_key, include_scheduler_limits=True)
         hardware = hardware_context.get("hardware") or {}
@@ -1530,6 +1604,8 @@ class SchedulerClient:
         })
 
     def get_hardware_optimization_context(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
+        if (delegate := self._knowledge_delegate()) is not None:
+            return delegate.get_hardware_optimization_context(candidate=candidate, limit=limit)
         # Deprecated compatibility wrapper. Prefer get_optimization_context(...).
         context = self.get_optimization_context(candidate=candidate, limit=limit)
         job_design_context = self.get_job_design_context(candidate, limit=limit)

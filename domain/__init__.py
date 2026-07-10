@@ -50,7 +50,7 @@ from .profiles import (
     SchedulerReport,
     SoloProfile,
 )
-from .progress import JobProgress, PlacementAssignment, ProgressSnapshot
+from .progress import JobMetricSample, JobProgress, PlacementAssignment, ProgressSnapshot
 
 __all__ = [
     "_to_primitive",
@@ -68,6 +68,7 @@ __all__ = [
     "DispatchResult",
     "JobCommand",
     "JobConfig",
+    "JobMetricSample",
     "JobProgress",
     "JobRun",
     "JobSpec",

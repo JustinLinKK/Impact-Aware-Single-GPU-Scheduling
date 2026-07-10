@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import json
+import subprocess
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from localml_scheduler.client import SchedulerClient
 from localml_scheduler.config import SchedulerConfig
 from localml_scheduler.domain import BatchProbeProfile, BatchResolution, JobRun, RuntimeProfile, TrainingJob
 from localml_scheduler.dto import SubmitJobRequest
 from localml_scheduler.graph_knowledge import SchedulerKnowledgeBase
+from localml_scheduler.hardware_client import HardwareKnowledgeClient
 
 
 class _MemoryCache:
@@ -106,6 +110,88 @@ class _FakeHardwareKnowledgeStore:
                 },
             ],
         }
+
+
+class HardwareKnowledgeClientTest(unittest.TestCase):
+    def test_probe_subprocess_supplies_current_hardware_without_scheduler(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerConfig.from_dict(
+                {
+                    "runtime_root": tmpdir,
+                    "graph_db": {"enabled": False, "mode": "off"},
+                    "hardware_knowledge_graph": {"enabled": False},
+                    "hardware_feature_db": {"enabled": False},
+                }
+            )
+            payload = {
+                "hardware_key": "probe-hw",
+                "os_name": "linux",
+                "gpu_name": "Probe GPU",
+                "total_vram_mb": 32768,
+                "compute_capability": "9.0",
+                "cuda_runtime": "12.4",
+                "torch_version": "2.5.0",
+            }
+
+            with patch(
+                "localml_scheduler.hardware_client.subprocess.run",
+                return_value=subprocess.CompletedProcess(["python"], 0, stdout=json.dumps(payload) + "\n", stderr=""),
+            ) as run_probe:
+                client = HardwareKnowledgeClient(settings, probe_timeout_seconds=3)
+                context = client.get_hardware_context()
+                second = client.get_hardware_context()
+
+            self.assertEqual(run_probe.call_count, 1)
+            self.assertTrue(context["found"])
+            self.assertEqual(context["hardware"]["gpu_name"], "Probe GPU")
+            self.assertEqual(context["hardware_probe_source"], "hardware_probe_subprocess")
+            self.assertTrue(context["hardware_probe_success"])
+            self.assertEqual(second["hardware"]["hardware_key"], "probe-hw")
+            self.assertEqual(context["backend_capabilities"], {})
+            self.assertEqual(context["scheduler_limits"], {})
+
+    def test_probe_failure_is_explicit_and_does_not_start_scheduler(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerConfig.from_dict(
+                {
+                    "runtime_root": tmpdir,
+                    "graph_db": {"enabled": False, "mode": "off"},
+                    "hardware_knowledge_graph": {"enabled": False},
+                    "hardware_feature_db": {"enabled": False},
+                }
+            )
+
+            with patch(
+                "localml_scheduler.hardware_client.subprocess.run",
+                return_value=subprocess.CompletedProcess(["python"], 7, stdout="", stderr="boom"),
+            ):
+                client = HardwareKnowledgeClient(settings, probe_timeout_seconds=3)
+                context = client.get_hardware_context()
+
+            self.assertFalse(context["found"])
+            self.assertEqual(context["source"], "hardware_probe_subprocess")
+            self.assertFalse(context["hardware_probe_success"])
+            self.assertIn("exited with code 7", context["reason"])
+
+    def test_scheduler_client_delegates_knowledge_surface(self) -> None:
+        class FakeHardwareKnowledge:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def get_optimization_context(self, *, candidate, limit):
+                self.calls.append((candidate, limit))
+                return {"hardware_context": {"found": True}, "confidence": 0.5}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            delegate = FakeHardwareKnowledge()
+            scheduler = SchedulerClient(
+                SchedulerConfig.from_dict({"runtime_root": tmpdir, "graph_db": {"enabled": False, "mode": "off"}}),
+                hardware_knowledge_client=delegate,
+            )
+            result = scheduler.get_optimization_context(candidate={"stage": "draft"}, limit=4)
+
+        self.assertEqual(delegate.calls, [({"stage": "draft"}, 4)])
+        self.assertEqual(result["confidence"], 0.5)
 
     def get_feature_details(self, *, hardware_terms, feature_ids, limit):
         self.detail_calls.append((list(hardware_terms), list(feature_ids), limit))

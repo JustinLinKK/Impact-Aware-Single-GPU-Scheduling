@@ -18,7 +18,14 @@ class _FakeStore:
 
 
 class _FakeSchedulerClient:
-    def __init__(self, settings: SchedulerSettings, *, active_service: bool = True, create_probe_profiles: bool = True):
+    def __init__(
+        self,
+        settings: SchedulerSettings,
+        *,
+        active_service: bool = True,
+        create_probe_profiles: bool = True,
+        complete_script_jobs_on_submit: bool = True,
+    ):
         self.settings = settings
         self.store = _FakeStore()
         self.submitted_jobs: list[TrainingJob] = []
@@ -26,8 +33,10 @@ class _FakeSchedulerClient:
         self.batch_probe_profiles: dict[str, BatchProbeProfile] = {}
         self.active_service = active_service
         self.create_probe_profiles = create_probe_profiles
+        self.complete_script_jobs_on_submit = complete_script_jobs_on_submit
         self.create_service_calls = 0
         self.submit_many_calls = 0
+        self.inspect_calls = 0
 
     def submit(self, job: TrainingJob) -> TrainingJob:
         self.submitted_jobs.append(job)
@@ -49,6 +58,14 @@ class _FakeSchedulerClient:
             self._jobs[job.job_id] = job
             return job
 
+        if not self.complete_script_jobs_on_submit:
+            self._jobs[job.job_id] = job
+            return job
+        self.complete_job(job.job_id, job=job)
+        return job
+
+    def complete_job(self, job_id: str, *, job: TrainingJob | None = None) -> TrainingJob:
+        job = job or self._jobs[job_id]
         result_path = Path(job.config.runner_kwargs["result_path"])
         result_path.parent.mkdir(parents=True, exist_ok=True)
         result_path.write_text(
@@ -90,6 +107,7 @@ class _FakeSchedulerClient:
         return self.batch_probe_profiles.get(profile_key)
 
     def inspect(self, job_id: str) -> TrainingJob | None:
+        self.inspect_calls += 1
         return self._jobs.get(job_id)
 
     def cancel(self, job_id: str) -> None:
@@ -229,11 +247,11 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertEqual(submitted.batch_probe.model_key, "safe-family")
             self.assertEqual(submitted.batch_probe.profile_key, profile_key)
             self.assertTrue(submitted.batch_probe.reuse_only)
-            self.assertEqual(submitted.config.runner_kwargs["batch_size"], 4)
-            self.assertEqual(submitted.metadata["resolved_batch_size"], 4)
-            self.assertEqual(submitted.metadata["batch_probe_source"], "model_family_profile")
+            self.assertEqual(submitted.config.runner_kwargs["batch_size"], 6)
+            self.assertNotIn("resolved_batch_size", submitted.metadata)
+            self.assertTrue(submitted.metadata["model_family_profile_available"])
 
-    def test_scheduler_submission_probes_unseen_model_family_before_training(self) -> None:
+    def test_scheduler_submission_defers_unseen_model_family_probe_to_singleton_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir) / "runtime"
             workdir = Path(tmpdir) / "workdir"
@@ -258,15 +276,14 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             )
 
             self.assertIsNone(result.exc_type)
-            self.assertEqual([job.task_type for job in fake_api.submitted_jobs], ["mlevolve_model_family_probe", "mlevolve_script"])
-            probe_job, train_job = fake_api.submitted_jobs
-            self.assertFalse(probe_job.packing.eligible)
-            self.assertEqual(probe_job.packing.backend_allowlist, ["exclusive"])
-            self.assertEqual(train_job.batch_probe.profile_key, probe_job.batch_probe.profile_key)
-            self.assertTrue(train_job.batch_probe.reuse_only)
-            self.assertEqual(train_job.metadata["batch_probe_source"], "model_family_profile")
+            self.assertEqual([job.task_type for job in fake_api.submitted_jobs], ["mlevolve_script"])
+            train_job = fake_api.submitted_jobs[0]
+            self.assertEqual(train_job.batch_probe.model_key, "new-family")
+            self.assertIsNotNone(train_job.batch_probe.profile_key)
+            self.assertFalse(train_job.batch_probe.reuse_only)
+            self.assertFalse(train_job.metadata["model_family_profile_available"])
 
-    def test_scheduler_submission_blocks_training_when_model_family_probe_fails(self) -> None:
+    def test_scheduler_submission_does_not_block_on_unseen_model_family(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir) / "runtime"
             workdir = Path(tmpdir) / "workdir"
@@ -290,9 +307,9 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
                 working_dir=str(workdir),
             )
 
-            self.assertEqual(result.exc_type, "RuntimeError")
-            self.assertIn("model-family probe failed", "".join(result.term_out).lower())
-            self.assertEqual([job.task_type for job in fake_api.submitted_jobs], ["mlevolve_model_family_probe"])
+            self.assertIsNone(result.exc_type)
+            self.assertEqual([job.task_type for job in fake_api.submitted_jobs], ["mlevolve_script"])
+            self.assertFalse(fake_api.submitted_jobs[0].batch_probe.reuse_only)
 
     def test_scheduler_bridge_starts_fallback_service_when_external_service_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -414,6 +431,114 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertTrue(all(job.packing.eligible for job in fake_api.submitted_jobs))
             self.assertTrue(all(job.packing.signature for job in fake_api.submitted_jobs))
             self.assertEqual(getattr(fake_api, "last_tuning_outcome")["recommendation_source"], "scheduler_round")
+
+    def test_submit_scheduler_single_job_returns_before_polling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            workdir = Path(tmpdir) / "workdir"
+            workdir.mkdir(parents=True, exist_ok=True)
+            settings = SchedulerSettings(runtime_root=runtime_root)
+            cfg = SimpleNamespace(
+                start_cpu_id=0,
+                cpu_number=1,
+                exp_id="unit-task",
+                exp_name="unit-exp",
+                experiment=SimpleNamespace(mode="hardware_aware"),
+                agent=SimpleNamespace(search=SimpleNamespace(parallel_search_num=1)),
+            )
+            interpreter = Interpreter(working_dir=workdir, timeout=10, max_parallel_run=1, cfg=cfg)
+            fake_api = _FakeSchedulerClient(settings, complete_script_jobs_on_submit=False)
+            interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
+
+            handles = interpreter.submit_scheduler(
+                [{"code": "batch_size = 2\nprint('stream')\n", "id": "node-stream"}],
+                working_dir=str(workdir),
+                submission_label="stream",
+            )
+
+            self.assertEqual(set(handles), {"node-stream"})
+            self.assertEqual(fake_api.submit_many_calls, 1)
+            self.assertEqual(fake_api.inspect_calls, 0)
+            self.assertEqual(interpreter.scheduler_outstanding_count(), 1)
+            self.assertEqual(interpreter.collect_scheduler(handles, wait=False), {})
+
+            fake_api.complete_job(handles["node-stream"].job_id)
+            results = interpreter.collect_scheduler(handles, wait=False)
+
+            self.assertEqual(set(results), {"node-stream"})
+            self.assertIsNone(results["node-stream"].exc_type)
+            self.assertEqual(interpreter.scheduler_outstanding_count(), 0)
+
+    def test_submit_scheduler_list_uses_same_pending_packet_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            workdir = Path(tmpdir) / "workdir"
+            workdir.mkdir(parents=True, exist_ok=True)
+            settings = SchedulerSettings(runtime_root=runtime_root)
+            cfg = SimpleNamespace(
+                start_cpu_id=0,
+                cpu_number=2,
+                exp_id="unit-task",
+                exp_name="unit-exp",
+                experiment=SimpleNamespace(mode="hardware_aware"),
+                agent=SimpleNamespace(search=SimpleNamespace(parallel_search_num=2)),
+            )
+            interpreter = Interpreter(working_dir=workdir, timeout=10, max_parallel_run=2, cfg=cfg)
+            fake_api = _FakeSchedulerClient(settings, complete_script_jobs_on_submit=False)
+            interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
+
+            handles = interpreter.submit_scheduler(
+                [
+                    ("batch_size = 2\nprint('a')\n", "node-a"),
+                    ("batch_size = 4\nprint('b')\n", "node-b"),
+                ],
+                working_dir=str(workdir),
+                submission_label="stream",
+            )
+
+            self.assertEqual(set(handles), {"node-a", "node-b"})
+            self.assertEqual(fake_api.submit_many_calls, 1)
+            self.assertEqual(len(fake_api.submitted_jobs), 2)
+            self.assertEqual(interpreter.scheduler_outstanding_count(), 2)
+            self.assertEqual(
+                {job.metadata["mlevolve_node_id"] for job in fake_api.submitted_jobs},
+                {"node-a", "node-b"},
+            )
+
+    def test_submit_scheduler_unseen_family_is_collectable_with_job_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            workdir = Path(tmpdir) / "workdir"
+            workdir.mkdir(parents=True, exist_ok=True)
+            settings = SchedulerSettings(runtime_root=runtime_root, gpu_scheduler={"model_family_probe_timeout_seconds": 1})
+            cfg = SimpleNamespace(
+                start_cpu_id=0,
+                cpu_number=1,
+                exp_id="unit-task",
+                exp_name="unit-exp",
+                experiment=SimpleNamespace(mode="hardware_aware"),
+                agent=SimpleNamespace(search=SimpleNamespace(parallel_search_num=1)),
+            )
+            interpreter = Interpreter(working_dir=workdir, timeout=10, max_parallel_run=1, cfg=cfg)
+            fake_api = _FakeSchedulerClient(settings, create_probe_profiles=False)
+            interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
+
+            handles = interpreter.submit_scheduler(
+                [{"code": "MODEL_FAMILY = 'blocked-family'\nbatch_size = 4\nprint('blocked')\n", "id": "node-blocked"}],
+                working_dir=str(workdir),
+                submission_label="stream",
+            )
+
+            self.assertEqual(set(handles), {"node-blocked"})
+            self.assertIsNotNone(handles["node-blocked"].job_id)
+            self.assertIsNone(handles["node-blocked"].error_result)
+            self.assertEqual(interpreter.scheduler_outstanding_count(), 1)
+
+            results = interpreter.collect_scheduler(wait=False)
+
+            self.assertEqual(set(results), {"node-blocked"})
+            self.assertIsNone(results["node-blocked"].exc_type)
+            self.assertEqual(interpreter.pending_scheduler_handles(), [])
 
     def test_run_many_uses_normalized_script_signature_for_raw_packing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

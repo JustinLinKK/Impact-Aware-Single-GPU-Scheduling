@@ -75,6 +75,10 @@ class BatchProbeTrialResult:
     memory_total_mb: int | None = None
     avg_step_time_ms: float | None = None
     message: str | None = None
+    failure_kind: str | None = None
+    returncode: int | None = None
+    stdout_excerpt: str | None = None
+    stderr_excerpt: str | None = None
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "BatchProbeTrialResult":

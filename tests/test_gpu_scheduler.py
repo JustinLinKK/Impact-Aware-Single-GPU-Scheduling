@@ -19,6 +19,7 @@ from localml_scheduler.domain import (
     PlacementDecision,
     PreloadSource,
     ResourceRequirements,
+    RuntimeProfile,
     SoloProfile,
     TrainingJob,
     build_batch_probe_key,
@@ -64,6 +65,36 @@ def _fake_hardware_profile(name: str) -> HardwareProfile:
 def _planner(settings: SchedulerSettings, store: SQLiteStateStore | None = None) -> tuple[SQLiteStateStore, PlacementPlanner]:
     scheduler_store = store or SQLiteStateStore(settings)
     return scheduler_store, PlacementPlanner(settings, scheduler_store, PriorityFifoPolicy(enable_priority_aging=False))
+
+
+def _seed_runtime_profile(
+    store: SQLiteStateStore,
+    job: TrainingJob,
+    *,
+    backend_name: str = "exclusive",
+    resolved_batch_size: int = 4,
+    scheduler_session_id: str | None = None,
+) -> None:
+    store.upsert_runtime_profile(
+        RuntimeProfile.create(
+            signature=job.packing.signature or job.job_id,
+            hardware_key=store.hardware_key(),
+            backend_name=backend_name,
+            resolved_batch_size=resolved_batch_size,
+            strategy=job.runtime_probe.strategy,
+            avg_step_time_ms=10.0,
+            estimated_total_runtime_seconds=60.0,
+            confidence=1.0,
+            observations=1,
+            last_job_id=job.job_id,
+            source="successful_execution",
+            metadata={
+                "success": True,
+                "candidate_returncode": 0,
+                "scheduler_session_id": scheduler_session_id,
+            },
+        )
+    )
 
 
 class _FakeParallelSupervisor:
@@ -609,6 +640,8 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             )
             raw_a.queue_sequence = 1
             raw_b.queue_sequence = 2
+            _seed_runtime_profile(store, raw_a)
+            _seed_runtime_profile(store, raw_b)
 
             raw_plan = planner.choose_plan(
                 [raw_a, raw_b],
@@ -617,7 +650,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             self.assertEqual(raw_plan.mode, "packed_pair")
             self.assertEqual(raw_plan.backend_name, "stream")
 
-    def test_parallel_auto_pack_uses_batch_probe_memory_without_runtime_profiles(self) -> None:
+    def test_parallel_auto_pack_does_not_pack_raw_jobs_with_batch_probe_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerSettings(
                 runtime_root=tmpdir,
@@ -669,9 +702,89 @@ class GpuSchedulerUnitTest(unittest.TestCase):
 
             plan = planner.choose_plan(jobs, backend_available={"exclusive": True, "cuda_process": True})
 
+            self.assertEqual(plan.mode, "exclusive")
+            self.assertEqual(plan.backend_name, "exclusive")
+            self.assertIn("runtime profile missing", plan.reason)
+
+    def test_parallel_auto_pack_uses_current_session_runtime_profiles_before_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                scheduler_session_id="session-a",
+                gpu_scheduler={
+                    "mode": SCHEDULER_MODE_PARALLEL_AUTO_PACK,
+                    "backend_priority": ["cuda_process", "exclusive"],
+                    "memory": {"vram_budget_fraction": 0.95},
+                },
+            )
+            store, planner = _planner(settings)
+            store._hardware_profile = _fake_hardware_profile("auto-pack-runtime-profiled")
+
+            jobs = []
+            for index, model_id in enumerate(["runtime-profiled-a", "runtime-profiled-b"], start=1):
+                job = build_mlevolve_job(
+                    workflow_id="wf",
+                    baseline_model_id=model_id,
+                    baseline_model_path=f"/tmp/{model_id}.py",
+                    runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                    runner_kwargs={"batch_size": 16},
+                    resource_requirements=ResourceRequirements(requires_gpu=True, estimated_vram_mb=1024),
+                    packing_family="mlevolve_script",
+                    packing_eligible=True,
+                    packing_backend_allowlist=["cuda_process"],
+                    task_type="mlevolve_script",
+                )
+                job.queue_sequence = index
+                jobs.append(job)
+                _seed_runtime_profile(
+                    store,
+                    job,
+                    resolved_batch_size=4,
+                    scheduler_session_id="session-a",
+                )
+
+            plan = planner.choose_plan(jobs, backend_available={"exclusive": True, "cuda_process": True})
+
             self.assertEqual(plan.mode, "packed_pair")
             self.assertEqual(plan.backend_name, "cuda_process")
+            self.assertEqual(plan.batch_overrides, {job.job_id: 4 for job in jobs})
             self.assertEqual(plan.reason, "auto-pack group selected")
+
+    def test_parallel_auto_pack_rejects_stale_runtime_profiles_for_raw_packing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                scheduler_session_id="current-session",
+                gpu_scheduler={
+                    "mode": SCHEDULER_MODE_PARALLEL_AUTO_PACK,
+                    "backend_priority": ["cuda_process", "exclusive"],
+                    "memory": {"vram_budget_fraction": 0.95},
+                },
+            )
+            store, planner = _planner(settings)
+            store._hardware_profile = _fake_hardware_profile("auto-pack-stale-profile")
+            jobs: list[TrainingJob] = []
+            for index in range(2):
+                job = build_mlevolve_job(
+                    workflow_id="wf",
+                    baseline_model_id=f"stale-{index}",
+                    baseline_model_path=f"/tmp/stale-{index}.py",
+                    runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                    runner_kwargs={"batch_size": 4},
+                    resource_requirements=ResourceRequirements(requires_gpu=True, estimated_vram_mb=1024),
+                    packing_family="mlevolve_script",
+                    packing_eligible=True,
+                    packing_backend_allowlist=["cuda_process"],
+                    task_type="mlevolve_script",
+                )
+                job.queue_sequence = index + 1
+                jobs.append(job)
+                _seed_runtime_profile(store, job, scheduler_session_id="old-session")
+
+            plan = planner.choose_plan(jobs, backend_available={"exclusive": True, "cuda_process": True})
+
+            self.assertEqual(plan.mode, "exclusive")
+            self.assertIn("runtime profile missing", plan.reason)
 
     def test_parallel_auto_pack_uses_startpoint_profile_key_for_derivative_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -724,9 +837,8 @@ class GpuSchedulerUnitTest(unittest.TestCase):
 
             plan = planner.choose_plan(jobs, backend_available={"exclusive": True, "cuda_process": True})
 
-            self.assertEqual(plan.mode, "packed_pair")
-            self.assertEqual(plan.backend_name, "cuda_process")
-            self.assertEqual(plan.reason, "auto-pack group selected")
+            self.assertEqual(plan.mode, "exclusive")
+            self.assertIn("runtime profile missing", plan.reason)
 
     def test_parallel_auto_pack_missing_memory_estimates_dispatches_calibration_probe(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -768,7 +880,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             plan = planner.choose_plan([first, second], backend_available={"exclusive": True, "cuda_process": True})
 
             self.assertEqual(plan.mode, "exclusive")
-            self.assertIn("calibration probe", plan.reason)
+            self.assertIn("runtime profile missing", plan.reason)
 
     def test_parallel_auto_pack_group_size_uses_candidate_window(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

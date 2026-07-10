@@ -64,6 +64,19 @@ def fake_limit_probe(context: RunnerContext, batch_size: int, warmup_steps: int,
     )
 
 
+def fake_dtype_error_probe(context: RunnerContext, batch_size: int, warmup_steps: int, measure_steps: int) -> BatchProbeTrialResult:
+    return BatchProbeTrialResult(
+        fits=False,
+        peak_vram_mb=256,
+        memory_total_mb=1024,
+        avg_step_time_ms=None,
+        message="expected scalar type Half but found Float",
+        failure_kind="dtype_error",
+        returncode=1,
+        stderr_excerpt="RuntimeError: expected scalar type Half but found Float",
+    )
+
+
 def _build_context(settings: SchedulerSettings, job: TrainingJob) -> RunnerContext:
     store = SQLiteStateStore(settings)
     store.save_job(job)
@@ -232,6 +245,44 @@ class BatchProbeUnitTest(unittest.TestCase):
             self.assertEqual(profile.metadata["search_mode"], BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO)
             trial_sizes = [event["payload"]["batch_size"] for event in context.store.list_events(job_id=job.job_id, event_type="batch_probe_trial")]
             self.assertEqual(trial_sizes, [2, 4, 8])
+
+    def test_probe_controller_stops_immediately_on_non_memory_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(runtime_root=tmpdir)
+            job = TrainingJob.create(
+                "pkg.runner:train",
+                "baseline-a",
+                "/tmp/a.pt",
+                task_type="classification",
+                runner_kwargs={"batch_size": 4},
+                batch_probe=BatchProbeSpec(
+                    enabled=True,
+                    probe_target="localml_scheduler.tests.test_batch_probe:fake_dtype_error_probe",
+                ),
+                metadata={"placement_backend": "exclusive"},
+                resource_requirements=ResourceRequirements(requires_gpu=True),
+                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
+            )
+            context = _build_context(settings, job)
+
+            with self.assertRaises(RuntimeError) as raised:
+                _run_probe_controller(
+                    context,
+                    key_info=BatchProbeKeyInfo(
+                        probe_key="probe-dtype",
+                        model_key="baseline-a",
+                        device_type="cuda-unavailable",
+                        shape_signature="shape-1",
+                        search_mode=BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
+                    ),
+                )
+
+            self.assertIn("dtype_error", str(raised.exception))
+            trial_events = context.store.list_events(job_id=job.job_id, event_type="batch_probe_trial")
+            self.assertEqual([event["payload"]["batch_size"] for event in trial_events], [4])
+            self.assertEqual(trial_events[0]["payload"]["failure_kind"], "dtype_error")
+            self.assertEqual(len(context.store.list_events(job_id=job.job_id, event_type="batch_probe_preflight_failed")), 1)
+            self.assertEqual(context.store.list_batch_probe_profiles(), [])
 
     def test_probe_controller_warns_when_capped_before_vram_saturation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

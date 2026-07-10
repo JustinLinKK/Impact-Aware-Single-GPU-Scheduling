@@ -34,7 +34,7 @@ class ObjectiveScorer:
     def evaluate_fixed_group(self, jobs: list[TrainingJob], backend_name: str) -> EvaluatedGroup | None:
         if not self.compatibility.compatible_group(jobs, backend_name=backend_name):
             return None
-        batch_overrides = {job.job_id: self.estimator.resolved_batch_size(job) for job in jobs}
+        batch_overrides = {job.job_id: self.estimator.packing_batch_size(job, backend_name) for job in jobs}
         estimated_vram_mb = sum(self.estimator.estimate_peak_vram_mb(job, batch_overrides[job.job_id], backend_name) for job in jobs)
         safe_budget_mb = self.estimator.safe_budget_mb()
         if estimated_vram_mb > safe_budget_mb:
@@ -65,6 +65,12 @@ class ObjectiveScorer:
             scheduler_mode=SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
         )
         if cached is not None and cached.batch_vector:
+            trusted_batch_overrides = {job.job_id: self.estimator.packing_batch_size(job, backend_name) for job in jobs}
+            if any(self.estimator.requires_successful_runtime_profile_for_packing(job) for job in jobs):
+                cached_vector = {str(job_id): int(batch_size) for job_id, batch_size in cached.batch_vector.items()}
+                if cached_vector != trusted_batch_overrides:
+                    cached = None
+        if cached is not None and cached.batch_vector:
             estimated_vram_mb = float(cached.peak_vram_mb or 0)
             return EvaluatedGroup(
                 jobs=jobs,
@@ -77,14 +83,24 @@ class ObjectiveScorer:
                 reason="cached optimal packed group selected",
             )
 
-        per_job_candidates = [self.candidate_generator.candidate_batch_sizes(job) for job in jobs]
+        per_job_candidates = [
+            [self.estimator.packing_batch_size(job, backend_name)]
+            if self.estimator.requires_successful_runtime_profile_for_packing(job)
+            else self.candidate_generator.candidate_batch_sizes(job)
+            for job in jobs
+        ]
         safe_budget_mb = self.estimator.safe_budget_mb()
         best: EvaluatedGroup | None = None
 
         if len(jobs) <= 3:
             search_space = product(*per_job_candidates)
         else:
-            baseline = tuple(self.estimator.resolved_batch_size(job) for job in jobs)
+            baseline = tuple(
+                self.estimator.packing_batch_size(job, backend_name)
+                if self.estimator.requires_successful_runtime_profile_for_packing(job)
+                else self.estimator.resolved_batch_size(job)
+                for job in jobs
+            )
             greedy_vectors = [baseline]
             for index, candidates in enumerate(per_job_candidates):
                 best_batch = max(candidates)
@@ -134,7 +150,7 @@ class ObjectiveScorer:
         if not self.compatibility.compatible_group(jobs, backend_name=backend_name):
             return None
 
-        batch_overrides = {job.job_id: self.estimator.resolved_batch_size(job) for job in jobs}
+        batch_overrides = {job.job_id: self.estimator.packing_batch_size(job, backend_name) for job in jobs}
         estimated_vram_mb = sum(self.estimator.estimate_peak_vram_mb(job, batch_overrides[job.job_id], backend_name) for job in jobs)
         if (active_vram_mb + estimated_vram_mb) > self.estimator.safe_budget_mb():
             return None

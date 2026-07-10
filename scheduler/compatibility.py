@@ -60,9 +60,22 @@ class CompatibilityEvaluator:
             return True
         return job.packing.allows_backend(backend_name)
 
+    def missing_runtime_profile_jobs(self, jobs: list[TrainingJob], *, backend_name: str) -> list[TrainingJob]:
+        missing: list[TrainingJob] = []
+        if len(jobs) <= 1:
+            return missing
+        for job in jobs:
+            if not self.estimator.requires_successful_runtime_profile_for_packing(job):
+                continue
+            if self.estimator.packing_runtime_profile(job, backend_name) is None:
+                missing.append(job)
+        return missing
+
     def compatible_group(self, jobs: list[TrainingJob], *, backend_name: str) -> bool:
         if len(jobs) <= 1:
             return True
+        if self.missing_runtime_profile_jobs(jobs, backend_name=backend_name):
+            return False
         thresholds = self.settings.gpu_scheduler.thresholds
         for left_job, right_job in combinations(jobs, 2):
             left_profile = self.estimator.solo_profile(left_job)

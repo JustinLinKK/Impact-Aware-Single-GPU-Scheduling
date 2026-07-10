@@ -1,6 +1,7 @@
 """Reusable local ML job scheduler with GPU-aware single-node execution."""
 
 from .client import SchedulerClient
+from .hardware_client import HardwareKnowledgeClient
 from .config import (
     BaselineCacheSettings,
     GpuSchedulerSettings,
@@ -16,6 +17,7 @@ from .domain import (
     CacheStats,
     CheckpointPolicy,
     JobConfig,
+    JobMetricSample,
     JobRun,
     JobSpec,
     JobStatus,
@@ -36,6 +38,7 @@ __all__ = [
     "CacheStats",
     "CheckpointPolicy",
     "JobConfig",
+    "JobMetricSample",
     "JobCommandRequest",
     "JobQuery",
     "JobRun",
@@ -52,6 +55,7 @@ __all__ = [
     "BaselineCacheSettings",
     "GpuSchedulerSettings",
     "HardwareFeatureDBSettings",
+    "HardwareKnowledgeClient",
     "RedisCacheSettings",
     "SchedulerClient",
     "SchedulerConfig",

@@ -33,6 +33,11 @@ class CandidateGenerator:
                     continue
                 if not jobs[0].packing.allows_backend(backend_name):
                     continue
+                if (
+                    self.estimator.requires_successful_runtime_profile_for_packing(jobs[0])
+                    and self.estimator.packing_runtime_profile(jobs[0], backend_name) is None
+                ):
+                    continue
                 candidates.append(backend_name)
             candidates.append("exclusive")
             return candidates

@@ -15,6 +15,7 @@ import sys
 from ..domain import TrainingJob
 from ..config import SchedulerSettings
 from .executor import SubprocessExecutor, WorkerProcessHandle
+from .process_utils import start_new_session_kwargs
 
 
 class ExecutionBackend(Protocol):
@@ -197,6 +198,7 @@ class StreamBackend:
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 text=True,
+                **start_new_session_kwargs(),
             )
         return [
             WorkerProcessHandle(

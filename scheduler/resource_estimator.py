@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from ..profiling.runtime_probe import runtime_profile_for_job
+from ..profiling.runtime_probe import runtime_profile_for_job, successful_runtime_profile_for_packing
 from ..domain import BatchResolution, SoloProfile, TrainingJob, build_batch_probe_key, build_batch_probe_shape_signature, normalize_batch_probe_search_mode
 from ..config import SchedulerSettings
 from .planning_repository import PlanningRepository
+
+RAW_MLEVOLVE_RUNNER_TARGET = "localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job"
 
 
 class ResourceEstimator:
@@ -29,7 +31,28 @@ class ResourceEstimator:
     def runtime_ready(self, job: TrainingJob, backend_name: str) -> bool:
         if not job.runtime_probe.enabled:
             return False
+        if self.requires_successful_runtime_profile_for_packing(job):
+            return self.packing_runtime_profile(job, backend_name) is not None
         return runtime_profile_for_job(self.repository, job, backend_name=backend_name) is not None
+
+    def requires_successful_runtime_profile_for_packing(self, job: TrainingJob) -> bool:
+        return job.config.runner_target == RAW_MLEVOLVE_RUNNER_TARGET or job.task_type == "mlevolve_script"
+
+    def packing_runtime_profile(self, job: TrainingJob, backend_name: str):
+        session_id = getattr(self.settings, "scheduler_session_id", None)
+        return successful_runtime_profile_for_packing(
+            self.repository,
+            job,
+            backend_name=backend_name,
+            scheduler_session_id=str(session_id) if session_id else None,
+        )
+
+    def packing_batch_size(self, job: TrainingJob, backend_name: str) -> int:
+        if self.requires_successful_runtime_profile_for_packing(job):
+            profile = self.packing_runtime_profile(job, backend_name)
+            if profile is not None:
+                return max(1, int(profile.resolved_batch_size))
+        return self.resolved_batch_size(job)
 
     def predicted_remaining_runtime_seconds(self, job: TrainingJob, *, backend_name: str) -> float | None:
         if job.metadata.get("runtime_remaining_runtime_seconds") is not None:
@@ -124,7 +147,7 @@ class ResourceEstimator:
         return 0.0
 
     def predicted_group_vram_mb(self, jobs: list[TrainingJob], *, backend_name: str) -> float:
-        return sum(self.estimate_peak_vram_mb(job, self.resolved_batch_size(job), backend_name) for job in jobs)
+        return sum(self.estimate_peak_vram_mb(job, self.packing_batch_size(job, backend_name), backend_name) for job in jobs)
 
     def predicted_group_sm_utilization(self, jobs: list[TrainingJob], *, backend_name: str) -> float:
-        return sum(self.estimate_sm_utilization(job, self.resolved_batch_size(job), backend_name) for job in jobs)
+        return sum(self.estimate_sm_utilization(job, self.packing_batch_size(job, backend_name), backend_name) for job in jobs)

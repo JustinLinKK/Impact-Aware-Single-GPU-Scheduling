@@ -5,19 +5,23 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Any
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import humanize
 
 from ..execution.runner_protocol import RunnerContext
 from ..scheduler.telemetry import GpuTelemetrySample, NvidiaSmiTelemetrySampler
-from ..domain import BatchProbeTrialResult, BatchResolution
+from ..domain import BatchProbeTrialResult, BatchResolution, JobStatus, ProgressSnapshot, utc_now
+from utils.candidate_timing import materialize_phase_instrumented_file, parse_phase_timing_log
 
 _BATCH_SIZE_NAMES = {
     "batch_size",
@@ -42,6 +46,17 @@ _PROBE_MODE_VAR = "_MLEVOLVE_PROBE_MODE"
 class InstrumentedScript:
     path: Path
     had_batch_rewrite: bool
+    syntax_error: str | None = None
+
+
+@dataclass(slots=True)
+class ProbeSubprocessResult:
+    fits: bool
+    samples: list[GpuTelemetrySample]
+    stdout_text: str
+    stderr_text: str
+    returncode: int | None
+    timed_out: bool = False
 
 
 def load_raw_file(path: str) -> bytes:
@@ -206,8 +221,8 @@ def _materialize_instrumented_script(script_path: Path, working_dir: Path) -> In
     source = script_path.read_text(encoding="utf-8")
     try:
         module = ast.parse(source, filename=str(script_path))
-    except SyntaxError:
-        return InstrumentedScript(path=script_path, had_batch_rewrite=False)
+    except SyntaxError as exc:
+        return InstrumentedScript(path=script_path, had_batch_rewrite=False, syntax_error=str(exc))
 
     transformer = _BatchOverrideTransformer()
     module = transformer.visit(module)
@@ -275,11 +290,241 @@ def _resolved_batch_size(context: RunnerContext) -> int | None:
     return BatchResolution.resolved_batch_size(context.job)
 
 
-def _parse_batch_size_failure(stderr_text: str) -> str | None:
+def _short_excerpt(text: str, *, limit: int = 1000) -> str | None:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return None
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[: limit - 3]}..."
+
+
+_METRIC_PAIR_RE = re.compile(
+    r"(?P<key>[A-Za-z_][A-Za-z0-9_\-./]*)\s*[:=]\s*(?P<value>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+)
+_METRIC_KEY_HINTS = (
+    "loss",
+    "acc",
+    "accuracy",
+    "auc",
+    "f1",
+    "score",
+    "precision",
+    "recall",
+    "iou",
+    "map",
+    "error",
+    "rmse",
+    "mae",
+    "mse",
+    "lr",
+    "learning_rate",
+)
+
+
+def _metric_key_allowed(key: str) -> bool:
+    normalized = str(key or "").strip().lower().replace("-", "_")
+    return any(token in normalized for token in _METRIC_KEY_HINTS)
+
+
+def _as_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_metric_line(line: str) -> tuple[dict[str, float], int | None, int | None] | None:
+    text = str(line or "").strip()
+    if not text:
+        return None
+
+    if "MLEVOLVE_METRIC" in text:
+        payload_text = text.split("MLEVOLVE_METRIC", 1)[1].strip()
+        payload_text = payload_text[1:].strip() if payload_text.startswith(":") else payload_text
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError:
+            payload = {}
+        if isinstance(payload, dict):
+            metrics: dict[str, float] = {}
+            epoch = None
+            global_step = None
+            for key, value in payload.items():
+                normalized = str(key).strip().lower()
+                numeric = _as_float(value)
+                if numeric is None:
+                    continue
+                if normalized in {"epoch", "epochs"}:
+                    epoch = int(numeric)
+                elif normalized in {"step", "global_step", "iteration", "iter"}:
+                    global_step = int(numeric)
+                elif _metric_key_allowed(normalized):
+                    metrics[str(key)] = numeric
+            return (metrics, epoch, global_step) if metrics else None
+
+    metrics = {}
+    epoch = None
+    global_step = None
+    for match in _METRIC_PAIR_RE.finditer(text):
+        key = match.group("key")
+        numeric = _as_float(match.group("value"))
+        if numeric is None:
+            continue
+        normalized = key.strip().lower().replace("-", "_")
+        if normalized in {"epoch", "epochs"}:
+            epoch = int(numeric)
+        elif normalized in {"step", "global_step", "iteration", "iter"}:
+            global_step = int(numeric)
+        elif _metric_key_allowed(normalized):
+            metrics[key] = numeric
+    return (metrics, epoch, global_step) if metrics else None
+
+
+def _enqueue_stream_lines(stream, stream_name: str, output_queue: Queue[tuple[str, str]]) -> None:
+    try:
+        for line in iter(stream.readline, ""):
+            if not line:
+                break
+            output_queue.put((stream_name, line))
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def _record_raw_metric_line(
+    context: RunnerContext,
+    line: str,
+    counters: dict[str, int],
+) -> None:
+    parsed = _parse_metric_line(line)
+    if parsed is None:
+        return
+    metrics, epoch, global_step = parsed
+    counters["sample_count"] = counters.get("sample_count", 0) + 1
+    if global_step is None:
+        global_step = max(counters.get("last_global_step", 0) + 1, counters["sample_count"])
+    if epoch is None:
+        epoch = counters.get("last_epoch", 0)
+    counters["last_global_step"] = int(global_step)
+    counters["last_epoch"] = int(epoch)
+    created_at = utc_now()
+    heartbeat = ProgressSnapshot(
+        job_id=context.job.job_id,
+        epoch=int(epoch),
+        global_step=int(global_step),
+        phase="train",
+        metrics=metrics,
+        last_safe_point="metric_log",
+    )
+    heartbeat.heartbeat_at = created_at
+    context.control_hook.control_plane.write_heartbeat(heartbeat)
+    if hasattr(context.store, "record_job_metric_sample"):
+        context.store.record_job_metric_sample(
+            job_id=context.job.job_id,
+            created_at=created_at,
+            epoch=int(epoch),
+            global_step=int(global_step),
+            metrics=metrics,
+        )
+    context.store.update_job(context.job.job_id, last_heartbeat_at=created_at)
+    if getattr(context.event_logger, "log_store", None) is not None:
+        context.event_logger.log_store.record_job_metric_sample(
+            job_id=context.job.job_id,
+            created_at=created_at,
+            epoch=int(epoch),
+            global_step=int(global_step),
+            avg_step_time_ms=None,
+            estimated_total_runtime_seconds=None,
+            remaining_runtime_seconds=None,
+            metrics=metrics,
+        )
+
+
+def _classify_probe_failure(
+    *,
+    stdout_text: str,
+    stderr_text: str,
+    returncode: int | None,
+    timed_out: bool,
+) -> tuple[str | None, str | None]:
+    combined = f"{stdout_text}\n{stderr_text}".lower()
+    if timed_out:
+        return "timeout", "probe subprocess timed out"
+    if returncode == 0:
+        return None, None
+    if "cuda out of memory" in combined or "out of memory" in combined or "cublas_status_alloc_failed" in combined:
+        return "oom", "cuda out of memory"
+    if "syntaxerror" in combined:
+        return "syntax_error", _short_excerpt(stderr_text, limit=400) or "syntax error"
+    if "modulenotfounderror" in combined or "importerror" in combined:
+        return "import_error", _short_excerpt(stderr_text, limit=400) or "import error"
+    invalid_model_markers = (
+        "not a valid model identifier",
+        "not a local folder",
+        "does not appear to have a file named",
+        "unknown model",
+        "invalid model",
+        "model not found",
+        "no pretrained weights exist",
+    )
+    if any(marker in combined for marker in invalid_model_markers):
+        return "invalid_model", _short_excerpt(stderr_text, limit=400) or "invalid model"
+    dtype_markers = (
+        "unsupported scalartype",
+        "unsupported dtype",
+        "expected scalar type",
+        "bfloat16",
+        "bf16",
+        "dtype mismatch",
+        "mat1 and mat2 must have the same dtype",
+    )
+    if any(marker in combined for marker in dtype_markers):
+        return "dtype_error", _short_excerpt(stderr_text, limit=400) or "dtype error"
+    if "traceback" in combined:
+        return "script_exception", _short_excerpt(stderr_text, limit=400) or "script exception"
+    if returncode not in (0, None):
+        return "unknown", _short_excerpt(stderr_text or stdout_text, limit=400) or f"probe subprocess failed with code {returncode}"
+    return None, None
+
+
+def _parse_batch_size_failure(stderr_text: str, stdout_text: str = "", returncode: int | None = None, timed_out: bool = False) -> tuple[str | None, str | None]:
+    failure_kind, message = _classify_probe_failure(
+        stdout_text=stdout_text,
+        stderr_text=stderr_text,
+        returncode=returncode,
+        timed_out=timed_out,
+    )
+    if failure_kind == "oom":
+        return failure_kind, message or "cuda out of memory"
+    return failure_kind, message
+
+
+def classify_mlevolve_probe_failure(
+    *,
+    stdout_text: str = "",
+    stderr_text: str = "",
+    returncode: int | None = None,
+    timed_out: bool = False,
+) -> tuple[str | None, str | None]:
+    """Public helper used by tests and probe wrappers to classify raw script failures."""
+    return _classify_probe_failure(
+        stdout_text=stdout_text,
+        stderr_text=stderr_text,
+        returncode=returncode,
+        timed_out=timed_out,
+    )
+
+
+def _message_indicates_oom(stderr_text: str) -> bool:
     lowered = stderr_text.lower()
     if "out of memory" in lowered or "cuda out of memory" in lowered:
-        return "cuda out of memory"
-    return None
+        return True
+    return False
 
 
 def _run_probe_subprocess(
@@ -293,7 +538,7 @@ def _run_probe_subprocess(
     device_index: int,
     probe_max_epochs: int,
     probe_max_train_batches: int,
-) -> tuple[bool, list[GpuTelemetrySample], str, str]:
+) -> ProbeSubprocessResult:
     stdout_path = working_dir / "working" / f"probe_stdout_bs_{batch_size}.log"
     stderr_path = working_dir / "working" / f"probe_stderr_bs_{batch_size}.log"
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -325,19 +570,28 @@ def _run_probe_subprocess(
                 break
             time.sleep(max(0.1, poll_interval_seconds))
 
+        timed_out = False
         fits = proc.poll() == 0
         if proc.poll() is None:
+            timed_out = True
             try:
                 proc.send_signal(signal.SIGINT)
                 proc.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=2.0)
-            fits = True
+            fits = False
 
     stdout_text = stdout_path.read_text(encoding="utf-8") if stdout_path.exists() else ""
     stderr_text = stderr_path.read_text(encoding="utf-8") if stderr_path.exists() else ""
-    return fits, samples, stdout_text, stderr_text
+    return ProbeSubprocessResult(
+        fits=fits,
+        samples=samples,
+        stdout_text=stdout_text,
+        stderr_text=stderr_text,
+        returncode=proc.returncode,
+        timed_out=timed_out,
+    )
 
 
 def probe_mlevolve_script_job(
@@ -353,6 +607,19 @@ def probe_mlevolve_script_job(
     python_executable = context.job.config.python_executable or sys.executable
     instrumented = _materialize_instrumented_script(script_path, working_dir)
 
+    if instrumented.syntax_error:
+        return BatchProbeTrialResult(
+            fits=False,
+            peak_vram_mb=None,
+            memory_total_mb=None,
+            avg_step_time_ms=None,
+            message=instrumented.syntax_error,
+            failure_kind="syntax_error",
+            returncode=None,
+            stdout_excerpt=None,
+            stderr_excerpt=instrumented.syntax_error,
+        )
+
     if not instrumented.had_batch_rewrite:
         return BatchProbeTrialResult(
             fits=True,
@@ -367,7 +634,7 @@ def probe_mlevolve_script_job(
     probe_max_epochs = max(1, int(kwargs.get("probe_max_epochs", 1)))
     probe_max_train_batches = max(1, int(kwargs.get("probe_max_train_batches", 3)))
     started_at = time.time()
-    fits, samples, _stdout_text, stderr_text = _run_probe_subprocess(
+    probe_result = _run_probe_subprocess(
         python_executable=python_executable,
         script_path=instrumented.path,
         working_dir=working_dir,
@@ -378,19 +645,29 @@ def probe_mlevolve_script_job(
         probe_max_epochs=probe_max_epochs,
         probe_max_train_batches=probe_max_train_batches,
     )
-    failure_reason = _parse_batch_size_failure(stderr_text)
-    if failure_reason is not None:
+    failure_kind, failure_reason = _parse_batch_size_failure(
+        probe_result.stderr_text,
+        stdout_text=probe_result.stdout_text,
+        returncode=probe_result.returncode,
+        timed_out=probe_result.timed_out,
+    )
+    fits = bool(probe_result.fits)
+    if failure_kind is not None or failure_reason is not None:
         fits = False
 
-    peak_vram_mb = max((sample.memory_used_mb for sample in samples), default=None)
-    memory_total_mb = max((sample.memory_total_mb for sample in samples), default=None)
+    peak_vram_mb = max((sample.memory_used_mb for sample in probe_result.samples), default=None)
+    memory_total_mb = max((sample.memory_total_mb for sample in probe_result.samples), default=None)
     elapsed_ms = (time.time() - started_at) * 1000.0
     return BatchProbeTrialResult(
         fits=bool(fits),
         peak_vram_mb=peak_vram_mb,
         memory_total_mb=memory_total_mb,
-        avg_step_time_ms=elapsed_ms / max(1, len(samples)) if samples else None,
-        message=failure_reason or ("probe window completed" if fits else stderr_text.strip()[:400]),
+        avg_step_time_ms=elapsed_ms / max(1, len(probe_result.samples)) if probe_result.samples else None,
+        message=failure_reason or ("probe window completed" if fits else _short_excerpt(probe_result.stderr_text, limit=400)),
+        failure_kind=failure_kind,
+        returncode=probe_result.returncode,
+        stdout_excerpt=_short_excerpt(probe_result.stdout_text),
+        stderr_excerpt=_short_excerpt(probe_result.stderr_text),
     )
 
 
@@ -412,7 +689,13 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
     python_executable = context.job.config.python_executable or sys.executable
 
     instrumented = _materialize_instrumented_script(script_path, working_dir)
-    executable_script = instrumented.path
+    phase_log_path = working_dir / "working" / "phase_timings" / f"phase_{context.job.job_id}.jsonl"
+    phase_output_path = working_dir / "working" / "instrumented_scripts" / f"{instrumented.path.stem}_phase.py"
+    executable_script, phase_metadata = materialize_phase_instrumented_file(
+        instrumented.path,
+        phase_output_path,
+        phase_log_path,
+    )
     batch_size_override = _resolved_batch_size(context) if instrumented.had_batch_rewrite else None
 
     start_time = time.time()
@@ -429,35 +712,90 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
     exc_type: str | None = None
     exc_info: dict[str, Any] = {}
     exc_stack: list[tuple[str, int, str, str]] = []
-    stdout = ""
-    stderr = ""
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    output_queue: Queue[tuple[str, str]] = Queue()
+    stdout_thread = threading.Thread(target=_enqueue_stream_lines, args=(proc.stdout, "stdout", output_queue), daemon=True)
+    stderr_thread = threading.Thread(target=_enqueue_stream_lines, args=(proc.stderr, "stderr", output_queue), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    counters = {"sample_count": 0, "last_global_step": 0, "last_epoch": 0}
+    early_stop_reason: str | None = None
+    timed_out = False
+    deadline = start_time + timeout if timeout is not None else None
 
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        exec_time = time.time() - start_time
-        if proc.returncode != 0:
-            exc_type, exc_info, exc_stack = _parse_exception(stderr, working_dir, executable_script)
-    except subprocess.TimeoutExpired:
-        try:
-            proc.send_signal(signal.SIGINT)
-            stdout, stderr = proc.communicate(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-        exec_time = time.time() - start_time
+    def drain_output() -> None:
+        while True:
+            try:
+                stream_name, line = output_queue.get_nowait()
+            except Empty:
+                break
+            if stream_name == "stderr":
+                stderr_lines.append(line)
+            else:
+                stdout_lines.append(line)
+            _record_raw_metric_line(context, line, counters)
+
+    while True:
+        drain_output()
+        if proc.poll() is not None:
+            break
+
+        command = context.control_hook.control_plane.read_command(context.job.job_id)
+        if command.action == "early_stop":
+            early_stop_reason = command.reason or "scheduler early stop requested"
+            context.control_hook.control_plane.clear_command(context.job.job_id)
+            try:
+                proc.send_signal(signal.SIGINT)
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+            break
+
+        if deadline is not None and time.time() >= deadline:
+            timed_out = True
+            try:
+                proc.send_signal(signal.SIGINT)
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2.0)
+            break
+
+        time.sleep(0.1)
+
+    stdout_thread.join(timeout=1.0)
+    stderr_thread.join(timeout=1.0)
+    drain_output()
+    exec_time = time.time() - start_time
+    stdout = "".join(stdout_lines)
+    stderr = "".join(stderr_lines)
+    if early_stop_reason is not None:
+        exc_info["scheduler_early_stop_reason"] = early_stop_reason
+    elif timed_out:
         exc_type = "TimeoutError"
+    elif proc.returncode != 0:
+        exc_type, exc_info, exc_stack = _parse_exception(stderr, working_dir, executable_script)
 
     output: list[str] = []
-    if stdout:
-        output.extend(stdout.splitlines(keepends=True))
-    if stderr:
-        output.extend(stderr.splitlines(keepends=True))
+    if stdout_lines:
+        output.extend(stdout_lines)
+    if stderr_lines:
+        output.extend(stderr_lines)
     if not output:
         output = [""]
     if output and output[-1] and not output[-1].endswith("\n"):
         output.append("\n")
 
-    if exc_type == "TimeoutError" and timeout is not None:
+    if early_stop_reason is not None:
+        output.append(f"Scheduler early stop: {early_stop_reason}\n")
+        output.append(f"Execution time: {humanize.naturaldelta(exec_time)} seconds (stopped early by scheduler).\n")
+    elif exc_type == "TimeoutError" and timeout is not None:
         output.append(f"Execution time: TimeoutError: Execution exceeded the time limit of {humanize.naturaldelta(timeout or 0)}")
     elif exc_type == "TimeoutError":
         output.append(f"Execution time: TimeoutError raised after {humanize.naturaldelta(exec_time)} seconds (no time limit).")
@@ -465,20 +803,92 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
         limit_text = "no time limit" if timeout is None else f"time limit is {humanize.naturaldelta(timeout)}"
         output.append(f"Execution time: {humanize.naturaldelta(exec_time)} seconds ({limit_text}).")
 
+    phase_timings = parse_phase_timing_log(phase_log_path, exec_time=exec_time, instrumentation=phase_metadata)
+    instrumentation = dict(phase_metadata or {})
+    if early_stop_reason is not None:
+        samples = context.store.list_job_metric_samples(context.job.job_id) if hasattr(context.store, "list_job_metric_samples") else []
+        artifact_payload: dict[str, Any] = {}
+        try:
+            from ..scheduler.training_plot import render_training_process
+
+            artifact_payload = render_training_process(
+                samples,
+                context.settings.job_runtime_dir(context.job.job_id),
+                decision=None,
+            )
+        except Exception as exc:
+            artifact_payload = {"plot_error": str(exc)}
+        completed_at = utc_now()
+        context.store.update_job(
+            context.job.job_id,
+            status=JobStatus.EARLY_STOPPED,
+            reason=early_stop_reason,
+            hold=True,
+            metadata_updates={
+                "scheduler_early_stop_pending": False,
+                "scheduler_early_stop_completed_at": completed_at,
+                "scheduler_early_stop_runtime_seconds": exec_time,
+                "scheduler_early_stop_plot_path": artifact_payload.get("plot_path"),
+                "scheduler_early_stop_summary_path": artifact_payload.get("summary_path"),
+            },
+        )
+        context.event_logger.emit(
+            "job_early_stopped",
+            job_id=context.job.job_id,
+            payload={
+                "reason": early_stop_reason,
+                "runtime_seconds": exec_time,
+                "plot_path": artifact_payload.get("plot_path"),
+                "summary_path": artifact_payload.get("summary_path"),
+            },
+        )
+        instrumentation["scheduler_early_stop"] = {
+            "reason": early_stop_reason,
+            "runtime_seconds": exec_time,
+            "plot_path": artifact_payload.get("plot_path"),
+            "summary_path": artifact_payload.get("summary_path"),
+            "sample_count": len(samples),
+        }
     result = {
         "term_out": output,
         "exec_time": exec_time,
         "exc_type": exc_type,
         "exc_info": exc_info,
         "exc_stack": exc_stack,
+        "phase_timings": phase_timings,
+        "instrumentation": instrumentation,
     }
     _write_json_atomic(result_path, result)
+    if early_stop_reason is None and proc.returncode == 0 and context.job.packing.signature:
+        backend_name = str(context.job.metadata.get("placement_backend") or "exclusive")
+        context.upsert_runtime_profile(
+            backend_name=backend_name,
+            strategy=context.job.runtime_probe.strategy,
+            startup_seconds=None,
+            epoch_1_seconds=None,
+            steps_per_epoch=None,
+            avg_step_time_ms=exec_time * 1000.0,
+            estimated_total_runtime_seconds=exec_time,
+            confidence=1.0,
+            source="successful_execution",
+            observations=1,
+            metadata={
+                "success": True,
+                "candidate_returncode": proc.returncode,
+                "scheduler_session_id": context.job.metadata.get("scheduler_session_id"),
+                "resolved_batch_size": BatchResolution.resolved_batch_size(context.job),
+                "batch_size_override": batch_size_override,
+                "phase_timing_available": bool(phase_timings),
+            },
+        )
     return {
-        "reason": "mlevolve script executed",
+        "reason": "mlevolve script early-stopped" if early_stop_reason is not None else "mlevolve script executed",
         "execution_result_path": str(result_path),
         "candidate_returncode": proc.returncode,
         "candidate_exc_type": exc_type,
         "batch_size_override": batch_size_override,
+        "phase_timings": phase_timings,
+        "instrumentation": instrumentation,
     }
 
 

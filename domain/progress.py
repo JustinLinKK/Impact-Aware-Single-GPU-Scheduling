@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+import json
 
 from .common import to_primitive, utc_now
 
@@ -48,3 +49,33 @@ class PlacementAssignment:
 
 ProgressSnapshot = JobProgress
 
+
+@dataclass(slots=True)
+class JobMetricSample:
+    job_id: str
+    created_at: str = field(default_factory=utc_now)
+    epoch: int = 0
+    global_step: int = 0
+    avg_step_time_ms: float | None = None
+    estimated_total_runtime_seconds: float | None = None
+    remaining_runtime_seconds: float | None = None
+    metrics: dict[str, float] = field(default_factory=dict)
+    sample_id: int | None = None
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "JobMetricSample":
+        metrics = json.loads(row.get("metrics_json") or "{}")
+        return cls(
+            sample_id=row.get("sample_id"),
+            job_id=row["job_id"],
+            created_at=row["created_at"],
+            epoch=int(row.get("epoch") or 0),
+            global_step=int(row.get("global_step") or 0),
+            avg_step_time_ms=row.get("avg_step_time_ms"),
+            estimated_total_runtime_seconds=row.get("estimated_total_runtime_seconds"),
+            remaining_runtime_seconds=row.get("remaining_runtime_seconds"),
+            metrics={str(key): float(value) for key, value in metrics.items() if isinstance(value, (int, float))},
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_primitive(self)
