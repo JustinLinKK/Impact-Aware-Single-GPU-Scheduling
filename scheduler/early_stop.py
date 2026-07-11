@@ -136,8 +136,8 @@ def analyze_metric_plateau(
     *,
     metric_key: str | None = None,
     direction: str = "auto",
-    warmup_samples: int = 5,
-    patience_samples: int = 5,
+    warmup_samples: int = 10,
+    patience_samples: int = 10,
     min_delta: float = 1e-4,
 ) -> EarlyStopDecision:
     warmup = max(0, int(warmup_samples or 0))

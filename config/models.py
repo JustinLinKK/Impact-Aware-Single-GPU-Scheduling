@@ -178,11 +178,11 @@ class GpuTelemetrySettings:
 @dataclass(slots=True)
 class EarlyStopSettings:
     enabled: bool = True
-    warmup_samples: int = 5
-    patience_samples: int = 5
+    warmup_samples: int = 10
+    patience_samples: int = 10
     min_delta: float = 1e-4
-    min_runtime_seconds: float = 60.0
-    min_global_step: int = 10
+    min_runtime_seconds: float = 120.0
+    min_global_step: int = 20
     metric_key: str | None = None
     direction: str = "auto"
     plot_enabled: bool = True
@@ -200,7 +200,7 @@ class EarlyStopSettings:
         try:
             self.min_runtime_seconds = max(0.0, float(self.min_runtime_seconds))
         except (TypeError, ValueError):
-            self.min_runtime_seconds = 60.0
+            self.min_runtime_seconds = 120.0
         self.metric_key = str(self.metric_key).strip() if self.metric_key else None
         normalized_direction = str(self.direction or "auto").strip().lower()
         if normalized_direction not in {"auto", "maximize", "minimize"}:
