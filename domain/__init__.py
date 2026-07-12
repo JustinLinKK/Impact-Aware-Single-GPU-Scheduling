@@ -50,6 +50,15 @@ from .profiles import (
     SchedulerReport,
     SoloProfile,
 )
+from .predictions import (
+    GroupPrediction,
+    PredictedScalar,
+    PredictionObservation,
+    PredictionRequest,
+    PredictionSource,
+    ResourcePrediction,
+    prediction_timestamp,
+)
 from .progress import JobMetricSample, JobProgress, PlacementAssignment, ProgressSnapshot
 
 __all__ = [
@@ -77,11 +86,16 @@ __all__ = [
     "PairProfile",
     "PlacementAssignment",
     "PlacementDecision",
+    "PredictedScalar",
+    "PredictionObservation",
+    "PredictionRequest",
+    "PredictionSource",
     "PreloadSource",
     "ProgressSnapshot",
     "RUNTIME_PROBE_STRATEGY_EPOCH_1",
     "RUNTIME_PROBE_STRATEGY_STEP_WINDOW",
     "ResourceRequirements",
+    "ResourcePrediction",
     "RunProfile",
     "RuntimeProfile",
     "RuntimeProbeSpec",
@@ -89,6 +103,7 @@ __all__ = [
     "SchedulerReport",
     "SoloProfile",
     "TrainingJob",
+    "GroupPrediction",
     "build_backend_scoped_pair_key",
     "build_batch_probe_key",
     "build_batch_probe_shape_signature",
@@ -104,6 +119,7 @@ __all__ = [
     "normalize_group_signatures",
     "normalize_runtime_probe_strategy",
     "parse_timestamp",
+    "prediction_timestamp",
     "stable_job_id",
     "to_primitive",
     "utc_now",

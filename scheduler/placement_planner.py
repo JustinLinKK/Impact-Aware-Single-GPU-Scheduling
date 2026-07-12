@@ -104,6 +104,14 @@ class PlacementPlanner:
                     "reason": evaluated.reason,
                 }
             )
+        prediction_traces: dict[str, Any] = {}
+        for job in jobs:
+            key = (job.job_id, backend, self.estimator.packing_batch_size(job, backend))
+            trace = self.estimator.last_prediction_results.get(key)
+            if trace is not None:
+                prediction_traces[job.job_id] = trace
+        if prediction_traces:
+            payload["prediction_traces"] = prediction_traces
         return payload
 
     def _plan_trace(self, plan: DispatchPlan | None) -> dict[str, Any] | None:
@@ -212,7 +220,6 @@ class PlacementPlanner:
         best_group: EvaluatedGroup | None = None
         packed_backend_unavailable = False
         missing_memory_estimate = False
-        missing_runtime_profile = False
         incompatible_group = False
         for group in self.candidate_generator.candidate_groups(ordered, scheduler_mode=scheduler_mode):
             configured_backends = [
@@ -242,28 +249,6 @@ class PlacementPlanner:
                     )
                 )
                 continue
-            profile_ready_backends: list[str] = []
-            for backend_name in available_backends:
-                if backend_name == "exclusive":
-                    profile_ready_backends.append(backend_name)
-                    continue
-                missing_profiles = self.compatibility.missing_runtime_profile_jobs(group, backend_name=backend_name)
-                if not missing_profiles:
-                    profile_ready_backends.append(backend_name)
-                    continue
-                missing_runtime_profile = True
-                trace["candidates"].append(
-                    self._candidate_trace(
-                        group,
-                        backend_name=backend_name,
-                        status="rejected",
-                        rejection_reason="packing runtime profile missing",
-                    )
-                    | {"missing_runtime_profile_job_ids": [job.job_id for job in missing_profiles]}
-                )
-            available_backends = profile_ready_backends
-            if not available_backends:
-                continue
             viable_backends = [
                 backend_name
                 for backend_name in available_backends
@@ -274,7 +259,7 @@ class PlacementPlanner:
                 memory_rejection_reason = (
                     "VRAM estimate unavailable; exclusive calibration probe required"
                     if scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK
-                    else "solo profile or VRAM estimate unavailable"
+                    else "VRAM estimate unavailable"
                 )
                 for backend_name in available_backends:
                     trace["candidates"].append(
@@ -322,10 +307,8 @@ class PlacementPlanner:
                 reason = (
                     "VRAM estimate unavailable; dispatching exclusive calibration probe"
                     if scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK
-                    else "solo profile or VRAM estimate unavailable"
+                    else "VRAM estimate unavailable"
                 )
-            elif missing_runtime_profile:
-                reason = "packing runtime profile missing; dispatching exclusive calibration probe"
             elif incompatible_group:
                 reason = "no compatible packed group"
             plan = DispatchPlan(mode="exclusive", backend_name="exclusive", job_ids=(primary.job_id,), reason=reason)
@@ -340,12 +323,6 @@ class PlacementPlanner:
                 and best_group.backend_name == "exclusive"
             ):
                 plan_reason = "VRAM estimate unavailable; dispatching exclusive calibration probe"
-            elif (
-                scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK
-                and missing_runtime_profile
-                and best_group.backend_name == "exclusive"
-            ):
-                plan_reason = "packing runtime profile missing; dispatching exclusive calibration probe"
             plan = DispatchPlan(
                 mode="exclusive",
                 backend_name=best_group.backend_name,

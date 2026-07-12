@@ -35,7 +35,9 @@ class ObjectiveScorer:
         if not self.compatibility.compatible_group(jobs, backend_name=backend_name):
             return None
         batch_overrides = {job.job_id: self.estimator.packing_batch_size(job, backend_name) for job in jobs}
-        estimated_vram_mb = sum(self.estimator.estimate_peak_vram_mb(job, batch_overrides[job.job_id], backend_name) for job in jobs)
+        estimated_vram_mb = self._estimated_group_vram_mb(jobs, batch_overrides, backend_name)
+        if estimated_vram_mb is None:
+            return None
         safe_budget_mb = self.estimator.safe_budget_mb()
         if estimated_vram_mb > safe_budget_mb:
             return None
@@ -65,12 +67,6 @@ class ObjectiveScorer:
             scheduler_mode=SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
         )
         if cached is not None and cached.batch_vector:
-            trusted_batch_overrides = {job.job_id: self.estimator.packing_batch_size(job, backend_name) for job in jobs}
-            if any(self.estimator.requires_successful_runtime_profile_for_packing(job) for job in jobs):
-                cached_vector = {str(job_id): int(batch_size) for job_id, batch_size in cached.batch_vector.items()}
-                if cached_vector != trusted_batch_overrides:
-                    cached = None
-        if cached is not None and cached.batch_vector:
             estimated_vram_mb = float(cached.peak_vram_mb or 0)
             return EvaluatedGroup(
                 jobs=jobs,
@@ -84,9 +80,7 @@ class ObjectiveScorer:
             )
 
         per_job_candidates = [
-            [self.estimator.packing_batch_size(job, backend_name)]
-            if self.estimator.requires_successful_runtime_profile_for_packing(job)
-            else self.candidate_generator.candidate_batch_sizes(job)
+            self.candidate_generator.candidate_batch_sizes(job)
             for job in jobs
         ]
         safe_budget_mb = self.estimator.safe_budget_mb()
@@ -96,9 +90,7 @@ class ObjectiveScorer:
             search_space = product(*per_job_candidates)
         else:
             baseline = tuple(
-                self.estimator.packing_batch_size(job, backend_name)
-                if self.estimator.requires_successful_runtime_profile_for_packing(job)
-                else self.estimator.resolved_batch_size(job)
+                self.estimator.resolved_batch_size(job)
                 for job in jobs
             )
             greedy_vectors = [baseline]
@@ -111,7 +103,9 @@ class ObjectiveScorer:
 
         for batch_vector in search_space:
             overrides = {job.job_id: int(batch_size) for job, batch_size in zip(jobs, batch_vector, strict=True)}
-            estimated_vram_mb = sum(self.estimator.estimate_peak_vram_mb(job, overrides[job.job_id], backend_name) for job in jobs)
+            estimated_vram_mb = self._estimated_group_vram_mb(jobs, overrides, backend_name)
+            if estimated_vram_mb is None:
+                continue
             if estimated_vram_mb > safe_budget_mb:
                 continue
             utilization = estimated_vram_mb / safe_budget_mb if safe_budget_mb > 0 else 0.0
@@ -151,10 +145,12 @@ class ObjectiveScorer:
             return None
 
         batch_overrides = {job.job_id: self.estimator.packing_batch_size(job, backend_name) for job in jobs}
-        estimated_vram_mb = sum(self.estimator.estimate_peak_vram_mb(job, batch_overrides[job.job_id], backend_name) for job in jobs)
+        estimated_vram_mb = self._estimated_group_vram_mb(jobs, batch_overrides, backend_name)
+        if estimated_vram_mb is None:
+            return None
         if (active_vram_mb + estimated_vram_mb) > self.estimator.safe_budget_mb():
             return None
-        estimated_sm_utilization = sum(self.estimator.estimate_sm_utilization(job, batch_overrides[job.job_id], backend_name) for job in jobs)
+        estimated_sm_utilization = self.estimator.predicted_group_sm_utilization(jobs, backend_name=backend_name)
         runtime_penalty, hard_reject = self.runtime_guardrail.runtime_penalty(jobs, backend_name=backend_name)
         if hard_reject:
             return None
@@ -185,3 +181,17 @@ class ObjectiveScorer:
             fallback_order=self.candidate_generator.fallback_order(jobs, batch_overrides, backend_name),
             reason="auto-pack group selected",
         )
+
+    def _estimated_group_vram_mb(
+        self,
+        jobs: list[TrainingJob],
+        batch_overrides: dict[str, int],
+        backend_name: str,
+    ) -> float | None:
+        estimates = [
+            self.estimator.estimate_peak_vram_mb(job, batch_overrides[job.job_id], backend_name)
+            for job in jobs
+        ]
+        if any(estimate is None for estimate in estimates):
+            return None
+        return sum(float(estimate) for estimate in estimates if estimate is not None)

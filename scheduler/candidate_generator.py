@@ -33,11 +33,6 @@ class CandidateGenerator:
                     continue
                 if not jobs[0].packing.allows_backend(backend_name):
                     continue
-                if (
-                    self.estimator.requires_successful_runtime_profile_for_packing(jobs[0])
-                    and self.estimator.packing_runtime_profile(jobs[0], backend_name) is None
-                ):
-                    continue
                 candidates.append(backend_name)
             candidates.append("exclusive")
             return candidates
@@ -77,7 +72,7 @@ class CandidateGenerator:
             key=lambda job: (
                 job.priority,
                 -(self.estimator.predicted_remaining_runtime_seconds(job, backend_name=backend_name) or 0.0),
-                -self.estimator.estimate_peak_vram_mb(job, batch_overrides.get(job.job_id, self.estimator.resolved_batch_size(job)), backend_name),
+                -(self.estimator.estimate_peak_vram_mb(job, batch_overrides.get(job.job_id, self.estimator.resolved_batch_size(job)), backend_name) or 0.0),
                 job.queue_sequence,
             ),
         )

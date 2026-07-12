@@ -480,7 +480,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             ):
                 self.assertFalse(backend.available())
 
-    def test_planner_requires_solo_profiles_and_falls_back_when_mps_is_unavailable(self) -> None:
+    def test_planner_requires_memory_predictions_and_falls_back_when_mps_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerSettings(runtime_root=tmpdir, gpu_scheduler={"mode": SCHEDULER_MODE_PARALLEL_DEFAULT})
             store = SQLiteStateStore(settings)
@@ -513,7 +513,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
 
             plan = planner.choose_plan([primary, secondary], backend_available={"exclusive": True, "mps": True})
             self.assertEqual(plan.mode, "exclusive")
-            self.assertIn("solo profile", plan.reason)
+            self.assertIn("VRAM estimate unavailable", plan.reason)
 
     def test_model_family_probe_jobs_force_exclusive_placement(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -704,7 +704,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
 
             self.assertEqual(plan.mode, "exclusive")
             self.assertEqual(plan.backend_name, "exclusive")
-            self.assertIn("runtime profile missing", plan.reason)
+            self.assertIn("VRAM estimate unavailable", plan.reason)
 
     def test_parallel_auto_pack_uses_current_session_runtime_profiles_before_probe(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -747,7 +747,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
 
             self.assertEqual(plan.mode, "packed_pair")
             self.assertEqual(plan.backend_name, "cuda_process")
-            self.assertEqual(plan.batch_overrides, {job.job_id: 4 for job in jobs})
+            self.assertEqual(plan.batch_overrides, {job.job_id: 16 for job in jobs})
             self.assertEqual(plan.reason, "auto-pack group selected")
 
     def test_parallel_auto_pack_rejects_stale_runtime_profiles_for_raw_packing(self) -> None:
@@ -783,8 +783,8 @@ class GpuSchedulerUnitTest(unittest.TestCase):
 
             plan = planner.choose_plan(jobs, backend_available={"exclusive": True, "cuda_process": True})
 
-            self.assertEqual(plan.mode, "exclusive")
-            self.assertIn("runtime profile missing", plan.reason)
+            self.assertEqual(plan.mode, "packed_pair")
+            self.assertEqual(plan.backend_name, "cuda_process")
 
     def test_parallel_auto_pack_uses_startpoint_profile_key_for_derivative_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -838,7 +838,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             plan = planner.choose_plan(jobs, backend_available={"exclusive": True, "cuda_process": True})
 
             self.assertEqual(plan.mode, "exclusive")
-            self.assertIn("runtime profile missing", plan.reason)
+            self.assertIn("VRAM estimate unavailable", plan.reason)
 
     def test_parallel_auto_pack_missing_memory_estimates_dispatches_calibration_probe(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -880,7 +880,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             plan = planner.choose_plan([first, second], backend_available={"exclusive": True, "cuda_process": True})
 
             self.assertEqual(plan.mode, "exclusive")
-            self.assertIn("runtime profile missing", plan.reason)
+            self.assertIn("VRAM estimate unavailable", plan.reason)
 
     def test_parallel_auto_pack_group_size_uses_candidate_window(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1262,7 +1262,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             self.assertEqual(plan.mode, "packed_pair")
             self.assertEqual(plan.backend_name, "cuda_process")
             self.assertEqual(plan.batch_overrides[jobs[0].job_id], 2)
-            self.assertEqual(plan.batch_overrides[jobs[1].job_id], 4)
+            self.assertEqual(plan.batch_overrides[jobs[1].job_id], 2)
 
     def test_parallel_batch_optimizer_power_of_two_restricts_batch_vector_search(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1321,7 +1321,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
 
             plan = planner.choose_plan(jobs, backend_available={"exclusive": True, "cuda_process": True})
             self.assertEqual(plan.mode, "packed_pair")
-            self.assertEqual(plan.batch_overrides[jobs[0].job_id], 4)
+            self.assertEqual(plan.batch_overrides[jobs[0].job_id], 2)
             self.assertEqual(plan.batch_overrides[jobs[1].job_id], 4)
 
     def test_parallel_batch_optimizer_legacy_binary_thresholds_use_power_of_two_range(self) -> None:

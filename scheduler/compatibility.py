@@ -61,36 +61,28 @@ class CompatibilityEvaluator:
         return job.packing.allows_backend(backend_name)
 
     def missing_runtime_profile_jobs(self, jobs: list[TrainingJob], *, backend_name: str) -> list[TrainingJob]:
-        missing: list[TrainingJob] = []
-        if len(jobs) <= 1:
-            return missing
-        for job in jobs:
-            if not self.estimator.requires_successful_runtime_profile_for_packing(job):
-                continue
-            if self.estimator.packing_runtime_profile(job, backend_name) is None:
-                missing.append(job)
-        return missing
+        del jobs, backend_name
+        return []
 
     def compatible_group(self, jobs: list[TrainingJob], *, backend_name: str) -> bool:
         if len(jobs) <= 1:
             return True
-        if self.missing_runtime_profile_jobs(jobs, backend_name=backend_name):
-            return False
         thresholds = self.settings.gpu_scheduler.thresholds
         for left_job, right_job in combinations(jobs, 2):
-            left_profile = self.estimator.solo_profile(left_job)
-            right_profile = self.estimator.solo_profile(right_job)
+            left_batch = self.estimator.packing_batch_size(left_job, backend_name)
+            right_batch = self.estimator.packing_batch_size(right_job, backend_name)
+            left_util = self.estimator.estimate_sm_utilization(left_job, left_batch, backend_name)
+            right_util = self.estimator.estimate_sm_utilization(right_job, right_batch, backend_name)
             pair_profile = self.repository.get_pair_profile(
                 left_job.packing.signature or "",
                 right_job.packing.signature or "",
                 backend_name=backend_name,
             )
-            if left_profile is None or right_profile is None:
-                if pair_profile is not None and (pair_profile.on_cooldown() or not pair_profile.compatible):
-                    return False
-                continue
-            score = compatibility_score(left_job, right_job, left_profile, right_profile, pair_profile, self.settings)
-            if score == float("-inf"):
+            if pair_profile is not None and (pair_profile.on_cooldown() or not pair_profile.compatible):
+                return False
+            if left_util is not None and left_util >= thresholds.pack_reject_sm_active_ge:
+                return False
+            if right_util is not None and right_util >= thresholds.pack_reject_sm_active_ge:
                 return False
             if pair_profile and pair_profile.slowdown_ratio is not None and pair_profile.slowdown_ratio > thresholds.pack_reject_max_slowdown:
                 return False

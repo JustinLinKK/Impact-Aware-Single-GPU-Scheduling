@@ -43,6 +43,8 @@ def import_string(target: str) -> Any:
 def to_primitive(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
+    if isinstance(value, datetime):
+        return value.isoformat()
     if isinstance(value, Path):
         return str(value)
     if is_dataclass(value):
@@ -55,4 +57,3 @@ def to_primitive(value: Any) -> Any:
 
 
 _to_primitive = to_primitive
-

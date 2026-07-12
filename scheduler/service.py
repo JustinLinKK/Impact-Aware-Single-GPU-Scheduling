@@ -1347,19 +1347,19 @@ class SchedulerService:
                     "candidate_count": len(candidates),
                 },
             )
-        missing_profile_candidates = [
+        missing_prediction_candidates = [
             candidate
             for candidate in candidates
-            if candidate.get("rejection_reason") == "packing runtime profile missing"
+            if str(candidate.get("rejection_reason") or "").startswith("VRAM estimate unavailable")
         ]
-        for candidate in missing_profile_candidates:
+        for candidate in missing_prediction_candidates:
             self.event_logger.emit(
-                "packing_skipped_profile_missing",
+                "packing_skipped_prediction_missing",
                 payload={
                     "scheduler_session_id": self.settings.scheduler_session_id,
                     "job_ids": list(candidate.get("job_ids") or []),
                     "backend_name": candidate.get("backend_name"),
-                    "missing_runtime_profile_job_ids": list(candidate.get("missing_runtime_profile_job_ids") or []),
+                    "reason": candidate.get("rejection_reason"),
                 },
             )
         if plan is not None and len(plan.job_ids) > 1:
@@ -1377,18 +1377,18 @@ class SchedulerService:
             plan is not None
             and len(plan.job_ids) == 1
             and plan.backend_name == "exclusive"
-            and missing_profile_candidates
+            and missing_prediction_candidates
         ):
             job = self.store.get_job(plan.job_ids[0])
             if job is not None and job.batch_probe.enabled:
                 self.event_logger.emit(
-                    "batch_probe_after_packing_miss",
+                    "batch_probe_after_prediction_miss",
                     job_id=job.job_id,
                     payload={
                         "scheduler_session_id": self.settings.scheduler_session_id,
                         "job_id": job.job_id,
                         "reason": plan.reason,
-                        "missed_packed_candidates": missing_profile_candidates,
+                        "missed_packed_candidates": missing_prediction_candidates,
                     },
                 )
 

@@ -345,6 +345,165 @@ class ParallelOptimizerSettings:
 
 
 @dataclass(slots=True)
+class PredictionBranchSettings:
+    enabled: bool = True
+    fixed_confidence_if_uncalibrated: float = 0.55
+
+    def __post_init__(self) -> None:
+        self.enabled = bool(self.enabled)
+        try:
+            self.fixed_confidence_if_uncalibrated = max(0.0, min(1.0, float(self.fixed_confidence_if_uncalibrated)))
+        except (TypeError, ValueError):
+            self.fixed_confidence_if_uncalibrated = 0.55
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "PredictionBranchSettings":
+        return cls(**(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "fixed_confidence_if_uncalibrated": self.fixed_confidence_if_uncalibrated,
+        }
+
+
+@dataclass(slots=True)
+class PredictionMLSettings:
+    enabled: bool = False
+    shadow: bool = False
+    hardware_key: str | None = None
+    checkpoint_path: str | None = None
+    calibration_path: str | None = None
+    device: str = "cpu"
+    cache_size: int = 1024
+
+    def __post_init__(self) -> None:
+        self.enabled = bool(self.enabled)
+        self.shadow = bool(self.shadow)
+        self.hardware_key = str(self.hardware_key).strip() if self.hardware_key else None
+        self.checkpoint_path = str(self.checkpoint_path).strip() if self.checkpoint_path else None
+        self.calibration_path = str(self.calibration_path).strip() if self.calibration_path else None
+        self.device = str(self.device or "cpu").strip().lower()
+        if self.device != "cpu" and self.enabled:
+            logger.warning("prediction.ml.device=%s may consume scheduled GPU resources; cpu is recommended.", self.device)
+        try:
+            self.cache_size = max(0, int(self.cache_size))
+        except (TypeError, ValueError):
+            self.cache_size = 1024
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "PredictionMLSettings":
+        return cls(**(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "shadow": self.shadow,
+            "hardware_key": self.hardware_key,
+            "checkpoint_path": self.checkpoint_path,
+            "calibration_path": self.calibration_path,
+            "device": self.device,
+            "cache_size": self.cache_size,
+        }
+
+
+@dataclass(slots=True)
+class PredictionSafetyMarginSettings:
+    branch: float = 1.20
+    ml_uncalibrated: float = 1.25
+    ml_calibrated: float = 1.00
+    explicit: float = 1.30
+    job_local_probe: float = 1.10
+
+    def __post_init__(self) -> None:
+        for name in ("branch", "ml_uncalibrated", "ml_calibrated", "explicit", "job_local_probe"):
+            try:
+                setattr(self, name, max(1.0, float(getattr(self, name))))
+            except (TypeError, ValueError):
+                setattr(self, name, 1.0)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "PredictionSafetyMarginSettings":
+        return cls(**(payload or {}))
+
+    def margin_for(self, source: str, *, warnings: tuple[str, ...] = ()) -> float:
+        normalized = str(source or "").strip().lower()
+        if normalized == "branch":
+            return self.branch
+        if normalized in {"ml_student", "ml_teacher"}:
+            return self.ml_uncalibrated if any("uncalibrated" in warning for warning in warnings) else self.ml_calibrated
+        if normalized == "explicit":
+            return self.explicit
+        if normalized == "job_local_probe":
+            return self.job_local_probe
+        return 1.30
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "branch": self.branch,
+            "ml_uncalibrated": self.ml_uncalibrated,
+            "ml_calibrated": self.ml_calibrated,
+            "explicit": self.explicit,
+            "job_local_probe": self.job_local_probe,
+        }
+
+
+@dataclass(slots=True)
+class PredictionSettings:
+    mode: str = "branch_only"
+    timeout_ms: int = 1000
+    unknown_value_policy: Any | None = None
+    fallback_to_exclusive: bool = True
+    branch: PredictionBranchSettings | dict[str, Any] = field(default_factory=PredictionBranchSettings)
+    ml: PredictionMLSettings | dict[str, Any] = field(default_factory=PredictionMLSettings)
+    safety_margin: PredictionSafetyMarginSettings | dict[str, Any] = field(default_factory=PredictionSafetyMarginSettings)
+
+    def __post_init__(self) -> None:
+        self.mode = str(self.mode or "branch_only").strip().lower().replace("-", "_")
+        if self.mode not in {"branch_only", "ml_shadow", "confidence_first", "ml_primary"}:
+            raise ValueError(f"Unsupported prediction mode: {self.mode}")
+        try:
+            self.timeout_ms = max(1, int(self.timeout_ms))
+        except (TypeError, ValueError):
+            self.timeout_ms = 1000
+        self.fallback_to_exclusive = bool(self.fallback_to_exclusive)
+        if self.branch is None:
+            self.branch = PredictionBranchSettings()
+        if isinstance(self.branch, dict):
+            self.branch = PredictionBranchSettings.from_dict(self.branch)
+        if self.ml is None:
+            self.ml = PredictionMLSettings()
+        if isinstance(self.ml, dict):
+            self.ml = PredictionMLSettings.from_dict(self.ml)
+        if self.safety_margin is None:
+            self.safety_margin = PredictionSafetyMarginSettings()
+        if isinstance(self.safety_margin, dict):
+            self.safety_margin = PredictionSafetyMarginSettings.from_dict(self.safety_margin)
+        if self.mode == "ml_shadow":
+            self.ml.shadow = True
+        if self.mode == "ml_primary" and not self.ml.checkpoint_path and not self.fallback_to_exclusive:
+            raise ValueError("prediction.mode=ml_primary requires prediction.ml.checkpoint_path or fallback_to_exclusive=true")
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "PredictionSettings":
+        data = dict(payload or {})
+        if "request_timeout_ms" in data and "timeout_ms" not in data:
+            data["timeout_ms"] = data.pop("request_timeout_ms")
+        return cls(**data)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "timeout_ms": self.timeout_ms,
+            "unknown_value_policy": self.unknown_value_policy,
+            "fallback_to_exclusive": self.fallback_to_exclusive,
+            "branch": self.branch.to_dict(),
+            "ml": self.ml.to_dict(),
+            "safety_margin": self.safety_margin.to_dict(),
+        }
+
+
+@dataclass(slots=True)
 class BaselineCacheSettings:
     warm_queue_policy: str = "top_k"
     warm_queue_top_k: int | None = 2
@@ -831,6 +990,7 @@ class SchedulerConfig:
     cache_socket_name: str = "cache_server.sock"
     redis_cache: RedisCacheSettings | dict[str, Any] = field(default_factory=RedisCacheSettings)
     auto_resume_recoverable: bool = False
+    prediction: PredictionSettings | dict[str, Any] = field(default_factory=PredictionSettings)
     gpu_scheduler: GpuSchedulerSettings = field(default_factory=GpuSchedulerSettings)
     graph_db: GraphDBSettings | dict[str, Any] = field(default_factory=GraphDBSettings)
     hardware_knowledge_graph: HardwareKnowledgeGraphSettings | dict[str, Any] = field(default_factory=HardwareKnowledgeGraphSettings)
@@ -862,6 +1022,10 @@ class SchedulerConfig:
             self.redis_cache = RedisCacheSettings()
         if isinstance(self.redis_cache, dict):
             self.redis_cache = RedisCacheSettings.from_dict(self.redis_cache)
+        if self.prediction is None:
+            self.prediction = PredictionSettings()
+        if isinstance(self.prediction, dict):
+            self.prediction = PredictionSettings.from_dict(self.prediction)
         if self.graph_db is None:
             self.graph_db = GraphDBSettings()
         if isinstance(self.graph_db, dict):
@@ -949,6 +1113,7 @@ class SchedulerConfig:
             "cache_socket_name": self.cache_socket_name,
             "redis_cache": self.redis_cache.to_dict(),
             "auto_resume_recoverable": self.auto_resume_recoverable,
+            "prediction": self.prediction.to_dict(),
             "gpu_scheduler": self.gpu_scheduler.to_dict(),
             "graph_db": self.graph_db.to_dict(),
             "hardware_knowledge_graph": self.hardware_knowledge_graph.to_dict(),
