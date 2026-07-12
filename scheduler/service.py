@@ -968,13 +968,6 @@ class SchedulerService:
             except Exception as exc:
                 artifact_payload = {"plot_error": str(exc)}
                 self.logger.warning("Failed to render training process for %s: %s", job.job_id, exc)
-        if not self.supervisor.request_early_stop(job.job_id, reason=reason):
-            self.event_logger.emit(
-                "scheduler_early_stop_skipped",
-                job_id=job.job_id,
-                payload={"reason": "early-stop request rejected by supervisor", "decision": decision.to_dict()},
-            )
-            return False
         requested_at = utc_now()
         metadata_updates = {
             "scheduler_early_stop_pending": True,
@@ -991,6 +984,13 @@ class SchedulerService:
             hold=True,
             metadata_updates=metadata_updates,
         )
+        if not self.supervisor.request_early_stop(job.job_id, reason=reason):
+            self.event_logger.emit(
+                "scheduler_early_stop_skipped",
+                job_id=job.job_id,
+                payload={"reason": "early-stop request rejected by supervisor", "decision": decision.to_dict()},
+            )
+            return False
         payload = {
             "reason": reason,
             "decision": decision.to_dict(),

@@ -215,6 +215,9 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
     torch.manual_seed(seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
     baseline = context.load_baseline_object()
     model = ToyMLP(
         int(baseline.get("input_dim", params["input_dim"])),
@@ -451,6 +454,13 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
         if max_steps is not None and global_step >= int(max_steps):
             break
 
+    peak_vram_mb = None
+    cuda_device_name = None
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        peak_vram_mb = int(torch.cuda.max_memory_allocated(device) / (1024 * 1024))
+        cuda_device_name = torch.cuda.get_device_name(device)
+
     context.control_hook.safe_point(
         SafePointType.EXPLICIT,
         epoch=min(total_epochs, start_epoch if total_epochs == 0 else total_epochs),
@@ -467,4 +477,10 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
         message="final checkpoint",
         state_factory=lambda: build_checkpoint_state(min(total_epochs, total_epochs), 0, global_step),
     )
-    return {"final_loss": last_loss, "global_step": global_step, "device": str(device)}
+    return {
+        "final_loss": last_loss,
+        "global_step": global_step,
+        "device": str(device),
+        "peak_vram_mb": peak_vram_mb,
+        "cuda_device_name": cuda_device_name,
+    }
