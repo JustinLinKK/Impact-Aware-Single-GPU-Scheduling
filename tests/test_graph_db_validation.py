@@ -948,6 +948,8 @@ class GraphDatabaseValidationTest(unittest.TestCase):
                 limit=5,
             )
             api.search_code_knowledge(query="pytorch amp", filters={"framework": "pytorch"}, limit=3)
+            api.get_runtime_environment(include_package_versions=False, include_precision_checks=False)
+            api.validate_generated_training_code("print('ok')", stage="code_review")
             api.get_code_optimization_context(
                 candidate={"model_key": "resnet50", "script_signature": "sig-resnet50", "proposed_batch_size": 32},
                 limit=3,
@@ -985,6 +987,8 @@ class GraphDatabaseValidationTest(unittest.TestCase):
                 "get_packet_compatibility",
                 "search_profile_summaries",
                 "search_code_knowledge",
+                "get_runtime_environment",
+                "validate_generated_training_code",
                 "get_code_optimization_context",
                 "get_optimization_context",
                 "plan_job_packet",

@@ -17,6 +17,7 @@ from localml_scheduler.code_knowledge.records import load_code_knowledge_records
 from localml_scheduler.hardware_features import load_seed_records, validate_feature_record
 from localml_scheduler.hardware_features.records import HardwareFeatureRecordError, load_feature_records
 from localml_scheduler.hardware_features.store import HardwareFeatureStore
+from localml_scheduler.hardware_knowledge.feature_filter import query_hardware_features
 from localml_scheduler.hardware_knowledge.records import load_hardware_knowledge_from_schema
 
 
@@ -176,6 +177,18 @@ class HardwareFeatureRecordTest(unittest.TestCase):
         self.assertTrue(any(item["feature_id"] == "bf16" for item in bundle["features"]))
         name_keys = [item["name_key"] for item in bundle["hardware"]]
         self.assertEqual(len(name_keys), len(set(name_keys)))
+
+    def test_bf16_amp_context_warns_about_validation_numpy_export(self) -> None:
+        result = query_hardware_features("NVIDIA GeForce RTX 5090", "training_parameters")
+        features = {item["feature_id"]: item for item in result["features"]}
+
+        bf16_text = features["bf16"]["description"]
+        amp_text = features["amp"]["description"]
+
+        self.assertIn("float32", bf16_text)
+        self.assertIn(".cpu().numpy()", bf16_text)
+        self.assertIn("validation", amp_text)
+        self.assertIn("submission", amp_text)
 
 
 class HardwareFeatureStoreTest(unittest.TestCase):

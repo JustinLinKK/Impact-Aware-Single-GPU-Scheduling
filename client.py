@@ -33,6 +33,10 @@ from .dto import JobCommandRequest, JobQuery, PreloadRequest, ReportQuery, Submi
 from .graph_knowledge import SchedulerKnowledgeBase
 from .model_cache.cache_server import CacheClient
 from .redis_cache import RedisLRUCache, graph_cache_enabled, invalidate_graph_cache
+from .runtime_environment import (
+    detect_runtime_environment,
+    validate_generated_training_code as _validate_generated_training_code,
+)
 from .scheduler.service import SchedulerService
 from .storage.state_store import StateStore
 
@@ -1123,6 +1127,26 @@ class SchedulerClient:
                 record_types=record_types,
                 limit=limit,
             )
+        )
+
+    def get_runtime_environment(
+        self,
+        *,
+        include_package_versions: bool = True,
+        include_precision_checks: bool = True,
+    ) -> dict[str, Any]:
+        device_index = int(getattr(getattr(self.settings, "gpu_scheduler", None), "device_index", 0) or 0)
+        return _sanitize_agent_response(
+            detect_runtime_environment(
+                include_package_versions=include_package_versions,
+                include_precision_checks=include_precision_checks,
+                device_index=device_index,
+            )
+        )
+
+    def validate_generated_training_code(self, code: str, stage: str = "code_review") -> dict[str, Any]:
+        return _sanitize_agent_response(
+            _validate_generated_training_code(code, stage=stage)
         )
 
     def _vector_filters_from_context(

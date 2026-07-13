@@ -142,6 +142,20 @@ def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
         )
 
     @server.tool()
+    def get_runtime_environment(
+        include_package_versions: bool = True,
+        include_precision_checks: bool = True,
+    ) -> dict[str, Any]:
+        return client.get_runtime_environment(
+            include_package_versions=include_package_versions,
+            include_precision_checks=include_precision_checks,
+        )
+
+    @server.tool()
+    def validate_generated_training_code(code: str, stage: str = "code_review") -> dict[str, Any]:
+        return client.validate_generated_training_code(code=code, stage=stage)
+
+    @server.tool()
     def get_code_optimization_context(
         candidate: dict[str, Any],
         graph_context: dict[str, Any] | None = None,
