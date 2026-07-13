@@ -21,6 +21,7 @@ import humanize
 from ..execution.runner_protocol import RunnerContext
 from ..scheduler.telemetry import GpuTelemetrySample, NvidiaSmiTelemetrySampler
 from ..domain import BatchProbeTrialResult, BatchResolution, JobStatus, ProgressSnapshot, utc_now
+from ..runtime_environment import repair_generated_training_code
 from utils.candidate_timing import materialize_phase_instrumented_file, parse_phase_timing_log
 
 _BATCH_SIZE_NAMES = {
@@ -47,6 +48,7 @@ class InstrumentedScript:
     path: Path
     had_batch_rewrite: bool
     syntax_error: str | None = None
+    precision_repair_count: int = 0
 
 
 @dataclass(slots=True)
@@ -219,16 +221,35 @@ class _BatchOverrideTransformer(ast.NodeTransformer):
 
 def _materialize_instrumented_script(script_path: Path, working_dir: Path) -> InstrumentedScript:
     source = script_path.read_text(encoding="utf-8")
+    repair_result = repair_generated_training_code(source, stage="scheduler_materialize")
+    source = str(repair_result.get("code") or source)
+    precision_repair_count = int(repair_result.get("replacement_count", 0) or 0)
     try:
         module = ast.parse(source, filename=str(script_path))
     except SyntaxError as exc:
-        return InstrumentedScript(path=script_path, had_batch_rewrite=False, syntax_error=str(exc))
+        return InstrumentedScript(
+            path=script_path,
+            had_batch_rewrite=False,
+            syntax_error=str(exc),
+            precision_repair_count=precision_repair_count,
+        )
 
     transformer = _BatchOverrideTransformer()
     module = transformer.visit(module)
     ast.fix_missing_locations(module)
+    instrumented_dir = working_dir / "working" / "instrumented_scripts"
+    instrumented_dir.mkdir(parents=True, exist_ok=True)
+
     if not transformer.modified:
-        return InstrumentedScript(path=script_path, had_batch_rewrite=False)
+        if precision_repair_count <= 0:
+            return InstrumentedScript(path=script_path, had_batch_rewrite=False)
+        guarded_path = instrumented_dir / f"{script_path.stem}_precision_guarded.py"
+        guarded_path.write_text(source, encoding="utf-8")
+        return InstrumentedScript(
+            path=guarded_path,
+            had_batch_rewrite=False,
+            precision_repair_count=precision_repair_count,
+        )
 
     helper_module = ast.parse(
         "import os\n"
@@ -257,11 +278,13 @@ def _materialize_instrumented_script(script_path: Path, working_dir: Path) -> In
     module.body = helper_module.body + module.body
     ast.fix_missing_locations(module)
 
-    instrumented_dir = working_dir / "working" / "instrumented_scripts"
-    instrumented_dir.mkdir(parents=True, exist_ok=True)
     instrumented_path = instrumented_dir / f"{script_path.stem}_instrumented.py"
     instrumented_path.write_text(ast.unparse(module), encoding="utf-8")
-    return InstrumentedScript(path=instrumented_path, had_batch_rewrite=True)
+    return InstrumentedScript(
+        path=instrumented_path,
+        had_batch_rewrite=True,
+        precision_repair_count=precision_repair_count,
+    )
 
 
 def _base_script_env(
@@ -480,6 +503,12 @@ def _classify_probe_failure(
         "expected scalar type",
         "bfloat16",
         "bf16",
+        "float8",
+        "fp8",
+        "mxfp8",
+        "nvfp4",
+        "mxfp4",
+        "fp4",
         "dtype mismatch",
         "mat1 and mat2 must have the same dtype",
     )
@@ -805,6 +834,11 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
 
     phase_timings = parse_phase_timing_log(phase_log_path, exec_time=exec_time, instrumentation=phase_metadata)
     instrumentation = dict(phase_metadata or {})
+    if instrumented.precision_repair_count:
+        instrumentation["precision_numpy_export_repair"] = {
+            "replacement_count": instrumented.precision_repair_count,
+            "script_path": str(instrumented.path),
+        }
     if early_stop_reason is not None:
         samples = context.store.list_job_metric_samples(context.job.job_id) if hasattr(context.store, "list_job_metric_samples") else []
         artifact_payload: dict[str, Any] = {}

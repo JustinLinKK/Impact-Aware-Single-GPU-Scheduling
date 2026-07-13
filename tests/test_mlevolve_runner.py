@@ -5,7 +5,11 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from localml_scheduler.adapters.mlevolve_runner import probe_mlevolve_script_job, run_mlevolve_script_job
+from localml_scheduler.adapters.mlevolve_runner import (
+    _materialize_instrumented_script,
+    probe_mlevolve_script_job,
+    run_mlevolve_script_job,
+)
 from localml_scheduler.checkpointing.manager import CheckpointManager
 from localml_scheduler.execution.control import ControlPlane, TrainingControlHook
 from localml_scheduler.execution.runner_protocol import RunnerContext
@@ -35,6 +39,56 @@ def _build_context(settings: SchedulerSettings, job: TrainingJob) -> RunnerConte
 
 
 class MLEvolveRunnerTest(unittest.TestCase):
+    def test_materialized_script_repairs_low_precision_numpy_export_with_batch_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            working_dir = Path(tmpdir) / "workspace"
+            working_dir.mkdir(parents=True, exist_ok=True)
+            script_path = working_dir / "candidate.py"
+            script_path.write_text(
+                "\n".join(
+                    [
+                        "import torch",
+                        "batch_size = 4",
+                        "AMP_DTYPE = torch.bfloat16",
+                        "preds_np = preds.cpu().numpy().flatten()",
+                        "labels_np = labels.cpu().numpy()",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            instrumented = _materialize_instrumented_script(script_path, working_dir)
+            materialized = instrumented.path.read_text(encoding="utf-8")
+
+            self.assertTrue(instrumented.had_batch_rewrite)
+            self.assertEqual(instrumented.precision_repair_count, 1)
+            self.assertIn("preds.detach().to(torch.float32).cpu().numpy().flatten()", materialized)
+            self.assertIn("labels.cpu().numpy()", materialized)
+
+    def test_materialized_script_repairs_low_precision_numpy_export_without_batch_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            working_dir = Path(tmpdir) / "workspace"
+            working_dir.mkdir(parents=True, exist_ok=True)
+            script_path = working_dir / "candidate.py"
+            script_path.write_text(
+                "\n".join(
+                    [
+                        "import transformer_engine.pytorch as te",
+                        "PRECISION = 'nvfp4'",
+                        "logits_np = logits.cpu().numpy()",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            instrumented = _materialize_instrumented_script(script_path, working_dir)
+            materialized = instrumented.path.read_text(encoding="utf-8")
+
+            self.assertFalse(instrumented.had_batch_rewrite)
+            self.assertEqual(instrumented.precision_repair_count, 1)
+            self.assertNotEqual(instrumented.path, script_path)
+            self.assertIn("logits.detach().to(torch.float32).cpu().numpy()", materialized)
+
     def test_run_script_job_honors_resolved_batch_size_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir) / "runtime"

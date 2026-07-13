@@ -187,8 +187,10 @@ class HardwareFeatureRecordTest(unittest.TestCase):
 
         self.assertIn("float32", bf16_text)
         self.assertIn(".cpu().numpy()", bf16_text)
+        self.assertIn("low-precision", bf16_text)
         self.assertIn("validation", amp_text)
         self.assertIn("submission", amp_text)
+        self.assertIn("NVFP4", amp_text)
 
 
 class HardwareFeatureStoreTest(unittest.TestCase):

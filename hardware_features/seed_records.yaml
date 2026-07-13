@@ -36,7 +36,7 @@ records:
     record_id: nvidia.blackwell.tensor_cores.precision_policy
     title: Blackwell Tensor Core precision policy
     summary_text: Blackwell Tensor Cores can accelerate low-precision AI math, but generated training code should use framework-supported AMP, bf16, or fp16 paths first and guard experimental precision choices.
-    detail_text: For MLEvolve training code, prefer torch.amp autocast with bf16 or fp16 when the toolkit, model, and loss path are compatible. Keep GradScaler optional because bf16 generally does not require scaling, while fp16 often benefits from it. Autocast should wrap forward and loss computation, but validation metrics, sklearn/NumPy log-loss calculations, pandas exports, and submission arrays should leave autocast and cast predictions/logits/probabilities to float32 before CPU/NumPy conversion. Treat FP4 and TensorRT-oriented low-precision paths as specialized acceleration features that require explicit framework support and validation.
+    detail_text: For MLEvolve training code, prefer framework-supported autocast or Transformer Engine precision paths only when the model and loss path are compatible. Keep GradScaler optional because bf16 generally does not require scaling, while fp16 often benefits from it. Autocast and FP8/NVFP4/MXFP4-style contexts should wrap forward and loss computation, but validation metrics, sklearn/NumPy log-loss calculations, pandas exports, and submission arrays should leave low precision and cast predictions/logits/probabilities to float32 before CPU/NumPy conversion. Treat FP4 and TensorRT-oriented low-precision paths as specialized acceleration features that require explicit framework support and validation.
     vendor: nvidia
     architectures: [blackwell]
     accelerator_names: [rtx_5090, geforce_rtx_5090]
@@ -49,10 +49,10 @@ records:
       - Use torch.amp.autocast with an explicit dtype selected from hardware and framework context.
       - Use GradScaler for fp16 training and make it optional for bf16 training.
       - Keep a full-precision fallback path for numerically fragile losses or metrics.
-      - Cast validation and submission tensors to float32 before passing them to NumPy, sklearn metrics, pandas, or CSV export.
+      - Cast validation and submission prediction/logit/probability tensors to float32 before passing them to NumPy, sklearn metrics, pandas, or CSV export.
     avoid_patterns:
       - Do not blindly enable every low-precision mode at once.
-      - Do not call .cpu().numpy() directly on BF16 tensors; use .float().cpu().numpy() or an equivalent float32 cast first.
+      - Do not call .cpu().numpy() directly on low-precision prediction tensors such as BF16, FP16, FP8, MXFP8, NVFP4, MXFP4, or Transformer Engine outputs; use tensor.detach().to(torch.float32).cpu().numpy() first.
       - Do not use inference-only FP4 paths in training code unless the stack explicitly supports that workflow.
     source_refs:
       - title: NVIDIA TensorRT FP4 on Blackwell GeForce RTX 50 Series
