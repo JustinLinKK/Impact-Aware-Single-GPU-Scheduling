@@ -69,6 +69,19 @@ def test_removed_stage_names_are_rejected():
             mod.query_hardware_node("GeForce RTX 5090", stage)
 
 
+def test_hardware_lookup_prefers_exact_match_before_fuzzy_match():
+    mod = load_filter_module()
+
+    for query in (
+        "GeForce RTX 4070 Super",
+        "rtx_4070_super",
+        "hw:nvidia.ada_lovelace.geforce_rtx_4070_super.spec",
+    ):
+        result = mod.query_hardware_node(query, "training_parameters")
+
+        assert result["gpu_name"] == "GeForce RTX 4070 Super"
+
+
 def test_5090_training_filter_marks_unconfirmed_candidates():
     mod = load_filter_module()
 

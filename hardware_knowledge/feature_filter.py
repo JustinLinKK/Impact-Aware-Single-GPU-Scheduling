@@ -434,7 +434,8 @@ def _append_unique_feature_pair(values: list[list[str]], feature_id: str, descri
 def _lookup_node(
     graph: dict[str, Any], hardware_name: str,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-    query = hardware_name.lower()
+    query = _normalize_hardware_query(hardware_name)
+    candidates: list[tuple[dict[str, Any], list[str]]] = []
     for node in graph["nodes"]:
         if node["label"] != "Hardware":
             continue
@@ -445,7 +446,20 @@ def _lookup_node(
             props.get("name", ""),
             props.get("name_key", ""),
         ] + list(props.get("aliases") or [])
-        if any(query in s.lower() or s.lower() in query for s in searchable if s):
+        candidates.append((node, [str(s) for s in searchable if s]))
+
+    for node, searchable in candidates:
+        if any(query == _normalize_hardware_query(value) for value in searchable):
+            hw_id = node["id"]
+            edges = [
+                e for e in graph["edges"]
+                if e.get("from") == hw_id and e.get("type") == "HAS_FEATURE"
+            ]
+            return node, edges
+
+    for node, searchable in candidates:
+        normalized_values = [_normalize_hardware_query(value) for value in searchable]
+        if any(query in value or value in query for value in normalized_values):
             hw_id = node["id"]
             edges = [
                 e for e in graph["edges"]
@@ -453,6 +467,12 @@ def _lookup_node(
             ]
             return node, edges
     return None, []
+
+
+def _normalize_hardware_query(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    return text.strip("_")
 
 
 def _first_list_entry(value: Any) -> str | None:
