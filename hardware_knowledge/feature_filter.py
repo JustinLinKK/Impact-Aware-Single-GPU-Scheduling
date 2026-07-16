@@ -172,6 +172,8 @@ def query_hardware_features(
             continue
 
         edge_props = edge.get("properties", {})
+        if _is_discouraged_datatype_speed_feature(feature_id, category, edge_props):
+            continue
         features.append(_compact_dict({
             "feature_id": feature_id,
             "name": _feature_name(feat_props),
@@ -268,13 +270,19 @@ def _stage_feature_key_index(
             continue
         edge_props = edge.get("properties") or {}
         description = _feature_short_description(feature_id, feat_props)
-        _append_unique_feature_pair(all_keys, feature_id, description)
+        discouraged_datatype_speed = _is_discouraged_datatype_speed_feature(
+            feature_id,
+            category,
+            edge_props,
+        )
         if edge_props.get("recommended") is False:
             _append_unique_feature_pair(not_recommended_keys, feature_id, description)
-        elif edge_props.get("recommended") is True:
-            _append_unique_feature_pair(recommended_keys, feature_id, description)
+        if not discouraged_datatype_speed:
+            _append_unique_feature_pair(all_keys, feature_id, description)
+            if edge_props.get("recommended") is True:
+                _append_unique_feature_pair(recommended_keys, feature_id, description)
         support_level = str(edge_props.get("support_level") or "").lower()
-        if (
+        if not discouraged_datatype_speed and (
             edge_props.get("recommended") is False
             or support_level in {"experimental", "limited"}
             or bool(edge_props.get("limitations"))
@@ -290,6 +298,33 @@ def _stage_feature_key_index(
         "not_recommended_feature_keys": not_recommended_keys,
         "conditional_feature_keys": conditional_keys,
     }
+
+
+def _is_discouraged_datatype_speed_feature(
+    feature_id: Any,
+    category: Any,
+    edge_props: dict[str, Any],
+) -> bool:
+    if edge_props.get("recommended") is not False:
+        return False
+    feature_key = str(feature_id or "").lower()
+    feature_category = str(category or "").lower()
+    scope = str(edge_props.get("recommendation_scope") or "").lower()
+    if feature_category == "precision":
+        return True
+    if feature_key == "fp8_all_gather_fsdp2":
+        return True
+    if any(token in feature_key for token in ("fp8", "fp4", "int8", "fp64")):
+        return True
+    return any(
+        token in scope
+        for token in (
+            "not_default_training_speed",
+            "inference",
+            "accuracy_reference",
+            "experimental_fp8",
+        )
+    )
 
 
 def _merge_text_values(*values: Any) -> str:

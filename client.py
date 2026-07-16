@@ -816,6 +816,55 @@ class SchedulerClient:
         )
 
     @staticmethod
+    def _is_default_datatype_precision_feature(feature: dict[str, Any]) -> bool:
+        category = str(feature.get("category") or "").lower()
+        if category != "precision":
+            return True
+
+        feature_id = str(feature.get("feature_id") or "").lower()
+        scope = str(feature.get("recommendation_scope") or "").lower()
+        support_level = str(feature.get("support_level") or "").lower()
+        if feature.get("recommended") is False:
+            return False
+        if support_level in {"experimental", "limited"}:
+            return False
+        if any(
+            token in scope
+            for token in (
+                "experimental",
+                "inference",
+                "accuracy_reference",
+                "not_default_training_speed",
+            )
+        ):
+            return False
+        return feature_id in {"amp", "bf16", "fp16", "tf32"}
+
+    @staticmethod
+    def _is_discouraged_datatype_speed_feature(feature: dict[str, Any]) -> bool:
+        if feature.get("recommended") is not False:
+            return False
+
+        feature_id = str(feature.get("feature_id") or "").lower()
+        category = str(feature.get("category") or "").lower()
+        scope = str(feature.get("recommendation_scope") or "").lower()
+        if category == "precision":
+            return True
+        if feature_id == "fp8_all_gather_fsdp2":
+            return True
+        if any(token in feature_id for token in ("fp8", "fp4", "int8", "fp64")):
+            return True
+        return any(
+            token in scope
+            for token in (
+                "not_default_training_speed",
+                "inference",
+                "accuracy_reference",
+                "experimental_fp8",
+            )
+        )
+
+    @staticmethod
     def _select_static_stage_features(
         *,
         stage: str,
@@ -824,6 +873,13 @@ class SchedulerClient:
         limit: int,
     ) -> list[dict[str, Any]]:
         per_stage_limit = max(1, int(limit))
+        if stage == "training_parameters" and scope == "datatype_precision":
+            default_precision_features = [
+                feature
+                for feature in features
+                if SchedulerClient._is_default_datatype_precision_feature(feature)
+            ]
+            return default_precision_features[:per_stage_limit]
         if stage == "training_parameters" and scope != "datatype_precision":
             # training_parameters merges the former optimizer and tuning stages;
             # keep one compact budget for each so graph order cannot hide optimizers.
@@ -832,7 +888,7 @@ class SchedulerClient:
             for feature in features:
                 if SchedulerClient._is_training_optimizer_feature(feature):
                     optimizer_features.append(feature)
-                else:
+                elif not SchedulerClient._is_discouraged_datatype_speed_feature(feature):
                     tuning_features.append(feature)
             return optimizer_features[:per_stage_limit] + tuning_features[:per_stage_limit]
         return features[:per_stage_limit]

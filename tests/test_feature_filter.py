@@ -56,7 +56,8 @@ def test_pipeline_stage_categories_align_with_contract():
     assert training["stage_filter"] == "training_parameters"
     assert {"muon_optimizer", "soap_optimizer", "ademamix_optimizer"} <= training_ids
     assert "gram_newton_schulz_symmetric_gemm" in training_ids
-    assert {"bf16", "fp8_rowwise_scaling", "async_tensor_parallel"} <= training_ids
+    assert {"bf16", "async_tensor_parallel"} <= training_ids
+    assert "fp8_rowwise_scaling" not in training_ids
 
 
 def test_removed_stage_names_are_rejected():
@@ -145,11 +146,12 @@ def test_training_parameters_feature_key_mapping_is_merged_and_source_free():
     assert {"dataset_decomposition", "nvimagecodec_gpu_decode"} <= datatype_keys
     assert "tensor_cores" not in datatype_keys
     assert "muon_optimizer" not in datatype_keys
-    assert {"bf16", "fp8_rowwise_scaling"} <= training_keys
+    assert "bf16" in training_keys
+    assert "fp8_rowwise_scaling" not in training_keys
     assert {"muon_optimizer", "gram_newton_schulz_symmetric_gemm"} <= training_keys
-    assert {"soap_optimizer", "ademamix_optimizer"} <= training_not_recommended
+    assert {"soap_optimizer", "ademamix_optimizer", "fp8_rowwise_scaling"} <= training_not_recommended
     assert any("gradient accumulation" in item.lower() for item in training["recommended_patterns"])
-    assert any("nvfp4" in item.lower() or "mxfp8" in item.lower() for item in training["recommended_patterns"])
+    assert not any("nvfp4" in item.lower() or "mxfp8" in item.lower() for item in training["recommended_patterns"])
     assert any("fp4" in item.lower() or "mxfp8" in item.lower() for item in training["avoid_patterns"])
     combined = json.dumps({"datatype": datatype, "training_parameters": training})
     assert "http://" not in combined
