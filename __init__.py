@@ -5,7 +5,6 @@ from .hardware_client import HardwareKnowledgeClient
 from .config import (
     BaselineCacheSettings,
     GpuSchedulerSettings,
-    HardwareFeatureDBSettings,
     RedisCacheSettings,
     SchedulerConfig,
 )
@@ -54,7 +53,6 @@ __all__ = [
     "RuntimeProfile",
     "BaselineCacheSettings",
     "GpuSchedulerSettings",
-    "HardwareFeatureDBSettings",
     "HardwareKnowledgeClient",
     "RedisCacheSettings",
     "SchedulerClient",

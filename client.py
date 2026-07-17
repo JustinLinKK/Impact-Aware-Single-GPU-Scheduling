@@ -32,7 +32,7 @@ from .domain import (
 from .dto import JobCommandRequest, JobQuery, PreloadRequest, ReportQuery, SubmitJobRequest
 from .graph_knowledge import SchedulerKnowledgeBase
 from .model_cache.cache_server import CacheClient
-from .redis_cache import RedisLRUCache, graph_cache_enabled, invalidate_graph_cache
+from .redis_cache import RedisLRUCache, graph_cache_enabled
 from .runtime_environment import (
     detect_runtime_environment,
     validate_generated_training_code as _validate_generated_training_code,
@@ -139,9 +139,7 @@ class SchedulerClient:
         self.store = StateStore(self.settings)
         self.knowledge = SchedulerKnowledgeBase(self.store)
         self.hardware_knowledge_client = hardware_knowledge_client
-        self._hardware_feature_store = None
         self._hardware_knowledge_store = None
-        self._code_knowledge_store = None
         self._hardware_neighborhood_cache = RedisLRUCache.from_settings(self.settings) if graph_cache_enabled(self.settings) else None
 
     def _knowledge_delegate(self) -> Any | None:
@@ -386,79 +384,12 @@ class SchedulerClient:
     def record_tuning_outcome(self, **kwargs: Any) -> dict[str, Any]:
         return self.knowledge.record_tuning_outcome(**kwargs)
 
-    def rebuild_evidence_graph(self, *, dry_run: bool = True, wipe: bool = False) -> dict[str, Any]:
-        jobs = [job for job in self.store.list_jobs() if job.status.is_terminal]
-        solo_profiles = list(self.store.list_solo_profiles()) if hasattr(self.store, "list_solo_profiles") else []
-        pair_profiles = list(self.store.list_pair_profiles()) if hasattr(self.store, "list_pair_profiles") else []
-        runtime_profiles = list(self.store.list_runtime_profiles()) if hasattr(self.store, "list_runtime_profiles") else []
-        batch_probe_profiles = list(self.store.list_batch_probe_profiles()) if hasattr(self.store, "list_batch_probe_profiles") else []
-        batch_size_observations = list(self.store.list_batch_size_observations()) if hasattr(self.store, "list_batch_size_observations") else []
-        combination_profiles = list(self.store.list_combination_profiles()) if hasattr(self.store, "list_combination_profiles") else []
-        counts = {
-            "terminal_jobs": len(jobs),
-            "solo_profiles": len(solo_profiles),
-            "pair_profiles": len(pair_profiles),
-            "runtime_profiles": len(runtime_profiles),
-            "batch_probe_profiles": len(batch_probe_profiles),
-            "batch_size_observations": len(batch_size_observations),
-            "combination_profiles": len(combination_profiles),
-        }
-        if dry_run:
-            return {"ok": True, "dry_run": True, "would_write": counts, "wipe": False}
-        from .storage.neo4j_store import Neo4jStateStore
-
-        target = getattr(self.store, "mirror_backend", None)
-        if target is None or not isinstance(target, Neo4jStateStore):
-            target = Neo4jStateStore(self.settings)
-        if wipe:
-            target._run_write("MATCH (n) DETACH DELETE n")
-            target._apply_constraints()
-        for job in jobs:
-            target.record_scheduler_job_evidence(job)
-        for profile in solo_profiles:
-            target.record_solo_profile_evidence(profile)
-        for profile in pair_profiles:
-            target.record_pair_profile_evidence(profile)
-        for profile in runtime_profiles:
-            target.record_runtime_profile_evidence(profile)
-        for profile in batch_probe_profiles:
-            target.record_batch_probe_evidence(profile)
-        for observation in batch_size_observations:
-            target.record_batch_size_observation_evidence(observation)
-        for profile in combination_profiles:
-            target.record_combination_profile_evidence(profile)
-        invalidate_graph_cache(self.settings)
-        return {"ok": True, "dry_run": False, "written": counts, "wipe": bool(wipe)}
-
-    def _feature_store(self):
-        if self._hardware_feature_store is None:
-            from .hardware_features import HardwareFeatureStore
-
-            self._hardware_feature_store = HardwareFeatureStore(self.settings)
-        return self._hardware_feature_store
-
     def _hardware_graph_store(self):
         if self._hardware_knowledge_store is None:
             from .hardware_knowledge import HardwareKnowledgeGraphStore
 
             self._hardware_knowledge_store = HardwareKnowledgeGraphStore(self.settings)
         return self._hardware_knowledge_store
-
-    def _code_store(self):
-        if self._code_knowledge_store is None:
-            from .code_knowledge import CodeKnowledgeStore
-
-            self._code_knowledge_store = CodeKnowledgeStore(self.settings)
-        return self._code_knowledge_store
-
-    def ingest_hardware_features(
-        self,
-        *,
-        source: str | Path | None = None,
-        recreate: bool = False,
-        dry_run: bool = False,
-    ) -> dict[str, Any]:
-        return self._feature_store().ingest_source(source, recreate=recreate, dry_run=dry_run)
 
     def ingest_hardware_knowledge_graph(
         self,
@@ -472,95 +403,6 @@ class SchedulerClient:
             recreate=recreate,
             dry_run=dry_run,
         )
-
-    def ingest_code_knowledge(
-        self,
-        *,
-        source: str | Path | None = None,
-        recreate: bool = False,
-        dry_run: bool = False,
-    ) -> dict[str, Any]:
-        return self._code_store().ingest_source(source, recreate=recreate, dry_run=dry_run)
-
-    def ingest_schema_knowledge(
-        self,
-        *,
-        schema_root: str | Path = "schema",
-        recreate: bool = False,
-        dry_run: bool = False,
-    ) -> dict[str, Any]:
-        from .code_knowledge.records import convert_hardware_feature_records, load_code_knowledge_records
-        from .hardware_features.records import load_feature_records
-
-        root = Path(schema_root)
-        hardware_path = root / "hardware_feature_records"
-        code_doc_path = root / "code_doc_chunks"
-        api_symbol_path = root / "api_symbol_chunks"
-
-        hardware_records = load_feature_records(hardware_path) if hardware_path.exists() else []
-        code_doc_records = load_code_knowledge_records(code_doc_path) if code_doc_path.exists() else []
-        api_symbol_records = load_code_knowledge_records(api_symbol_path) if api_symbol_path.exists() else []
-        converted_records = convert_hardware_feature_records(hardware_records) if hardware_records else []
-        code_records = code_doc_records + api_symbol_records + converted_records
-
-        hardware_result = (
-            self._feature_store().ingest_records(
-                hardware_records,
-                recreate=recreate,
-                dry_run=dry_run,
-            )
-            if hardware_records
-            else {"ok": True, "skipped": True, "reason": f"missing {hardware_path}"}
-        )
-        code_result = (
-            self._code_store().ingest_records(
-                code_records,
-                recreate=recreate,
-                dry_run=dry_run,
-            )
-            if code_records
-            else {"ok": True, "skipped": True, "reason": "no code knowledge records found"}
-        )
-        try:
-            hardware_graph_result = self.ingest_hardware_knowledge_graph(
-                schema_root=root,
-                recreate=recreate,
-                dry_run=dry_run,
-            )
-        except Exception as exc:
-            hardware_graph_result = {"ok": False, "reason": str(exc)}
-        return {
-            "ok": bool(hardware_result.get("ok")) and bool(code_result.get("ok")) and bool(hardware_graph_result.get("ok")),
-            "dry_run": bool(dry_run),
-            "schema_root": str(root),
-            "collections": {
-                "hardware_feature_knowledge": {
-                    "target": self.settings.hardware_feature_db.collection_name,
-                    "record_count": len(hardware_records),
-                    "result": hardware_result,
-                },
-                "code_doc_chunks": {
-                    "target": self.settings.hardware_feature_db.code_doc_collection_name,
-                    "record_count": sum(1 for record in code_records if record.get("record_type") == "code_doc_chunks"),
-                },
-                "optimization_recipe_chunks": {
-                    "target": self.settings.hardware_feature_db.optimization_recipe_collection_name,
-                    "record_count": sum(1 for record in code_records if record.get("record_type") == "optimization_recipe_chunks"),
-                },
-                "api_symbol_chunks": {
-                    "target": self.settings.hardware_feature_db.api_symbol_collection_name,
-                    "record_count": sum(1 for record in code_records if record.get("record_type") == "api_symbol_chunks"),
-                },
-            },
-            "code_knowledge_result": code_result,
-            "hardware_knowledge_graph_result": hardware_graph_result,
-            "source_counts": {
-                "hardware_feature_records": len(hardware_records),
-                "code_doc_chunks": len(code_doc_records),
-                "api_symbol_chunks": len(api_symbol_records),
-                "converted_from_hardware": len(converted_records),
-            },
-        }
 
     def _hardware_lookup_terms(
         self,
@@ -1161,30 +1003,6 @@ class SchedulerClient:
             return delegate.get_profile_evidence(candidate=candidate, limit=limit)
         return self.knowledge.get_profile_evidence(candidate=candidate, limit=limit)
 
-    def search_code_knowledge(
-        self,
-        *,
-        query: str,
-        filters: dict[str, Any] | None = None,
-        record_types: list[str] | None = None,
-        limit: int = 8,
-    ) -> list[dict[str, Any]]:
-        if (delegate := self._knowledge_delegate()) is not None:
-            return delegate.search_code_knowledge(
-                query=query,
-                filters=filters,
-                record_types=record_types,
-                limit=limit,
-            )
-        return _sanitize_agent_response(
-            self._code_store().search(
-                query=query,
-                filters=filters or {},
-                record_types=record_types,
-                limit=limit,
-            )
-        )
-
     def get_runtime_environment(
         self,
         *,
@@ -1204,117 +1022,6 @@ class SchedulerClient:
         return _sanitize_agent_response(
             _validate_generated_training_code(code, stage=stage)
         )
-
-    def _vector_filters_from_context(
-        self,
-        candidate: dict[str, Any],
-        graph_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        hardware_context = graph_context.get("hardware_context") or {}
-        hardware = hardware_context.get("hardware") or {}
-        diagnosis = graph_context.get("derived_diagnosis") or {}
-        filters: dict[str, Any] = {
-            "framework": str(candidate.get("framework") or "pytorch"),
-        }
-        if candidate.get("model_family") or candidate.get("packing_family"):
-            filters["model_families"] = candidate.get("model_family") or candidate.get("packing_family")
-        if candidate.get("workload_type") or candidate.get("task_type"):
-            filters["workload_types"] = candidate.get("workload_type") or candidate.get("task_type")
-        if diagnosis.get("profile_symptoms"):
-            filters["profile_symptoms"] = list(diagnosis["profile_symptoms"])
-        if diagnosis.get("optimization_targets"):
-            filters["optimization_targets"] = list(diagnosis["optimization_targets"])
-        stage_hardware = graph_context.get("stage_hardware_features") or {}
-        hardware_features = [
-            str(item.get("feature_id"))
-            for item in stage_hardware.get("features") or []
-            if item.get("feature_id")
-        ]
-        if not hardware_features:
-            hardware_features = list((hardware.get("technology_keys") or []))
-        if not hardware_features and hardware.get("compute_capability"):
-            hardware_features.append(f"cuda_capability_{str(hardware['compute_capability']).replace('.', '')}")
-        if hardware_features:
-            filters["hardware_feature_keys"] = hardware_features
-        return {key: value for key, value in filters.items() if value}
-
-    def _code_query_from_context(self, candidate: dict[str, Any], graph_context: dict[str, Any]) -> str:
-        diagnosis = graph_context.get("derived_diagnosis") or {}
-        stage_hardware = graph_context.get("stage_hardware_features") or {}
-        stage_features = stage_hardware.get("features") or []
-        parts = [
-            str(candidate.get("framework") or "pytorch"),
-            " ".join(self._hardware_stages_for_candidate(candidate)),
-            str(candidate.get("model_family") or candidate.get("packing_family") or ""),
-            str(candidate.get("workload_type") or candidate.get("task_type") or ""),
-            " ".join(str(item.get("feature_id") or "") for item in stage_features[:12]),
-            " ".join(str(item.get("name") or item.get("feature_name") or "") for item in stage_features[:8]),
-            " ".join(diagnosis.get("profile_symptoms") or []),
-            " ".join(diagnosis.get("optimization_targets") or []),
-            "training optimization code batch size precision throughput vram",
-        ]
-        return " ".join(part for part in parts if part.strip())
-
-    def get_code_optimization_context(
-        self,
-        *,
-        candidate: dict[str, Any],
-        graph_context: dict[str, Any] | None = None,
-        limit: int = 8,
-    ) -> dict[str, Any]:
-        if (delegate := self._knowledge_delegate()) is not None:
-            return delegate.get_code_optimization_context(
-                candidate=candidate,
-                graph_context=graph_context,
-                limit=limit,
-            )
-        graph_context = graph_context or self.get_profile_evidence(candidate=candidate, limit=limit)
-        if not (graph_context.get("stage_hardware_features") or {}).get("found"):
-            pipeline_stages = self._hardware_stages_for_candidate(candidate)
-            if pipeline_stages:
-                try:
-                    graph_context = dict(graph_context or {})
-                    graph_context["stage_hardware_features"] = self.get_stage_hardware_features(
-                        hardware_id="current",
-                        pipeline_stage=pipeline_stages,
-                        limit=max(2, int(limit)),
-                    )
-                except Exception:
-                    pass
-        query = self._code_query_from_context(candidate, graph_context)
-        filters = self._vector_filters_from_context(candidate, graph_context)
-        results = self.search_code_knowledge(
-            query=query,
-            filters=filters,
-            record_types=["optimization_recipe_chunks", "code_doc_chunks", "api_symbol_chunks"],
-            limit=limit,
-        )
-        if not results and filters:
-            relaxed_filters = {"framework": filters.get("framework", "pytorch")}
-            results = self.search_code_knowledge(
-                query=query,
-                filters=relaxed_filters,
-                record_types=["optimization_recipe_chunks", "code_doc_chunks", "api_symbol_chunks"],
-                limit=limit,
-            )
-        recipes = [item for item in results if item.get("record_type") == "optimization_recipe_chunks"]
-        docs = [item for item in results if item.get("record_type") == "code_doc_chunks"]
-        api_symbols = [item for item in results if item.get("record_type") == "api_symbol_chunks"]
-        return _sanitize_agent_response({
-            "found": bool(results),
-            "query": query,
-            "filters": filters,
-            "vector_evidence": {
-                "recipes": recipes,
-                "docs": docs,
-                "api_symbols": api_symbols,
-            },
-            "evidence_refs": [
-                f"code_knowledge:{item.get('record_type')}:{item.get('record_id')}"
-                for item in results
-                if item.get("record_id")
-            ],
-        })
 
     def get_optimization_context(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
         if (delegate := self._knowledge_delegate()) is not None:
@@ -1339,7 +1046,6 @@ class SchedulerClient:
             if stage_hardware_features:
                 graph_context = dict(graph_context or {})
                 graph_context["stage_hardware_features"] = stage_hardware_features
-        code_context = self.get_code_optimization_context(candidate=candidate, graph_context=graph_context, limit=limit)
         recommendations: list[str] = []
         risks: list[str] = list(graph_context.get("risk_flags") or [])
         batch_recommendation = graph_context.get("batch_size_recommendation") or {}
@@ -1348,32 +1054,20 @@ class SchedulerClient:
         epoch_recommendation = graph_context.get("epoch_recommendation") or {}
         if epoch_recommendation.get("found") and epoch_recommendation.get("recommended_epochs") is not None:
             recommendations.append(f"Use historical epoch budget {epoch_recommendation['recommended_epochs']} unless the agent has a scoring reason to differ.")
-        vector_evidence = code_context.get("vector_evidence") or {}
-        for item in (vector_evidence.get("recipes") or []) + (vector_evidence.get("docs") or []):
-            for pattern in item.get("recommended_patterns") or []:
-                if pattern not in recommendations:
-                    recommendations.append(pattern)
-            for pattern in item.get("avoid_patterns") or []:
-                if pattern not in risks:
-                    risks.append(pattern)
+        for feature in stage_hardware_features.get("features") or []:
+            name = feature.get("name") or feature.get("feature_name")
+            if feature.get("recommended") and name and name not in recommendations:
+                recommendations.append(str(name))
         graph_confidence = float(graph_context.get("confidence") or 0.0)
-        vector_confidences = [
-            float(item.get("confidence"))
-            for group in vector_evidence.values()
-            for item in (group or [])
-            if item.get("confidence") is not None
-        ]
-        vector_confidence = max(vector_confidences) if vector_confidences else 0.0
-        confidence = round(max(graph_confidence, vector_confidence), 3)
+        confidence = round(graph_confidence, 3)
         result = _sanitize_agent_response({
             "hardware_context": graph_context.get("hardware_context"),
             "graph_evidence": graph_context.get("graph_evidence") or {"exact_profiles": [], "similar_profiles": [], "packed_profiles": []},
             "derived_diagnosis": graph_context.get("derived_diagnosis") or {"profile_symptoms": [], "optimization_targets": []},
             "stage_hardware_features": stage_hardware_features,
-            "vector_evidence": vector_evidence,
             "recommendations": recommendations[: max(1, int(limit))],
             "risk_flags": risks,
-            "evidence_refs": list(graph_context.get("evidence_refs") or []) + list(code_context.get("evidence_refs") or []),
+            "evidence_refs": list(graph_context.get("evidence_refs") or []),
             "confidence": confidence,
         })
         graph_evidence = dict(result.get("graph_evidence") or {})
@@ -1385,11 +1079,6 @@ class SchedulerClient:
         derived_diagnosis.setdefault("profile_symptoms", [])
         derived_diagnosis.setdefault("optimization_targets", [])
         result["derived_diagnosis"] = derived_diagnosis
-        preserved_vector_evidence = dict(result.get("vector_evidence") or {})
-        preserved_vector_evidence.setdefault("recipes", [])
-        preserved_vector_evidence.setdefault("docs", [])
-        preserved_vector_evidence.setdefault("api_symbols", [])
-        result["vector_evidence"] = preserved_vector_evidence
         result.setdefault("recommendations", [])
         result.setdefault("risk_flags", [])
         result.setdefault("evidence_refs", [])
@@ -1410,7 +1099,6 @@ class SchedulerClient:
                     "hardware_context": None,
                     "graph_evidence": {"exact_profiles": [], "similar_profiles": [], "packed_profiles": []},
                     "derived_diagnosis": {"profile_symptoms": ["context_lookup_failed"], "optimization_targets": []},
-                    "vector_evidence": {},
                     "recommendations": [],
                     "risk_flags": [f"context lookup failed: {exc}"],
                     "evidence_refs": [],
@@ -1522,64 +1210,33 @@ class SchedulerClient:
         except Exception:
             feature_index = {"found": False, "features": []}
         families = candidate_families or self._default_model_families_for_workload(workload)
-        hardware = hardware_context.get("hardware") or {}
-        gpu_name = hardware.get("gpu_name") or hardware.get("hardware_key") or "current GPU"
         options: list[dict[str, Any]] = []
         evidence_refs: list[str] = []
         risk_flags: list[str] = []
+        feature_words = self._hardware_feature_words(list((feature_index or {}).get("features") or []))
 
         for family in families[: max(1, int(limit))]:
-            query = (
-                f"{gpu_name} {workload} {family} pytorch training throughput utilization "
-                "tensor cores bf16 fp16 fp8 transformer engine convolution dataloader"
-            )
-            try:
-                matches = self.search_code_knowledge(
-                    query=query,
-                    filters={"framework": "pytorch", "workload_types": workload, "model_families": family},
-                    record_types=["optimization_recipe_chunks", "code_doc_chunks", "api_symbol_chunks"],
-                    limit=max(1, min(4, int(limit))),
-                )
-            except Exception:
-                matches = []
-            if not matches:
-                try:
-                    matches = self.search_hardware_features(
-                        query=query,
-                        hardware_key=hardware_key,
-                        workload_type=workload,
-                        framework="pytorch",
-                        limit=max(1, min(4, int(limit))),
-                    )
-                except Exception:
-                    matches = []
             refs = [
-                f"code_knowledge:{item.get('record_type', 'hardware_feature')}:{item.get('record_id')}"
-                for item in matches
-                if item.get("record_id")
+                f"hardware_feature:{item.get('feature_id')}"
+                for item in (feature_index or {}).get("features") or []
+                if item.get("feature_id")
             ]
             evidence_refs.extend(refs)
-            recommended_patterns: list[str] = []
-            avoid_patterns: list[str] = []
-            for item in matches:
-                recommended_patterns.extend(str(pattern) for pattern in item.get("recommended_patterns") or [])
-                avoid_patterns.extend(str(pattern) for pattern in item.get("avoid_patterns") or [])
-            feature_words = self._hardware_feature_words(matches)
-            confidence = max([float(item.get("confidence") or 0.0) for item in matches] or [0.0])
-            score = round((confidence or 0.1) + min(0.4, 0.05 * len(matches)), 3) if matches else 0.05
+            confidence = round(0.25 + min(0.5, 0.03 * len(feature_words)), 3)
+            score = round(confidence + min(0.2, 0.02 * len(feature_words)), 3)
             options.append(
                 {
                     "model_family": family,
+                    "branch_name": family,
                     "score": score,
                     "confidence": round(confidence, 3),
-                    "rationale": self._model_family_rationale(family, workload, feature_words, bool(matches)),
+                    "rationale": self._model_family_rationale(family, workload, feature_words, bool(feature_words)),
                     "hardware_features": feature_words[:8],
-                    "expected_benefits": recommended_patterns[:4],
-                    "risks": avoid_patterns[:4],
+                    "expected_benefits": [],
+                    "risks": [],
                     "evidence_refs": refs,
                 }
             )
-            risk_flags.extend(avoid_patterns[:4])
 
         options.sort(key=lambda item: (float(item.get("score") or 0.0), float(item.get("confidence") or 0.0)), reverse=True)
         recommendations = [
@@ -1680,7 +1337,11 @@ class SchedulerClient:
             "hardware_context": hardware_context,
             "query": query,
             "matches": matches,
-            "evidence_refs": [f"code_knowledge:{match.get('record_type', 'hardware_feature')}:{match['record_id']}" for match in matches if match.get("record_id")],
+            "evidence_refs": [
+                f"hardware_feature:{match.get('feature_id') or match.get('record_id')}"
+                for match in matches
+                if match.get("feature_id") or match.get("record_id")
+            ],
         })
 
     def get_hardware_optimization_context(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
@@ -1690,12 +1351,8 @@ class SchedulerClient:
         context = self.get_optimization_context(candidate=candidate, limit=limit)
         job_design_context = self.get_job_design_context(candidate, limit=limit)
         feature_context = {
-            "found": any(context.get("vector_evidence", {}).values()),
-            "matches": (
-                list(context.get("vector_evidence", {}).get("recipes") or [])
-                + list(context.get("vector_evidence", {}).get("docs") or [])
-                + list(context.get("vector_evidence", {}).get("api_symbols") or [])
-            ),
+            "found": bool((context.get("stage_hardware_features") or {}).get("features")),
+            "matches": list((context.get("stage_hardware_features") or {}).get("features") or []),
         }
         return _sanitize_agent_response({
             "hardware_context": context.get("hardware_context"),
@@ -1722,7 +1379,7 @@ class SchedulerClient:
     def _hardware_feature_words(self, matches: list[dict[str, Any]]) -> list[str]:
         features: list[str] = []
         for item in matches:
-            for key in ("hardware_feature_keys", "technology_keys", "api_symbols"):
+            for key in ("feature_id", "feature_name", "category", "hardware_feature_keys", "technology_keys", "api_symbols"):
                 raw_values = item.get(key) or []
                 if isinstance(raw_values, str):
                     raw_values = [raw_values]

@@ -27,7 +27,7 @@ from ..domain import (
 )
 from ..hardware import HardwareProfile, detect_hardware_profile
 from ..config import SchedulerSettings
-from .models import MIGRATION_STATEMENTS, SCHEMA_STATEMENTS
+from .models import SCHEMA_STATEMENTS
 
 
 class SQLiteStateStore:
@@ -50,12 +50,6 @@ class SQLiteStateStore:
         with self._connect() as connection:
             for statement in SCHEMA_STATEMENTS:
                 connection.execute(statement)
-            for statement in MIGRATION_STATEMENTS:
-                try:
-                    connection.execute(statement)
-                except sqlite3.OperationalError as exc:
-                    if "duplicate column name" not in str(exc).lower():
-                        raise
             connection.commit()
 
     def hardware_profile(self) -> HardwareProfile:

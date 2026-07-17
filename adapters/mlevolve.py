@@ -137,20 +137,68 @@ def build_startpoint_shape_signature(*, task_id: str, model_key: str, modality: 
     return f"mlevolve-startpoint-shape:{digest[:24]}"
 
 
-def normalize_model_family(value: str | None) -> str:
+def normalize_branch_name(value: str | None) -> str:
     normalized = re.sub(r"[^a-zA-Z0-9_.:/-]+", "-", str(value or "").strip().lower())
     normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
-    return normalized or "unknown-family"
+    normalized = normalized.replace(":", "-").replace("/", "-")
+    normalized = re.sub(r"[_-]+", "-", normalized)
+    if not normalized:
+        return "unknown-branch"
+
+    compact = normalized.replace("-", "_")
+    resnet = re.search(r"(?:^|_)resnet_?(\d+)(?:d|v\d+|_[a-z0-9]+)?(?:_|$)", compact)
+    if resnet:
+        return f"resnet{resnet.group(1)}"
+    efficientnet = re.search(r"(?:^|_)efficientnet[_-]?([a-z]\d+)", compact)
+    if efficientnet:
+        return f"efficientnet-{efficientnet.group(1)}"
+    convnext = re.search(r"(?:^|_)convnext[_-]?([a-z]+)", compact)
+    if convnext:
+        return f"convnext-{convnext.group(1)}"
+    swin = re.search(r"(?:^|_)swin[_-]?([a-z0-9]+)", compact)
+    if swin:
+        return f"swin-{swin.group(1)}"
+    vit = re.search(r"(?:^|_)(?:vit|vision-transformer)[_-]?([a-z0-9]+)?", compact)
+    if vit:
+        suffix = vit.group(1)
+        return f"vit-{suffix}" if suffix else "vit"
+    return normalized or "unknown-branch"
+
+
+def normalize_model_family(value: str | None) -> str:
+    """Legacy alias for branch-name normalization."""
+
+    return normalize_branch_name(value)
+
+
+def build_branch_profile_key(branch_name: str) -> str:
+    return f"branch-profile:{normalize_branch_name(branch_name)}"
 
 
 def build_model_family_profile_key(*, task_id: str, model_family: str) -> str:
+    """Legacy alias for a task-independent branch profile key."""
+
+    del task_id
+    return build_branch_profile_key(model_family)
+
+
+def build_branch_shape_signature(
+    *,
+    branch_name: str,
+    shape_hints: dict[str, Any] | None = None,
+) -> str:
+    hints = {
+        str(key): value
+        for key, value in dict(shape_hints or {}).items()
+        if key not in {"task_id", "exp_id", "workflow_id", "script_signature"}
+    }
     payload = {
-        "kind": "mlevolve_model_family",
-        "model_family": normalize_model_family(model_family),
-        "task_id": str(task_id or "mlevolve"),
+        "kind": "mlevolve_branch_shape",
+        "branch_name": normalize_branch_name(branch_name),
+        "shape_hints": hints,
     }
     digest = sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-    return f"mlevolve-family:{digest[:24]}"
+    return f"mlevolve-branch-shape:{digest[:24]}"
 
 
 def build_model_family_shape_signature(
@@ -159,14 +207,8 @@ def build_model_family_shape_signature(
     model_family: str,
     shape_hints: dict[str, Any] | None = None,
 ) -> str:
-    payload = {
-        "kind": "mlevolve_model_family_shape",
-        "model_family": normalize_model_family(model_family),
-        "shape_hints": shape_hints or {},
-        "task_id": str(task_id or "mlevolve"),
-    }
-    digest = sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-    return f"mlevolve-family-shape:{digest[:24]}"
+    del task_id
+    return build_branch_shape_signature(branch_name=model_family, shape_hints=shape_hints)
 
 
 def build_model_family_probe_job(
@@ -184,8 +226,9 @@ def build_model_family_probe_job(
     probe_max_batch_size: int | None = None,
 ) -> TrainingJob:
     """Build an exclusive probe job for a generated MLEvolve model family."""
-    normalized_family = normalize_model_family(model_family)
+    normalized_family = normalize_branch_name(model_family)
     hints = dict(shape_hints or {})
+    hints.setdefault("branch_name", normalized_family)
     hints.setdefault("model_family", normalized_family)
     profile_key = build_model_family_profile_key(task_id=task_id, model_family=normalized_family)
     shape_signature = build_model_family_shape_signature(
@@ -205,7 +248,7 @@ def build_model_family_probe_job(
     }
     return build_mlevolve_job(
         workflow_id=workflow_id,
-        baseline_model_id=f"mlevolve-model-family:{normalized_family}",
+        baseline_model_id=f"mlevolve-branch:{normalized_family}",
         baseline_model_path=str(script_path),
         runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_model_family_probe_job",
         runner_kwargs=runner_kwargs,
@@ -232,6 +275,8 @@ def build_model_family_probe_job(
         metadata={
             "kind": "mlevolve_model_family_probe",
             "task_id": str(task_id or "mlevolve"),
+            "branch_name": normalized_family,
+            "branch_profile_key": profile_key,
             "model_family": normalized_family,
             "profile_key": profile_key,
             "shape_signature": shape_signature,

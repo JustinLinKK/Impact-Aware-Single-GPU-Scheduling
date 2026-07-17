@@ -13,6 +13,7 @@ from localml_scheduler.domain import BatchProbeProfile, BatchResolution, JobRun,
 from localml_scheduler.dto import SubmitJobRequest
 from localml_scheduler.graph_knowledge import SchedulerKnowledgeBase
 from localml_scheduler.hardware_client import HardwareKnowledgeClient
+from localml_scheduler.hardware_knowledge import HardwareKnowledgeSettings
 
 
 class _MemoryCache:
@@ -118,9 +119,6 @@ class HardwareKnowledgeClientTest(unittest.TestCase):
             settings = SchedulerConfig.from_dict(
                 {
                     "runtime_root": tmpdir,
-                    "graph_db": {"enabled": False, "mode": "off"},
-                    "hardware_knowledge_graph": {"enabled": False},
-                    "hardware_feature_db": {"enabled": False},
                 }
             )
             payload = {
@@ -155,9 +153,6 @@ class HardwareKnowledgeClientTest(unittest.TestCase):
             settings = SchedulerConfig.from_dict(
                 {
                     "runtime_root": tmpdir,
-                    "graph_db": {"enabled": False, "mode": "off"},
-                    "hardware_knowledge_graph": {"enabled": False},
-                    "hardware_feature_db": {"enabled": False},
                 }
             )
 
@@ -185,7 +180,7 @@ class HardwareKnowledgeClientTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             delegate = FakeHardwareKnowledge()
             scheduler = SchedulerClient(
-                SchedulerConfig.from_dict({"runtime_root": tmpdir, "graph_db": {"enabled": False, "mode": "off"}}),
+                SchedulerConfig.from_dict({"runtime_root": tmpdir}),
                 hardware_knowledge_client=delegate,
             )
             result = scheduler.get_optimization_context(candidate={"stage": "draft"}, limit=4)
@@ -291,17 +286,18 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
                 "hardware": {"gpu_name": "RTX 5090", "summary_text": "RTX 5090"},
                 "scheduler_limits": {"safe_vram_budget_mb": 24000},
             }
-            client.get_hardware_feature_index = lambda *_, **__: {"found": False, "features": []}  # type: ignore[method-assign]
-            client.search_code_knowledge = lambda **_: [  # type: ignore[method-assign]
-                {
-                    "record_id": "bf16-doc",
-                    "record_type": "code_doc_chunks",
-                    "title": "BF16 tensor core training",
-                    "summary_text": "Use bf16 tensor core paths for transformer throughput.",
-                    "recommended_patterns": ["Use bf16 autocast."],
-                    "confidence": 0.8,
-                }
-            ]
+            client.get_stage_hardware_features = lambda *_, **__: {"found": False, "features": []}  # type: ignore[method-assign]
+            client.get_hardware_feature_index = lambda *_, **__: {  # type: ignore[method-assign]
+                "found": True,
+                "features": [
+                    {
+                        "feature_id": "bf16",
+                        "feature_name": "BF16 tensor core training",
+                        "category": "precision",
+                        "confidence": 0.8,
+                    }
+                ],
+            }
 
             context = client.get_model_design_hardware_context(
                 workload_type="vision_training",
@@ -311,14 +307,13 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
 
             self.assertTrue(context["found"])
             self.assertEqual(context["model_options"][0]["model_family"], "vision_transformer")
-            self.assertIn("code_knowledge:code_doc_chunks:bf16-doc", context["evidence_refs"])
-            self.assertGreaterEqual(context["confidence"], 0.8)
+            self.assertIn("hardware_feature:bf16", context["evidence_refs"])
+            self.assertGreater(context["confidence"], 0.0)
 
     def test_hardware_feature_index_prewarm_and_details_use_neighborhood_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerConfig(
                 runtime_root=tmpdir,
-                graph_db={"enabled": False, "mode": "off"},
                 redis_cache={"enabled": True},
             )
             client = SchedulerClient(settings)
@@ -497,11 +492,39 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
             self.assertNotIn("int8", training_ids)
             self.assertIn("async_tensor_parallel", training_ids)
 
+    def test_hardware_knowledge_client_queries_graph_without_scheduler_client(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = HardwareKnowledgeSettings(
+                runtime_root=f"{tmpdir}/hardware",
+                branch_profile_db_path=f"{tmpdir}/scheduler/db/branch_profile.sqlite3",
+                graph={"enabled": False},
+                redis_cache={"enabled": False},
+            )
+            client = HardwareKnowledgeClient(settings, include_profile_evidence=True)
+            client.get_hardware_context = lambda *_, **__: {  # type: ignore[method-assign]
+                "found": True,
+                "hardware": {"gpu_name": "GeForce RTX 5090", "hardware_key": "rtx5090"},
+            }
+
+            result = client.get_stage_hardware_features(
+                hardware_id="current",
+                pipeline_stage="training_parameters",
+                limit=4,
+            )
+            evidence = client.get_profile_evidence(
+                candidate={"branch_name": "resnet50", "branch_profile_key": "branch-profile:resnet50"},
+                limit=2,
+            )
+
+            self.assertFalse(client.scheduler_context_attached)
+            self.assertTrue(result["found"])
+            self.assertEqual(result["source"], "hardware_knowledge_graph.json")
+            self.assertEqual(evidence["graph_evidence"]["exact_profiles"], [])
+
     def test_optimization_context_attaches_candidate_stage_hardware_filter(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             client = SchedulerClient(SchedulerConfig(runtime_root=tmpdir))
             stage_calls = []
-            code_context_inputs = []
 
             client.get_profile_evidence = lambda **_: {  # type: ignore[method-assign]
                 "hardware_context": {"found": True},
@@ -529,12 +552,7 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
                     "source": "unit-test",
                 }
 
-            def fake_code_context(*, candidate, graph_context, limit):
-                code_context_inputs.append((candidate, graph_context, limit))
-                return {"vector_evidence": {}, "evidence_refs": []}
-
             client.get_stage_hardware_features = fake_stage_features  # type: ignore[method-assign]
-            client.get_code_optimization_context = fake_code_context  # type: ignore[method-assign]
 
             context = client.get_optimization_context(
                 candidate={"stage": "training_evaluation", "framework": "pytorch"},
@@ -542,7 +560,7 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
             )
 
             self.assertEqual(stage_calls, [("current", ["training_parameters"], 3)])
-            self.assertEqual(code_context_inputs[0][1]["stage_hardware_features"]["stage_filter"], ["training_parameters"])
+            self.assertEqual(context["stage_hardware_features"]["stage_filter"], ["training_parameters"])
             self.assertEqual(context["stage_hardware_features"]["features"][0]["feature_id"], "bf16")
 
     def test_batch_resolution_apply_updates_runner_kwargs_and_metadata(self) -> None:

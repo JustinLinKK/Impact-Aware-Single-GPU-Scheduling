@@ -8,7 +8,7 @@ from localml_scheduler.config import SchedulerSettings
 from localml_scheduler.domain import BatchProbeProfile, ResourceRequirements, TrainingJob
 from localml_scheduler.hardware import HardwareProfile, build_hardware_key
 from localml_scheduler.scheduler.resource_estimator import ResourceEstimator
-from localml_scheduler.storage.sqlite_store import SQLiteStateStore
+from localml_scheduler.storage import StateStore
 
 
 def _fake_hardware_profile(name: str = "prediction-gpu") -> HardwareProfile:
@@ -112,7 +112,7 @@ class SchedulerPredictionTest(unittest.TestCase):
     def test_job_local_probe_prediction_requires_same_job_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerSettings(runtime_root=tmpdir)
-            store = SQLiteStateStore(settings)
+            store = StateStore(settings)
             store._hardware_profile = _fake_hardware_profile("job-local-probe")
             estimator = ResourceEstimator(settings, store)
             job = TrainingJob.create(

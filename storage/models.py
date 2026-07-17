@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-SCHEMA_STATEMENTS = [
+CONTROL_SCHEMA_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS jobs (
         job_id TEXT PRIMARY KEY,
@@ -70,6 +70,30 @@ SCHEMA_STATEMENTS = [
         metadata_json TEXT
     )
     """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_jobs_status_priority
+    ON jobs(status, priority DESC, queue_sequence ASC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_commands_processed_created
+    ON commands(processed_at, created_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_events_created_at
+    ON events(created_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_checkpoints_job_created
+    ON checkpoints(job_id, created_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_job_metric_samples_job_created
+    ON job_metric_samples(job_id, created_at, sample_id)
+    """,
+]
+
+
+BRANCH_PROFILE_SCHEMA_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS solo_profiles (
         signature TEXT NOT NULL,
@@ -187,26 +211,6 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
-    CREATE INDEX IF NOT EXISTS idx_jobs_status_priority
-    ON jobs(status, priority DESC, queue_sequence ASC)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_commands_processed_created
-    ON commands(processed_at, created_at)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_events_created_at
-    ON events(created_at)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_checkpoints_job_created
-    ON checkpoints(job_id, created_at DESC)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_job_metric_samples_job_created
-    ON job_metric_samples(job_id, created_at, sample_id)
-    """,
-    """
     CREATE INDEX IF NOT EXISTS idx_solo_profiles_family
     ON solo_profiles(family, hardware_key, updated_at DESC)
     """,
@@ -236,6 +240,17 @@ SCHEMA_STATEMENTS = [
     """,
 ]
 
+
+SCHEMA_STATEMENTS = CONTROL_SCHEMA_STATEMENTS
+
+PROFILE_TABLE_NAMES = (
+    "solo_profiles",
+    "pair_profiles",
+    "batch_probe_profiles",
+    "batch_size_observations",
+    "combination_profiles",
+    "runtime_profiles",
+)
 
 MIGRATION_STATEMENTS = [
     "ALTER TABLE solo_profiles ADD COLUMN hardware_key TEXT NOT NULL DEFAULT ''",

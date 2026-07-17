@@ -13,6 +13,8 @@ _JOB_DESIGN_CANDIDATE_KEYS = {
     "stage",
     "task_type",
     "model_key",
+    "branch_name",
+    "branch_profile_key",
     "model_family",
     "packing_family",
     "proposed_batch_size",
@@ -417,15 +419,23 @@ class SchedulerKnowledgeBase:
         if script_signature and signature == script_signature:
             return "signature_exact"
         model_key = self._model_key_for_signature(str(signature or ""))
+        reason = self._match_model_key(candidate.get("branch_profile_key"), model_key)
+        if reason:
+            return "branch_profile_key_exact" if reason == "model_key_exact" else reason
         reason = self._match_model_key(candidate.get("model_key"), model_key)
         if reason:
             return reason
+        reason = self._match_model_key(candidate.get("branch_name"), model_key)
+        if reason:
+            return "branch_name_exact" if reason == "model_key_exact" else reason
         return self._match_model_key(candidate.get("model_key"), signature)
 
     def _solo_match_reason(self, signature: str | None, family: str | None, candidate: dict[str, Any]) -> str | None:
         reason = self._runtime_match_reason(signature, candidate)
         if reason:
             return reason
+        if candidate.get("branch_name") and family and str(candidate["branch_name"]).strip().lower() == str(family).strip().lower():
+            return "branch_name_exact"
         if candidate.get("packing_family") and family and candidate["packing_family"] == family:
             return "packing_family_exact"
         if candidate.get("model_family") and family and candidate["model_family"] == family:
@@ -433,19 +443,34 @@ class SchedulerKnowledgeBase:
         return None
 
     def _batch_probe_match_reason(self, model_key: str | None, candidate: dict[str, Any]) -> str | None:
+        reason = self._match_model_key(candidate.get("branch_profile_key"), model_key)
+        if reason:
+            return "branch_profile_key_exact" if reason == "model_key_exact" else reason
         reason = self._match_model_key(candidate.get("model_key"), model_key)
         if reason:
             return reason
+        if candidate.get("branch_name"):
+            reason = self._match_model_key(candidate["branch_name"], model_key)
+            if reason:
+                return "branch_name_exact" if reason == "model_key_exact" else reason
         if candidate.get("packing_family"):
             return self._match_model_key(candidate["packing_family"], model_key)
+        if candidate.get("model_family"):
+            return self._match_model_key(candidate["model_family"], model_key)
         return None
 
     def _run_match_reason(self, profile: RunProfile, candidate: dict[str, Any]) -> str | None:
         if candidate.get("script_signature") and profile.signature == candidate["script_signature"]:
             return "signature_exact"
+        reason = self._match_model_key(candidate.get("branch_profile_key"), profile.model_key)
+        if reason:
+            return "branch_profile_key_exact" if reason == "model_key_exact" else reason
         reason = self._match_model_key(candidate.get("model_key"), profile.model_key)
         if reason:
             return reason
+        reason = self._match_model_key(candidate.get("branch_name"), profile.model_key)
+        if reason:
+            return "branch_name_exact" if reason == "model_key_exact" else reason
         return self._match_model_key(candidate.get("model_key"), profile.signature)
 
     def _evidence_score(self, kind: str, match_reason: str, backend_name: str | None, candidate: dict[str, Any]) -> int:
@@ -461,8 +486,10 @@ class SchedulerKnowledgeBase:
         }.get(kind, 0)
         match_weight = {
             "signature_exact": 30,
+            "branch_profile_key_exact": 24,
             "model_key_exact": 22,
             "model_key_contains": 12,
+            "branch_name_exact": 12,
             "packing_family_exact": 10,
             "model_family_exact": 8,
         }.get(match_reason, 0)
@@ -1182,7 +1209,12 @@ class SchedulerKnowledgeBase:
                 right_model = self._model_key_for_signature(profile.right_signature) or profile.right_signature
                 model_key = str(candidate.get("model_key") or "")
                 signature = str(candidate.get("script_signature") or "")
-                packing_family = str(candidate.get("packing_family") or candidate.get("model_family") or "")
+                packing_family = str(
+                    candidate.get("branch_name")
+                    or candidate.get("packing_family")
+                    or candidate.get("model_family")
+                    or ""
+                )
                 values = {str(left_model), str(right_model), profile.left_signature, profile.right_signature}
                 if model_key and model_key not in values and signature and signature not in values:
                     if not packing_family:
@@ -1272,7 +1304,7 @@ class SchedulerKnowledgeBase:
         def build() -> dict[str, Any]:
             design_context = self.get_job_design_context(candidate=candidate, limit=limit)
             matched_profiles = list(design_context.get("matched_profiles") or [])
-            exact_reasons = {"signature_exact", "model_key_exact"}
+            exact_reasons = {"signature_exact", "branch_profile_key_exact", "branch_name_exact", "model_key_exact"}
             exact_profiles = [entry for entry in matched_profiles if entry.get("match_reason") in exact_reasons]
             similar_profiles = [entry for entry in matched_profiles if entry.get("match_reason") not in exact_reasons]
             packed_profiles = self._packed_profiles_for_candidate(self._normalized_job_design_candidate(candidate), limit=limit)
@@ -1311,7 +1343,9 @@ class SchedulerKnowledgeBase:
             matched_profiles = self._matched_profiles_for_candidate(normalized_candidate, limit=max(1, int(limit)))
             runtime_estimate = self._runtime_estimate_for_candidate(normalized_candidate)
             recommendation_key = str(
-                normalized_candidate.get("model_key")
+                normalized_candidate.get("branch_profile_key")
+                or normalized_candidate.get("model_key")
+                or normalized_candidate.get("branch_name")
                 or normalized_candidate.get("script_signature")
                 or normalized_candidate.get("packing_family")
                 or ""

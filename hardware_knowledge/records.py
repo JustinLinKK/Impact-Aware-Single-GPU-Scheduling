@@ -9,8 +9,6 @@ import re
 
 import yaml
 
-from localml_scheduler.hardware_features.records import load_feature_records, validate_feature_record
-
 
 HARDWARE_KNOWLEDGE_SCHEMA_VERSION = "hardware_knowledge_graph_v1"
 
@@ -161,40 +159,6 @@ def _feature_sample_code(feature_id: str) -> str:
     return ""
 
 
-def _max_verified_date(record: dict[str, Any]) -> str:
-    dates = [
-        str(ref.get("retrieved_or_verified_date") or "").strip()
-        for ref in record.get("source_refs") or []
-        if isinstance(ref, dict)
-    ]
-    dates = [value for value in dates if value]
-    return max(dates) if dates else str(record.get("last_verified") or "").strip()
-
-
-def _aliases_for_record(record: dict[str, Any]) -> list[str]:
-    aliases: list[str] = []
-    name = str(record["title"]).strip()
-    if name.lower().startswith("nvidia "):
-        aliases.append(name[7:])
-    for accelerator in record.get("accelerator_names") or []:
-        text = str(accelerator).strip()
-        if not text:
-            continue
-        aliases.append(text)
-        aliases.append(text.replace("_", " "))
-    compact = re.sub(r"[^A-Za-z0-9]+", " ", name).strip()
-    if compact:
-        aliases.append(compact)
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for alias in aliases:
-        key = alias.lower()
-        if key and key not in seen and alias != name:
-            seen.add(key)
-            deduped.append(alias)
-    return deduped
-
-
 def validate_hardware_spec(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise HardwareKnowledgeRecordError("HardwareSpec record must be an object")
@@ -319,97 +283,12 @@ def feature_from_key(feature_id: str, *, ontology: dict[str, dict[str, Any]] | N
     )
 
 
-def _recommended_for_feature(feature_id: str, patterns: list[str]) -> bool:
-    aliases = {feature_id.lower(), feature_id.lower().replace("_", " ")}
-    if feature_id.startswith("tensor_cores"):
-        aliases.add("tensor core")
-    if feature_id == "amp":
-        aliases.add("autocast")
-        aliases.add("mixed precision")
-    for pattern in patterns:
-        lowered = pattern.lower()
-        if any(alias and alias in lowered for alias in aliases):
-            return True
-    return False
-
-
-def _relationship_defaults(record: dict[str, Any], feature_id: str, feature: dict[str, Any]) -> dict[str, Any]:
-    recommended_patterns = list(record.get("recommended_patterns") or [])
-    avoid_patterns = list(record.get("avoid_patterns") or [])
-    matching_recommendation = next((pattern for pattern in recommended_patterns if _recommended_for_feature(feature_id, [pattern])), "")
-    matching_limitation = next((pattern for pattern in avoid_patterns if _recommended_for_feature(feature_id, [pattern])), "")
-    impact = "high" if feature_id in _HIGH_IMPACT_FEATURES or feature_id.startswith("sm_") else "medium" if feature_id in _MEDIUM_IMPACT_FEATURES else "low"
-    verified_at = _max_verified_date(record)
-    return validate_has_feature(
-        {
-            "hardware_id": record["record_id"],
-            "feature_id": feature_id,
-            "support_level": "native" if feature_id in _NATIVE_FEATURES or feature_id.startswith("sm_") else "supported",
-            "recommended": bool(matching_recommendation),
-            "performance_impact": impact,
-            "software_requirements": [_display_stack(item) for item in list(record.get("toolkits") or []) + list(record.get("frameworks") or [])],
-            "limitations": matching_limitation,
-            "hardware_specific_how_to_use": matching_recommendation or feature.get("how_to_use", ""),
-            "hardware_specific_sample_code": feature.get("sample_code", ""),
-            "verified": bool(record.get("source_refs")),
-            "last_verified_at": verified_at,
-        }
-    )
-
-
-def convert_hardware_feature_records_to_graph(records: list[dict[str, Any]], *, ontology: dict[str, dict[str, Any]] | None = None) -> dict[str, list[dict[str, Any]]]:
-    hardware_specs: list[dict[str, Any]] = []
-    features_by_id: dict[str, dict[str, Any]] = {}
-    relationships: list[dict[str, Any]] = []
-    for raw_record in records:
-        record = validate_feature_record(raw_record)
-        verified_at = _max_verified_date(record)
-        precision_values = ["FP32"]
-        for feature_id in record.get("features") or []:
-            if feature_id in _PRECISION_NAMES and _PRECISION_NAMES[feature_id] not in precision_values:
-                precision_values.append(_PRECISION_NAMES[feature_id])
-        frameworks = [_display_stack(item) for item in record.get("frameworks") or []]
-        hardware_specs.append(
-            validate_hardware_spec(
-                {
-                    "hardware_id": record["record_id"],
-                    "name": record["title"],
-                    "name_key": record["title"],
-                    "aliases": _aliases_for_record(record),
-                    "vendor": "NVIDIA" if record.get("vendor") == "nvidia" else str(record.get("vendor") or "").upper(),
-                    "hardware_type": "GPU",
-                    "architecture": (record.get("architectures") or [""])[0],
-                    "description": record.get("summary_text") or record.get("detail_text") or "",
-                    "memory_gb": float(record.get("vram_MB") or 0) / 1024.0 if record.get("vram_MB") else None,
-                    "memory_type": record.get("vram_type") or "",
-                    "supported_precisions": precision_values,
-                    "software_stack": [_display_stack(item) for item in record.get("toolkits") or []] + frameworks,
-                    "created_at": verified_at,
-                    "updated_at": verified_at,
-                }
-            )
-        )
-        for feature_id in record.get("features") or []:
-            feature = features_by_id.setdefault(
-                feature_id,
-                feature_from_key(feature_id, ontology=ontology, frameworks=frameworks or ["PyTorch"]),
-            )
-            relationships.append(_relationship_defaults(record, feature_id, feature))
-    return {
-        "hardware": hardware_specs,
-        "features": list(features_by_id.values()),
-        "relationships": relationships,
-    }
-
-
 def load_hardware_knowledge_from_schema(schema_root: str | Path = "schema") -> dict[str, list[dict[str, Any]]]:
     root = Path(schema_root)
     graph_json = root / "hardware_knowledge_graph.json"
     if graph_json.exists():
         return load_hardware_knowledge_from_graph_json(graph_json)
-    records = load_feature_records(root / "hardware_feature_records")
-    ontology = load_feature_ontology(root / "ontology" / "hardware_feature_keys.yaml")
-    return convert_hardware_feature_records_to_graph(records, ontology=ontology)
+    raise HardwareKnowledgeRecordError(f"Missing hardware knowledge graph JSON: {graph_json}")
 
 
 def load_hardware_knowledge_from_graph_json(path: str | Path) -> dict[str, list[dict[str, Any]]]:

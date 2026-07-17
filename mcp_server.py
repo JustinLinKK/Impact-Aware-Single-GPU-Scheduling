@@ -128,20 +128,6 @@ def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
         return client.search_profile_summaries(query=query, limit=limit)
 
     @server.tool()
-    def search_code_knowledge(
-        query: str,
-        filters: dict[str, Any] | None = None,
-        record_types: list[str] | None = None,
-        limit: int = 8,
-    ) -> list[dict[str, Any]]:
-        return client.search_code_knowledge(
-            query=query,
-            filters=filters or {},
-            record_types=record_types,
-            limit=limit,
-        )
-
-    @server.tool()
     def get_runtime_environment(
         include_package_versions: bool = True,
         include_precision_checks: bool = True,
@@ -154,18 +140,6 @@ def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
     @server.tool()
     def validate_generated_training_code(code: str, stage: str = "code_review") -> dict[str, Any]:
         return client.validate_generated_training_code(code=code, stage=stage)
-
-    @server.tool()
-    def get_code_optimization_context(
-        candidate: dict[str, Any],
-        graph_context: dict[str, Any] | None = None,
-        limit: int = 8,
-    ) -> dict[str, Any]:
-        return client.get_code_optimization_context(
-            candidate=candidate,
-            graph_context=graph_context,
-            limit=limit,
-        )
 
     @server.tool()
     def get_optimization_context(candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:

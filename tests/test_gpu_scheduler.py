@@ -40,7 +40,7 @@ from localml_scheduler.config import (
     SchedulerSettings,
     effective_scheduler_mode,
 )
-from localml_scheduler.storage.sqlite_store import SQLiteStateStore
+from localml_scheduler.storage import StateStore
 
 
 def _fake_hardware_profile(name: str) -> HardwareProfile:
@@ -62,13 +62,13 @@ def _fake_hardware_profile(name: str) -> HardwareProfile:
     )
 
 
-def _planner(settings: SchedulerSettings, store: SQLiteStateStore | None = None) -> tuple[SQLiteStateStore, PlacementPlanner]:
-    scheduler_store = store or SQLiteStateStore(settings)
+def _planner(settings: SchedulerSettings, store: StateStore | None = None) -> tuple[StateStore, PlacementPlanner]:
+    scheduler_store = store or StateStore(settings)
     return scheduler_store, PlacementPlanner(settings, scheduler_store, PriorityFifoPolicy(enable_priority_aging=False))
 
 
 def _seed_runtime_profile(
-    store: SQLiteStateStore,
+    store: StateStore,
     job: TrainingJob,
     *,
     backend_name: str = "exclusive",
@@ -204,7 +204,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                     "cuda_process": {"enabled": False},
                 },
             )
-            store = SQLiteStateStore(settings)
+            store = StateStore(settings)
             supervisor = _FakeParallelSupervisor(
                 available_backends={
                     "exclusive": True,
@@ -241,7 +241,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                     "mps": {"enabled": False},
                 },
             )
-            store = SQLiteStateStore(settings)
+            store = StateStore(settings)
             supervisor = _FakeParallelSupervisor(
                 available_backends={
                     "exclusive": True,
@@ -483,7 +483,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
     def test_planner_requires_memory_predictions_and_falls_back_when_mps_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerSettings(runtime_root=tmpdir, gpu_scheduler={"mode": SCHEDULER_MODE_PARALLEL_DEFAULT})
-            store = SQLiteStateStore(settings)
+            store = StateStore(settings)
             planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
 
             primary = build_mlevolve_job(
@@ -924,7 +924,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
     def test_raw_mlevolve_jobs_are_not_preemptible_without_checkpoint_resume_support(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerSettings(runtime_root=tmpdir)
-            service = SchedulerService(settings, store=SQLiteStateStore(settings))
+            service = SchedulerService(settings, store=StateStore(settings))
             raw = build_mlevolve_job(
                 workflow_id="wf",
                 baseline_model_id="raw",
@@ -967,7 +967,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                 runtime_root=tmpdir,
                 gpu_scheduler={"mode": SCHEDULER_MODE_PARALLEL_AUTO_PACK, "backend_priority": ["exclusive"]},
             )
-            store = SQLiteStateStore(settings)
+            store = StateStore(settings)
             low = TrainingJob.create(
                 "pkg.runner:train",
                 "low",
@@ -1012,7 +1012,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                 runtime_root=tmpdir,
                 gpu_scheduler={"mode": SCHEDULER_MODE_PARALLEL_AUTO_PACK, "backend_priority": ["exclusive"]},
             )
-            store = SQLiteStateStore(settings)
+            store = StateStore(settings)
             active = TrainingJob.create(
                 "pkg.runner:train",
                 "active",
@@ -1072,7 +1072,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                     "checkpoint_preemption_min_estimated_gain_seconds": 15,
                 },
             )
-            store = SQLiteStateStore(settings)
+            store = StateStore(settings)
             active = TrainingJob.create(
                 "pkg.runner:train",
                 "active",
@@ -1432,7 +1432,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
     def test_batch_size_and_combination_profiles_are_hardware_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerSettings(runtime_root=tmpdir)
-            store = SQLiteStateStore(settings)
+            store = StateStore(settings)
             hardware_a = _fake_hardware_profile("gpu-a")
             hardware_b = _fake_hardware_profile("gpu-b")
             store._hardware_profile = hardware_a
@@ -1542,7 +1542,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                 runtime_root=runtime_root,
                 baseline_cache={"warm_queue_top_k": 4, "entry_capacity": 8},
             )
-            store = SQLiteStateStore(settings)
+            store = StateStore(settings)
             shared_startpoint = workdir / "shared-start.ckpt"
             shared_startpoint.write_bytes(b"shared-startpoint")
             script_a = workdir / "candidate_a.py"
@@ -1596,7 +1596,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                     "memory_budget_bytes": 10,
                 },
             )
-            store = SQLiteStateStore(settings)
+            store = StateStore(settings)
             shared_paths = []
             for index, size in enumerate((4, 4, 4), start=1):
                 shared_startpoint = workdir / f"shared_{index}.ckpt"
@@ -1640,7 +1640,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             workdir = Path(tmpdir) / "workspace"
             workdir.mkdir(parents=True, exist_ok=True)
             settings = SchedulerSettings(runtime_root=runtime_root, baseline_cache={"entry_capacity": 8})
-            store = SQLiteStateStore(settings)
+            store = StateStore(settings)
             script_path = workdir / "candidate.py"
             script_path.write_text("print('script')\n", encoding="utf-8")
             shared_startpoint = workdir / "shared-start.ckpt"
@@ -1682,7 +1682,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                 gpu_scheduler={"backend_priority": ["cuda_process", "exclusive"]},
                 baseline_cache={"entry_capacity": 8, "warm_queue_top_k": 0},
             )
-            store = SQLiteStateStore(settings)
+            store = StateStore(settings)
             shared_startpoint = workdir / "shared-start.ckpt"
             shared_startpoint.write_bytes(b"shared-startpoint")
             preload_source = PreloadSource(

@@ -927,9 +927,11 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
 
 
 def run_mlevolve_model_family_probe_job(context: RunnerContext) -> dict[str, Any]:
-    """Complete after batch-probe preflight has written the model-family profile."""
+    """Complete after batch-probe preflight has written the branch profile."""
     return {
         "kind": "mlevolve_model_family_probe",
+        "branch_name": context.job.metadata.get("branch_name") or context.job.metadata.get("model_family"),
+        "branch_profile_key": context.job.batch_probe.profile_key,
         "model_family": context.job.metadata.get("model_family"),
         "profile_key": context.job.batch_probe.profile_key,
         "resolved_batch_size": context.job.metadata.get("resolved_batch_size"),

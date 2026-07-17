@@ -56,9 +56,6 @@ class LiveGpuSchedulerFullFlowTest(unittest.TestCase):
                     "cuda_process": {"enabled": False},
                     "mps": {"enabled": False},
                 },
-                graph_db={"enabled": False, "mode": "off"},
-                hardware_feature_db={"enabled": False},
-                hardware_knowledge_graph={"enabled": False},
                 log_db={"enabled": False},
                 redis_cache={"enabled": False},
             )
@@ -173,9 +170,6 @@ class LiveGpuSchedulerFullFlowTest(unittest.TestCase):
                     "mps": {"enabled": False},
                     "cuda_process": {"enabled": True},
                 },
-                graph_db={"enabled": False, "mode": "off"},
-                hardware_feature_db={"enabled": False},
-                hardware_knowledge_graph={"enabled": False},
                 log_db={"enabled": False},
                 redis_cache={"enabled": False},
             )

@@ -32,7 +32,7 @@ from localml_scheduler.domain import (
 )
 from localml_scheduler.scheduler.supervisor import WorkerSupervisor
 from localml_scheduler.config import SCHEDULER_MODE_PARALLEL_AUTO_PACK, SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED, SchedulerSettings
-from localml_scheduler.storage.sqlite_store import SQLiteStateStore
+from localml_scheduler.storage import StateStore
 
 
 def wait_for(predicate, timeout: float = 30.0, interval: float = 0.1) -> None:
@@ -78,7 +78,7 @@ def fake_dtype_error_probe(context: RunnerContext, batch_size: int, warmup_steps
 
 
 def _build_context(settings: SchedulerSettings, job: TrainingJob) -> RunnerContext:
-    store = SQLiteStateStore(settings)
+    store = StateStore(settings)
     store.save_job(job)
     event_logger = EventLogger(store, settings.events_jsonl_path)
     checkpoint_manager = CheckpointManager(settings, store, event_logger)
@@ -160,7 +160,7 @@ class BatchProbeUnitTest(unittest.TestCase):
 
     def test_batch_probe_store_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            store = SQLiteStateStore(SchedulerSettings(runtime_root=tmpdir))
+            store = StateStore(SchedulerSettings(runtime_root=tmpdir))
             profile = BatchProbeProfile(
                 probe_key="probe-1",
                 model_key="baseline-a",

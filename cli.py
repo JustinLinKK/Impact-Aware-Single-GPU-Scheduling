@@ -13,20 +13,16 @@ from .client import SchedulerClient
 from .config import SchedulerConfig
 from .dto import JobCommandRequest, PreloadRequest
 from .domain import CommandType
+from .hardware_client import HardwareKnowledgeClient
+from .hardware_knowledge import HardwareKnowledgeSettings
 from .mcp_server import run_stdio as run_mcp_stdio
 
 
 app = typer.Typer(help="Local single-GPU ML job scheduler")
 scheduler_app = typer.Typer(help="Scheduler process commands")
-hardware_features_app = typer.Typer(help="Hardware feature vector database commands")
 hardware_knowledge_app = typer.Typer(help="Static hardware knowledge graph commands")
-code_knowledge_app = typer.Typer(help="Code-knowledge vector database commands")
-knowledge_app = typer.Typer(help="Combined knowledge ingestion commands")
 app.add_typer(scheduler_app, name="scheduler")
-app.add_typer(hardware_features_app, name="hardware-features")
 app.add_typer(hardware_knowledge_app, name="hardware-knowledge")
-app.add_typer(code_knowledge_app, name="code-knowledge")
-app.add_typer(knowledge_app, name="knowledge")
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -61,6 +57,18 @@ def _settings_from_unified_config(config_path: str | None = None) -> SchedulerCo
     return SchedulerConfig.from_dict(settings_payload)
 
 
+def _hardware_settings_from_unified_config(config_path: str | None = None) -> HardwareKnowledgeSettings | None:
+    path = _resolve_unified_config_path(config_path)
+    if path is None:
+        return None
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    hardware = payload.get("hardware_knowledge") if isinstance(payload, dict) else None
+    if not isinstance(hardware, dict):
+        return None
+    settings_payload = hardware.get("settings") if isinstance(hardware.get("settings"), dict) else hardware
+    return HardwareKnowledgeSettings.from_dict(settings_payload)
+
+
 def _build_scheduler_config(settings_path: str | None = None, config_path: str | None = None) -> SchedulerConfig:
     if settings_path:
         typer.echo(
@@ -74,6 +82,11 @@ def _build_scheduler_config(settings_path: str | None = None, config_path: str |
 def _build_client(settings_path: str | None = None, config_path: str | None = None) -> SchedulerClient:
     settings = _build_scheduler_config(settings_path, config_path)
     return SchedulerClient(settings)
+
+
+def _build_hardware_client(config_path: str | None = None) -> HardwareKnowledgeClient:
+    settings = _hardware_settings_from_unified_config(config_path) or HardwareKnowledgeSettings()
+    return HardwareKnowledgeClient(settings)
 
 
 @scheduler_app.command("start")
@@ -97,67 +110,15 @@ def scheduler_mcp(
     run_mcp_stdio(settings_path=settings and str(settings), settings=_build_scheduler_config(settings, config_path))
 
 
-@scheduler_app.command("rebuild-evidence-graph")
-def scheduler_rebuild_evidence_graph(
-    settings: str | None = typer.Option(None, "--settings", help="Deprecated path to scheduler YAML config"),
-    config_path: str | None = typer.Option(None, "--config", help="Path to root MLEvolve config.yaml"),
-    dry_run: bool = typer.Option(True, "--dry-run/--execute", help="Preview writes by default; use --execute to write to Neo4j"),
-    wipe: bool = typer.Option(False, "--wipe/--no-wipe", help="Explicitly wipe Neo4j before rebuilding; ignored during dry-run"),
-) -> None:
-    client = _build_client(settings, config_path)
-    result = client.rebuild_evidence_graph(dry_run=dry_run, wipe=(wipe and not dry_run))
-    typer.echo(json.dumps(result, indent=2, sort_keys=True))
-
-
-@hardware_features_app.command("ingest")
-def hardware_features_ingest(
-    settings: str | None = typer.Option(None, "--settings", help="Deprecated path to scheduler YAML config"),
-    config_path: str | None = typer.Option(None, "--config", help="Path to root MLEvolve config.yaml"),
-    source: Path | None = typer.Option(None, "--source", help="YAML feature corpus to ingest; defaults to repo seed records"),
-    recreate: bool = typer.Option(False, "--recreate/--no-recreate", help="Recreate the Qdrant collection before ingesting"),
-    dry_run: bool = typer.Option(False, "--dry-run/--no-dry-run", help="Validate and summarize records without writing to Qdrant"),
-) -> None:
-    client = _build_client(settings, config_path)
-    result = client.ingest_hardware_features(source=source, recreate=recreate, dry_run=dry_run)
-    typer.echo(json.dumps(result, indent=2, sort_keys=True))
-
-
 @hardware_knowledge_app.command("ingest")
 def hardware_knowledge_ingest(
-    settings: str | None = typer.Option(None, "--settings", help="Deprecated path to scheduler YAML config"),
     config_path: str | None = typer.Option(None, "--config", help="Path to root MLEvolve config.yaml"),
     schema_root: Path = typer.Option(Path("schema"), "--schema-root", help="Schema root containing hardware_knowledge_graph.json"),
     recreate: bool = typer.Option(False, "--recreate/--no-recreate", help="Recreate hardware graph nodes before ingesting"),
     dry_run: bool = typer.Option(False, "--dry-run/--no-dry-run", help="Validate and summarize records without writing to Neo4j"),
 ) -> None:
-    client = _build_client(settings, config_path)
+    client = _build_hardware_client(config_path)
     result = client.ingest_hardware_knowledge_graph(schema_root=schema_root, recreate=recreate, dry_run=dry_run)
-    typer.echo(json.dumps(result, indent=2, sort_keys=True))
-
-
-@code_knowledge_app.command("ingest")
-def code_knowledge_ingest(
-    settings: str | None = typer.Option(None, "--settings", help="Deprecated path to scheduler YAML config"),
-    config_path: str | None = typer.Option(None, "--config", help="Path to root MLEvolve config.yaml"),
-    source: Path | None = typer.Option(None, "--source", help="YAML code-knowledge corpus to ingest; defaults to converted hardware-feature seed records"),
-    recreate: bool = typer.Option(False, "--recreate/--no-recreate", help="Recreate Qdrant collections before ingesting"),
-    dry_run: bool = typer.Option(False, "--dry-run/--no-dry-run", help="Validate and summarize records without writing to Qdrant"),
-) -> None:
-    client = _build_client(settings, config_path)
-    result = client.ingest_code_knowledge(source=source, recreate=recreate, dry_run=dry_run)
-    typer.echo(json.dumps(result, indent=2, sort_keys=True))
-
-
-@knowledge_app.command("ingest-schema")
-def knowledge_ingest_schema(
-    settings: str | None = typer.Option(None, "--settings", help="Deprecated path to scheduler YAML config"),
-    config_path: str | None = typer.Option(None, "--config", help="Path to root MLEvolve config.yaml"),
-    schema_root: Path = typer.Option(Path("schema"), "--schema-root", help="Schema root containing vector YAML directories"),
-    recreate: bool = typer.Option(False, "--recreate/--no-recreate", help="Recreate Qdrant collections before ingesting"),
-    dry_run: bool = typer.Option(False, "--dry-run/--no-dry-run", help="Validate and summarize records without writing to Qdrant"),
-) -> None:
-    client = _build_client(settings, config_path)
-    result = client.ingest_schema_knowledge(schema_root=schema_root, recreate=recreate, dry_run=dry_run)
     typer.echo(json.dumps(result, indent=2, sort_keys=True))
 
 

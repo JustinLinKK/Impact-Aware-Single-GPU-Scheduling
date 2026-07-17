@@ -56,7 +56,7 @@ It is packaged as a root-level module so it can be used by MLEvolve or detached 
 
 - `adapters/`: `mlevolve.py` builds `TrainingJob` from MLEvolve runner specs
 
-- `hardware_features/`: Qdrant-backed semantic search store + seed records
+- `hardware_knowledge/`: standalone hardware knowledge graph config, records, and Neo4j store
 
 - `configs/`: example YAML settings (single-machine, nautilus, full-stack variants)
 
@@ -64,7 +64,7 @@ It is packaged as a root-level module so it can be used by MLEvolve or detached 
 
 - `examples/`: toy PyTorch runner plus demo submission scripts
 
-- `tests/`: 15 test modules including new `test_graph_db_validation.py` and `test_hardware_features.py`
+- `tests/`: scheduler, profile, cache, hardware knowledge, and integration tests
 
 ## Scheduler Internals (`scheduler/`)
 
@@ -222,14 +222,17 @@ See [`docs/scheduler_observability.md`](../docs/scheduler_observability.md) for 
 
 All tools are read-only. They summarize graph evidence and config-derived scheduler limits but do not mutate jobs, profiles, or event history.
 
-The hardware feature tools use Qdrant as an external vector service. For local development, start Qdrant and ingest the repo-curated seed corpus:
+The hardware feature tools read the standalone hardware knowledge graph. For
+local development, start the hardware Neo4j service and ingest the graph JSON:
 
 ```bash
-docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant
-python -m localml_scheduler.cli knowledge ingest-schema --config config.yaml --schema-root schema
+./docker_host_databases.sh up
+python -m localml_scheduler.cli hardware-knowledge ingest --config config.yaml --schema-root schema
 ```
 
-Use `--dry-run` to validate and summarize seed records without writing to Qdrant. MCP search/context calls return empty results instead of failing the scheduler when the feature database is disabled or unavailable.
+Use `--dry-run` to validate and summarize graph records without writing to
+Neo4j. MCP search/context calls return empty results instead of failing the
+scheduler when the hardware graph is disabled or unavailable.
 
 ## How To Run
 
@@ -327,8 +330,5 @@ The pause flow is:
 python -m unittest discover localml_scheduler/tests
 ```
 
-New test modules (since the 2026-05-15 refactor):
-
-- `tests/test_graph_db_validation.py` covers the Neo4j-mirrored knowledge graph
-
-- `tests/test_hardware_features.py` covers the Qdrant-backed hardware feature store
+Newer tests cover branch-profile SQLite storage, scheduler replay, and the
+standalone hardware knowledge graph.

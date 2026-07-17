@@ -24,7 +24,6 @@ class RedisCacheSettings:
     max_entries: int | None = 4096
     socket_timeout_seconds: float = 0.2
     cache_graph_queries: bool = True
-    cache_vector_queries: bool = True
 
     def __post_init__(self) -> None:
         self.enabled = bool(self.enabled)
@@ -37,7 +36,6 @@ class RedisCacheSettings:
             self.max_entries = max(0, int(self.max_entries))
         self.socket_timeout_seconds = max(0.0, float(self.socket_timeout_seconds))
         self.cache_graph_queries = bool(self.cache_graph_queries)
-        self.cache_vector_queries = bool(self.cache_vector_queries)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "RedisCacheSettings":
@@ -60,7 +58,6 @@ class RedisCacheSettings:
             "max_entries": self.max_entries,
             "socket_timeout_seconds": self.socket_timeout_seconds,
             "cache_graph_queries": self.cache_graph_queries,
-            "cache_vector_queries": self.cache_vector_queries,
         }
 
 
@@ -68,8 +65,8 @@ class RedisLRUCache:
     """Tiny application-level LRU cache layered on Redis string keys.
 
     Redis itself can enforce maxmemory policies, but this wrapper keeps an
-    explicit per-namespace recency index so vector and graph caches can be
-    evicted independently in the same Redis database.
+    explicit per-namespace recency index so graph caches can be evicted
+    independently in the same Redis database.
     """
 
     def __init__(self, settings: RedisCacheSettings, *, redis_client: Any | None = None):
@@ -202,13 +199,6 @@ def graph_cache_enabled(settings: Any) -> bool:
     if isinstance(redis_settings, dict):
         redis_settings = RedisCacheSettings.from_dict(redis_settings)
     return bool(getattr(redis_settings, "enabled", False) and getattr(redis_settings, "cache_graph_queries", True))
-
-
-def vector_cache_enabled(settings: Any) -> bool:
-    redis_settings = getattr(settings, "redis_cache", None)
-    if isinstance(redis_settings, dict):
-        redis_settings = RedisCacheSettings.from_dict(redis_settings)
-    return bool(getattr(redis_settings, "enabled", False) and getattr(redis_settings, "cache_vector_queries", True))
 
 
 def invalidate_graph_cache(settings: Any) -> None:
