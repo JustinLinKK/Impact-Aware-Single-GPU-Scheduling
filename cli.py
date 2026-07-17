@@ -13,8 +13,7 @@ from .client import SchedulerClient
 from .config import SchedulerConfig
 from .dto import JobCommandRequest, PreloadRequest
 from .domain import CommandType
-from .hardware_client import HardwareKnowledgeClient
-from .hardware_knowledge import HardwareKnowledgeSettings
+from hardware_knowledge_graph import HardwareKnowledgeClient, HardwareKnowledgeSettings
 from .mcp_server import run_stdio as run_mcp_stdio
 
 

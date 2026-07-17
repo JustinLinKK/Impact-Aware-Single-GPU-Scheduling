@@ -12,8 +12,7 @@ from localml_scheduler.config import SchedulerConfig
 from localml_scheduler.domain import BatchProbeProfile, BatchResolution, JobRun, RuntimeProfile, TrainingJob
 from localml_scheduler.dto import SubmitJobRequest
 from localml_scheduler.graph_knowledge import SchedulerKnowledgeBase
-from localml_scheduler.hardware_client import HardwareKnowledgeClient
-from localml_scheduler.hardware_knowledge import HardwareKnowledgeSettings
+from hardware_knowledge_graph import HardwareKnowledgeClient, HardwareKnowledgeSettings
 
 
 class _MemoryCache:
@@ -116,7 +115,7 @@ class _FakeHardwareKnowledgeStore:
 class HardwareKnowledgeClientTest(unittest.TestCase):
     def test_probe_subprocess_supplies_current_hardware_without_scheduler(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            settings = SchedulerConfig.from_dict(
+            settings = HardwareKnowledgeSettings.from_dict(
                 {
                     "runtime_root": tmpdir,
                 }
@@ -132,7 +131,7 @@ class HardwareKnowledgeClientTest(unittest.TestCase):
             }
 
             with patch(
-                "localml_scheduler.hardware_client.subprocess.run",
+                "hardware_knowledge_graph.client.subprocess.run",
                 return_value=subprocess.CompletedProcess(["python"], 0, stdout=json.dumps(payload) + "\n", stderr=""),
             ) as run_probe:
                 client = HardwareKnowledgeClient(settings, probe_timeout_seconds=3)
@@ -150,14 +149,14 @@ class HardwareKnowledgeClientTest(unittest.TestCase):
 
     def test_probe_failure_is_explicit_and_does_not_start_scheduler(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            settings = SchedulerConfig.from_dict(
+            settings = HardwareKnowledgeSettings.from_dict(
                 {
                     "runtime_root": tmpdir,
                 }
             )
 
             with patch(
-                "localml_scheduler.hardware_client.subprocess.run",
+                "hardware_knowledge_graph.client.subprocess.run",
                 return_value=subprocess.CompletedProcess(["python"], 7, stdout="", stderr="boom"),
             ):
                 client = HardwareKnowledgeClient(settings, probe_timeout_seconds=3)

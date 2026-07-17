@@ -2,20 +2,14 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 
 import pytest
+from hardware_knowledge_graph import feature_filter as mod
 
 
 def load_filter_module():
-    spec = importlib.util.spec_from_file_location(
-        "feature_filter",
-        str(Path(__file__).resolve().parents[1] / "hardware_knowledge" / "feature_filter.py"),
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
     return mod
 
 

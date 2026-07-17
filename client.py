@@ -386,7 +386,7 @@ class SchedulerClient:
 
     def _hardware_graph_store(self):
         if self._hardware_knowledge_store is None:
-            from .hardware_knowledge import HardwareKnowledgeGraphStore
+            from hardware_knowledge_graph import HardwareKnowledgeGraphStore
 
             self._hardware_knowledge_store = HardwareKnowledgeGraphStore(self.settings)
         return self._hardware_knowledge_store
@@ -767,7 +767,7 @@ class SchedulerClient:
                 "reason": "missing hardware name",
             }
         try:
-            from .hardware_knowledge.feature_filter import query_hardware_features, query_hardware_node
+            from hardware_knowledge_graph.feature_filter import query_hardware_features, query_hardware_node
         except Exception as exc:
             return {
                 "found": False,

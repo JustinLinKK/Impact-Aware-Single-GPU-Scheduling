@@ -44,7 +44,7 @@ It is packaged as a root-level module so it can be used by MLEvolve or detached 
 
 - `execution/`: subprocess launcher, backends, file-based control plane, worker entry, stream host
 
-- `storage/`: `StateStore` facade plus SQLite, Neo4j mirror, and Postgres log-store backends
+- `storage/`: `StateStore` facade plus scheduler SQLite, branch-profile SQLite, and Postgres log-store backends
 
 - `profiling/`: `batch_probe.py` and `runtime_probe.py`
 
@@ -56,7 +56,7 @@ It is packaged as a root-level module so it can be used by MLEvolve or detached 
 
 - `adapters/`: `mlevolve.py` builds `TrainingJob` from MLEvolve runner specs
 
-- `hardware_knowledge/`: standalone hardware knowledge graph config, records, and Neo4j store
+- `../hardware_knowledge_graph/`: standalone hardware knowledge graph config, client, records, and Neo4j store
 
 - `configs/`: example YAML settings (single-machine, nautilus, full-stack variants)
 
@@ -227,7 +227,7 @@ local development, start the hardware Neo4j service and ingest the graph JSON:
 
 ```bash
 ./docker_host_databases.sh up
-python -m localml_scheduler.cli hardware-knowledge ingest --config config.yaml --schema-root schema
+python -m hardware_knowledge_graph.cli ingest --config config.yaml --schema-root schema
 ```
 
 Use `--dry-run` to validate and summarize graph records without writing to
