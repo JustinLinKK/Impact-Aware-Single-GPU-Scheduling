@@ -41,6 +41,7 @@ _EPOCH_COUNT_NAMES = {
 }
 _EPOCH_OVERRIDE_VAR = "_MLEVOLVE_PROBE_MAX_EPOCHS"
 _PROBE_MODE_VAR = "_MLEVOLVE_PROBE_MODE"
+_TRAIN_BATCH_OVERRIDE_VAR = "_MLEVOLVE_PROBE_MAX_TRAIN_BATCHES"
 
 
 @dataclass(slots=True)
@@ -144,15 +145,8 @@ def _override_batch_expr(original_value: ast.expr) -> ast.expr:
 
 def _override_epoch_expr(original_value: ast.expr) -> ast.expr:
     override_name = ast.Name(id=_EPOCH_OVERRIDE_VAR, ctx=ast.Load())
-    probe_mode = ast.Name(id=_PROBE_MODE_VAR, ctx=ast.Load())
     return ast.IfExp(
-        test=ast.BoolOp(
-            op=ast.And(),
-            values=[
-                probe_mode,
-                ast.Compare(left=override_name, ops=[ast.IsNot()], comparators=[ast.Constant(value=None)]),
-            ],
-        ),
+        test=ast.Compare(left=override_name, ops=[ast.IsNot()], comparators=[ast.Constant(value=None)]),
         body=ast.Call(
             func=ast.Name(id="min", ctx=ast.Load()),
             args=[
@@ -219,6 +213,21 @@ class _BatchOverrideTransformer(ast.NodeTransformer):
         return node
 
 
+def _prepend_after_module_preamble(module: ast.Module, statements: list[ast.stmt]) -> None:
+    """Keep the module docstring and future imports in their required leading positions."""
+    insertion_index = 0
+    if module.body and isinstance(module.body[0], ast.Expr):
+        value = module.body[0].value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            insertion_index = 1
+    while insertion_index < len(module.body):
+        node = module.body[insertion_index]
+        if not isinstance(node, ast.ImportFrom) or node.module != "__future__":
+            break
+        insertion_index += 1
+    module.body[insertion_index:insertion_index] = statements
+
+
 def _materialize_instrumented_script(script_path: Path, working_dir: Path) -> InstrumentedScript:
     source = script_path.read_text(encoding="utf-8")
     repair_result = repair_generated_training_code(source, stage="scheduler_materialize")
@@ -251,14 +260,73 @@ def _materialize_instrumented_script(script_path: Path, working_dir: Path) -> In
             precision_repair_count=precision_repair_count,
         )
 
-    helper_module = ast.parse(
+    helper_source = (
         "import os\n"
         f"{_BATCH_OVERRIDE_VAR} = os.environ.get('MLEVOLVE_BATCH_SIZE_OVERRIDE')\n"
         f"{_PROBE_MODE_VAR} = os.environ.get('MLEVOLVE_PROBE_MODE') == '1'\n"
-        f"{_EPOCH_OVERRIDE_VAR} = int(os.environ['MLEVOLVE_PROBE_MAX_EPOCHS']) if os.environ.get('MLEVOLVE_PROBE_MAX_EPOCHS') else None\n"
-        "_MLEVOLVE_PROBE_MAX_TRAIN_BATCHES = int(os.environ['MLEVOLVE_PROBE_MAX_TRAIN_BATCHES']) if os.environ.get('MLEVOLVE_PROBE_MAX_TRAIN_BATCHES') else None\n"
+        f"{_EPOCH_OVERRIDE_VAR} = int(os.environ['MLEVOLVE_PROBE_MAX_EPOCHS']) if {_PROBE_MODE_VAR} and os.environ.get('MLEVOLVE_PROBE_MAX_EPOCHS') else None\n"
+        f"{_TRAIN_BATCH_OVERRIDE_VAR} = int(os.environ['MLEVOLVE_PROBE_MAX_TRAIN_BATCHES']) if {_PROBE_MODE_VAR} and os.environ.get('MLEVOLVE_PROBE_MAX_TRAIN_BATCHES') else None\n"
+        "def _mlevolve_probe_column_names(table):\n"
+        "    try:\n"
+        "        columns = getattr(table, 'columns', None)\n"
+        "    except Exception:\n"
+        "        return set()\n"
+        "    if columns is None:\n"
+        "        return set()\n"
+        "    try:\n"
+        "        return {str(column).strip().lower() for column in columns}\n"
+        "    except Exception:\n"
+        "        return set()\n"
+        "def _mlevolve_probe_table_without_labels(table):\n"
+        "    columns = _mlevolve_probe_column_names(table)\n"
+        "    if not columns:\n"
+        "        return False\n"
+        "    label_columns = {'label', 'labels', 'target', 'targets', 'class', 'classes', 'category', 'y'}\n"
+        "    id_columns = {'id', 'image_id', 'file', 'filename', 'path', 'filepath', 'image', 'image_path'}\n"
+        "    return bool(columns & id_columns) and not bool(columns & label_columns)\n"
+        "def _mlevolve_probe_submission_like(loader):\n"
+        "    candidates = []\n"
+        "    try:\n"
+        "        current = getattr(loader, 'dataset', None)\n"
+        "    except Exception:\n"
+        "        current = None\n"
+        "    seen_ids = set()\n"
+        "    for _ in range(4):\n"
+        "        if current is None or id(current) in seen_ids:\n"
+        "            break\n"
+        "        seen_ids.add(id(current))\n"
+        "        candidates.append(current)\n"
+        "        try:\n"
+        "            current = getattr(current, 'dataset', None)\n"
+        "        except Exception:\n"
+        "            break\n"
+        "    for obj in candidates:\n"
+        "        for attr_name in ('is_test', 'is_submission', 'submission', 'predict', 'inference'):\n"
+        "            try:\n"
+        "                value = getattr(obj, attr_name, None)\n"
+        "            except Exception:\n"
+        "                continue\n"
+        "            if isinstance(value, bool) and value:\n"
+        "                return True\n"
+        "        for attr_name in ('mode', 'split', 'stage', 'phase'):\n"
+        "            try:\n"
+        "                value = getattr(obj, attr_name, None)\n"
+        "            except Exception:\n"
+        "                continue\n"
+        "            if isinstance(value, str) and value.strip().lower() in {'test', 'submission', 'submit', 'predict', 'prediction', 'inference'}:\n"
+        "                return True\n"
+        "        if _mlevolve_probe_table_without_labels(obj):\n"
+        "            return True\n"
+        "        for attr_name in ('df', 'dataframe', 'metadata', 'table'):\n"
+        "            try:\n"
+        "                table = getattr(obj, attr_name, None)\n"
+        "            except Exception:\n"
+        "                continue\n"
+        "            if _mlevolve_probe_table_without_labels(table):\n"
+        "                return True\n"
+        "    return False\n"
         "def _mlevolve_apply_probe_limits():\n"
-        "    if not _MLEVOLVE_PROBE_MODE or _MLEVOLVE_PROBE_MAX_TRAIN_BATCHES is None:\n"
+        f"    if {_TRAIN_BATCH_OVERRIDE_VAR} is None:\n"
         "        return\n"
         "    try:\n"
         "        from torch.utils.data import DataLoader\n"
@@ -267,15 +335,18 @@ def _materialize_instrumented_script(script_path: Path, working_dir: Path) -> In
         "    _original_iter = DataLoader.__iter__\n"
         "    def _limited_iter(self):\n"
         "        iterator = _original_iter(self)\n"
+        "        if _mlevolve_probe_submission_like(self):\n"
+        "            yield from iterator\n"
+        "            return\n"
         "        for _idx, item in enumerate(iterator):\n"
-        "            if _idx >= _MLEVOLVE_PROBE_MAX_TRAIN_BATCHES:\n"
+        f"            if _idx >= {_TRAIN_BATCH_OVERRIDE_VAR}:\n"
         "                break\n"
         "            yield item\n"
         "    DataLoader.__iter__ = _limited_iter\n"
-        "_mlevolve_apply_probe_limits()\n",
-        filename=str(script_path),
+        "_mlevolve_apply_probe_limits()\n"
     )
-    module.body = helper_module.body + module.body
+    helper_module = ast.parse(helper_source, filename=str(script_path))
+    _prepend_after_module_preamble(module, helper_module.body)
     ast.fix_missing_locations(module)
 
     instrumented_path = instrumented_dir / f"{script_path.stem}_instrumented.py"
@@ -295,6 +366,13 @@ def _base_script_env(
     probe_max_train_batches: int | None = None,
 ) -> dict[str, str]:
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    for key in (
+        "MLEVOLVE_BATCH_SIZE_OVERRIDE",
+        "MLEVOLVE_PROBE_MODE",
+        "MLEVOLVE_PROBE_MAX_EPOCHS",
+        "MLEVOLVE_PROBE_MAX_TRAIN_BATCHES",
+    ):
+        env.pop(key, None)
     if batch_size_override is not None:
         env["MLEVOLVE_BATCH_SIZE_OVERRIDE"] = str(int(batch_size_override))
     if probe_mode:
@@ -716,7 +794,6 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
         except (TypeError, ValueError):
             timeout = None
     python_executable = context.job.config.python_executable or sys.executable
-
     instrumented = _materialize_instrumented_script(script_path, working_dir)
     phase_log_path = working_dir / "working" / "phase_timings" / f"phase_{context.job.job_id}.jsonl"
     phase_output_path = working_dir / "working" / "instrumented_scripts" / f"{instrumented.path.stem}_phase.py"

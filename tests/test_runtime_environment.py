@@ -4,7 +4,29 @@ from pathlib import Path
 
 from localml_scheduler.client import SchedulerClient
 from localml_scheduler.config import SchedulerConfig
-from localml_scheduler.runtime_environment import repair_generated_training_code
+from localml_scheduler.runtime_environment import (
+    repair_generated_training_code,
+    validate_model_api_contracts,
+)
+
+
+def _future_vision_contract() -> dict:
+    return {
+        "schema_version": 3,
+        "display_name": "FutureVision",
+        "model_id": "vendor/future-vision",
+        "preprocessing": {"fixed_image_size": 384},
+        "feature_apis": [
+            {
+                "method": "encode_images",
+                "call": "features = model.encode_images(pixel_values=pixel_values)",
+                "return_kind": "tensor",
+                "invalid_result_attributes": ["pooler_output", "last_hidden_state"],
+                "dimension_config_path": "vision_config.hidden_size",
+            }
+        ],
+        "invalid_config_paths": ["hidden_size", "projection_dim"],
+    }
 
 
 def test_runtime_environment_reports_torch_scheduler_signature(tmp_path: Path) -> None:
@@ -128,3 +150,177 @@ preds_np = preds.cpu().numpy()
     assert '"""module docstring"""' in repair["code"]
     assert "from __future__ import annotations\nimport torch\n" in repair["code"]
     assert "preds.detach().to(torch.float32).cpu().numpy()" in repair["code"]
+
+
+def test_validate_generated_training_code_flags_hf_repo_built_from_sanitized_branch(tmp_path: Path) -> None:
+    client = SchedulerClient(SchedulerConfig(runtime_root=tmp_path / "runtime"))
+    code = """
+from transformers import AutoProcessor
+MODEL_BRANCH = "siglip2_so400m_patch16_256"
+processor = AutoProcessor.from_pretrained(f"google/{MODEL_BRANCH}")
+"""
+
+    result = client.validate_generated_training_code(code, stage="code_review")
+
+    assert result["ok"] is False
+    assert result["critical_count"] == 1
+    issue = result["issues"][0]
+    assert issue["category"] == "derived_huggingface_model_id_from_scheduler_branch"
+    assert "PRETRAINED_MODEL_ID" in issue["repair_hint"]
+    assert "google/siglip2-so400m-patch16-256" in issue["repair_hint"]
+
+
+def test_repair_generated_training_code_fixes_known_sanitized_hf_branch() -> None:
+    code = """
+from transformers import AutoModel, AutoProcessor
+MODEL_BRANCH = "siglip2_so400m_patch16_256"
+processor = AutoProcessor.from_pretrained(f"google/{MODEL_BRANCH}")
+model = AutoModel.from_pretrained(f"google/{MODEL_BRANCH}")
+"""
+
+    repair = repair_generated_training_code(code, stage="code_review")
+
+    assert repair["changed"] is True
+    assert repair["replacement_count"] == 2
+    assert 'MODEL_BRANCH = "siglip2_so400m_patch16_256"' in repair["code"]
+    assert repair["code"].count("from_pretrained('google/siglip2-so400m-patch16-256')") == 2
+    assert repair["validation"]["ok"] is True
+
+
+def test_repair_generated_training_code_fixes_known_direct_invalid_hf_repo() -> None:
+    code = 'model = AutoModel.from_pretrained("google/siglip2_so400m_patch16_256")'
+
+    repair = repair_generated_training_code(code, stage="code_review")
+
+    assert repair["changed"] is True
+    assert repair["replacement_count"] == 1
+    assert '"google/siglip2-so400m-patch16-256"' in repair["code"]
+    assert repair["validation"]["ok"] is True
+
+
+def test_validate_generated_training_code_flags_zip_extractall_directory_mismatch(tmp_path: Path) -> None:
+    client = SchedulerClient(SchedulerConfig(runtime_root=tmp_path / "runtime"))
+    code = """
+with zipfile.ZipFile(TRAIN_ZIP_PATH, 'r') as zip_ref:
+    zip_ref.extractall(WORKING_DIR)
+with zipfile.ZipFile(TEST_ZIP_PATH, 'r') as zip_ref:
+    zip_ref.extractall(WORKING_DIR)
+train_filepaths = list(TRAIN_DIR.glob('*.jpg'))
+test_filepaths = list(TEST_DIR.glob('*.jpg'))
+"""
+
+    result = client.validate_generated_training_code(code, stage="code_review")
+
+    assert result["ok"] is False
+    assert result["critical_count"] == 1
+    issue = result["issues"][0]
+    assert issue["category"] == "zip_extractall_directory_mismatch"
+    assert issue["autofixable"] is True
+
+
+def test_repair_generated_training_code_fixes_zip_extractall_directory_mismatch() -> None:
+    code = """
+with zipfile.ZipFile(TRAIN_ZIP_PATH, 'r') as zip_ref:
+    zip_ref.extractall(WORKING_DIR)
+with zipfile.ZipFile(TEST_ZIP_PATH, 'r') as zip_ref:
+    zip_ref.extractall(WORKING_DIR)
+train_filepaths = list(TRAIN_DIR.glob('*.jpg'))
+test_filepaths = list(TEST_DIR.glob('*.jpg'))
+"""
+
+    repair = repair_generated_training_code(code, stage="code_review")
+
+    assert repair["changed"] is True
+    assert repair["replacement_count"] == 2
+    assert "zip_ref.extractall(TRAIN_DIR)" in repair["code"]
+    assert "zip_ref.extractall(TEST_DIR)" in repair["code"]
+    assert "zip_ref.extractall(WORKING_DIR)" not in repair["code"]
+    assert repair["validation"]["ok"] is True
+
+
+def test_repair_generated_training_code_fixes_configured_zip_extractall_directory_mismatch() -> None:
+    code = """
+class DataConfig:
+    WORKING_PATH = Path('./working')
+    TRAIN_ZIP_PATH = Path('./input/train.zip')
+    TEST_ZIP_PATH = Path('./input/test.zip')
+    TRAIN_DATA_PATH = WORKING_PATH / 'train'
+    TEST_DATA_PATH = WORKING_PATH / 'test'
+
+def extract_data(config):
+    with zipfile.ZipFile(config.TRAIN_ZIP_PATH, 'r') as zip_ref:
+        zip_ref.extractall(config.WORKING_PATH)
+    with zipfile.ZipFile(config.TEST_ZIP_PATH, 'r') as zip_ref:
+        zip_ref.extractall(config.WORKING_PATH)
+"""
+
+    repair = repair_generated_training_code(code, stage="code_review")
+
+    assert repair["changed"] is True
+    assert repair["replacement_count"] == 2
+    assert "zip_ref.extractall(config.TRAIN_DATA_PATH)" in repair["code"]
+    assert "zip_ref.extractall(config.TEST_DATA_PATH)" in repair["code"]
+    assert "zip_ref.extractall(config.WORKING_PATH)" not in repair["code"]
+    assert repair["validation"]["ok"] is True
+
+
+def test_validate_model_api_contracts_is_model_family_agnostic() -> None:
+    code = '''
+MODEL_ID = "vendor/future-vision"
+IMAGE_SIZE = 224
+model = AutoModel.from_pretrained(MODEL_ID)
+features = model.encode_images(pixel_values=pixel_values)
+pooled = features.pooler_output
+classifier = Linear(model.config.hidden_size, 2)
+'''
+
+    issues = validate_model_api_contracts(code, [_future_vision_contract()])
+
+    assert {issue["category"] for issue in issues} == {
+        "model_feature_return_contract_violation",
+        "model_config_path_contract_violation",
+        "model_input_size_contract_violation",
+    }
+    assert all(issue["model_id"] == "vendor/future-vision" for issue in issues)
+    assert all(issue["contract_version"] == 3 for issue in issues)
+
+
+def test_validate_model_api_contracts_accepts_contract_compliant_code() -> None:
+    code = '''
+MODEL_ID = "vendor/future-vision"
+IMAGE_SIZE = 384
+model = AutoModel.from_pretrained(MODEL_ID)
+features = model.encode_images(pixel_values=pixel_values)
+classifier = Linear(model.config.vision_config.hidden_size, 2)
+'''
+
+    assert validate_model_api_contracts(code, [_future_vision_contract()]) == []
+
+
+def test_validate_model_api_contracts_catches_observed_siglip_tensor_misuse() -> None:
+    contract = {
+        **_future_vision_contract(),
+        "display_name": "SigLIP 2",
+        "model_id": "google/siglip2-so400m-patch16-256",
+        "feature_apis": [
+            {
+                "method": "get_image_features",
+                "call": "features = model.get_image_features(pixel_values=pixel_values)",
+                "return_kind": "tensor",
+                "invalid_result_attributes": ["pooler_output", "last_hidden_state"],
+                "dimension_config_path": "vision_config.hidden_size",
+            }
+        ],
+    }
+    code = '''
+MODEL_ID = "google/siglip2-so400m-patch16-256"
+model = AutoModel.from_pretrained(MODEL_ID)
+vision_outputs = model.get_image_features(pixel_values=pixel_values)
+pooled_output = vision_outputs.pooler_output
+'''
+
+    issues = validate_model_api_contracts(code, [contract])
+
+    assert [issue["category"] for issue in issues] == [
+        "model_feature_return_contract_violation"
+    ]

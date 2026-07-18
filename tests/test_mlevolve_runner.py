@@ -39,6 +39,22 @@ def _build_context(settings: SchedulerSettings, job: TrainingJob) -> RunnerConte
 
 
 class MLEvolveRunnerTest(unittest.TestCase):
+    def test_materialized_script_preserves_future_import_preamble(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            working_dir = Path(tmpdir) / "workspace"
+            working_dir.mkdir(parents=True, exist_ok=True)
+            script_path = working_dir / "candidate.py"
+            script_path.write_text(
+                '\"\"\"candidate module\"\"\"\nfrom __future__ import annotations\nbatch_size = 4\n',
+                encoding="utf-8",
+            )
+
+            instrumented = _materialize_instrumented_script(script_path, working_dir)
+            materialized = instrumented.path.read_text(encoding="utf-8")
+
+            compile(materialized, str(instrumented.path), "exec")
+            self.assertLess(materialized.index("from __future__ import annotations"), materialized.index("import os"))
+
     def test_materialized_script_repairs_low_precision_numpy_export_with_batch_probe(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             working_dir = Path(tmpdir) / "workspace"
@@ -322,6 +338,70 @@ class MLEvolveRunnerTest(unittest.TestCase):
             self.assertEqual({entry["epoch"] for entry in trace}, {0})
             self.assertEqual([entry["step"] for entry in trace], [0, 1, 2])
             self.assertEqual([entry["size"] for entry in trace], [7, 7, 6])
+
+    def test_probe_script_job_does_not_limit_test_submission_loader(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            working_dir = Path(tmpdir) / "workspace"
+            working_dir.mkdir(parents=True, exist_ok=True)
+            script_path = working_dir / "candidate.py"
+            script_path.write_text(
+                "\n".join(
+                    [
+                        "import json",
+                        "from pathlib import Path",
+                        "from torch.utils.data import DataLoader, Dataset",
+                        "class DemoDataset(Dataset):",
+                        "    def __init__(self, size, is_test=False):",
+                        "        self.size = size",
+                        "        self.is_test = is_test",
+                        "    def __len__(self):",
+                        "        return self.size",
+                        "    def __getitem__(self, idx):",
+                        "        return idx",
+                        "batch_size = 2",
+                        "train_loader = DataLoader(DemoDataset(20), batch_size=batch_size)",
+                        "test_loader = DataLoader(DemoDataset(12, is_test=True), batch_size=batch_size)",
+                        "trace = {'train': [], 'test': []}",
+                        "for batch in train_loader:",
+                        "    trace['train'].append(int(len(batch)))",
+                        "for batch in test_loader:",
+                        "    trace['test'].append(int(len(batch)))",
+                        "Path('probe_trace.json').write_text(json.dumps(trace), encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            settings = SchedulerSettings(runtime_root=runtime_root)
+            job = TrainingJob.create(
+                runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                baseline_model_id="script",
+                baseline_model_path=str(script_path),
+                runner_kwargs={
+                    "script_path": str(script_path),
+                    "working_dir": str(working_dir),
+                    "result_path": str(working_dir / "result.json"),
+                    "timeout": 30,
+                    "probe_timeout_seconds": 5,
+                    "probe_poll_interval_seconds": 0.2,
+                    "probe_max_epochs": 1,
+                    "probe_max_train_batches": 2,
+                },
+                batch_probe=BatchProbeSpec(
+                    enabled=True,
+                    probe_target="localml_scheduler.adapters.mlevolve_runner:probe_mlevolve_script_job",
+                ),
+                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
+                metadata={"placement_backend": "exclusive"},
+            )
+            context = _build_context(settings, job)
+
+            result = probe_mlevolve_script_job(context, batch_size=3, warmup_steps=1, measure_steps=1)
+
+            self.assertTrue(result.fits)
+            trace = json.loads((working_dir / "probe_trace.json").read_text(encoding="utf-8"))
+            self.assertEqual(trace["train"], [3, 3])
+            self.assertEqual(trace["test"], [3, 3, 3, 3])
 
 
 if __name__ == "__main__":

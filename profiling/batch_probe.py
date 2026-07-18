@@ -87,6 +87,8 @@ def _should_fail_fast(attempt: ProbeAttempt | None) -> bool:
     if attempt is None:
         return False
     failure_kind = attempt.result.failure_kind
+    if failure_kind == "timeout":
+        return False
     return bool(failure_kind and failure_kind not in MEMORY_PROBE_FAILURE_KINDS)
 
 

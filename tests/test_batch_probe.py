@@ -77,6 +77,28 @@ def fake_dtype_error_probe(context: RunnerContext, batch_size: int, warmup_steps
     )
 
 
+def fake_timeout_then_fit_probe(context: RunnerContext, batch_size: int, warmup_steps: int, measure_steps: int) -> BatchProbeTrialResult:
+    timeout_at = int(context.job.metadata.get("probe_timeout_at", 8))
+    if batch_size >= timeout_at:
+        return BatchProbeTrialResult(
+            fits=False,
+            peak_vram_mb=512,
+            memory_total_mb=4096,
+            avg_step_time_ms=None,
+            message="probe subprocess timed out",
+            failure_kind="timeout",
+            returncode=124,
+            stderr_excerpt="KeyboardInterrupt",
+        )
+    return BatchProbeTrialResult(
+        fits=True,
+        peak_vram_mb=256,
+        memory_total_mb=4096,
+        avg_step_time_ms=10.0,
+        message="probe window completed",
+    )
+
+
 def _build_context(settings: SchedulerSettings, job: TrainingJob) -> RunnerContext:
     store = StateStore(settings)
     store.save_job(job)
@@ -283,6 +305,44 @@ class BatchProbeUnitTest(unittest.TestCase):
             self.assertEqual(trial_events[0]["payload"]["failure_kind"], "dtype_error")
             self.assertEqual(len(context.store.list_events(job_id=job.job_id, event_type="batch_probe_preflight_failed")), 1)
             self.assertEqual(context.store.list_batch_probe_profiles(), [])
+
+    def test_probe_controller_downshifts_on_probe_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(runtime_root=tmpdir)
+            job = TrainingJob.create(
+                "pkg.runner:train",
+                "baseline-a",
+                "/tmp/a.pt",
+                task_type="classification",
+                runner_kwargs={"batch_size": 8},
+                batch_probe=BatchProbeSpec(
+                    enabled=True,
+                    probe_target="localml_scheduler.tests.test_batch_probe:fake_timeout_then_fit_probe",
+                    search_mode=BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
+                ),
+                metadata={"placement_backend": "exclusive", "probe_timeout_at": 8},
+                resource_requirements=ResourceRequirements(requires_gpu=True),
+                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
+            )
+            context = _build_context(settings, job)
+
+            profile = _run_probe_controller(
+                context,
+                key_info=BatchProbeKeyInfo(
+                    probe_key="probe-timeout-downshift",
+                    model_key="baseline-a",
+                    device_type="cuda-unavailable",
+                    shape_signature="shape-1",
+                    search_mode=BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
+                ),
+            )
+
+            self.assertEqual(profile.resolved_batch_size, 4)
+            self.assertEqual(profile.metadata["failure_batch_size"], 8)
+            trial_events = context.store.list_events(job_id=job.job_id, event_type="batch_probe_trial")
+            self.assertEqual([event["payload"]["batch_size"] for event in trial_events], [8, 4, 8])
+            self.assertEqual(trial_events[0]["payload"]["failure_kind"], "timeout")
+            self.assertEqual(len(context.store.list_events(job_id=job.job_id, event_type="batch_probe_preflight_failed")), 0)
 
     def test_probe_controller_warns_when_capped_before_vram_saturation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

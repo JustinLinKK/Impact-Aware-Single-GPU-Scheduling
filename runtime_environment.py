@@ -86,6 +86,24 @@ _NON_PREDICTION_EXPORT_TOKENS = (
     "image",
     "input",
 )
+_SCHEDULER_BRANCH_KEY_NAMES = {
+    "MODEL_BRANCH",
+    "model_branch",
+    "BRANCH_NAME",
+    "branch_name",
+    "SCHEDULER_BRANCH_NAME",
+    "scheduler_branch_name",
+    "MODEL_FAMILY",
+    "model_family",
+    "SCHEDULER_MODEL_FAMILY",
+    "scheduler_model_family",
+}
+_KNOWN_HF_REPO_ID_REPAIRS = {
+    "google/siglip2_so400m_patch16_256": "google/siglip2-so400m-patch16-256",
+}
+_KNOWN_HF_BRANCH_VALUE_REPAIRS = {
+    "siglip2_so400m_patch16_256": "siglip2-so400m-patch16-256",
+}
 
 
 def detect_runtime_environment(
@@ -121,14 +139,22 @@ def detect_runtime_environment(
     return payload
 
 
-def validate_generated_training_code(code: str, *, stage: str = "code_review") -> dict[str, Any]:
+def validate_generated_training_code(
+    code: str,
+    *,
+    stage: str = "code_review",
+    model_contracts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Statically flag generated-code patterns known to fail in this runtime."""
     code_text = str(code or "")
     issues: list[dict[str, Any]] = []
 
     issues.extend(_detect_invalid_torch_scheduler_kwargs(code_text))
     issues.extend(_detect_low_precision_numpy_conversion(code_text))
+    issues.extend(_detect_hf_model_source_identifier_issues(code_text))
+    issues.extend(_detect_zip_extractall_directory_mismatch(code_text))
     issues.extend(_detect_deprecated_cuda_amp(code_text))
+    issues.extend(validate_model_api_contracts(code_text, model_contracts or []))
 
     critical_count = sum(1 for issue in issues if issue.get("severity") == "critical")
     warning_count = sum(1 for issue in issues if issue.get("severity") == "warning")
@@ -142,11 +168,248 @@ def validate_generated_training_code(code: str, *, stage: str = "code_review") -
     }
 
 
+def validate_model_api_contracts(
+    code: str,
+    model_contracts: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Validate generated code against data-driven pretrained-model API contracts."""
+    code_text = str(code or "")
+    try:
+        tree = ast.parse(code_text)
+    except SyntaxError:
+        return []
+
+    issues: list[dict[str, Any]] = []
+    for contract in model_contracts or []:
+        if not isinstance(contract, dict):
+            continue
+        model_id = str(contract.get("model_id") or "").strip()
+        if not model_id or model_id not in code_text:
+            continue
+        display_name = str(contract.get("display_name") or model_id)
+        issues.extend(
+            _detect_model_feature_api_contract_violations(
+                code_text,
+                tree,
+                contract,
+                model_id=model_id,
+                display_name=display_name,
+            )
+        )
+        issues.extend(
+            _detect_model_config_contract_violations(
+                code_text,
+                tree,
+                contract,
+                model_id=model_id,
+                display_name=display_name,
+            )
+        )
+        issues.extend(
+            _detect_model_input_size_contract_violations(
+                code_text,
+                tree,
+                contract,
+                model_id=model_id,
+                display_name=display_name,
+            )
+        )
+    return issues
+
+
+def _detect_model_feature_api_contract_violations(
+    code: str,
+    tree: ast.AST,
+    contract: dict[str, Any],
+    *,
+    model_id: str,
+    display_name: str,
+) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    feature_apis = contract.get("feature_apis")
+    if not isinstance(feature_apis, list):
+        return issues
+
+    for feature_api in feature_apis:
+        if not isinstance(feature_api, dict) or feature_api.get("return_kind") != "tensor":
+            continue
+        method = str(feature_api.get("method") or "").strip()
+        invalid_attributes = {
+            str(value).strip()
+            for value in feature_api.get("invalid_result_attributes", [])
+            if str(value).strip()
+        }
+        if not method or not invalid_attributes:
+            continue
+
+        result_names: set[str] = set()
+        for node in ast.walk(tree):
+            value: ast.AST | None = None
+            targets: list[ast.AST] = []
+            if isinstance(node, ast.Assign):
+                value = node.value
+                targets = list(node.targets)
+            elif isinstance(node, ast.AnnAssign):
+                value = node.value
+                targets = [node.target]
+            if not isinstance(value, ast.Call) or _call_name(value.func) != method:
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    result_names.add(target.id)
+
+        seen: set[tuple[int, str]] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute) or node.attr not in invalid_attributes:
+                continue
+            direct_call = isinstance(node.value, ast.Call) and _call_name(node.value.func) == method
+            named_result = isinstance(node.value, ast.Name) and node.value.id in result_names
+            if not direct_call and not named_result:
+                continue
+            finding_key = (getattr(node, "lineno", 0), node.attr)
+            if finding_key in seen:
+                continue
+            seen.add(finding_key)
+            dimension_path = str(feature_api.get("dimension_config_path") or "").strip()
+            call = str(feature_api.get("call") or f"features = model.{method}(...)")
+            hint = f"Use the tensor returned by `{call}` directly."
+            if dimension_path:
+                hint += f" Read the classifier input dimension from `model.config.{dimension_path}`."
+            issues.append(
+                {
+                    "severity": "critical",
+                    "category": "model_feature_return_contract_violation",
+                    "message": (
+                        f"{display_name} `{method}(...)` returns a tensor, so accessing "
+                        f"`.{node.attr}` on its result will fail."
+                    ),
+                    "evidence": _source_segment(code, node),
+                    "repair_hint": hint,
+                    "autofixable": False,
+                    "model_id": model_id,
+                    "contract_version": contract.get("schema_version"),
+                }
+            )
+    return issues
+
+
+def _detect_model_config_contract_violations(
+    code: str,
+    tree: ast.AST,
+    contract: dict[str, Any],
+    *,
+    model_id: str,
+    display_name: str,
+) -> list[dict[str, Any]]:
+    invalid_paths = {
+        str(value).strip()
+        for value in contract.get("invalid_config_paths", [])
+        if str(value).strip()
+    }
+    if not invalid_paths:
+        return []
+    dimension_paths = [
+        str(feature_api.get("dimension_config_path") or "").strip()
+        for feature_api in contract.get("feature_apis", [])
+        if isinstance(feature_api, dict) and feature_api.get("dimension_config_path")
+    ]
+    replacement_path = dimension_paths[0] if dimension_paths else ""
+    issues: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        chain = _attribute_chain(node)
+        if len(chain) < 2 or chain[-2] != "config" or chain[-1] not in invalid_paths:
+            continue
+        finding_key = (getattr(node, "lineno", 0), chain[-1])
+        if finding_key in seen:
+            continue
+        seen.add(finding_key)
+        hint = f"Do not assume `{'.'.join(chain[-2:])}` exists for `{model_id}`."
+        if replacement_path:
+            hint += f" Use `model.config.{replacement_path}` for this contract's feature dimension."
+        issues.append(
+            {
+                "severity": "critical",
+                "category": "model_config_path_contract_violation",
+                "message": f"{display_name} does not expose the generated config path `{'.'.join(chain[-2:])}`.",
+                "evidence": _source_segment(code, node),
+                "repair_hint": hint,
+                "autofixable": False,
+                "model_id": model_id,
+                "contract_version": contract.get("schema_version"),
+            }
+        )
+    return issues
+
+
+def _detect_model_input_size_contract_violations(
+    code: str,
+    tree: ast.AST,
+    contract: dict[str, Any],
+    *,
+    model_id: str,
+    display_name: str,
+) -> list[dict[str, Any]]:
+    preprocessing = contract.get("preprocessing")
+    if not isinstance(preprocessing, dict):
+        return []
+    required_size = preprocessing.get("fixed_image_size")
+    if not isinstance(required_size, int) or required_size <= 0:
+        return []
+
+    size_names = {"IMAGE_SIZE", "IMG_SIZE", "INPUT_SIZE", "INPUT_RESOLUTION"}
+    issues: list[dict[str, Any]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = list(node.targets) if isinstance(node, ast.Assign) else [node.target]
+        value = node.value
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, int):
+            continue
+        target = next((item for item in targets if isinstance(item, ast.Name) and item.id.upper() in size_names), None)
+        if target is None or value.value == required_size:
+            continue
+        issues.append(
+            {
+                "severity": "critical",
+                "category": "model_input_size_contract_violation",
+                "message": (
+                    f"{display_name} requires fixed `{required_size}x{required_size}` inputs, but "
+                    f"`{target.id}` is set to `{value.value}`."
+                ),
+                "evidence": _source_segment(code, node),
+                "repair_hint": (
+                    f"Use `{target.id} = {required_size}` or preprocess images with the contract's configured processor."
+                ),
+                "autofixable": False,
+                "model_id": model_id,
+                "contract_version": contract.get("schema_version"),
+            }
+        )
+    return issues
+
+
+def _attribute_chain(node: ast.AST) -> list[str]:
+    parts: list[str] = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if isinstance(current, ast.Name):
+        parts.append(current.id)
+    return list(reversed(parts))
+
+
 def repair_generated_training_code(code: str, *, stage: str = "code_review") -> dict[str, Any]:
     """Deterministically repair prediction-like low-precision Tensor -> NumPy exports."""
     original_code = str(code or "")
-    replacements = _low_precision_numpy_replacements(original_code)
-    repaired_code = original_code
+    repaired_code, model_source_repair_count = _repair_known_hf_model_source_ids(original_code)
+    zip_replacements = _zip_extractall_target_replacements(repaired_code)
+    for start, end, replacement in sorted(zip_replacements, key=lambda item: item[0], reverse=True):
+        repaired_code = repaired_code[:start] + replacement + repaired_code[end:]
+    replacements = _low_precision_numpy_replacements(repaired_code)
     for start, end, replacement in sorted(replacements, key=lambda item: item[0], reverse=True):
         repaired_code = repaired_code[:start] + replacement + repaired_code[end:]
     if replacements and "torch.float32" in repaired_code and not _has_torch_import(repaired_code):
@@ -156,7 +419,11 @@ def repair_generated_training_code(code: str, *, stage: str = "code_review") -> 
     return {
         "code": repaired_code,
         "changed": repaired_code != original_code,
-        "replacement_count": len(replacements),
+        "replacement_count": (
+            model_source_repair_count
+            + len(zip_replacements)
+            + len(replacements)
+        ),
         "stage": stage,
         "validation": validation,
     }
@@ -410,6 +677,269 @@ def _low_precision_numpy_replacements(code: str) -> list[tuple[int, int, str]]:
         if replacement and replacement != expr_source:
             replacements.append((span[0], span[1], replacement))
     return replacements
+
+
+def _repair_known_hf_model_source_ids(code: str) -> tuple[str, int]:
+    repaired = str(code or "")
+    replacement_count = 0
+    for invalid, valid in _KNOWN_HF_REPO_ID_REPAIRS.items():
+        occurrences = repaired.count(invalid)
+        if occurrences:
+            repaired = repaired.replace(invalid, valid)
+            replacement_count += occurrences
+
+    source_replacements = _known_hf_branch_source_replacements(repaired)
+    for start, end, replacement in sorted(source_replacements, key=lambda item: item[0], reverse=True):
+        repaired = repaired[:start] + replacement + repaired[end:]
+    replacement_count += len(source_replacements)
+
+    return repaired, replacement_count
+
+
+def _known_hf_branch_source_replacements(code: str) -> list[tuple[int, int, str]]:
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return []
+
+    assignments = _simple_string_assignments(tree)
+    offsets = _line_offsets(code)
+    replacements: list[tuple[int, int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "from_pretrained" or not node.args:
+            continue
+        first_arg = node.args[0]
+        derived = _hf_model_id_built_from_branch_key(first_arg, assignments)
+        if derived is None:
+            continue
+        provider, _, branch_value = derived
+        repaired_branch = _KNOWN_HF_BRANCH_VALUE_REPAIRS.get(branch_value)
+        if not repaired_branch:
+            continue
+        span = _node_span(first_arg, offsets)
+        if span is not None:
+            replacements.append((span[0], span[1], repr(f"{provider}{repaired_branch}")))
+    return replacements
+
+
+def _detect_hf_model_source_identifier_issues(code: str) -> list[dict[str, Any]]:
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return []
+
+    assignments = _simple_string_assignments(tree)
+    issues: list[dict[str, Any]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "from_pretrained" or not node.args:
+            continue
+
+        first_arg = node.args[0]
+        direct_id = _constant_string(first_arg)
+        if direct_id in _KNOWN_HF_REPO_ID_REPAIRS:
+            issues.append(
+                {
+                    "severity": "critical",
+                    "category": "invalid_huggingface_model_id",
+                    "message": f"Hugging Face model id `{direct_id}` is a known invalid transformed id.",
+                    "evidence": _source_segment(code, node),
+                    "repair_hint": f"Use `{_KNOWN_HF_REPO_ID_REPAIRS[direct_id]}` exactly as the external pretrained model id.",
+                    "autofixable": True,
+                }
+            )
+            continue
+
+        derived = _hf_model_id_built_from_branch_key(first_arg, assignments)
+        if derived is None:
+            continue
+        provider, branch_name, branch_value = derived
+        repaired_branch = _KNOWN_HF_BRANCH_VALUE_REPAIRS.get(branch_value)
+        branch_looks_sanitized = "_" in branch_value and "/" not in branch_value
+        if not repaired_branch and not branch_looks_sanitized:
+            continue
+        expected = f"{provider}{repaired_branch}" if repaired_branch else None
+        hint = (
+            f"Keep the exact external model id in `PRETRAINED_MODEL_ID`/`MODEL_ID` and pass that to from_pretrained; "
+            f"`{branch_name}` is a scheduler/profile key, not a repo id."
+        )
+        if expected:
+            hint = f"Use `PRETRAINED_MODEL_ID = \"{expected}\"` for from_pretrained and keep `{branch_name}` only for scheduler/profile reuse."
+        issues.append(
+            {
+                "severity": "critical",
+                "category": "derived_huggingface_model_id_from_scheduler_branch",
+                "message": (
+                    f"Hugging Face model id is derived from `{branch_name}` value `{branch_value}`, "
+                    "which looks like a sanitized scheduler/profile key and may not be a valid repo id."
+                ),
+                "evidence": _source_segment(code, node),
+                "repair_hint": hint,
+                "autofixable": bool(repaired_branch),
+            }
+        )
+    return issues
+
+
+def _detect_zip_extractall_directory_mismatch(code: str) -> list[dict[str, Any]]:
+    findings = _zip_extractall_target_replacements(code)
+    if not findings:
+        return []
+    return [
+        {
+            "severity": "critical",
+            "category": "zip_extractall_directory_mismatch",
+            "message": (
+                "Generated data preparation extracts train/test zip files into the shared working "
+                "directory while later searching dedicated TRAIN_DIR/TEST_DIR image folders."
+            ),
+            "evidence": "zip_ref.extractall(WORKING_DIR)",
+            "repair_hint": "Extract TRAIN_ZIP_PATH into TRAIN_DIR and TEST_ZIP_PATH into TEST_DIR, or search WORKING_DIR directly after extraction.",
+            "autofixable": True,
+        }
+    ]
+
+
+def _zip_extractall_target_replacements(code: str) -> list[tuple[int, int, str]]:
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return []
+
+    offsets = _line_offsets(code)
+    replacements: list[tuple[int, int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.With):
+            continue
+        expected_target_by_alias = _zipfile_expected_extract_targets(node, code)
+        if not expected_target_by_alias:
+            continue
+        for child in ast.walk(ast.Module(body=list(node.body), type_ignores=[])):
+            if not isinstance(child, ast.Call):
+                continue
+            if not isinstance(child.func, ast.Attribute) or child.func.attr != "extractall":
+                continue
+            if not isinstance(child.func.value, ast.Name):
+                continue
+            expected_target = expected_target_by_alias.get(child.func.value.id)
+            if not expected_target or not child.args:
+                continue
+            first_arg = child.args[0]
+            if not _is_working_extract_target(first_arg):
+                continue
+            span = _node_span(first_arg, offsets)
+            if span is not None:
+                replacements.append((span[0], span[1], expected_target))
+    return replacements
+
+
+def _zipfile_expected_extract_targets(node: ast.With, code: str) -> dict[str, str]:
+    expected: dict[str, str] = {}
+    for item in node.items:
+        context = item.context_expr
+        optional = item.optional_vars
+        if not isinstance(optional, ast.Name):
+            continue
+        expected_target = _zipfile_context_expected_extract_target(context, code)
+        if expected_target:
+            expected[optional.id] = expected_target
+    return expected
+
+
+def _zipfile_context_expected_extract_target(node: ast.AST, code: str) -> str | None:
+    if not isinstance(node, ast.Call) or not node.args:
+        return None
+    func_name = _call_name(node.func)
+    if func_name != "ZipFile":
+        return None
+    first_arg = node.args[0]
+    if isinstance(first_arg, ast.Name) and first_arg.id in {"TRAIN_ZIP_PATH", "TEST_ZIP_PATH"}:
+        return _zip_extract_target_name(first_arg.id, code)
+    if isinstance(first_arg, ast.Attribute) and first_arg.attr in {"TRAIN_ZIP_PATH", "TEST_ZIP_PATH"}:
+        qualifier = _source_segment(code, first_arg.value)
+        if not qualifier:
+            return None
+        target_name = _zip_extract_target_name(first_arg.attr, code, qualifier=qualifier)
+        return f"{qualifier}.{target_name}" if target_name else None
+    return None
+
+
+def _zip_extract_target_name(archive_name: str, code: str, *, qualifier: str | None = None) -> str | None:
+    prefix = f"{qualifier}." if qualifier else ""
+    if archive_name == "TRAIN_ZIP_PATH":
+        if f"{prefix}TRAIN_DATA_PATH" in (code or "") or (qualifier and "TRAIN_DATA_PATH" in (code or "")):
+            return "TRAIN_DATA_PATH"
+        return "TRAIN_DIR"
+    if archive_name == "TEST_ZIP_PATH":
+        if f"{prefix}TEST_DATA_PATH" in (code or "") or (qualifier and "TEST_DATA_PATH" in (code or "")):
+            return "TEST_DATA_PATH"
+        return "TEST_DIR"
+    return None
+
+
+def _is_working_extract_target(node: ast.AST) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in {"WORKING_DIR", "WORKING_PATH"}
+    if isinstance(node, ast.Attribute):
+        return node.attr in {"WORKING_DIR", "WORKING_PATH"}
+    return False
+
+
+def _simple_string_assignments(tree: ast.AST) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            value = _constant_string(node.value)
+            if value is not None:
+                values[node.targets[0].id] = value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            value = _constant_string(node.value)
+            if value is not None:
+                values[node.target.id] = value
+    return values
+
+
+def _hf_model_id_built_from_branch_key(node: ast.AST, assignments: dict[str, str]) -> tuple[str, str, str] | None:
+    if isinstance(node, ast.JoinedStr):
+        provider = ""
+        branch_name = None
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                provider += value.value
+            elif isinstance(value, ast.FormattedValue) and isinstance(value.value, ast.Name):
+                if value.value.id in _SCHEDULER_BRANCH_KEY_NAMES:
+                    branch_name = value.value.id
+                    break
+        if branch_name and provider.endswith("/") and assignments.get(branch_name):
+            return provider, branch_name, assignments[branch_name]
+
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        parts = _flatten_string_add(node)
+        if len(parts) == 2 and isinstance(parts[0], str) and isinstance(parts[1], ast.Name):
+            branch_name = parts[1].id
+            if parts[0].endswith("/") and branch_name in _SCHEDULER_BRANCH_KEY_NAMES and assignments.get(branch_name):
+                return parts[0], branch_name, assignments[branch_name]
+    return None
+
+
+def _flatten_string_add(node: ast.AST) -> list[str | ast.Name]:
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _flatten_string_add(node.left) + _flatten_string_add(node.right)
+    constant = _constant_string(node)
+    if constant is not None:
+        return [constant]
+    if isinstance(node, ast.Name):
+        return [node]
+    return [""]
+
+
+def _constant_string(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
 
 
 def _line_offsets(code: str) -> list[int]:
