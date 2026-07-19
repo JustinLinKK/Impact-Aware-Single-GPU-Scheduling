@@ -124,7 +124,10 @@ class BatchProbeSpec:
     search_mode: str | None = None
     shape_hints: dict[str, Any] = field(default_factory=dict)
     profile_key: str | None = None
+    profile_namespace: str | None = None
     shape_signature_override: str | None = None
+    minimum_batch_size: int | None = None
+    contract_version: int = 2
     reuse_only: bool = False
 
     @classmethod

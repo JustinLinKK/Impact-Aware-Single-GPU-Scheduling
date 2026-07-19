@@ -53,13 +53,19 @@ class BranchProfileStore(SQLiteStateStore):
     def initialize(self) -> None:
         with self._connect() as connection:
             for statement in BRANCH_PROFILE_SCHEMA_STATEMENTS:
-                connection.execute(statement)
+                try:
+                    connection.execute(statement)
+                except sqlite3.OperationalError as exc:
+                    if "no such column" not in str(exc).lower():
+                        raise
             for statement in MIGRATION_STATEMENTS:
                 try:
                     connection.execute(statement)
                 except sqlite3.OperationalError as exc:
                     if "duplicate column name" not in str(exc).lower():
                         raise
+            for statement in BRANCH_PROFILE_SCHEMA_STATEMENTS:
+                connection.execute(statement)
             connection.commit()
 
     def _profile_row_count(self, connection: sqlite3.Connection, *, schema: str | None = None) -> int:

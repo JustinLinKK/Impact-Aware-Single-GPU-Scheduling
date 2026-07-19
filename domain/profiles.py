@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from hashlib import sha1
 from typing import Any
 import json
+import re
 
 from .common import parse_timestamp, to_primitive, utc_now
 from .identity import build_backend_scoped_pair_key, build_combination_key, build_runtime_profile_key, decode_batch_vector
@@ -69,6 +71,37 @@ class SoloProfile:
 
 
 @dataclass(slots=True)
+class FailureDiagnostic:
+    kind: str
+    phase: str | None = None
+    exception_type: str | None = None
+    exception_message: str | None = None
+    fingerprint: str | None = None
+    batch_size: int | None = None
+    probe_key: str | None = None
+    returncode: int | None = None
+    timed_out: bool = False
+    stdout_head: str | None = None
+    stdout_tail: str | None = None
+    stderr_head: str | None = None
+    stderr_tail: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.fingerprint:
+            return
+        message = re.sub(r"0x[0-9a-fA-F]+|\b\d+(?:\.\d+)?\b", "<n>", str(self.exception_message or "").lower())
+        payload = f"{self.kind}|{self.phase or ''}|{self.exception_type or ''}|{message.strip()}"
+        self.fingerprint = sha1(payload.encode("utf-8")).hexdigest()[:20]
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "FailureDiagnostic | None":
+        return cls(**dict(payload)) if payload else None
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_primitive(self)
+
+
+@dataclass(slots=True)
 class BatchProbeTrialResult:
     fits: bool
     peak_vram_mb: int | None = None
@@ -79,9 +112,13 @@ class BatchProbeTrialResult:
     returncode: int | None = None
     stdout_excerpt: str | None = None
     stderr_excerpt: str | None = None
+    diagnostic: FailureDiagnostic | None = None
+    probe_completed: bool = False
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "BatchProbeTrialResult":
+        payload = dict(payload)
+        payload["diagnostic"] = FailureDiagnostic.from_dict(payload.get("diagnostic"))
         return cls(**payload)
 
     def to_dict(self) -> dict[str, Any]:
@@ -96,6 +133,10 @@ class BatchProbeProfile:
     shape_signature: str
     batch_param_name: str
     resolved_batch_size: int
+    profile_namespace: str | None = None
+    hardware_key: str | None = None
+    search_mode: str | None = None
+    contract_version: int = 1
     peak_vram_mb: int | None = None
     memory_total_mb: int | None = None
     target_budget_mb: int | None = None
@@ -112,6 +153,10 @@ class BatchProbeProfile:
             model_key=row["model_key"],
             device_type=row["device_type"],
             shape_signature=row["shape_signature"],
+            profile_namespace=row.get("profile_namespace"),
+            hardware_key=row.get("hardware_key"),
+            search_mode=row.get("search_mode"),
+            contract_version=int(row.get("contract_version") or 1),
             batch_param_name=row["batch_param_name"],
             resolved_batch_size=row["resolved_batch_size"],
             peak_vram_mb=row["peak_vram_mb"],

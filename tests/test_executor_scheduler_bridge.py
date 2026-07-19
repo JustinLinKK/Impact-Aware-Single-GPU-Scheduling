@@ -143,6 +143,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             settings = SchedulerSettings(
                 runtime_root=runtime_root,
                 gpu_scheduler={
+                    "batch_probe_max_batch_size": 4,
                     "submission_defaults": {
                         "requires_gpu": True,
                         "estimated_vram_mb": 4096,
@@ -190,12 +191,12 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertEqual(submitted.packing.family, "scheduler-owned-family")
             self.assertEqual(submitted.packing.max_slowdown_ratio, 1.15)
             self.assertEqual(submitted.packing.backend_allowlist, ["cuda_process"])
-            self.assertTrue(submitted.batch_probe.enabled)
+            self.assertFalse(submitted.batch_probe.enabled)
             self.assertEqual(submitted.batch_probe.model_key, "scheduler-model-key")
             self.assertEqual(submitted.batch_probe.search_mode, "power_of_two")
             self.assertEqual(submitted.config.runner_kwargs["probe_timeout_seconds"], 11)
             self.assertEqual(submitted.config.runner_kwargs["probe_poll_interval_seconds"], 0.25)
-            self.assertEqual(submitted.config.runner_kwargs["probe_max_batch_size"], 8)
+            self.assertEqual(submitted.config.runner_kwargs["probe_max_batch_size"], 4)
             self.assertTrue(submitted.baseline_model_id.startswith("mlevolve-script-"))
             self.assertIsNotNone(submitted.preload_source)
             self.assertEqual(submitted.preload_source.model_id, "shared-startpoint")
@@ -245,11 +246,11 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertIsNone(result.exc_type)
             submitted = fake_api.submitted_jobs[0]
             self.assertEqual(submitted.batch_probe.model_key, "safe-family")
-            self.assertEqual(submitted.batch_probe.profile_key, profile_key)
-            self.assertTrue(submitted.batch_probe.reuse_only)
+            self.assertEqual(submitted.batch_probe.profile_namespace, profile_key)
+            self.assertFalse(submitted.batch_probe.reuse_only)
             self.assertEqual(submitted.config.runner_kwargs["batch_size"], 6)
             self.assertNotIn("resolved_batch_size", submitted.metadata)
-            self.assertTrue(submitted.metadata["model_family_profile_available"])
+            self.assertFalse(submitted.metadata["model_family_profile_available"])
 
     def test_scheduler_submission_defers_unseen_model_family_probe_to_singleton_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -279,7 +280,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertEqual([job.task_type for job in fake_api.submitted_jobs], ["mlevolve_script"])
             train_job = fake_api.submitted_jobs[0]
             self.assertEqual(train_job.batch_probe.model_key, "new-family")
-            self.assertIsNotNone(train_job.batch_probe.profile_key)
+            self.assertIsNotNone(train_job.batch_probe.profile_namespace)
             self.assertFalse(train_job.batch_probe.reuse_only)
             self.assertFalse(train_job.metadata["model_family_profile_available"])
 

@@ -190,7 +190,7 @@ def build_branch_shape_signature(
     hints = {
         str(key): value
         for key, value in dict(shape_hints or {}).items()
-        if key not in {"task_id", "exp_id", "workflow_id", "script_signature"}
+        if key not in {"task_id", "exp_id", "workflow_id"}
     }
     payload = {
         "kind": "mlevolve_branch_shape",
@@ -262,8 +262,10 @@ def build_model_family_probe_job(
             model_key=normalized_family,
             search_mode=BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
             shape_hints=hints,
-            profile_key=profile_key,
+            profile_namespace=profile_key,
             shape_signature_override=shape_signature,
+            minimum_batch_size=int(hints.get("minimum_batch_size") or 1),
+            contract_version=2,
             reuse_only=False,
         ),
         resource_requirements=ResourceRequirements(requires_gpu=True),
@@ -333,8 +335,10 @@ def build_startpoint_probe_job(
             model_key=model_key,
             search_mode=BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
             shape_hints=shape_hints,
-            profile_key=profile_key,
+            profile_namespace=profile_key,
             shape_signature_override=shape_signature,
+            minimum_batch_size=int(shape_hints.get("minimum_batch_size") or 1),
+            contract_version=2,
             reuse_only=False,
         ),
         resource_requirements=ResourceRequirements(requires_gpu=True),

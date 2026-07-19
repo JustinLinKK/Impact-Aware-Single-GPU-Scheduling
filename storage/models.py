@@ -135,6 +135,10 @@ BRANCH_PROFILE_SCHEMA_STATEMENTS = [
         model_key TEXT NOT NULL,
         device_type TEXT NOT NULL,
         shape_signature TEXT NOT NULL,
+        profile_namespace TEXT,
+        hardware_key TEXT,
+        search_mode TEXT,
+        contract_version INTEGER NOT NULL DEFAULT 1,
         batch_param_name TEXT NOT NULL,
         resolved_batch_size INTEGER NOT NULL,
         peak_vram_mb INTEGER,
@@ -227,6 +231,10 @@ BRANCH_PROFILE_SCHEMA_STATEMENTS = [
     ON batch_probe_profiles(model_key, device_type, updated_at DESC)
     """,
     """
+    CREATE INDEX IF NOT EXISTS idx_batch_probe_profiles_compatibility
+    ON batch_probe_profiles(profile_namespace, hardware_key, shape_signature, search_mode, contract_version, updated_at DESC)
+    """,
+    """
     CREATE INDEX IF NOT EXISTS idx_batch_size_observations_lookup
     ON batch_size_observations(model_key, shape_signature, hardware_key, backend_name, batch_size, updated_at DESC)
     """,
@@ -256,4 +264,8 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE solo_profiles ADD COLUMN hardware_key TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE pair_profiles ADD COLUMN hardware_key TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE pair_profiles ADD COLUMN backend_name TEXT NOT NULL DEFAULT 'exclusive'",
+    "ALTER TABLE batch_probe_profiles ADD COLUMN profile_namespace TEXT",
+    "ALTER TABLE batch_probe_profiles ADD COLUMN hardware_key TEXT",
+    "ALTER TABLE batch_probe_profiles ADD COLUMN search_mode TEXT",
+    "ALTER TABLE batch_probe_profiles ADD COLUMN contract_version INTEGER NOT NULL DEFAULT 1",
 ]

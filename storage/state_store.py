@@ -22,6 +22,7 @@ _PROFILE_METHODS = {
     "list_runtime_profiles",
     "upsert_batch_probe_profile",
     "get_batch_probe_profile",
+    "get_compatible_batch_probe_profile",
     "list_batch_probe_profiles",
     "upsert_batch_size_observation",
     "get_batch_size_observation",

@@ -482,7 +482,14 @@ class SchedulerService:
             self._emit_worker_finished_event(snapshot, run_context=run_context)
             return
         if snapshot.returncode == 0:
-            if job.status in {JobStatus.COMPLETED, JobStatus.PAUSED, JobStatus.EARLY_STOPPED, JobStatus.CANCELLED, JobStatus.READY}:
+            if job.status in {
+                JobStatus.COMPLETED,
+                JobStatus.PAUSED,
+                JobStatus.EARLY_STOPPED,
+                JobStatus.CANCELLED,
+                JobStatus.READY,
+                JobStatus.FAILED,
+            }:
                 self._emit_worker_finished_event(snapshot, run_context=run_context)
                 return
             self.store.set_job_status(job.job_id, JobStatus.FAILED, reason="worker exited without terminal status update", hold=True)

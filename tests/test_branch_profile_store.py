@@ -42,6 +42,38 @@ def test_state_store_creates_dedicated_branch_profile_database(tmp_path) -> None
     assert store.branch_profile_store.db_path == settings.branch_profile_db_path
 
 
+def test_legacy_batch_probe_table_is_migrated(tmp_path) -> None:
+    settings = SchedulerSettings(runtime_root=tmp_path)
+    settings.ensure_runtime_layout()
+    with sqlite3.connect(settings.branch_profile_db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE batch_probe_profiles (
+                probe_key TEXT PRIMARY KEY,
+                model_key TEXT NOT NULL,
+                device_type TEXT NOT NULL,
+                shape_signature TEXT NOT NULL,
+                batch_param_name TEXT NOT NULL,
+                resolved_batch_size INTEGER NOT NULL,
+                peak_vram_mb INTEGER,
+                memory_total_mb INTEGER,
+                target_budget_mb INTEGER,
+                observations INTEGER NOT NULL DEFAULT 1,
+                last_job_id TEXT,
+                updated_at TEXT NOT NULL,
+                metadata_json TEXT
+            )
+            """
+        )
+        connection.commit()
+
+    StateStore(settings)
+
+    with sqlite3.connect(settings.branch_profile_db_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(batch_probe_profiles)")}
+    assert {"profile_namespace", "hardware_key", "search_mode", "contract_version"} <= columns
+
+
 def test_profile_writes_land_in_branch_database_only(tmp_path) -> None:
     settings = SchedulerSettings(runtime_root=tmp_path)
     store = StateStore(settings)
@@ -66,6 +98,54 @@ def test_profile_writes_land_in_branch_database_only(tmp_path) -> None:
     assert restored.metadata["branch_name"] == "resnet50"
     assert _count_rows(settings.branch_profile_db_path, "batch_probe_profiles") == 1
     assert not _table_exists(settings.db_path, "batch_probe_profiles")
+
+
+def test_compatible_profile_lookup_excludes_legacy_rows(tmp_path) -> None:
+    settings = SchedulerSettings(runtime_root=tmp_path)
+    store = StateStore(settings)
+    namespace = "branch-profile:resnet18"
+    store.upsert_batch_probe_profile(
+        BatchProbeProfile(
+            probe_key="legacy-branch-only",
+            model_key="resnet18",
+            device_type="test-gpu",
+            shape_signature="shape-a",
+            batch_param_name="batch_size",
+            resolved_batch_size=8,
+        )
+    )
+    store.upsert_batch_probe_profile(
+        BatchProbeProfile(
+            probe_key="concrete-v2",
+            model_key="resnet18",
+            device_type="test-gpu",
+            shape_signature="shape-a",
+            batch_param_name="batch_size",
+            resolved_batch_size=16,
+            profile_namespace=namespace,
+            hardware_key="gpu-a",
+            search_mode="power_of_two",
+            contract_version=2,
+        )
+    )
+
+    compatible = store.get_compatible_batch_probe_profile(
+        profile_namespace=namespace,
+        hardware_key="gpu-a",
+        shape_signature="shape-a",
+        search_mode="power_of_two",
+        contract_version=2,
+    )
+
+    assert compatible is not None
+    assert compatible.probe_key == "concrete-v2"
+    assert store.get_compatible_batch_probe_profile(
+        profile_namespace=namespace,
+        hardware_key="gpu-b",
+        shape_signature="shape-a",
+        search_mode="power_of_two",
+        contract_version=2,
+    ) is None
 
 
 def test_branch_store_imports_legacy_scheduler_profiles_once(tmp_path) -> None:

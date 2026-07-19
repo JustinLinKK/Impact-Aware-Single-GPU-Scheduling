@@ -567,6 +567,9 @@ class SchedulerSubmissionDefaults:
     batch_probe_enabled: bool = True
     batch_probe_model_key: str | None = None
     batch_probe_probe_timeout_seconds: int = 45
+    batch_probe_startup_timeout_seconds: int = 90
+    batch_probe_step_timeout_seconds: int = 30
+    batch_probe_optimizer_steps: int = 1
     batch_probe_poll_interval_seconds: float = 0.5
     batch_probe_max_multiplier: int = 32
     batch_probe_search_mode: str = BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO
@@ -598,6 +601,9 @@ class SchedulerSubmissionDefaults:
             "batch_probe_enabled": self.batch_probe_enabled,
             "batch_probe_model_key": self.batch_probe_model_key,
             "batch_probe_probe_timeout_seconds": self.batch_probe_probe_timeout_seconds,
+            "batch_probe_startup_timeout_seconds": self.batch_probe_startup_timeout_seconds,
+            "batch_probe_step_timeout_seconds": self.batch_probe_step_timeout_seconds,
+            "batch_probe_optimizer_steps": self.batch_probe_optimizer_steps,
             "batch_probe_poll_interval_seconds": self.batch_probe_poll_interval_seconds,
             "batch_probe_max_multiplier": self.batch_probe_max_multiplier,
             "batch_probe_search_mode": self.batch_probe_search_mode,

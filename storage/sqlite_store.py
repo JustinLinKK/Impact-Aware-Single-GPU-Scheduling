@@ -676,6 +676,10 @@ class SQLiteStateStore:
                     model_key,
                     device_type,
                     shape_signature,
+                    profile_namespace,
+                    hardware_key,
+                    search_mode,
+                    contract_version,
                     batch_param_name,
                     resolved_batch_size,
                     peak_vram_mb,
@@ -686,11 +690,15 @@ class SQLiteStateStore:
                     updated_at,
                     metadata_json
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(probe_key) DO UPDATE SET
                     model_key=excluded.model_key,
                     device_type=excluded.device_type,
                     shape_signature=excluded.shape_signature,
+                    profile_namespace=excluded.profile_namespace,
+                    hardware_key=excluded.hardware_key,
+                    search_mode=excluded.search_mode,
+                    contract_version=excluded.contract_version,
                     batch_param_name=excluded.batch_param_name,
                     resolved_batch_size=excluded.resolved_batch_size,
                     peak_vram_mb=excluded.peak_vram_mb,
@@ -706,6 +714,10 @@ class SQLiteStateStore:
                     profile.model_key,
                     profile.device_type,
                     profile.shape_signature,
+                    profile.profile_namespace,
+                    profile.hardware_key,
+                    profile.search_mode,
+                    profile.contract_version,
                     profile.batch_param_name,
                     profile.resolved_batch_size,
                     profile.peak_vram_mb,
@@ -723,6 +735,31 @@ class SQLiteStateStore:
     def get_batch_probe_profile(self, probe_key: str) -> BatchProbeProfile | None:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM batch_probe_profiles WHERE probe_key = ?", (probe_key,)).fetchone()
+        return BatchProbeProfile.from_row(dict(row)) if row else None
+
+    def get_compatible_batch_probe_profile(
+        self,
+        *,
+        profile_namespace: str,
+        hardware_key: str,
+        shape_signature: str,
+        search_mode: str,
+        contract_version: int = 2,
+    ) -> BatchProbeProfile | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM batch_probe_profiles
+                WHERE profile_namespace = ?
+                  AND hardware_key = ?
+                  AND shape_signature = ?
+                  AND search_mode = ?
+                  AND contract_version = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (profile_namespace, hardware_key, shape_signature, search_mode, int(contract_version)),
+            ).fetchone()
         return BatchProbeProfile.from_row(dict(row)) if row else None
 
     def list_batch_probe_profiles(self) -> list[BatchProbeProfile]:

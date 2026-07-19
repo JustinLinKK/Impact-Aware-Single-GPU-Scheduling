@@ -29,6 +29,7 @@ from localml_scheduler.domain import (
     SoloProfile,
     TrainingJob,
     build_batch_probe_shape_signature,
+    build_batch_probe_key,
 )
 from localml_scheduler.scheduler.supervisor import WorkerSupervisor
 from localml_scheduler.config import SCHEDULER_MODE_PARALLEL_AUTO_PACK, SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED, SchedulerSettings
@@ -152,6 +153,28 @@ def _seed_solo_profile(api: SchedulerClient, job: TrainingJob) -> None:
 
 
 class BatchProbeUnitTest(unittest.TestCase):
+    def test_v2_probe_key_isolates_hardware_shape_namespace_and_contract(self) -> None:
+        base = dict(
+            model_key="resnet18",
+            device_type="RTX 5090",
+            shape_signature="script-224-bf16",
+            search_mode="power_of_two",
+            hardware_key="gpu-a",
+            profile_namespace="branch-profile:resnet18",
+            contract_version=2,
+        )
+        key = build_batch_probe_key(**base)
+
+        for field, value in (
+            ("hardware_key", "gpu-b"),
+            ("shape_signature", "script-160-bf16"),
+            ("profile_namespace", "branch-profile:resnet34"),
+            ("contract_version", 3),
+        ):
+            changed = dict(base)
+            changed[field] = value
+            self.assertNotEqual(key, build_batch_probe_key(**changed))
+
     def test_shape_signature_ignores_batch_size_but_changes_with_shape(self) -> None:
         job_a = TrainingJob.create(
             "pkg.runner:train",
@@ -343,6 +366,77 @@ class BatchProbeUnitTest(unittest.TestCase):
             self.assertEqual([event["payload"]["batch_size"] for event in trial_events], [8, 4, 8])
             self.assertEqual(trial_events[0]["payload"]["failure_kind"], "timeout")
             self.assertEqual(len(context.store.list_events(job_id=job.job_id, event_type="batch_probe_preflight_failed")), 0)
+
+    def test_minimum_batch_timeout_preserves_structured_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(runtime_root=tmpdir)
+            job = TrainingJob.create(
+                "pkg.runner:train",
+                "baseline-a",
+                "/tmp/a.pt",
+                runner_kwargs={"batch_size": 1},
+                batch_probe=BatchProbeSpec(
+                    enabled=True,
+                    probe_target="localml_scheduler.tests.test_batch_probe:fake_timeout_then_fit_probe",
+                    minimum_batch_size=1,
+                ),
+                metadata={"placement_backend": "exclusive", "probe_timeout_at": 1},
+                resource_requirements=ResourceRequirements(requires_gpu=True),
+            )
+            context = _build_context(settings, job)
+
+            with self.assertRaises(RuntimeError) as raised:
+                _run_probe_controller(
+                    context,
+                    BatchProbeKeyInfo(
+                        probe_key="probe-min-timeout",
+                        model_key="baseline-a",
+                        device_type="cuda-unavailable",
+                        shape_signature="shape-1",
+                        search_mode=BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
+                    ),
+                )
+
+            self.assertEqual(getattr(raised.exception, "failure_kind", None), "timeout")
+            self.assertEqual(raised.exception.attempt.batch_size, 1)
+            self.assertEqual(raised.exception.attempt.result.returncode, 124)
+
+    def test_search_round_exhaustion_preserves_structured_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                gpu_scheduler={"batch_probe_max_search_rounds": 2},
+            )
+            job = TrainingJob.create(
+                "pkg.runner:train",
+                "baseline-a",
+                "/tmp/a.pt",
+                runner_kwargs={"batch_size": 8},
+                batch_probe=BatchProbeSpec(
+                    enabled=True,
+                    probe_target="localml_scheduler.tests.test_batch_probe:fake_timeout_then_fit_probe",
+                    minimum_batch_size=1,
+                ),
+                metadata={"placement_backend": "exclusive", "probe_timeout_at": 1},
+                resource_requirements=ResourceRequirements(requires_gpu=True),
+            )
+            context = _build_context(settings, job)
+
+            with self.assertRaises(RuntimeError) as raised:
+                _run_probe_controller(
+                    context,
+                    BatchProbeKeyInfo(
+                        probe_key="probe-round-timeout",
+                        model_key="baseline-a",
+                        device_type="cuda-unavailable",
+                        shape_signature="shape-1",
+                        search_mode=BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
+                    ),
+                )
+
+            self.assertEqual(getattr(raised.exception, "failure_kind", None), "timeout")
+            self.assertEqual(raised.exception.attempt.batch_size, 4)
+            self.assertEqual(raised.exception.attempt.result.returncode, 124)
 
     def test_probe_controller_warns_when_capped_before_vram_saturation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

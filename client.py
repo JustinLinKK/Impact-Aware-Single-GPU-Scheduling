@@ -307,6 +307,23 @@ class SchedulerClient:
     def get_batch_probe_profile(self, probe_key: str) -> BatchProbeProfile | None:
         return self.store.get_batch_probe_profile(probe_key)
 
+    def get_compatible_batch_probe_profile(
+        self,
+        *,
+        profile_namespace: str,
+        hardware_key: str,
+        shape_signature: str,
+        search_mode: str,
+        contract_version: int = 2,
+    ) -> BatchProbeProfile | None:
+        return self.store.get_compatible_batch_probe_profile(
+            profile_namespace=profile_namespace,
+            hardware_key=hardware_key,
+            shape_signature=shape_signature,
+            search_mode=search_mode,
+            contract_version=contract_version,
+        )
+
     def upsert_batch_probe_profile(self, profile: BatchProbeProfile) -> BatchProbeProfile:
         return self.store.upsert_batch_probe_profile(profile)
 
