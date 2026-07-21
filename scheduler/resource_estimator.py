@@ -118,6 +118,19 @@ class ResourceEstimator:
         if router_result.selected is not None:
             return router_result.selected
 
+        compatible_profile = self._compatible_batch_probe_profile(job)
+        if compatible_profile is not None:
+            return self._prediction_from_batch_probe_profile(
+                job,
+                batch_size,
+                backend_name,
+                compatible_profile,
+                source=PredictionSource.BRANCH,
+                predictor_version="branch_batch_probe_profile_v1",
+                confidence=0.88,
+                warnings=("branch_batch_probe_profile",),
+            )
+
         explicit_prediction = self._explicit_prediction(job, batch_size, backend_name)
         if explicit_prediction is not None:
             return explicit_prediction
@@ -223,6 +236,42 @@ class ResourceEstimator:
                 return profile
         return None
 
+    def _compatible_batch_probe_profile(self, job: TrainingJob) -> BatchProbeProfile | None:
+        getter = getattr(self.repository, "get_compatible_batch_probe_profile", None)
+        if not callable(getter):
+            return None
+        profile_namespace = (
+            job.batch_probe.profile_namespace
+            or job.metadata.get("batch_probe_profile_namespace")
+            or job.metadata.get("branch_profile_key")
+            or job.metadata.get("model_family_profile_key")
+        )
+        if not profile_namespace:
+            return None
+        shape_signature = (
+            job.batch_probe.shape_signature_override
+            or job.metadata.get("branch_shape_signature")
+            or job.metadata.get("model_family_shape_signature")
+            or self.shape_signature(job)
+        )
+        search_mode = job.batch_probe.search_mode or self.settings.gpu_scheduler.batch_probe_search_mode
+        contract_version = int(job.batch_probe.contract_version or job.metadata.get("batch_probe_contract_version") or 2)
+        try:
+            profile = getter(
+                profile_namespace=str(profile_namespace),
+                hardware_key=self.repository.hardware_key(),
+                shape_signature=str(shape_signature),
+                search_mode=str(search_mode),
+                contract_version=contract_version,
+            )
+        except Exception:
+            return None
+        if profile is None:
+            return None
+        if profile.peak_vram_mb is None or int(profile.resolved_batch_size or 0) <= 0:
+            return None
+        return profile
+
     def _prediction_from_batch_observation(
         self,
         job: TrainingJob,
@@ -253,6 +302,11 @@ class ResourceEstimator:
         batch_size: int,
         backend_name: str,
         profile: BatchProbeProfile,
+        *,
+        source: PredictionSource = PredictionSource.JOB_LOCAL_PROBE,
+        predictor_version: str = "job_local_batch_probe_v1",
+        confidence: float = 0.90,
+        warnings: tuple[str, ...] = ("same_job_batch_probe",),
     ) -> ResourcePrediction:
         base_batch = max(1, int(profile.resolved_batch_size))
         ratio = float(batch_size) / float(base_batch)
@@ -262,12 +316,12 @@ class ResourceEstimator:
             job=job,
             batch_size=batch_size,
             backend_name=backend_name,
-            source=PredictionSource.JOB_LOCAL_PROBE,
-            predictor_version="job_local_batch_probe_v1",
+            source=source,
+            predictor_version=predictor_version,
             peak_vram_used_mib=peak_vram,
             step_time_ms=avg_step,
-            confidence=0.90,
-            warnings=("same_job_batch_probe",),
+            confidence=confidence,
+            warnings=warnings,
         )
 
     def _explicit_prediction(self, job: TrainingJob, batch_size: int, backend_name: str) -> ResourcePrediction | None:

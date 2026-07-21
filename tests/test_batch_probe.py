@@ -503,6 +503,86 @@ class BatchProbeUnitTest(unittest.TestCase):
             self.assertEqual(len(context.store.list_events(job_id=job.job_id, event_type="batch_probe_reuse_miss")), 1)
             self.assertEqual(context.store.list_events(job_id=job.job_id, event_type="batch_probe_started"), [])
 
+    def test_nonexclusive_preflight_applies_cached_batch_probe_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                gpu_scheduler={"mode": SCHEDULER_MODE_PARALLEL_AUTO_PACK},
+            )
+            exclusive_job = TrainingJob.create(
+                "pkg.runner:train",
+                "baseline-a",
+                "/tmp/a.pt",
+                task_type="classification",
+                runner_kwargs={"batch_size": 3, "probe_max_batch_size": 6},
+                batch_probe=BatchProbeSpec(
+                    enabled=True,
+                    probe_target="localml_scheduler.tests.test_batch_probe:fake_limit_probe",
+                ),
+                metadata={"placement_backend": "exclusive", "probe_threshold": 5},
+                resource_requirements=ResourceRequirements(requires_gpu=True),
+            )
+            exclusive_context = _build_context(settings, exclusive_job)
+            resolved_exclusive = run_batch_probe_preflight(exclusive_context)
+            self.assertEqual(resolved_exclusive.config.runner_kwargs["batch_size"], 4)
+            self.assertEqual(resolved_exclusive.metadata["batch_probe_source"], "probe")
+
+            stream_job = TrainingJob.create(
+                "pkg.runner:train",
+                "baseline-a",
+                "/tmp/a.pt",
+                task_type="classification",
+                runner_kwargs={"batch_size": 1, "probe_max_batch_size": 6},
+                batch_probe=BatchProbeSpec(
+                    enabled=True,
+                    probe_target="localml_scheduler.tests.test_batch_probe:fake_limit_probe",
+                ),
+                metadata={"placement_backend": "stream", "probe_threshold": 5},
+                resource_requirements=ResourceRequirements(requires_gpu=True),
+            )
+            stream_job.metadata.update(
+                {
+                    "batch_probe_key": resolved_exclusive.metadata["batch_probe_key"],
+                    "resolved_batch_size": 1,
+                }
+            )
+            stream_context = _build_context(settings, stream_job)
+            resolved_stream = run_batch_probe_preflight(stream_context)
+
+            self.assertEqual(resolved_stream.config.runner_kwargs["batch_size"], 4)
+            self.assertEqual(resolved_stream.metadata["batch_probe_source"], "cache")
+            self.assertEqual(len(stream_context.store.list_events(job_id=stream_job.job_id, event_type="batch_probe_cache_hit")), 1)
+            self.assertEqual(stream_context.store.list_events(job_id=stream_job.job_id, event_type="batch_probe_started"), [])
+
+    def test_nonexclusive_preflight_cache_miss_does_not_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                gpu_scheduler={"mode": SCHEDULER_MODE_PARALLEL_AUTO_PACK},
+            )
+            job = TrainingJob.create(
+                "pkg.runner:train",
+                "baseline-a",
+                "/tmp/a.pt",
+                task_type="classification",
+                runner_kwargs={"batch_size": 3, "probe_max_batch_size": 6},
+                batch_probe=BatchProbeSpec(
+                    enabled=True,
+                    probe_target="localml_scheduler.tests.test_batch_probe:fake_limit_probe",
+                ),
+                metadata={"placement_backend": "stream", "probe_threshold": 5},
+                resource_requirements=ResourceRequirements(requires_gpu=True),
+            )
+            context = _build_context(settings, job)
+
+            resolved = run_batch_probe_preflight(context)
+
+            self.assertEqual(resolved.config.runner_kwargs["batch_size"], 3)
+            self.assertIsNone(resolved.metadata.get("batch_probe_source"))
+            self.assertEqual(context.store.list_batch_probe_profiles(), [])
+            self.assertEqual(len(context.store.list_events(job_id=job.job_id, event_type="batch_probe_cache_miss_nonexclusive")), 1)
+            self.assertEqual(context.store.list_events(job_id=job.job_id, event_type="batch_probe_started"), [])
+
 
 class BatchProbeIntegrationTest(unittest.TestCase):
     def _build_probe_job(

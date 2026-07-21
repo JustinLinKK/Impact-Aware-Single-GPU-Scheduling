@@ -9,6 +9,7 @@ import torch
 
 from ..observability.events import EventLogger
 from ..observability.logging_utils import setup_scheduler_logger
+from ..profiling.batch_probe import run_batch_probe_preflight
 from ..config import SchedulerSettings
 from ..storage.log_store import SchedulerLogStore
 from ..storage.state_store import StateStore
@@ -26,6 +27,7 @@ def _run_job_in_thread(settings: SchedulerSettings, store: StateStore, event_log
     mark_job_started(settings, store, event_logger, job_id, backend_name="stream")
 
     try:
+        context.job = run_batch_probe_preflight(context)
         runner = resolve_runner(context)
         if torch.cuda.is_available():
             torch.cuda.set_device(settings.gpu_scheduler.device_index)

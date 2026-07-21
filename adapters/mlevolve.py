@@ -241,7 +241,7 @@ def build_model_family_probe_job(
         "working_dir": working_dir,
         "probe_timeout_seconds": int(probe_timeout_seconds),
         "probe_poll_interval_seconds": float(probe_poll_interval_seconds),
-        "probe_max_epochs": 1,
+        "probe_max_epochs": 2,
         "probe_max_train_batches": 3,
         "batch_size": int(start_batch_size or hints.get("start_batch_size") or 1),
         "probe_max_batch_size": int(probe_max_batch_size or hints.get("probe_max_batch_size") or 256),

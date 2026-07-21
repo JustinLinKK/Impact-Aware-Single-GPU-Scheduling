@@ -51,6 +51,11 @@ def test_pipeline_stage_categories_align_with_contract():
     assert {"muon_optimizer", "soap_optimizer", "ademamix_optimizer"} <= training_ids
     assert "gram_newton_schulz_symmetric_gemm" in training_ids
     assert {"bf16", "async_tensor_parallel"} <= training_ids
+    assert {
+        "cuda_stream_scheduler_compatibility",
+        "cuda_process_scheduler_compatibility",
+        "mps_scheduler_compatibility",
+    } <= training_ids
     assert "fp8_rowwise_scaling" not in training_ids
 
 

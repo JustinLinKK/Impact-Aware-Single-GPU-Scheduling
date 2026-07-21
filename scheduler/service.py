@@ -36,6 +36,8 @@ from .training_plot import render_training_process
 
 RAW_MLEVOLVE_RUNNER_TARGET = "localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job"
 NON_PREEMPTIBLE_PROBE_TASK_TYPES = {"mlevolve_model_family_probe", "mlevolve_startpoint_probe"}
+EVENT_CANDIDATE_SAMPLE_LIMIT = 8
+EVENT_JOB_ID_SAMPLE_LIMIT = 12
 
 
 @dataclass(slots=True)
@@ -97,6 +99,7 @@ class SchedulerService:
         self._device_samples: list[GpuTelemetrySample] = []
         self._last_telemetry_poll_at = 0.0
         self._idle_coalescing_started_at: float | None = None
+        self._event_throttle_last_emitted: dict[tuple[Any, ...], float] = {}
         self.event_logger.emit(
             "scheduler_session_started",
             payload={
@@ -382,6 +385,8 @@ class SchedulerService:
     def _pick_fallback_candidate(self) -> tuple[str, str] | None:
         candidates: list[tuple[int, float, int, str, str]] = []
         for group_id, run in self._active_runs.items():
+            if run.mode == "exclusive" or len(run.job_ids) < 2:
+                continue
             for job_id in self._supervisor_active_job_ids_by_group().get(group_id, []):
                 job = self.store.get_job(job_id)
                 if job is None:
@@ -1089,11 +1094,109 @@ class SchedulerService:
         except (TypeError, ValueError):
             return default
 
+    def _should_emit_throttled_event(self, key: tuple[Any, ...], *, cooldown_seconds: float = 30.0) -> bool:
+        now = time.monotonic()
+        last = self._event_throttle_last_emitted.get(key)
+        if last is not None and (now - last) < cooldown_seconds:
+            return False
+        self._event_throttle_last_emitted[key] = now
+        return True
+
+    def _sample_values_for_event(self, values: list[Any], *, limit: int = EVENT_JOB_ID_SAMPLE_LIMIT) -> tuple[list[Any], int]:
+        sample = values[:limit]
+        return sample, max(0, len(values) - len(sample))
+
+    def _compact_candidate_for_event(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        job_ids = list(candidate.get("job_ids") or [])
+        packing_signatures = list(candidate.get("packing_signatures") or [])
+        sampled_job_ids, truncated_job_count = self._sample_values_for_event(job_ids)
+        sampled_signatures, truncated_signature_count = self._sample_values_for_event(packing_signatures)
+        compact: dict[str, Any] = {
+            "job_ids": sampled_job_ids,
+            "job_count": len(job_ids),
+            "truncated_job_count": truncated_job_count,
+            "backend_name": candidate.get("backend_name"),
+            "status": candidate.get("status"),
+            "rejection_reason": candidate.get("rejection_reason"),
+            "expected_runtime_seconds": candidate.get("expected_runtime_seconds"),
+            "job_expected_runtime_seconds": {
+                job_id: value
+                for job_id, value in list((candidate.get("job_expected_runtime_seconds") or {}).items())[
+                    :EVENT_JOB_ID_SAMPLE_LIMIT
+                ]
+            },
+        }
+        if packing_signatures:
+            compact["packing_signatures"] = sampled_signatures
+            compact["truncated_packing_signature_count"] = truncated_signature_count
+        for key in (
+            "objective_score",
+            "estimated_vram_mb",
+            "estimated_sm_utilization",
+            "batch_overrides",
+            "fallback_order",
+            "reason",
+        ):
+            if key in candidate:
+                compact[key] = candidate.get(key)
+        prediction_traces = candidate.get("prediction_traces") or {}
+        if prediction_traces:
+            trace_job_ids, truncated_trace_count = self._sample_values_for_event(list(prediction_traces), limit=EVENT_JOB_ID_SAMPLE_LIMIT)
+            compact["prediction_trace_job_ids"] = trace_job_ids
+            compact["truncated_prediction_trace_count"] = truncated_trace_count
+        return compact
+
+    def _candidate_summary_for_event(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        reason_counts: dict[str, int] = {}
+        backend_counts: dict[str, int] = {}
+        unique_job_ids: list[str] = []
+        seen_job_ids: set[str] = set()
+        for candidate in candidates:
+            reason = str(candidate.get("rejection_reason") or candidate.get("status") or "unknown")
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            backend = str(candidate.get("backend_name") or "unselected")
+            backend_counts[backend] = backend_counts.get(backend, 0) + 1
+            for job_id in list(candidate.get("job_ids") or []):
+                if job_id in seen_job_ids:
+                    continue
+                seen_job_ids.add(job_id)
+                unique_job_ids.append(job_id)
+        sample_candidates = [
+            self._compact_candidate_for_event(candidate)
+            for candidate in candidates[:EVENT_CANDIDATE_SAMPLE_LIMIT]
+        ]
+        sample_job_ids, truncated_job_id_count = self._sample_values_for_event(unique_job_ids)
+        return {
+            "candidate_count": len(candidates),
+            "sample_candidates": sample_candidates,
+            "truncated_candidate_count": max(0, len(candidates) - len(sample_candidates)),
+            "candidate_rejection_reason_counts": reason_counts,
+            "candidate_backend_counts": backend_counts,
+            "candidate_job_ids": sample_job_ids,
+            "candidate_unique_job_count": len(unique_job_ids),
+            "truncated_candidate_job_id_count": truncated_job_id_count,
+        }
+
+    def _planner_trace_for_event(self, trace: dict[str, Any]) -> dict[str, Any]:
+        event_trace = dict(trace)
+        candidates = list(event_trace.pop("candidates", []) or [])
+        event_trace.update(self._candidate_summary_for_event(candidates))
+        return event_trace
+
     def _emit_scheduler_preemption_skipped(self, job: TrainingJob, *, reason: str, payload: dict[str, Any] | None = None) -> None:
+        event_payload = {"reason": reason, **(payload or {})}
+        key = (
+            "scheduler_preemption_skipped",
+            job.job_id,
+            reason,
+            str(event_payload.get("strategy") or ""),
+        )
+        if not self._should_emit_throttled_event(key):
+            return
         self.event_logger.emit(
             "scheduler_preemption_skipped",
             job_id=job.job_id,
-            payload={"reason": reason, **(payload or {})},
+            payload=event_payload,
         )
 
     def _can_preempt_active_job(
@@ -1338,7 +1441,19 @@ class SchedulerService:
                 "batch_overrides": dict(plan.batch_overrides),
                 "fallback_order": list(plan.fallback_order),
             }
-        self.event_logger.emit("planner_decision_trace", payload=trace)
+        event_trace = self._planner_trace_for_event(trace)
+        selected_plan = event_trace.get("selected_plan") or {}
+        key = (
+            "planner_decision_trace",
+            selected_plan.get("mode"),
+            selected_plan.get("backend_name"),
+            tuple(selected_plan.get("job_ids") or []),
+            event_trace.get("decision_reason"),
+            event_trace.get("candidate_count"),
+        )
+        if not self._should_emit_throttled_event(key, cooldown_seconds=5.0):
+            return
+        self.event_logger.emit("planner_decision_trace", payload=event_trace)
 
     def _emit_packing_probe_order_events(self, runnable: list[TrainingJob], plan: DispatchPlan | None) -> None:
         if effective_scheduler_mode(self.settings.gpu_scheduler.mode) != SCHEDULER_MODE_PARALLEL_AUTO_PACK:
@@ -1346,29 +1461,45 @@ class SchedulerService:
         trace = getattr(self.planner, "last_decision_trace", None)
         candidates = list(trace.get("candidates") or []) if isinstance(trace, dict) else []
         if len(runnable) > 1:
-            self.event_logger.emit(
-                "packing_attempted_before_probe",
-                payload={
-                    "scheduler_session_id": self.settings.scheduler_session_id,
-                    "runnable_job_ids": [job.job_id for job in runnable],
-                    "candidate_count": len(candidates),
-                },
-            )
+            runnable_job_ids = [job.job_id for job in runnable]
+            if self._should_emit_throttled_event(
+                ("packing_attempted_before_probe", tuple(runnable_job_ids), len(candidates))
+            ):
+                self.event_logger.emit(
+                    "packing_attempted_before_probe",
+                    payload={
+                        "scheduler_session_id": self.settings.scheduler_session_id,
+                        "runnable_job_ids": runnable_job_ids,
+                        "candidate_count": len(candidates),
+                    },
+                )
         missing_prediction_candidates = [
             candidate
             for candidate in candidates
             if str(candidate.get("rejection_reason") or "").startswith("VRAM estimate unavailable")
         ]
-        for candidate in missing_prediction_candidates:
-            self.event_logger.emit(
+        if missing_prediction_candidates:
+            active_job_ids = self._supervisor_active_job_ids()
+            summary_payload = {
+                "scheduler_session_id": self.settings.scheduler_session_id,
+                "reason": "VRAM estimate unavailable; exclusive calibration probe required",
+                "runnable_job_count": len(runnable),
+                "active_job_ids": active_job_ids,
+                "active_run_count": len(self._active_runs),
+            }
+            summary_payload.update(self._candidate_summary_for_event(missing_prediction_candidates))
+            key = (
                 "packing_skipped_prediction_missing",
-                payload={
-                    "scheduler_session_id": self.settings.scheduler_session_id,
-                    "job_ids": list(candidate.get("job_ids") or []),
-                    "backend_name": candidate.get("backend_name"),
-                    "reason": candidate.get("rejection_reason"),
-                },
+                tuple(active_job_ids),
+                len(runnable),
+                summary_payload.get("candidate_count"),
+                tuple(sorted((summary_payload.get("candidate_backend_counts") or {}).items())),
+                str(summary_payload.get("reason")),
             )
+            if self._should_emit_throttled_event(key, cooldown_seconds=30.0):
+                self.event_logger.emit("packing_skipped_prediction_missing", payload=summary_payload)
+            if self._active_runs and plan is not None and len(plan.job_ids) == 1 and plan.backend_name == "exclusive":
+                return
         if plan is not None and len(plan.job_ids) > 1:
             self.event_logger.emit(
                 "packing_selected_before_probe",
@@ -1395,7 +1526,12 @@ class SchedulerService:
                         "scheduler_session_id": self.settings.scheduler_session_id,
                         "job_id": job.job_id,
                         "reason": plan.reason,
-                        "missed_packed_candidates": missing_prediction_candidates,
+                        "missed_packed_candidates": self._candidate_summary_for_event(missing_prediction_candidates)[
+                            "sample_candidates"
+                        ],
+                        "missed_packed_candidate_count": len(missing_prediction_candidates),
+                        "missed_packed_candidates_truncated": len(missing_prediction_candidates)
+                        > EVENT_CANDIDATE_SAMPLE_LIMIT,
                     },
                 )
 
@@ -1513,7 +1649,11 @@ class SchedulerService:
                     self.logger.warning("Exclusive fallback dispatch also failed for %s: %s", fallback_job.job_id, fallback_exc)
             return False
         if not dispatched.can_run:
-            self.logger.info("Skipping dispatch for %s: %s", ",".join(plan.job_ids), dispatched.reason)
+            if self._should_emit_throttled_event(
+                ("dispatch_skipped", tuple(plan.job_ids), dispatched.reason),
+                cooldown_seconds=30.0,
+            ):
+                self.logger.info("Skipping dispatch for %s: %s", ",".join(plan.job_ids), dispatched.reason)
             return False
         group_id = dispatched.group_id or f"legacy-{plan.job_ids[0]}-{time.monotonic_ns()}"
 

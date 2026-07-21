@@ -4,9 +4,11 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from localml_scheduler.adapters.mlevolve_runner import (
     _materialize_instrumented_script,
+    ProbeSubprocessResult,
     classify_mlevolve_probe_failure,
     probe_mlevolve_script_job,
     run_mlevolve_script_job,
@@ -16,6 +18,7 @@ from localml_scheduler.execution.control import ControlPlane, TrainingControlHoo
 from localml_scheduler.execution.runner_protocol import RunnerContext
 from localml_scheduler.execution.worker_runtime import mark_job_completed
 from localml_scheduler.observability.events import EventLogger
+from localml_scheduler.scheduler.telemetry import GpuTelemetrySample
 from localml_scheduler.domain import BatchProbeSpec, CheckpointPolicy, JobStatus, SafePointType, TrainingJob
 from localml_scheduler.config import SchedulerSettings
 from localml_scheduler.storage.sqlite_store import SQLiteStateStore
@@ -191,6 +194,53 @@ class MLEvolveRunnerTest(unittest.TestCase):
             trace = json.loads((working_dir / "batch_sizes.json").read_text(encoding="utf-8"))
             self.assertEqual(trace["train"], [9])
             self.assertEqual(trace["test"], [4, 4])
+
+    def test_run_script_job_honors_max_epochs_without_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            working_dir = Path(tmpdir) / "workspace"
+            working_dir.mkdir(parents=True, exist_ok=True)
+            script_path = working_dir / "candidate.py"
+            script_path.write_text(
+                "\n".join(
+                    [
+                        "import json",
+                        "from pathlib import Path",
+                        "num_epochs = 5",
+                        "seen_epochs = []",
+                        "for epoch in range(num_epochs):",
+                        "    seen_epochs.append(epoch)",
+                        "Path('seen_epochs.json').write_text(json.dumps(seen_epochs), encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            result_path = working_dir / "result.json"
+            settings = SchedulerSettings(runtime_root=runtime_root)
+            job = TrainingJob.create(
+                runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                baseline_model_id="script",
+                baseline_model_path=str(script_path),
+                runner_kwargs={
+                    "script_path": str(script_path),
+                    "working_dir": str(working_dir),
+                    "result_path": str(result_path),
+                    "max_epochs": 2,
+                },
+                batch_probe=BatchProbeSpec(enabled=False),
+                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
+                metadata={"placement_backend": "exclusive"},
+            )
+            context = _build_context(settings, job)
+
+            result = run_mlevolve_script_job(context)
+
+            self.assertEqual(result["candidate_returncode"], 0)
+            self.assertEqual(result["instrumentation"]["max_epochs_override"], 2)
+            self.assertEqual(json.loads((working_dir / "seen_epochs.json").read_text(encoding="utf-8")), [0, 1])
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertIn("no time limit", "".join(payload["term_out"]))
+            self.assertEqual(payload["instrumentation"]["max_epochs_override"], 2)
 
     def test_run_script_job_records_phase_timing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -380,6 +430,61 @@ class MLEvolveRunnerTest(unittest.TestCase):
             self.assertFalse(result.fits)
             self.assertEqual(result.failure_kind, "probe_incomplete")
             self.assertFalse(result.probe_completed)
+
+    def test_probe_script_job_accepts_training_completion_with_sampled_vram_when_hook_is_missed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            working_dir = Path(tmpdir) / "workspace"
+            working_dir.mkdir(parents=True, exist_ok=True)
+            script_path = working_dir / "candidate.py"
+            script_path.write_text(
+                "\n".join(
+                    [
+                        "from torch.utils.data import DataLoader",
+                        "batch_size = 2",
+                        "train_loader = DataLoader(range(8), batch_size=batch_size, shuffle=True)",
+                        "for batch in train_loader:",
+                        "    pass",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            settings = SchedulerSettings(runtime_root=runtime_root)
+            job = TrainingJob.create(
+                runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                baseline_model_id="script",
+                baseline_model_path=str(script_path),
+                runner_kwargs={
+                    "script_path": str(script_path),
+                    "working_dir": str(working_dir),
+                    "result_path": str(working_dir / "result.json"),
+                    "probe_timeout_seconds": 5,
+                },
+                batch_probe=BatchProbeSpec(
+                    enabled=True,
+                    probe_target="localml_scheduler.adapters.mlevolve_runner:probe_mlevolve_script_job",
+                ),
+                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
+                metadata={"placement_backend": "exclusive"},
+            )
+            probe_result = ProbeSubprocessResult(
+                fits=False,
+                samples=[GpuTelemetrySample(memory_used_mb=1234, memory_total_mb=8192)],
+                stdout_text="Epoch 1/2 - Train Loss: 0.42\nTraining finished\nFinal Validation Score: 0.5",
+                stderr_text="",
+                returncode=0,
+                timed_out=False,
+                completion_event=None,
+            )
+
+            with patch("localml_scheduler.adapters.mlevolve_runner._run_probe_subprocess", return_value=probe_result):
+                result = probe_mlevolve_script_job(_build_context(settings, job), 4, 1, 1)
+
+            self.assertTrue(result.fits)
+            self.assertIsNone(result.failure_kind)
+            self.assertFalse(result.probe_completed)
+            self.assertEqual(result.peak_vram_mb, 1234)
+            self.assertIn("using sampled VRAM", result.message or "")
 
     def test_probe_script_job_exits_after_optimizer_step(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

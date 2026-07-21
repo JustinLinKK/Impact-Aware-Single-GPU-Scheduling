@@ -635,7 +635,7 @@ class GpuSchedulerSettings:
     batch_probe_search_mode: str = BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO
     model_family_probe_enabled: bool = True
     model_family_probe_priority: int = 100
-    model_family_probe_timeout_seconds: int = 300
+    model_family_probe_timeout_seconds: int | None = 300
     checkpoint_preemption_enabled: bool = True
     checkpoint_preemption_cooldown_seconds: float = 60.0
     checkpoint_preemption_min_runtime_seconds: float = 15.0
@@ -666,10 +666,12 @@ class GpuSchedulerSettings:
             self.model_family_probe_priority = int(self.model_family_probe_priority)
         except (TypeError, ValueError):
             self.model_family_probe_priority = 100
-        try:
-            self.model_family_probe_timeout_seconds = max(1, int(self.model_family_probe_timeout_seconds))
-        except (TypeError, ValueError):
-            self.model_family_probe_timeout_seconds = 300
+        if self.model_family_probe_timeout_seconds is not None:
+            try:
+                parsed_probe_timeout = int(self.model_family_probe_timeout_seconds)
+            except (TypeError, ValueError):
+                parsed_probe_timeout = 300
+            self.model_family_probe_timeout_seconds = None if parsed_probe_timeout <= 0 else parsed_probe_timeout
         self.checkpoint_preemption_enabled = bool(self.checkpoint_preemption_enabled)
         try:
             self.checkpoint_preemption_cooldown_seconds = max(0.0, float(self.checkpoint_preemption_cooldown_seconds))

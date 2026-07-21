@@ -68,6 +68,53 @@ scaler = torch.cuda.amp.GradScaler()
     assert result["critical_count"] == 2
 
 
+def test_validate_generated_training_code_flags_diff_marker_fragments(tmp_path: Path) -> None:
+    client = SchedulerClient(SchedulerConfig(runtime_root=tmp_path / "runtime"))
+    open_marker = "<" * 7 + " SEARCH"
+    middle_marker = "=" * 7
+    close_marker = ">" * 7 + " REPLACE"
+    code = "\n".join(
+        [
+            "def train():",
+            "    return 1",
+            open_marker,
+            "old",
+            middle_marker,
+            "new",
+            close_marker,
+        ]
+    )
+
+    result = client.validate_generated_training_code(code, stage="debug")
+
+    assert result["ok"] is False
+    assert "diff_marker_or_conflict_fragment" in {issue["category"] for issue in result["issues"]}
+
+
+def test_validate_generated_training_code_flags_engineered_feature_dim_mismatch(tmp_path: Path) -> None:
+    client = SchedulerClient(SchedulerConfig(runtime_root=tmp_path / "runtime"))
+    code = """
+import numpy as np
+from torch import nn
+
+feature_names = [f"f{i}" for i in range(18)]
+
+def compute_patch_features(row):
+    return np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18])
+
+feature_dim = 16
+norm = nn.LayerNorm(16)
+"""
+
+    result = client.validate_generated_training_code(code, stage="code_review")
+
+    categories = {issue["category"] for issue in result["issues"]}
+    assert "engineered_feature_dim_mismatch" in categories
+    issue = next(item for item in result["issues"] if item["category"] == "engineered_feature_dim_mismatch")
+    assert "feature_dim" in issue["evidence"]
+    assert "LayerNorm" in issue["evidence"]
+
+
 def test_runtime_environment_reports_precision_export_policy(tmp_path: Path) -> None:
     client = SchedulerClient(SchedulerConfig(runtime_root=tmp_path / "runtime"))
 

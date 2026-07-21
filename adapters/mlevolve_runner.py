@@ -304,7 +304,7 @@ def _materialize_instrumented_script(script_path: Path, working_dir: Path) -> In
         "import time as _mlevolve_time\n"
         f"{_BATCH_OVERRIDE_VAR} = os.environ.get('MLEVOLVE_BATCH_SIZE_OVERRIDE')\n"
         f"{_PROBE_MODE_VAR} = os.environ.get('MLEVOLVE_PROBE_MODE') == '1'\n"
-        f"{_EPOCH_OVERRIDE_VAR} = int(os.environ['MLEVOLVE_PROBE_MAX_EPOCHS']) if {_PROBE_MODE_VAR} and os.environ.get('MLEVOLVE_PROBE_MAX_EPOCHS') else None\n"
+        f"{_EPOCH_OVERRIDE_VAR} = int(os.environ['MLEVOLVE_PROBE_MAX_EPOCHS']) if os.environ.get('MLEVOLVE_PROBE_MAX_EPOCHS') else None\n"
         f"{_PROBE_EVENT_PATH_VAR} = os.environ.get('MLEVOLVE_PROBE_EVENT_PATH')\n"
         f"{_PROBE_OPTIMIZER_STEPS_VAR} = max(1, int(os.environ.get('MLEVOLVE_PROBE_OPTIMIZER_STEPS', '1')))\n"
         "_mlevolve_probe_step_started = None\n"
@@ -412,6 +412,23 @@ def _resolved_batch_size(context: RunnerContext) -> int | None:
     if raw_value is None:
         return None
     return BatchResolution.resolved_batch_size(context.job)
+
+
+def _max_epochs_override(context: RunnerContext) -> int | None:
+    for value in (
+        context.job.config.runner_kwargs.get("max_epochs"),
+        context.job.config.max_epochs,
+        context.job.max_epochs,
+    ):
+        if value is None:
+            continue
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return None
 
 
 def _short_excerpt(text: str, *, limit: int = 1000) -> str | None:
@@ -660,6 +677,19 @@ def _parse_batch_size_failure(stderr_text: str, stdout_text: str = "", returncod
     return failure_kind, message
 
 
+def _stdout_indicates_training_progress(stdout_text: str) -> bool:
+    lowered = stdout_text.lower()
+    markers = (
+        "final validation score",
+        "training finished",
+        "train loss",
+        "val loss",
+        "val auc",
+        "epoch ",
+    )
+    return any(marker in lowered for marker in markers)
+
+
 def classify_mlevolve_probe_failure(
     *,
     stdout_text: str = "",
@@ -826,7 +856,7 @@ def probe_mlevolve_script_job(
     timeout_seconds = int(kwargs.get("probe_startup_timeout_seconds", kwargs.get("probe_timeout_seconds", max(20, warmup_steps + measure_steps))))
     step_timeout_seconds = int(kwargs.get("probe_step_timeout_seconds", 30))
     poll_interval_seconds = float(kwargs.get("probe_poll_interval_seconds", 0.5))
-    probe_max_epochs = max(1, int(kwargs.get("probe_max_epochs", 1)))
+    probe_max_epochs = max(1, int(kwargs.get("probe_max_epochs", 2)))
     probe_max_train_batches = max(1, int(kwargs.get("probe_max_train_batches", 3)))
     probe_optimizer_steps = max(1, int(kwargs.get("probe_optimizer_steps", 1)))
     probe_result = _run_probe_subprocess(
@@ -848,12 +878,6 @@ def probe_mlevolve_script_job(
         returncode=probe_result.returncode,
         timed_out=probe_result.timed_out,
     )
-    fits = bool(probe_result.fits)
-    if probe_result.returncode == 0 and probe_result.completion_event is None and not probe_result.timed_out:
-        failure_kind = "probe_incomplete"
-        failure_reason = "probe exited without completing an optimizer step"
-    if failure_kind is not None or failure_reason is not None:
-        fits = False
 
     completion = probe_result.completion_event or {}
     allocator_peak_mb = int(completion.get("peak_allocated_bytes", 0) / (1024 * 1024)) or None
@@ -866,6 +890,20 @@ def probe_mlevolve_script_job(
     stdout_head, stdout_tail = _head_tail(probe_result.stdout_text)
     stderr_head, stderr_tail = _head_tail(probe_result.stderr_text)
     exception_type, exception_message = _terminal_exception(probe_result.stderr_text)
+    completed_without_hook = (
+        probe_result.returncode == 0
+        and probe_result.completion_event is None
+        and not probe_result.timed_out
+        and failure_kind is None
+        and peak_vram_mb is not None
+        and _stdout_indicates_training_progress(probe_result.stdout_text)
+    )
+    fits = bool(probe_result.fits or completed_without_hook)
+    if probe_result.returncode == 0 and probe_result.completion_event is None and not probe_result.timed_out and not completed_without_hook:
+        failure_kind = "probe_incomplete"
+        failure_reason = "probe exited without completing an optimizer step"
+    if failure_kind is not None or failure_reason is not None:
+        fits = False
     phase = probe_result.timeout_phase or ("optimizer_step" if completion else "subprocess")
     diagnostic = None
     if not fits:
@@ -887,7 +925,14 @@ def probe_mlevolve_script_job(
         peak_vram_mb=peak_vram_mb,
         memory_total_mb=memory_total_mb,
         avg_step_time_ms=_as_float(completion.get("optimizer_step_time_ms")),
-        message=failure_reason or ("optimizer step completed" if fits else _short_excerpt(probe_result.stderr_text, limit=400)),
+        message=failure_reason
+        or (
+            "optimizer step completed"
+            if probe_result.fits
+            else "probe process completed with training output; using sampled VRAM telemetry"
+            if completed_without_hook
+            else _short_excerpt(probe_result.stderr_text, limit=400)
+        ),
         failure_kind=failure_kind,
         returncode=probe_result.returncode,
         stdout_excerpt=stdout_tail,
@@ -922,6 +967,7 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
         phase_log_path,
     )
     batch_size_override = _resolved_batch_size(context) if instrumented.had_batch_rewrite else None
+    max_epochs_override = _max_epochs_override(context)
 
     start_time = time.time()
     proc = subprocess.Popen(
@@ -931,7 +977,7 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
-        env=_base_script_env(batch_size_override=batch_size_override),
+        env=_base_script_env(batch_size_override=batch_size_override, probe_max_epochs=max_epochs_override),
     )
 
     exc_type: str | None = None
@@ -1030,6 +1076,8 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
 
     phase_timings = parse_phase_timing_log(phase_log_path, exec_time=exec_time, instrumentation=phase_metadata)
     instrumentation = dict(phase_metadata or {})
+    if max_epochs_override is not None:
+        instrumentation["max_epochs_override"] = max_epochs_override
     failure_diagnostic = None
     if exc_type is not None:
         stdout_head, stdout_tail = _head_tail(stdout)
@@ -1136,6 +1184,7 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
                 "scheduler_session_id": context.job.metadata.get("scheduler_session_id"),
                 "resolved_batch_size": BatchResolution.resolved_batch_size(context.job),
                 "batch_size_override": batch_size_override,
+                "max_epochs_override": max_epochs_override,
                 "phase_timing_available": bool(phase_timings),
             },
         )

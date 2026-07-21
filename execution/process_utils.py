@@ -12,11 +12,30 @@ def start_new_session_kwargs() -> dict[str, bool]:
     return {"start_new_session": True} if os.name == "posix" else {}
 
 
+def signal_process_tree(process: subprocess.Popen, sig: int) -> None:
+    """Signal a process and its descendants when it owns a POSIX process group."""
+    if process.poll() is not None:
+        return
+    _signal_process(process, pgid=_isolated_process_group_id(process), sig=sig)
+
+
 def terminate_process_tree(process: subprocess.Popen, *, timeout: float = 2.0) -> None:
     """Terminate a process and its descendants when it owns a POSIX process group."""
     if process.poll() is not None:
         return
 
+    _signal_process(process, pgid=_isolated_process_group_id(process), sig=signal.SIGTERM)
+    try:
+        process.wait(timeout=timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    _signal_process(process, pgid=_isolated_process_group_id(process), sig=signal.SIGKILL)
+    process.wait()
+
+
+def _isolated_process_group_id(process: subprocess.Popen) -> int | None:
     pgid: int | None = None
     if os.name == "posix":
         try:
@@ -25,16 +44,7 @@ def terminate_process_tree(process: subprocess.Popen, *, timeout: float = 2.0) -
             pgid = None
         if pgid == os.getpgrp():
             pgid = None
-
-    _signal_process(process, pgid=pgid, sig=signal.SIGTERM)
-    try:
-        process.wait(timeout=timeout)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-
-    _signal_process(process, pgid=pgid, sig=signal.SIGKILL)
-    process.wait()
+    return pgid
 
 
 def _signal_process(process: subprocess.Popen, *, pgid: int | None, sig: int) -> None:

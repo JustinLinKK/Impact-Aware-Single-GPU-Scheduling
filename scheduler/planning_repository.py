@@ -31,6 +31,17 @@ class PlanningRepository(Protocol):
     def get_batch_probe_profile(self, probe_key: str) -> BatchProbeProfile | None:
         ...
 
+    def get_compatible_batch_probe_profile(
+        self,
+        *,
+        profile_namespace: str,
+        hardware_key: str,
+        shape_signature: str,
+        search_mode: str,
+        contract_version: int = 2,
+    ) -> BatchProbeProfile | None:
+        ...
+
     def get_batch_size_observation(
         self,
         *,
@@ -61,4 +72,3 @@ class PlanningRepository(Protocol):
         scheduler_mode: str,
     ) -> CombinationProfile | None:
         ...
-

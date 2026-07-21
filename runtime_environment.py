@@ -149,7 +149,9 @@ def validate_generated_training_code(
     code_text = str(code or "")
     issues: list[dict[str, Any]] = []
 
+    issues.extend(_detect_diff_or_conflict_fragments(code_text))
     issues.extend(_detect_invalid_torch_scheduler_kwargs(code_text))
+    issues.extend(_detect_engineered_feature_dim_mismatch(code_text))
     issues.extend(_detect_low_precision_numpy_conversion(code_text))
     issues.extend(_detect_hf_model_source_identifier_issues(code_text))
     issues.extend(_detect_zip_extractall_directory_mismatch(code_text))
@@ -427,6 +429,134 @@ def repair_generated_training_code(code: str, *, stage: str = "code_review") -> 
         "stage": stage,
         "validation": validation,
     }
+
+
+_DIFF_OR_CONFLICT_MARKER_RE = re.compile(
+    r"(?m)^\s*(?:<<<<<<<(?:\s+SEARCH)?|=======|>>>>>>>(?:\s+REPLACE)?|<\s*SEARCH|>\s*REPLACE)\s*$"
+)
+
+
+def _detect_diff_or_conflict_fragments(code: str) -> list[dict[str, Any]]:
+    matches = list(_DIFF_OR_CONFLICT_MARKER_RE.finditer(code or ""))
+    if not matches:
+        return []
+    evidence_lines = []
+    lines = (code or "").splitlines()
+    for match in matches[:5]:
+        lineno = (code[: match.start()].count("\n") + 1)
+        line_text = lines[lineno - 1].strip() if 0 <= lineno - 1 < len(lines) else match.group(0).strip()
+        evidence_lines.append(f"line {lineno}: {line_text}")
+    return [
+        {
+            "severity": "critical",
+            "category": "diff_marker_or_conflict_fragment",
+            "message": "Generated code still contains SEARCH/REPLACE or merge-conflict marker fragments.",
+            "evidence": "\n".join(evidence_lines),
+            "repair_hint": "Resolve the patch into ordinary Python code and remove all diff/conflict marker lines before execution.",
+            "autofixable": False,
+        }
+    ]
+
+
+def _static_int_literal(node: ast.AST | None) -> int | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+        return int(node.value)
+    return None
+
+
+def _literal_sequence_len(node: ast.AST | None) -> int | None:
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return len(node.elts)
+    if isinstance(node, ast.Call) and node.args:
+        call_name = _call_name(node.func)
+        if call_name in {"array", "tensor", "asarray"}:
+            return _literal_sequence_len(node.args[0])
+    return None
+
+
+def _assignment_targets(node: ast.AST) -> list[ast.AST]:
+    if isinstance(node, ast.Assign):
+        return list(node.targets)
+    if isinstance(node, ast.AnnAssign):
+        return [node.target]
+    return []
+
+
+def _target_name(target: ast.AST) -> str | None:
+    if isinstance(target, ast.Name):
+        return target.id
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    return None
+
+
+def _detect_engineered_feature_dim_mismatch(code: str) -> list[dict[str, Any]]:
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return []
+
+    feature_lengths: list[tuple[int, ast.AST, str]] = []
+    declared_dims: list[tuple[int, ast.AST, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value
+            for target in _assignment_targets(node):
+                name = (_target_name(target) or "").lower()
+                if name in {"feature_names", "feature_cols", "feature_columns"}:
+                    length = _literal_sequence_len(value)
+                    if length is not None:
+                        feature_lengths.append((length, node, name))
+                if name in {"feature_dim", "input_dim", "num_features", "n_features", "feature_size"}:
+                    dim = _static_int_literal(value)
+                    if dim is not None:
+                        declared_dims.append((dim, node, name))
+        if isinstance(node, ast.FunctionDef) and "feature" in node.name.lower():
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Return):
+                    length = _literal_sequence_len(inner.value)
+                    if length is not None:
+                        feature_lengths.append((length, inner, node.name))
+        if isinstance(node, ast.Call):
+            call_name = _call_name(node.func)
+            if call_name in {"LayerNorm", "BatchNorm1d", "Linear"} and node.args:
+                dim = _static_int_literal(node.args[0])
+                if dim is not None:
+                    declared_dims.append((dim, node, call_name))
+
+    expected_lengths = {length for length, _node, _source in feature_lengths if length > 0}
+    if len(expected_lengths) != 1:
+        return []
+    expected = next(iter(expected_lengths))
+    mismatches = [
+        (dim, node, source)
+        for dim, node, source in declared_dims
+        if dim > 0 and dim != expected
+    ]
+    if not mismatches:
+        return []
+    evidence_parts = [
+        f"feature vector length evidence: {source} -> {expected}"
+        for _length, _node, source in feature_lengths[:2]
+    ]
+    for dim, node, source in mismatches[:3]:
+        evidence_parts.append(f"declared {source}={dim}: {_source_segment(code, node)}")
+    return [
+        {
+            "severity": "critical",
+            "category": "engineered_feature_dim_mismatch",
+            "message": (
+                f"Engineered feature vector has {expected} explicit values, but model/config code declares "
+                f"a different feature dimension."
+            ),
+            "evidence": "\n".join(evidence_parts),
+            "repair_hint": (
+                "Use one source of truth for engineered features: derive feature_dim from len(feature_names) "
+                "or a sample feature tensor shape, then assert the data bundle and model input dimensions match."
+            ),
+            "autofixable": False,
+        }
+    ]
 
 
 def _torch_runtime_info(*, device_index: int) -> dict[str, Any]:

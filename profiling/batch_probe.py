@@ -163,13 +163,13 @@ def _is_raw_script_job(job: TrainingJob) -> bool:
     return job.config.runner_target == "localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job"
 
 
-def _requires_probe(job: TrainingJob) -> bool:
+def _batch_probe_candidate(job: TrainingJob) -> bool:
+    return job.resource_requirements.requires_gpu and job.batch_probe.enabled
+
+
+def _requires_exclusive_probe(job: TrainingJob) -> bool:
     backend_name = str(job.metadata.get("placement_backend", ""))
-    return (
-        job.resource_requirements.requires_gpu
-        and job.batch_probe.enabled
-        and backend_name == "exclusive"
-    )
+    return _batch_probe_candidate(job) and backend_name == "exclusive"
 
 
 def resolve_visible_device_type() -> str:
@@ -638,6 +638,8 @@ def _job_has_resolved_batch_size(job: TrainingJob, key_info: BatchProbeKeyInfo) 
     batch_param_name = BatchResolution.param_name(job)
     if job.metadata.get("batch_probe_key") != key_info.probe_key:
         return False
+    if job.metadata.get("batch_probe_source") not in {"probe", "cache"}:
+        return False
     if job.metadata.get("resolved_batch_size") is None:
         return False
     return batch_param_name in job.config.runner_kwargs
@@ -649,11 +651,9 @@ def run_batch_probe_preflight(context: RunnerContext) -> TrainingJob:
     if (
         not context.settings.gpu_scheduler.batch_probe_enabled
         or scheduler_mode not in probe_modes
-        or not _requires_probe(context.job)
+        or not _batch_probe_candidate(context.job)
     ):
         return context.job
-    if not context.job.batch_probe.probe_target:
-        raise ValueError("batch_probe.probe_target is required when batch_probe.enabled is true")
 
     key_info = _probe_key_info(context, default_search_mode=context.settings.gpu_scheduler.batch_probe_search_mode)
     context.store.update_job(
@@ -724,6 +724,29 @@ def run_batch_probe_preflight(context: RunnerContext) -> TrainingJob:
             source="cache",
         )
         return context.job
+
+    if not _requires_exclusive_probe(context.job):
+        context.event_logger.emit(
+            "batch_probe_cache_miss_nonexclusive",
+            job_id=context.job.job_id,
+            payload={
+                "probe_key": key_info.probe_key,
+                "device_type": key_info.device_type,
+                "search_mode": key_info.search_mode,
+                "placement_backend": context.job.metadata.get("placement_backend"),
+                "reason": "non-exclusive placements reuse cache but do not run calibration probes",
+            },
+        )
+        logger.info(
+            "[batch_probe] job=%s cache miss probe_key=%s placement_backend=%s; non-exclusive probe skipped",
+            context.job.job_id,
+            key_info.probe_key,
+            context.job.metadata.get("placement_backend"),
+        )
+        return context.job
+
+    if not context.job.batch_probe.probe_target:
+        raise ValueError("batch_probe.probe_target is required when batch_probe.enabled is true")
 
     context.event_logger.emit(
         "batch_probe_cache_miss",

@@ -30,7 +30,8 @@ def candidate_group_sizing(
             include_singletons=True,
         )
 
-    max_group_size = max(1, int(settings.gpu_scheduler.max_packed_jobs_per_gpu))
+    configured_max_group_size = int(settings.gpu_scheduler.max_packed_jobs_per_gpu)
+    max_group_size = window_size if configured_max_group_size <= 0 else max(1, configured_max_group_size)
     if settings.gpu_scheduler.allow_three_way_packing:
         max_group_size = max(max_group_size, 3)
     return CandidateGroupSizing(

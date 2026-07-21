@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from localml_scheduler.config import SchedulerSettings
-from localml_scheduler.domain import BatchProbeProfile, ResourceRequirements, TrainingJob
+from localml_scheduler.domain import BatchProbeProfile, BatchProbeSpec, ResourceRequirements, TrainingJob
 from localml_scheduler.hardware import HardwareProfile, build_hardware_key
 from localml_scheduler.scheduler.resource_estimator import ResourceEstimator
 from localml_scheduler.storage import StateStore
@@ -151,6 +151,51 @@ class SchedulerPredictionTest(unittest.TestCase):
             )
 
             self.assertEqual(estimator.estimate_peak_vram_mb(job, 4, "cuda_process"), 1024.0 * 1.10)
+
+    def test_compatible_branch_batch_probe_profile_reuses_across_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(runtime_root=tmpdir)
+            store = StateStore(settings)
+            store._hardware_profile = _fake_hardware_profile("branch-profile-reuse")
+            estimator = ResourceEstimator(settings, store)
+            job = TrainingJob.create(
+                "pkg.runner:train",
+                "same-family-job",
+                "/tmp/family.pt",
+                runner_kwargs={"batch_size": 8},
+                batch_probe=BatchProbeSpec(
+                    enabled=True,
+                    model_key="efficientnet-b0",
+                    profile_namespace="branch-profile:efficientnet-b0",
+                    shape_signature_override="shape-efficientnet-b0",
+                    search_mode=settings.gpu_scheduler.batch_probe_search_mode,
+                    contract_version=2,
+                ),
+            )
+            store.upsert_batch_probe_profile(
+                BatchProbeProfile(
+                    probe_key="probe-from-other-job",
+                    model_key="efficientnet-b0",
+                    device_type=store.hardware_profile().gpu_name,
+                    profile_namespace="branch-profile:efficientnet-b0",
+                    hardware_key=store.hardware_key(),
+                    shape_signature="shape-efficientnet-b0",
+                    search_mode=settings.gpu_scheduler.batch_probe_search_mode,
+                    contract_version=2,
+                    batch_param_name="batch_size",
+                    resolved_batch_size=4,
+                    peak_vram_mb=1024,
+                    last_job_id="calibration-job",
+                    metadata={"avg_step_time_ms": 12.5},
+                )
+            )
+
+            prediction = estimator.resource_prediction(job, 8, "cuda_process")
+
+            self.assertIsNotNone(prediction)
+            self.assertEqual(prediction.source.value, "branch")
+            self.assertEqual(prediction.step_time_ms.mean, 12.5)
+            self.assertEqual(estimator.estimate_peak_vram_mb(job, 8, "cuda_process"), 2048.0 * 1.20)
 
 
 if __name__ == "__main__":

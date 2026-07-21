@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 from engine.executor import Interpreter
-from localml_scheduler.adapters.mlevolve import build_model_family_profile_key
+from localml_scheduler.adapters.mlevolve import build_model_family_probe_job, build_model_family_profile_key
 from localml_scheduler.domain import BatchProbeProfile, JobStatus, TrainingJob
 from localml_scheduler.config import SchedulerSettings
 
@@ -135,6 +135,24 @@ class _FakeSchedulerClient:
 
 
 class InterpreterSchedulerBridgeTest(unittest.TestCase):
+    def test_model_family_probe_zero_timeout_means_no_global_deadline_and_two_epochs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=Path(tmpdir) / "runtime",
+                gpu_scheduler={"model_family_probe_timeout_seconds": 0},
+            )
+            probe_job = build_model_family_probe_job(
+                workflow_id="wf",
+                task_id="task",
+                model_family="efficientnet-b0",
+                script_path=str(Path(tmpdir) / "candidate.py"),
+                working_dir=tmpdir,
+            )
+
+            self.assertIsNone(settings.gpu_scheduler.model_family_probe_timeout_seconds)
+            self.assertEqual(probe_job.config.runner_kwargs["probe_max_epochs"], 2)
+            self.assertNotIn("timeout", probe_job.config.runner_kwargs)
+
     def test_scheduler_submission_uses_scheduler_defaults_and_preload_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir) / "runtime"
