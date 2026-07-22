@@ -249,6 +249,27 @@ def test_bounded_dp_uses_conservative_buckets_and_never_exceeds_exact_budget(tmp
     assert len(plan.job_ids) <= settings.gpu_scheduler.max_packed_jobs_per_gpu
 
 
+def test_bounded_dp_rounds_total_vram_once_and_preserves_fifo_fairness(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, exact_cutoff=8)
+    store, planner = _planner(settings)
+    planner.estimator.safe_budget_mb = lambda: 29_888.0
+    jobs = [_job(f"fair{index:02d}", queue_sequence=index) for index in range(1, 13)]
+    for index, job in enumerate(jobs, start=1):
+        vram_mb = 3_601 if index <= 5 else 3_713 if index <= 10 else 3_630
+        _profile(
+            store,
+            job,
+            {4: (vram_mb, 40.0), 8: (vram_mb, 70.0), 16: (vram_mb, 100.0)},
+        )
+
+    plan = planner.choose_plan(jobs, backend_available={"stream": True, "exclusive": True})
+
+    assert plan is not None
+    assert plan.solver_kind == "bounded_multiple_choice_dp"
+    assert set(plan.job_ids) == {f"fair{index:02d}" for index in range(1, 9)}
+    assert plan.estimated_vram_mb <= 29_888.0
+
+
 def test_sixteen_candidate_planner_p95_is_below_100_ms(tmp_path: Path) -> None:
     settings = _settings(tmp_path, exact_cutoff=8)
     store, planner = _planner(settings)

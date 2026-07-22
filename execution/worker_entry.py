@@ -21,7 +21,8 @@ def _run_job(runtime_root: str, job_id: str) -> int:
     context, job = create_runner_context(settings, store, event_logger, job_id)
     if context is None or job is None:
         raise KeyError(f"Unknown job_id: {job_id}")
-    mark_job_started(settings, store, event_logger, job_id, backend_name="exclusive")
+    backend_name = str(job.metadata.get("placement_backend") or "exclusive")
+    mark_job_started(settings, store, event_logger, job_id, backend_name=backend_name)
 
     try:
         result = resolve_runner(context)(context)
@@ -35,9 +36,9 @@ def _run_job(runtime_root: str, job_id: str) -> int:
         logger.info("Job %s early-stopped cleanly at a safe point", job_id)
         return 0
     except Exception as exc:
-        return mark_job_failed(settings, store, event_logger, job_id, exc, backend_name="exclusive")
+        return mark_job_failed(settings, store, event_logger, job_id, exc, backend_name=backend_name)
 
-    return mark_job_completed(settings, store, event_logger, job_id, result, backend_name="exclusive")
+    return mark_job_completed(settings, store, event_logger, job_id, result, backend_name=backend_name)
 
 
 def main() -> int:

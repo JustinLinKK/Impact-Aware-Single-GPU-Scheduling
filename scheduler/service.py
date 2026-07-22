@@ -12,6 +12,7 @@ import os
 import time
 import uuid
 
+from ..atomic_io import atomic_json_dump
 from ..model_cache.baseline_cache import BaselineModelCache, CachedModelEntry
 from ..model_cache.cache_server import CacheServer
 from ..model_cache.warming import select_models_to_warm
@@ -162,11 +163,7 @@ class SchedulerService:
             "runtime_root": str(self.settings.runtime_root),
         }
         path = self.settings.service_heartbeat_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-        tmp_path.replace(path)
+        atomic_json_dump(path, payload, indent=2, sort_keys=True)
 
     def _on_cache_update(self, event_name: str, entry: CachedModelEntry, payload: dict[str, Any] | None) -> None:
         self.store.update_cache_metadata(
@@ -1337,6 +1334,15 @@ class SchedulerService:
                 },
             )
         if plan is not None:
+            event_key = (
+                "adaptive_plan_selected",
+                plan.backend_name,
+                tuple(plan.job_ids),
+                tuple(plan.active_job_ids),
+                tuple(sorted(plan.batch_overrides.items())),
+            )
+            if not self._should_emit_throttled_event(event_key, cooldown_seconds=30.0):
+                return
             self.event_logger.emit(
                 "adaptive_plan_selected",
                 payload={
@@ -1796,6 +1802,7 @@ class SchedulerService:
                 "source_job_id": source.job_id,
             },
             python_executable=source.config.python_executable,
+            loader_target=source.config.loader_target,
             env=dict(source.config.env),
         )
         probe.profile_state = ProfileState.PROBING

@@ -6,8 +6,108 @@ from localml_scheduler.client import SchedulerClient
 from localml_scheduler.config import SchedulerConfig
 from localml_scheduler.runtime_environment import (
     repair_generated_training_code,
+    validate_generated_training_code,
     validate_model_api_contracts,
 )
+
+
+def _valid_scheduler_script() -> str:
+    return """
+from localml_scheduler.elastic import ElasticTrainingSession
+MODEL_BRANCH = "linear-v1"
+batch_size = 8
+epochs = 2
+session = ElasticTrainingSession.from_env()
+train_loader = session.make_dataloader(train_dataset, shuffle=True)
+session.register_training_state(model, optimizer, lr_scheduler=lr_scheduler, scaler=scaler)
+progress = session.restore_if_present()
+optimizer.step()
+session.optimizer_step_completed(8, progress["epoch"], 0, progress["global_step"] + 1)
+"""
+
+
+def test_scheduler_submission_contract_accepts_canonical_script() -> None:
+    result = validate_generated_training_code(
+        _valid_scheduler_script(),
+        require_scheduler_submission_contract=True,
+    )
+
+    assert result["ok"] is True
+    assert result["critical_count"] == 0
+
+
+def test_elastic_contract_rejects_wrong_runtime_keyword_and_repairs_known_alias() -> None:
+    code = _valid_scheduler_script().replace(
+        "session.optimizer_step_completed(8, progress[\"epoch\"], 0, progress[\"global_step\"] + 1)",
+        "session.optimizer_step_completed(samples=8, epoch=0, batch_idx=0, global_step=1)",
+    )
+
+    result = validate_generated_training_code(code, require_scheduler_submission_contract=True)
+    repair = repair_generated_training_code(code, require_scheduler_submission_contract=True)
+
+    assert result["ok"] is False
+    assert "elastic_api_call_signature_invalid" in {issue.get("code") for issue in result["issues"]}
+    assert "batch_index=0" in repair["code"]
+    assert "batch_idx=0" not in repair["code"]
+    assert repair["validation"]["ok"] is True
+
+
+def test_scheduler_client_exposes_strict_generated_script_validation(tmp_path: Path) -> None:
+    client = SchedulerClient(SchedulerConfig(runtime_root=tmp_path / "runtime"))
+
+    loose = client.validate_generated_training_code("print('hello')")
+    strict = client.validate_generated_training_code(
+        "print('hello')",
+        require_scheduler_submission_contract=True,
+    )
+
+    assert loose["ok"] is True
+    assert strict["ok"] is False
+    assert strict["critical_count"] >= 1
+
+
+def test_scheduler_submission_contract_rejects_environment_authored_batch() -> None:
+    code = _valid_scheduler_script().replace(
+        "batch_size = 8",
+        'batch_size = int(os.environ.get("BATCH_SIZE", "8"))',
+    )
+
+    result = validate_generated_training_code(code, require_scheduler_submission_contract=True)
+
+    assert result["ok"] is False
+    assert "scheduler_authored_batch_not_literal" in {issue.get("code") for issue in result["issues"]}
+
+
+def test_elastic_contract_rejects_loader_batch_override_and_raw_training_loader() -> None:
+    code = _valid_scheduler_script().replace(
+        "train_loader = session.make_dataloader(train_dataset, shuffle=True)",
+        "train_loader = DataLoader(train_dataset, batch_size=8)\n"
+        "elastic_loader = session.make_dataloader(train_dataset, batch_size=8)",
+    )
+
+    result = validate_generated_training_code(code, require_scheduler_submission_contract=True)
+
+    codes = {issue.get("code") for issue in result["issues"]}
+    assert "elastic_loader_batch_size_override" in codes
+    assert "elastic_training_loader_bypasses_session" in codes
+
+
+def test_elastic_contract_method_names_in_comments_do_not_satisfy_validator() -> None:
+    code = """
+# ElasticTrainingSession.from_env()
+# session.make_dataloader(dataset)
+# session.register_training_state(model, optimizer)
+# session.restore_if_present()
+# session.optimizer_step_completed(1, 0, 0, 1)
+MODEL_BRANCH = "comments-only"
+batch_size = 4
+epochs = 1
+"""
+
+    result = validate_generated_training_code(code, require_scheduler_submission_contract=True)
+
+    assert result["ok"] is False
+    assert sum(issue.get("code") == "elastic_training_contract_missing" for issue in result["issues"]) == 6
 
 
 def _future_vision_contract() -> dict:

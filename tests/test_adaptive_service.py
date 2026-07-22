@@ -102,6 +102,7 @@ def _job(job_id: str, *, namespace: str, status: JobStatus = JobStatus.PENDING) 
         job_id=job_id,
         task_type="mlevolve_script",
         runner_kwargs={"batch_size": 8},
+        loader_target="localml_scheduler.adapters.mlevolve_runner:load_raw_file",
         packing=PackingSpec(eligible=True, signature=f"sig:{job_id}", backend_allowlist=["stream"]),
         batch_probe=BatchProbeSpec(
             enabled=True,
@@ -149,6 +150,7 @@ def test_missing_profile_latches_drain_and_deduplicates_arrivals(tmp_path: Path)
     probes = [job for job in store.list_jobs() if job.task_type == "mlevolve_branch_profile_probe"]
     assert len(probes) == 1
     assert probes[0].metadata["profile_gate_key"].startswith("shared|")
+    assert probes[0].config.loader_target == "localml_scheduler.adapters.mlevolve_runner:load_raw_file"
 
     # A later job for the same branch joins the current drain cycle.
     waiting_e = _job("e", namespace="shared")

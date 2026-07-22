@@ -145,6 +145,7 @@ def validate_generated_training_code(
     stage: str = "code_review",
     model_contracts: list[dict[str, Any]] | None = None,
     require_elastic_contract: bool = False,
+    require_scheduler_submission_contract: bool = False,
 ) -> dict[str, Any]:
     """Statically flag generated-code patterns known to fail in this runtime."""
     code_text = str(code or "")
@@ -158,8 +159,10 @@ def validate_generated_training_code(
     issues.extend(_detect_zip_extractall_directory_mismatch(code_text))
     issues.extend(_detect_deprecated_cuda_amp(code_text))
     issues.extend(validate_model_api_contracts(code_text, model_contracts or []))
-    if require_elastic_contract:
+    if require_elastic_contract or require_scheduler_submission_contract:
         issues.extend(_detect_elastic_training_contract_violations(code_text))
+    if require_scheduler_submission_contract:
+        issues.extend(_detect_scheduler_submission_contract_violations(code_text))
 
     critical_count = sum(1 for issue in issues if issue.get("severity") == "critical")
     warning_count = sum(1 for issue in issues if issue.get("severity") == "warning")
@@ -412,12 +415,20 @@ def repair_generated_training_code(
     *,
     stage: str = "code_review",
     require_elastic_contract: bool = False,
+    require_scheduler_submission_contract: bool = False,
 ) -> dict[str, Any]:
     """Deterministically repair prediction-like low-precision Tensor -> NumPy exports."""
     original_code = str(code or "")
     repaired_code, model_source_repair_count = _repair_known_hf_model_source_ids(original_code)
     zip_replacements = _zip_extractall_target_replacements(repaired_code)
     for start, end, replacement in sorted(zip_replacements, key=lambda item: item[0], reverse=True):
+        repaired_code = repaired_code[:start] + replacement + repaired_code[end:]
+    elastic_api_replacements = (
+        _elastic_api_keyword_replacements(repaired_code)
+        if require_elastic_contract or require_scheduler_submission_contract
+        else []
+    )
+    for start, end, replacement in sorted(elastic_api_replacements, key=lambda item: item[0], reverse=True):
         repaired_code = repaired_code[:start] + replacement + repaired_code[end:]
     replacements = _low_precision_numpy_replacements(repaired_code)
     for start, end, replacement in sorted(replacements, key=lambda item: item[0], reverse=True):
@@ -429,6 +440,7 @@ def repair_generated_training_code(
         repaired_code,
         stage=stage,
         require_elastic_contract=require_elastic_contract,
+        require_scheduler_submission_contract=require_scheduler_submission_contract,
     )
     return {
         "code": repaired_code,
@@ -436,6 +448,7 @@ def repair_generated_training_code(
         "replacement_count": (
             model_source_repair_count
             + len(zip_replacements)
+            + len(elastic_api_replacements)
             + len(replacements)
         ),
         "stage": stage,
@@ -443,26 +456,371 @@ def repair_generated_training_code(
     }
 
 
-def _detect_elastic_training_contract_violations(code: str) -> list[dict[str, Any]]:
-    required = {
-        "ElasticTrainingSession": "import and create an ElasticTrainingSession",
-        ".from_env(": "create the session with ElasticTrainingSession.from_env()",
-        ".make_dataloader(": "construct the training DataLoader through session.make_dataloader(...) ",
-        ".register_training_state(": "register model, optimizer, scheduler, scaler, and extra state",
-        ".restore_if_present(": "restore the scheduler checkpoint before training",
-        ".optimizer_step_completed(": "report every completed optimizer step as a safe point",
+def _contract_issue(*, code: str, message: str, hint: str, evidence: str | None = None) -> dict[str, Any]:
+    issue: dict[str, Any] = {
+        "severity": "critical",
+        "category": "elastic_training_contract",
+        "code": code,
+        "message": message,
+        "repair_hint": hint,
+        "autofixable": False,
     }
+    if evidence:
+        issue["evidence"] = evidence
+    return issue
+
+
+def _detect_elastic_training_contract_violations(code: str) -> list[dict[str, Any]]:
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return []
+
     issues: list[dict[str, Any]] = []
-    for token, instruction in required.items():
-        if token in code:
+    has_import = any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "localml_scheduler.elastic"
+        and any(alias.name == "ElasticTrainingSession" for alias in node.names)
+        for node in tree.body
+    )
+    if not has_import:
+        issues.append(
+            _contract_issue(
+                code="elastic_training_contract_missing",
+                message="Mandatory elastic training contract is missing the exact `ElasticTrainingSession` import.",
+                hint="Add `from localml_scheduler.elastic import ElasticTrainingSession`.",
+            )
+        )
+
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+
+    def is_from_env_call(node: ast.AST | None) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "from_env"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "ElasticTrainingSession"
+        )
+
+    session_assignments = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        and any(_target_name(target) == "session" for target in _assignment_targets(node))
+        and is_from_env_call(node.value)
+    ]
+    if not session_assignments:
+        issues.append(
+            _contract_issue(
+                code="elastic_training_contract_missing",
+                message="Mandatory elastic training contract is missing `session = ElasticTrainingSession.from_env()`.",
+                hint="Assign the scheduler-owned session to the canonical `session` variable in the executable path.",
+            )
+        )
+    else:
+        for assignment in session_assignments:
+            if assignment.value.args or assignment.value.keywords:
+                issues.append(
+                    _contract_issue(
+                        code="elastic_api_call_signature_invalid",
+                        message="`ElasticTrainingSession.from_env()` does not accept arguments.",
+                        hint="Create the session exactly as `session = ElasticTrainingSession.from_env()`.",
+                        evidence=_source_segment(code, assignment.value),
+                    )
+                )
+
+    required_methods = {
+        "make_dataloader": "construct the training loader through the elastic session",
+        "register_training_state": "register model, optimizer, scheduler, scaler, and extra state",
+        "restore_if_present": "restore checkpoint state before training",
+        "optimizer_step_completed": "report each completed optimizer update as a safe point",
+    }
+    method_calls: dict[str, list[ast.Call]] = {name: [] for name in required_methods}
+    for call in calls:
+        if not isinstance(call.func, ast.Attribute):
+            continue
+        if (
+            call.func.attr in method_calls
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "session"
+        ):
+            method_calls[call.func.attr].append(call)
+    for method_name, instruction in required_methods.items():
+        if method_calls[method_name]:
             continue
         issues.append(
-            {
-                "severity": "critical",
-                "code": "elastic_training_contract_missing",
-                "message": f"Mandatory elastic training contract is missing `{token}`.",
-                "hint": instruction,
-            }
+            _contract_issue(
+                code="elastic_training_contract_missing",
+                message=f"Mandatory elastic training contract is missing `.{method_name}(...)`.",
+                hint=instruction,
+            )
+        )
+
+    for call in method_calls["optimizer_step_completed"]:
+        issues.extend(
+            _validate_elastic_method_call(
+                code,
+                call,
+                method_name="optimizer_step_completed",
+                positional_parameters=("samples", "epoch", "batch_index", "global_step"),
+                keyword_only_parameters=("metrics",),
+            )
+        )
+
+    for call in method_calls["register_training_state"]:
+        issues.extend(
+            _validate_elastic_method_call(
+                code,
+                call,
+                method_name="register_training_state",
+                positional_parameters=("model", "optimizer"),
+                keyword_only_parameters=(
+                    "lr_scheduler",
+                    "scaler",
+                    "extra_state",
+                    "extra_state_loader",
+                ),
+            )
+        )
+
+    for call in method_calls["restore_if_present"]:
+        if call.args or call.keywords:
+            issues.append(
+                _contract_issue(
+                    code="elastic_api_call_signature_invalid",
+                    message="`session.restore_if_present()` does not accept arguments.",
+                    hint="Call exactly `progress = session.restore_if_present()`.",
+                    evidence=_source_segment(code, call),
+                )
+            )
+
+    for call in method_calls["make_dataloader"]:
+        dataset_keywords = [keyword for keyword in call.keywords if keyword.arg == "dataset"]
+        if len(call.args) > 1 or (not call.args and not dataset_keywords) or (call.args and dataset_keywords):
+            issues.append(
+                _contract_issue(
+                    code="elastic_api_call_signature_invalid",
+                    message="`session.make_dataloader(...)` requires exactly one training dataset.",
+                    hint="Call `train_loader = session.make_dataloader(train_dataset, shuffle=True, ...)`.",
+                    evidence=_source_segment(code, call),
+                )
+            )
+        if any(keyword.arg == "batch_size" for keyword in call.keywords):
+            issues.append(
+                _contract_issue(
+                    code="elastic_loader_batch_size_override",
+                    message="`session.make_dataloader(...)` must not receive `batch_size=`; the scheduler owns the physical batch.",
+                    hint="Remove the `batch_size` keyword and read the resolved value from `session.batch_size`.",
+                    evidence=_source_segment(code, call),
+                )
+            )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if not isinstance(value, ast.Call) or _call_name(value.func) != "DataLoader":
+            continue
+        targets = _assignment_targets(node)
+        target_names = {(_target_name(target) or "").lower() for target in targets}
+        if target_names & {"loader", "train_loader", "training_loader", "train_dataloader"}:
+            issues.append(
+                _contract_issue(
+                    code="elastic_training_loader_bypasses_session",
+                    message="The training loader is constructed with raw `DataLoader(...)` instead of the elastic session.",
+                    hint="Use `session.make_dataloader(train_dataset, ...)`; reserve raw DataLoader for validation/test only.",
+                    evidence=_source_segment(code, node),
+                )
+            )
+
+    return issues
+
+
+def _validate_elastic_method_call(
+    code: str,
+    call: ast.Call,
+    *,
+    method_name: str,
+    positional_parameters: tuple[str, ...],
+    keyword_only_parameters: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """Validate generated calls against the public ElasticTrainingSession API."""
+
+    issues: list[dict[str, Any]] = []
+    allowed_keywords = set(positional_parameters) | set(keyword_only_parameters)
+    explicit_keywords = [keyword.arg for keyword in call.keywords if keyword.arg is not None]
+    unknown_keywords = sorted(set(explicit_keywords) - allowed_keywords)
+    starred_keywords = any(keyword.arg is None for keyword in call.keywords)
+    missing_parameters = [
+        name
+        for index, name in enumerate(positional_parameters)
+        if index >= len(call.args) and name not in explicit_keywords
+    ]
+    duplicate_parameters = sorted(
+        name
+        for name in set(explicit_keywords)
+        if explicit_keywords.count(name) > 1
+        or (name in positional_parameters and positional_parameters.index(name) < len(call.args))
+    )
+    if (
+        len(call.args) > len(positional_parameters)
+        or unknown_keywords
+        or starred_keywords
+        or duplicate_parameters
+        or missing_parameters
+    ):
+        signature = ", ".join(positional_parameters)
+        if keyword_only_parameters:
+            signature += ", *, " + ", ".join(keyword_only_parameters)
+        details: list[str] = []
+        if len(call.args) > len(positional_parameters):
+            details.append(f"too many positional arguments ({len(call.args)})")
+        if unknown_keywords:
+            details.append(f"unsupported keyword(s): {', '.join(unknown_keywords)}")
+        if starred_keywords:
+            details.append("dynamic **kwargs cannot be verified")
+        if duplicate_parameters:
+            details.append(f"duplicate argument(s): {', '.join(duplicate_parameters)}")
+        if missing_parameters:
+            details.append(f"missing required argument(s): {', '.join(missing_parameters)}")
+        issues.append(
+            _contract_issue(
+                code="elastic_api_call_signature_invalid",
+                message=f"`session.{method_name}(...)` does not match the runtime API: {'; '.join(details)}.",
+                hint=f"Use only the exact parameters `{signature}`. For safe points the batch keyword is `batch_index`, not `batch_idx`.",
+                evidence=_source_segment(code, call),
+            )
+        )
+    return issues
+
+
+def _elastic_api_keyword_replacements(code: str) -> list[tuple[int, int, str]]:
+    """Repair unambiguous generated aliases for elastic runtime keywords."""
+
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return []
+    offsets = _line_offsets(code)
+    replacements: list[tuple[int, int, str]] = []
+    for call in ast.walk(tree):
+        if not isinstance(call, ast.Call):
+            continue
+        if not (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr == "optimizer_step_completed"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "session"
+        ):
+            continue
+        for keyword in call.keywords:
+            if keyword.arg != "batch_idx":
+                continue
+            span = _node_span(keyword, offsets)
+            if span is None:
+                continue
+            source = code[span[0] : span[1]]
+            separator = source.find("=")
+            if separator < 0:
+                continue
+            replacements.append((span[0], span[0] + separator, "batch_index"))
+    return replacements
+
+
+def _top_level_assignment(tree: ast.Module, name: str) -> list[ast.Assign | ast.AnnAssign]:
+    matches: list[ast.Assign | ast.AnnAssign] = []
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        if any(_target_name(target) == name for target in _assignment_targets(node)):
+            matches.append(node)
+    return matches
+
+
+def _detect_scheduler_submission_contract_violations(code: str) -> list[dict[str, Any]]:
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return []
+
+    issues: list[dict[str, Any]] = []
+    branch_assignments = _top_level_assignment(tree, "MODEL_BRANCH")
+    if len(branch_assignments) != 1 or not isinstance(branch_assignments[0].value, ast.Constant) or not isinstance(branch_assignments[0].value.value, str) or not branch_assignments[0].value.value.strip():
+        issues.append(
+            _contract_issue(
+                code="scheduler_model_branch_invalid",
+                message="Scheduler submission requires exactly one non-empty top-level string literal `MODEL_BRANCH`.",
+                hint="Add `MODEL_BRANCH = \"canonical-architecture-name\"` near the imports and update it when the mother model changes.",
+            )
+        )
+
+    batch_assignments = _top_level_assignment(tree, "batch_size")
+    batch_value = None
+    if len(batch_assignments) == 1:
+        batch_value = _static_int_literal(batch_assignments[0].value)
+    if len(batch_assignments) != 1 or batch_value is None:
+        issues.append(
+            _contract_issue(
+                code="scheduler_authored_batch_not_literal",
+                message="Scheduler submission requires exactly one top-level integer literal `batch_size`.",
+                hint="Declare, for example, `batch_size = 32`; do not derive the authored batch from environment variables or overwrite it.",
+            )
+        )
+    elif batch_value <= 0 or (batch_value & (batch_value - 1)) != 0:
+        issues.append(
+            _contract_issue(
+                code="scheduler_authored_batch_not_power_of_two",
+                message=f"Authored `batch_size = {batch_value}` is not a positive power of two.",
+                hint="Choose one of 1, 2, 4, 8, 16, 32, 64, ... as the authored batch.",
+                evidence=_source_segment(code, batch_assignments[0]),
+            )
+        )
+
+    all_batch_assignments = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        and any(_target_name(target) == "batch_size" for target in _assignment_targets(node))
+    ]
+    if len(all_batch_assignments) > len(batch_assignments):
+        issues.append(
+            _contract_issue(
+                code="scheduler_authored_batch_mutated",
+                message="The immutable authored `batch_size` is reassigned after its top-level declaration.",
+                hint="Keep `batch_size` immutable and use `session.batch_size` for the scheduler-selected physical batch.",
+            )
+        )
+
+    epoch_assignments = _top_level_assignment(tree, "epochs")
+    epoch_value = _static_int_literal(epoch_assignments[0].value) if len(epoch_assignments) == 1 else None
+    if len(epoch_assignments) != 1 or epoch_value is None or epoch_value <= 0:
+        issues.append(
+            _contract_issue(
+                code="scheduler_epoch_count_not_literal",
+                message="Scheduler submission requires one positive top-level integer literal `epochs`.",
+                hint="Declare, for example, `epochs = 5`; scheduler/probe limits are applied externally.",
+            )
+        )
+
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    optimizer_steps = [
+        call
+        for call in calls
+        if isinstance(call.func, ast.Attribute)
+        and call.func.attr == "step"
+        and not (
+            isinstance(call.func.value, ast.Name)
+            and call.func.value.id.lower() in {"scheduler", "lr_scheduler"}
+        )
+    ]
+    if not optimizer_steps:
+        issues.append(
+            _contract_issue(
+                code="scheduler_optimizer_step_missing",
+                message="Scheduler submission has no concrete optimizer or GradScaler `step(...)` call.",
+                hint="Use a checkpointable PyTorch optimizer and call its step (or `scaler.step(optimizer)`) before each elastic safe point.",
+            )
         )
     return issues
 

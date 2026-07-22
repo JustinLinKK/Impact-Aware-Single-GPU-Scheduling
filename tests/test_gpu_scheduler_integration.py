@@ -151,6 +151,11 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
                 self.assertEqual(api.inspect(first.job_id).metadata["placement_backend"], "cuda_process")
                 self.assertEqual(api.inspect(second.job_id).metadata["placement_backend"], "cuda_process")
                 self.assertEqual(api.report()["packed_dispatches"], 1)
+                for job in (first, second):
+                    started = api.list_events(job_id=job.job_id, event_type="job_started")
+                    completed = api.list_events(job_id=job.job_id, event_type="job_completed")
+                    self.assertEqual(started[-1]["payload"]["backend_name"], "cuda_process")
+                    self.assertEqual(completed[-1]["payload"]["backend_name"], "cuda_process")
             finally:
                 service.stop()
 

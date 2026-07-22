@@ -8,6 +8,7 @@ from typing import Any, Callable
 import json
 import time
 
+from ..atomic_io import atomic_json_dump as _atomic_json_dump
 from ..checkpointing.manager import CheckpointManager
 from ..observability.events import EventLogger
 from ..domain import JobStatus, ProgressSnapshot, SafePointType, TrainingJob, utc_now
@@ -48,15 +49,6 @@ class ControlCommand:
             "hold": self.hold,
             "transaction_id": self.transaction_id,
         }
-
-
-def _atomic_json_dump(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    with temp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-    temp_path.replace(path)
-
 
 class ControlPlane:
     """Read and write job control files."""

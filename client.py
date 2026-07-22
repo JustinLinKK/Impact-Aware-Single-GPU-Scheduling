@@ -1035,9 +1035,19 @@ class SchedulerClient:
             )
         )
 
-    def validate_generated_training_code(self, code: str, stage: str = "code_review") -> dict[str, Any]:
+    def validate_generated_training_code(
+        self,
+        code: str,
+        stage: str = "code_review",
+        *,
+        require_scheduler_submission_contract: bool = False,
+    ) -> dict[str, Any]:
         return _sanitize_agent_response(
-            _validate_generated_training_code(code, stage=stage)
+            _validate_generated_training_code(
+                code,
+                stage=stage,
+                require_scheduler_submission_contract=require_scheduler_submission_contract,
+            )
         )
 
     def get_optimization_context(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:

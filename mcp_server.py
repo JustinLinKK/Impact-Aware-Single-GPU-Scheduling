@@ -138,8 +138,17 @@ def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
         )
 
     @server.tool()
-    def validate_generated_training_code(code: str, stage: str = "code_review") -> dict[str, Any]:
-        return client.validate_generated_training_code(code=code, stage=stage)
+    def validate_generated_training_code(
+        code: str,
+        stage: str = "code_review",
+        require_scheduler_submission_contract: bool = False,
+    ) -> dict[str, Any]:
+        """Validate generated code, optionally enforcing the scheduler submission contract."""
+        return client.validate_generated_training_code(
+            code=code,
+            stage=stage,
+            require_scheduler_submission_contract=require_scheduler_submission_contract,
+        )
 
     @server.tool()
     def get_optimization_context(candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:

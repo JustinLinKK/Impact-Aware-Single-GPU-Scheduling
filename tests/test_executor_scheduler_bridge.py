@@ -12,15 +12,18 @@ from localml_scheduler.domain import BatchProbeProfile, JobStatus, TrainingJob
 from localml_scheduler.config import SchedulerSettings
 
 
-def _elastic_source(batch_size: int, body: str = "") -> str:
+def _elastic_source(batch_size: int, body: str = "", *, model_branch: str = "unit-test-model") -> str:
     return "\n".join(
         [
             "from localml_scheduler.elastic import ElasticTrainingSession",
+            f"MODEL_BRANCH = {model_branch!r}",
             f"batch_size = {batch_size}",
+            "epochs = 1",
             "session = ElasticTrainingSession.from_env()",
             "loader = session.make_dataloader(dataset)",
             "session.register_training_state(model, optimizer)",
             "session.restore_if_present()",
+            "optimizer.step()",
             "session.optimizer_step_completed(batch_size, 0, 0, 1)",
             body,
         ]
@@ -150,6 +153,29 @@ class _FakeSchedulerClient:
 
 
 class InterpreterSchedulerBridgeTest(unittest.TestCase):
+    def test_scheduler_submission_rejects_dynamic_authored_batch_before_submit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            workdir = Path(tmpdir) / "workdir"
+            workdir.mkdir(parents=True, exist_ok=True)
+            settings = SchedulerSettings(runtime_root=runtime_root)
+            interpreter = Interpreter(working_dir=workdir, timeout=10, max_parallel_run=1)
+            fake_api = _FakeSchedulerClient(settings)
+            interpreter.attach_scheduler(
+                fake_api,
+                SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01),
+            )
+            code = _elastic_source(4, "print('must not submit')").replace(
+                "batch_size = 4",
+                'batch_size = int(os.environ.get("BATCH_SIZE", "4"))',
+            )
+
+            result = interpreter._run_scheduler_job(code=code, id="node-dynamic-batch", working_dir=str(workdir))
+
+            self.assertEqual(result.exc_type, "RuntimeError")
+            self.assertIn("top-level integer literal `batch_size`", "".join(result.term_out))
+            self.assertEqual(fake_api.submitted_jobs, [])
+
     def test_model_family_probe_zero_timeout_means_no_global_deadline_and_two_epochs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerSettings(
@@ -207,7 +233,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             interpreter.attach_scheduler(fake_api, bridge_cfg)
 
             result = interpreter._run_scheduler_job(
-                code=_elastic_source(4, "print('hello from bridge')"),
+                code=_elastic_source(4, "print('hello from bridge')", model_branch="scheduler-model-key"),
                 id="node-1",
                 working_dir=str(workdir),
             )
@@ -221,7 +247,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertEqual(submitted.resource_requirements.estimated_vram_mb, 4096)
             self.assertEqual(submitted.resource_requirements.estimated_ram_mb, 2048)
             self.assertTrue(submitted.packing.eligible)
-            self.assertEqual(submitted.packing.family, "scheduler-owned-family")
+            self.assertEqual(submitted.packing.family, "scheduler-model-key")
             self.assertEqual(submitted.packing.max_slowdown_ratio, 1.15)
             self.assertEqual(submitted.packing.backend_allowlist, ["cuda_process"])
             self.assertTrue(submitted.batch_probe.enabled)
@@ -272,7 +298,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
 
             result = interpreter._run_scheduler_job(
-                code="MODEL_FAMILY = 'safe-family'\n" + _elastic_source(8, "print('family reuse')"),
+                code=_elastic_source(8, "print('family reuse')", model_branch="safe-family"),
                 id="node-family",
                 working_dir=str(workdir),
             )
@@ -305,7 +331,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
 
             result = interpreter._run_scheduler_job(
-                code="MODEL_FAMILY = 'new-family'\n" + _elastic_source(8, "print('new family')"),
+                code=_elastic_source(8, "print('new family')", model_branch="new-family"),
                 id="node-new-family",
                 working_dir=str(workdir),
             )
@@ -337,7 +363,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
 
             result = interpreter._run_scheduler_job(
-                code="MODEL_FAMILY = 'blocked-family'\n" + _elastic_source(8, "print('blocked')"),
+                code=_elastic_source(8, "print('blocked')", model_branch="blocked-family"),
                 id="node-blocked-family",
                 working_dir=str(workdir),
             )
@@ -561,8 +587,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             handles = interpreter.submit_scheduler(
                 [
                     {
-                        "code": "MODEL_FAMILY = 'blocked-family'\n"
-                        + _elastic_source(4, "print('blocked')"),
+                        "code": _elastic_source(4, "print('blocked')", model_branch="blocked-family"),
                         "id": "node-blocked",
                     }
                 ],
@@ -639,10 +664,14 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             elastic_code = "\n".join(
                 [
                     "from localml_scheduler.elastic import ElasticTrainingSession",
+                    "MODEL_BRANCH = 'packet-test-model'",
+                    "batch_size = 2",
+                    "epochs = 1",
                     "session = ElasticTrainingSession.from_env()",
                     "loader = session.make_dataloader(dataset)",
                     "session.register_training_state(model, optimizer)",
                     "session.restore_if_present()",
+                    "optimizer.step()",
                     "session.optimizer_step_completed(1, 0, 0, 1)",
                 ]
             )

@@ -17,6 +17,7 @@ import time
 
 import humanize
 
+from ..atomic_io import atomic_json_dump
 from ..execution.runner_protocol import RunnerContext
 from ..scheduler.telemetry import GpuTelemetrySample, NvidiaSmiTelemetrySampler
 from ..domain import BatchProbeTrialResult, BatchResolution, FailureDiagnostic, JobStatus, ProgressSnapshot, utc_now
@@ -100,10 +101,7 @@ def _parse_exception(stderr_text: str, working_dir: Path, script_path: Path) -> 
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload), encoding="utf-8")
-    tmp_path.replace(path)
+    atomic_json_dump(path, payload)
 
 
 def _base_script_env(

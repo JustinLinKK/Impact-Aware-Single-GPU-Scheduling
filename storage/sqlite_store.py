@@ -68,34 +68,36 @@ class SQLiteStateStore:
             return int(row["value"]) + 1
 
     def save_job(self, job: TrainingJob) -> None:
-        payload_json = job.to_json()
-        now = utc_now()
         with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO jobs(job_id, status, priority, baseline_model_id, submitted_at, queue_sequence, payload_json, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(job_id) DO UPDATE SET
-                    status=excluded.status,
-                    priority=excluded.priority,
-                    baseline_model_id=excluded.baseline_model_id,
-                    submitted_at=excluded.submitted_at,
-                    queue_sequence=excluded.queue_sequence,
-                    payload_json=excluded.payload_json,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    job.job_id,
-                    job.status.value,
-                    job.priority,
-                    job.baseline_model_id,
-                    job.submitted_at,
-                    job.queue_sequence,
-                    payload_json,
-                    now,
-                ),
-            )
+            self._save_job_on_connection(connection, job)
             connection.commit()
+
+    @staticmethod
+    def _save_job_on_connection(connection: sqlite3.Connection, job: TrainingJob) -> None:
+        connection.execute(
+            """
+            INSERT INTO jobs(job_id, status, priority, baseline_model_id, submitted_at, queue_sequence, payload_json, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                status=excluded.status,
+                priority=excluded.priority,
+                baseline_model_id=excluded.baseline_model_id,
+                submitted_at=excluded.submitted_at,
+                queue_sequence=excluded.queue_sequence,
+                payload_json=excluded.payload_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                job.job_id,
+                job.status.value,
+                job.priority,
+                job.baseline_model_id,
+                job.submitted_at,
+                job.queue_sequence,
+                job.to_json(),
+                utc_now(),
+            ),
+        )
 
     def submit_job(self, job: TrainingJob) -> TrainingJob:
         from ..domain import BatchResolution
@@ -154,27 +156,36 @@ class SQLiteStateStore:
         status_timestamps: dict[str, str] | None = None,
         metadata_updates: dict[str, Any] | None = None,
     ) -> TrainingJob:
-        job = self.get_job(job_id)
-        if job is None:
-            raise KeyError(f"Unknown job_id: {job_id}")
-        if status is not None:
-            job.mark_status(status, reason=reason)
-        elif reason is not None:
-            job.status_reason = reason
-        if hold is not None:
-            job.hold = hold
-        if latest_checkpoint_path is not None:
-            job.latest_checkpoint_path = latest_checkpoint_path
-        if last_heartbeat_at is not None:
-            job.last_heartbeat_at = last_heartbeat_at
-        if last_dispatched_at is not None:
-            job.last_dispatched_at = last_dispatched_at
-        if status_timestamps:
-            job.status_timestamps.update(status_timestamps)
-        if metadata_updates:
-            job.metadata.update(metadata_updates)
-        self.save_job(job)
-        return job
+        # Scheduler and worker processes both update the same job record. Keep
+        # the read/merge/write cycle under one SQLite write transaction so a
+        # heartbeat update cannot overwrite a concurrent status or metadata
+        # transition with an object read before that transition committed.
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT payload_json FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                raise KeyError(f"Unknown job_id: {job_id}")
+            job = TrainingJob.from_dict(json.loads(row["payload_json"]))
+            if status is not None:
+                job.mark_status(status, reason=reason)
+            elif reason is not None:
+                job.status_reason = reason
+            if hold is not None:
+                job.hold = hold
+            if latest_checkpoint_path is not None:
+                job.latest_checkpoint_path = latest_checkpoint_path
+            if last_heartbeat_at is not None:
+                job.last_heartbeat_at = last_heartbeat_at
+            if last_dispatched_at is not None:
+                job.last_dispatched_at = last_dispatched_at
+            if status_timestamps:
+                job.status_timestamps.update(status_timestamps)
+            if metadata_updates:
+                job.metadata.update(metadata_updates)
+            self._save_job_on_connection(connection, job)
+            connection.commit()
+            return job
 
     def set_job_status(self, job_id: str, status: JobStatus, *, reason: str | None = None, hold: bool | None = None) -> TrainingJob:
         return self.update_job(job_id, status=status, reason=reason, hold=hold)

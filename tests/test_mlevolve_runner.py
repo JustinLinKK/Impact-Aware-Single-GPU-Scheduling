@@ -98,7 +98,10 @@ def test_missing_elastic_contract_is_rejected_and_one_repair_still_fails() -> No
     source = "from torch.utils.data import DataLoader\nloader = DataLoader(range(8), batch_size=4)\n"
     validation = validate_generated_training_code(source, require_elastic_contract=True)
     assert validation["ok"] is False
-    assert {issue["code"] for issue in validation["issues"]} == {"elastic_training_contract_missing"}
+    assert {issue["code"] for issue in validation["issues"]} == {
+        "elastic_training_contract_missing",
+        "elastic_training_loader_bypasses_session",
+    }
     repaired = repair_generated_training_code(source, require_elastic_contract=True)
     assert repaired["validation"]["ok"] is False
 

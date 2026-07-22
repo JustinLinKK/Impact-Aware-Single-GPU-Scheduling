@@ -234,8 +234,7 @@ class AdaptivePlacementSearch:
                 )
             ),
             conservative_vram_buckets=(
-                state.conservative_vram_buckets
-                + int(ceil(choice.vram_mb / self.settings.gpu_scheduler.adaptive.vram_bucket_mb))
+                int(ceil(vram / self.settings.gpu_scheduler.adaptive.vram_bucket_mb))
             ),
             blocked_job_ids=(
                 state.blocked_job_ids
