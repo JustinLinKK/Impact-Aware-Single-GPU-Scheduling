@@ -85,7 +85,11 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
     def test_packed_pair_dispatches_when_fake_mps_is_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir)
-            settings = SchedulerSettings(runtime_root=runtime_root, scheduler_poll_interval_seconds=0.05)
+            settings = SchedulerSettings(
+                runtime_root=runtime_root,
+                scheduler_poll_interval_seconds=0.05,
+                prediction={"mode": "ml_predictor"},
+            )
             api = SchedulerClient(settings)
             supervisor = _build_supervisor(settings, mps_available=True)
             service = api.create_service(supervisor=supervisor).start(background=True)
@@ -123,6 +127,7 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
                 runtime_root=runtime_root,
                 scheduler_poll_interval_seconds=0.05,
                 gpu_scheduler={"backend_priority": ["cuda_process", "exclusive"]},
+                prediction={"mode": "ml_predictor"},
             )
             api = SchedulerClient(settings)
             supervisor = _build_cuda_process_supervisor(settings)
@@ -157,6 +162,7 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
                 scheduler_poll_interval_seconds=0.05,
                 baseline_cache={"warm_queue_top_k": 0, "entry_capacity": 8},
                 gpu_scheduler={"backend_priority": ["cuda_process", "exclusive"]},
+                prediction={"mode": "ml_predictor"},
             )
             api = SchedulerClient(settings)
             supervisor = _build_cuda_process_supervisor(settings)
@@ -232,8 +238,8 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
                 gpu_scheduler={
                     "backend_priority": ["cuda_process", "exclusive"],
                     "max_packed_jobs_per_gpu": 3,
-                    "allow_three_way_packing": True,
                 },
+                prediction={"mode": "ml_predictor"},
             )
             api = SchedulerClient(settings)
             supervisor = _build_cuda_process_supervisor(settings)
@@ -265,6 +271,7 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
                 runtime_root=runtime_root,
                 scheduler_poll_interval_seconds=0.05,
                 gpu_scheduler={"backend_priority": ["cuda_process", "exclusive"]},
+                prediction={"mode": "ml_predictor"},
             )
             api = SchedulerClient(settings)
             supervisor = _build_cuda_process_supervisor(settings)
@@ -300,7 +307,11 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
     def test_jobs_fall_back_to_exclusive_when_mps_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir)
-            settings = SchedulerSettings(runtime_root=runtime_root, scheduler_poll_interval_seconds=0.05)
+            settings = SchedulerSettings(
+                runtime_root=runtime_root,
+                scheduler_poll_interval_seconds=0.05,
+                prediction={"mode": "ml_predictor"},
+            )
             api = SchedulerClient(settings)
             supervisor = _build_supervisor(settings, mps_available=False)
             service = api.create_service(supervisor=supervisor).start(background=True)
@@ -328,7 +339,11 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
     def test_secondary_failure_marks_pair_incompatible_and_keeps_primary_alive(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir)
-            settings = SchedulerSettings(runtime_root=runtime_root, scheduler_poll_interval_seconds=0.05)
+            settings = SchedulerSettings(
+                runtime_root=runtime_root,
+                scheduler_poll_interval_seconds=0.05,
+                prediction={"mode": "ml_predictor"},
+            )
             api = SchedulerClient(settings)
             supervisor = _build_supervisor(settings, mps_available=True)
             service = api.create_service(supervisor=supervisor).start(background=True)
@@ -366,7 +381,11 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
     def test_manual_pause_and_cancel_work_per_job_in_packed_group(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir)
-            settings = SchedulerSettings(runtime_root=runtime_root, scheduler_poll_interval_seconds=0.05)
+            settings = SchedulerSettings(
+                runtime_root=runtime_root,
+                scheduler_poll_interval_seconds=0.05,
+                prediction={"mode": "ml_predictor"},
+            )
             api = SchedulerClient(settings)
             supervisor = _build_supervisor(settings, mps_available=True)
             service = api.create_service(supervisor=supervisor).start(background=True)

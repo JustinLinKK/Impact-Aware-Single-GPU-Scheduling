@@ -265,7 +265,7 @@ def build_model_family_probe_job(
             profile_namespace=profile_key,
             shape_signature_override=shape_signature,
             minimum_batch_size=int(hints.get("minimum_batch_size") or 1),
-            contract_version=2,
+            contract_version=3,
             reuse_only=False,
         ),
         resource_requirements=ResourceRequirements(requires_gpu=True),

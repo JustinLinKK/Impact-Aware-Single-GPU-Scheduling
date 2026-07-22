@@ -7,8 +7,8 @@ import unittest
 
 from engine.executor import Interpreter
 from localml_scheduler.client import SchedulerClient
-from localml_scheduler.config import SCHEDULER_MODE_PARALLEL_AUTO_PACK, SchedulerSettings
-from localml_scheduler.domain import JobStatus
+from localml_scheduler.config import SCHEDULER_MODE_ADAPTIVE, SchedulerSettings
+from localml_scheduler.domain import JobStatus, ProfileState
 
 
 SIMULATED_TRAINING_EPOCHS = 5
@@ -51,17 +51,21 @@ def _agent_candidate_code(label: str, *, batch_size: int, model_family: str) -> 
         [
             "import json",
             "import torch",
-            "from torch.utils.data import DataLoader, TensorDataset",
+            "from torch.utils.data import TensorDataset",
+            "from localml_scheduler.elastic import ElasticTrainingSession",
             f"MODEL_FAMILY = {model_family!r}",
             f"batch_size = {batch_size}",
             f"epochs = {SIMULATED_TRAINING_EPOCHS}",
-            "features = torch.arange(128, dtype=torch.float32).reshape(64, 2)",
+            "session = ElasticTrainingSession.from_env()",
+            "features = torch.arange(2048, dtype=torch.float32).reshape(1024, 2)",
             "targets = features.sum(dim=1, keepdim=True)",
-            "train_loader = DataLoader(TensorDataset(features, targets), batch_size=batch_size, shuffle=True)",
+            "train_loader = session.make_dataloader(TensorDataset(features, targets), shuffle=True)",
             "model = torch.nn.Linear(2, 1)",
             "optimizer = torch.optim.SGD(model.parameters(), lr=1e-5)",
-            "global_step = 0",
-            "for epoch in range(epochs):",
+            "session.register_training_state(model, optimizer, extra_state={'label': MODEL_FAMILY})",
+            "progress = session.restore_if_present()",
+            "global_step = progress['global_step']",
+            "for epoch in range(progress['epoch'], epochs):",
             "    for step, (inputs, labels) in enumerate(train_loader):",
             f"        if step >= {SIMULATED_STEPS_PER_EPOCH}:",
             "            break",
@@ -70,6 +74,7 @@ def _agent_candidate_code(label: str, *, batch_size: int, model_family: str) -> 
             "        loss.backward()",
             "        optimizer.step()",
             "        global_step += 1",
+            "        session.optimizer_step_completed(len(inputs), epoch, step, global_step, metrics={'loss': float(loss.item())})",
             "        print(",
             "            'MLEVOLVE_METRIC: ' + json.dumps({",
             "                'loss': 1.0 / (step + 1),",
@@ -79,7 +84,7 @@ def _agent_candidate_code(label: str, *, batch_size: int, model_family: str) -> 
             "            }),",
             "            flush=True,",
             "        )",
-            f"print('agent candidate {label} completed batch_size=' + str(batch_size), flush=True)",
+            f"print('agent candidate {label} completed batch_size=' + str(session.batch_size), flush=True)",
         ]
     )
 
@@ -95,9 +100,9 @@ class MLEvolveSchedulerSimulationTest(unittest.TestCase):
                 runtime_root=runtime_root,
                 scheduler_poll_interval_seconds=0.05,
                 gpu_scheduler={
-                    "mode": SCHEDULER_MODE_PARALLEL_AUTO_PACK,
+                    "mode": SCHEDULER_MODE_ADAPTIVE,
                     "backend_priority": ["exclusive"],
-                    "idle_coalescing_window_seconds": 0.0,
+                    "adaptive": {"replan_debounce_seconds": 0.0},
                     "batch_probe_max_search_rounds": 4,
                     "profiling": {"warmup_steps": 1, "solo_probe_steps": 1},
                     "submission_defaults": {
@@ -165,21 +170,29 @@ class MLEvolveSchedulerSimulationTest(unittest.TestCase):
                     self.assertEqual(final_job.metadata["proposed_epochs"], SIMULATED_TRAINING_EPOCHS)
                     self.assertEqual(final_job.metadata["placement_backend"], "exclusive")
                     self.assertEqual(final_job.metadata["placement_mode"], "exclusive")
-                    self.assertEqual(final_job.metadata["batch_probe_source"], "probe")
-                    self.assertGreaterEqual(int(final_job.metadata["resolved_batch_size"]), int(final_job.metadata["detected_batch_size"]))
+                    self.assertEqual(final_job.profile_state, ProfileState.READY)
+                    self.assertEqual(final_job.authored_batch_size, int(final_job.metadata["detected_batch_size"]))
                     self.assertIn("scheduler_session_id", final_job.metadata)
-                    self.assertIsNotNone(api.get_batch_probe_profile(str(final_job.metadata["batch_probe_key"])))
+                    curves = [
+                        curve
+                        for curve in api.store.list_batch_profile_curves()
+                        if curve.profile_namespace == final_job.batch_probe.profile_namespace
+                    ]
+                    self.assertEqual(len(curves), 1)
+                    self.assertEqual(curves[0].contract_version, 3)
+                    self.assertTrue(curves[0].points)
                     self.assertGreaterEqual(
                         len(api.list_job_metric_samples(final_job.job_id)),
                         SIMULATED_TRAINING_EPOCHS * SIMULATED_STEPS_PER_EPOCH,
                     )
 
                 report = api.report()
-                self.assertEqual(report["total_jobs"], 3)
-                self.assertEqual(report["completed_jobs"], 3)
+                self.assertEqual(report["total_jobs"], 6)
+                self.assertEqual(report["completed_jobs"], 6)
                 self.assertEqual(report["failed_jobs"], 0)
                 self.assertEqual(len(api.tuning_outcomes), 3)
-                self.assertGreaterEqual(len(api.list_events(event_type="batch_probe_selected")), 3)
+                self.assertGreaterEqual(len(api.list_events(event_type="branch_profile_probe_queued")), 3)
+                self.assertGreaterEqual(len(api.list_events(event_type="batch_probe_started")), 3)
                 self.assertGreaterEqual(len(api.list_events(event_type="job_dispatched")), 3)
             finally:
                 interpreter.terminate_all_subprocesses()

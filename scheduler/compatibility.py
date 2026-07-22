@@ -52,6 +52,19 @@ class CompatibilityEvaluator:
         self.settings = settings
         self.repository = repository
         self.estimator = estimator
+        self._pair_cache: dict[tuple[str, str, str], PairProfile | bool] = {}
+        self._pairs_prefetched = False
+
+    def begin_planning_cycle(self) -> None:
+        self._pair_cache.clear()
+        self._pairs_prefetched = False
+        lister = getattr(self.repository, "list_pair_profiles", None)
+        if not callable(lister):
+            return
+        self._pairs_prefetched = True
+        for profile in lister(hardware_key=self.repository.hardware_key()):
+            signatures = sorted((profile.left_signature, profile.right_signature))
+            self._pair_cache[(signatures[0], signatures[1], profile.backend_name)] = profile
 
     def pack_eligible(self, job: TrainingJob, *, backend_name: str | None = None) -> bool:
         if not (job.packing.eligible and job.packing.signature):
@@ -69,20 +82,15 @@ class CompatibilityEvaluator:
             return True
         thresholds = self.settings.gpu_scheduler.thresholds
         for left_job, right_job in combinations(jobs, 2):
-            left_batch = self.estimator.packing_batch_size(left_job, backend_name)
-            right_batch = self.estimator.packing_batch_size(right_job, backend_name)
-            left_util = self.estimator.estimate_sm_utilization(left_job, left_batch, backend_name)
-            right_util = self.estimator.estimate_sm_utilization(right_job, right_batch, backend_name)
-            pair_profile = self.repository.get_pair_profile(
-                left_job.packing.signature or "",
-                right_job.packing.signature or "",
-                backend_name=backend_name,
-            )
+            signatures = sorted((left_job.packing.signature or "", right_job.packing.signature or ""))
+            key = (signatures[0], signatures[1], backend_name)
+            if key not in self._pair_cache and not self._pairs_prefetched:
+                self._pair_cache[key] = self.repository.get_pair_profile(
+                    signatures[0], signatures[1], backend_name=backend_name
+                ) or False
+            cached = self._pair_cache.get(key, False)
+            pair_profile = cached if isinstance(cached, PairProfile) else None
             if pair_profile is not None and (pair_profile.on_cooldown() or not pair_profile.compatible):
-                return False
-            if left_util is not None and left_util >= thresholds.pack_reject_sm_active_ge:
-                return False
-            if right_util is not None and right_util >= thresholds.pack_reject_sm_active_ge:
                 return False
             if pair_profile and pair_profile.slowdown_ratio is not None and pair_profile.slowdown_ratio > thresholds.pack_reject_max_slowdown:
                 return False

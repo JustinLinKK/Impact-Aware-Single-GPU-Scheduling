@@ -16,36 +16,22 @@ from ..domain.jobs import BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO, normalize_batch_
 from ..redis_cache import RedisCacheSettings
 
 
-SCHEDULER_MODE_SERIAL_BASIC = "serial_basic"
-SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED = "serial_batch_optimized"
-SCHEDULER_MODE_PARALLEL_DEFAULT = "parallel_default"
-SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED = "parallel_batch_optimized"
-SCHEDULER_MODE_PARALLEL_AUTO_PACK = "parallel_auto_pack"
-SCHEDULER_MODE_AUTO = "auto"
+SCHEDULER_MODE_ADAPTIVE = "adaptive"
+PREDICTION_MODE_BRANCH_PROFILE = "branch_profile"
+PREDICTION_MODE_ML_PREDICTOR = "ml_predictor"
 _UNIX_SOCKET_PATH_SAFE_BYTES = 100
 logger = logging.getLogger("localml_scheduler")
 
 
 def normalize_scheduler_mode(value: str | None) -> str:
-    normalized = str(value or SCHEDULER_MODE_AUTO).strip().lower().replace("-", "_")
-    allowed = {
-        SCHEDULER_MODE_SERIAL_BASIC,
-        SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED,
-        SCHEDULER_MODE_PARALLEL_DEFAULT,
-        SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
-        SCHEDULER_MODE_PARALLEL_AUTO_PACK,
-        SCHEDULER_MODE_AUTO,
-    }
-    if normalized not in allowed:
+    normalized = str(value or SCHEDULER_MODE_ADAPTIVE).strip().lower().replace("-", "_")
+    if normalized != SCHEDULER_MODE_ADAPTIVE:
         raise ValueError(f"Unsupported scheduler mode: {value}")
     return normalized
 
 
 def effective_scheduler_mode(value: str | None) -> str:
-    normalized = normalize_scheduler_mode(value)
-    if normalized == SCHEDULER_MODE_AUTO:
-        return SCHEDULER_MODE_PARALLEL_AUTO_PACK
-    return normalized
+    return normalize_scheduler_mode(value)
 
 
 def _cache_socket_path(runtime_root: Path, socket_name: str) -> Path:
@@ -60,8 +46,8 @@ def _cache_socket_path(runtime_root: Path, socket_name: str) -> Path:
 
 @dataclass(slots=True)
 class GpuProfilingSettings:
-    warmup_steps: int = 30
-    solo_probe_steps: int = 80
+    warmup_steps: int = 2
+    solo_probe_steps: int = 5
     pair_probe_steps: int = 60
     reuse_profile_if_confidence_ge: float = 0.8
 
@@ -81,7 +67,7 @@ class GpuProfilingSettings:
 @dataclass(slots=True)
 class GpuMemorySettings:
     vram_budget_fraction: float = 0.95
-    safe_vram_budget_gib: float | None = field(default=28.0, repr=False)
+    safe_vram_budget_gib: float | None = field(default=None, repr=False)
     hard_stop_memory_fraction: float | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -290,57 +276,34 @@ class StreamSettings:
 
 
 @dataclass(slots=True)
-class AutoPackSettings:
-    target_metric: str = "vram"
-    target_vram_fraction: float | None = field(default=None, repr=False)
-    target_sm_fraction: float = 0.90
-    runtime_skew_guardrail_ratio: float = 2.0
+class AdaptivePlannerSettings:
+    exact_search_max_jobs: int = 8
+    vram_bucket_mb: int = 128
+    frontier_width: int = 32
+    finalist_limit: int = 64
+    replan_debounce_seconds: float = 1.0
+    minimum_throughput_gain_fraction: float = 0.05
 
     def __post_init__(self) -> None:
-        normalized = str(self.target_metric or "vram").strip().lower().replace("-", "_")
-        if normalized not in {"vram", "sm"}:
-            normalized = "vram"
-        self.target_metric = normalized
+        self.exact_search_max_jobs = max(1, int(self.exact_search_max_jobs))
+        self.vram_bucket_mb = max(1, int(self.vram_bucket_mb))
+        self.frontier_width = max(1, int(self.frontier_width))
+        self.finalist_limit = max(1, int(self.finalist_limit))
+        self.replan_debounce_seconds = max(0.0, float(self.replan_debounce_seconds))
+        self.minimum_throughput_gain_fraction = max(0.0, float(self.minimum_throughput_gain_fraction))
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "AutoPackSettings":
+    def from_dict(cls, payload: dict[str, Any] | None) -> "AdaptivePlannerSettings":
         return cls(**(payload or {}))
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "target_metric": self.target_metric,
-            "target_sm_fraction": self.target_sm_fraction,
-            "runtime_skew_guardrail_ratio": self.runtime_skew_guardrail_ratio,
-        }
-
-
-@dataclass(slots=True)
-class ParallelOptimizerSettings:
-    batch_search_mode: str = BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO
-    target_vram_fraction: float | None = field(default=None, repr=False)
-    max_probe_jobs: int = 3
-    binary_range_up: int = 32
-    binary_range_down: int = 1
-    power_of_two_range_up: int = 5
-    power_of_two_range_down: int = 1
-
-    def __post_init__(self) -> None:
-        self.batch_search_mode = normalize_batch_probe_search_mode(self.batch_search_mode)
-        self.binary_range_up = max(0, int(self.binary_range_up))
-        self.binary_range_down = max(0, int(self.binary_range_down))
-        self.power_of_two_range_up = max(0, int(self.power_of_two_range_up))
-        self.power_of_two_range_down = max(0, int(self.power_of_two_range_down))
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "ParallelOptimizerSettings":
-        return cls(**(payload or {}))
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "batch_search_mode": self.batch_search_mode,
-            "max_probe_jobs": self.max_probe_jobs,
-            "power_of_two_range_up": self.power_of_two_range_up,
-            "power_of_two_range_down": self.power_of_two_range_down,
+            "exact_search_max_jobs": self.exact_search_max_jobs,
+            "vram_bucket_mb": self.vram_bucket_mb,
+            "frontier_width": self.frontier_width,
+            "finalist_limit": self.finalist_limit,
+            "replan_debounce_seconds": self.replan_debounce_seconds,
+            "minimum_throughput_gain_fraction": self.minimum_throughput_gain_fraction,
         }
 
 
@@ -370,7 +333,6 @@ class PredictionBranchSettings:
 @dataclass(slots=True)
 class PredictionMLSettings:
     enabled: bool = False
-    shadow: bool = False
     hardware_key: str | None = None
     checkpoint_path: str | None = None
     calibration_path: str | None = None
@@ -379,7 +341,6 @@ class PredictionMLSettings:
 
     def __post_init__(self) -> None:
         self.enabled = bool(self.enabled)
-        self.shadow = bool(self.shadow)
         self.hardware_key = str(self.hardware_key).strip() if self.hardware_key else None
         self.checkpoint_path = str(self.checkpoint_path).strip() if self.checkpoint_path else None
         self.calibration_path = str(self.calibration_path).strip() if self.calibration_path else None
@@ -398,7 +359,6 @@ class PredictionMLSettings:
     def to_dict(self) -> dict[str, Any]:
         return {
             "enabled": self.enabled,
-            "shadow": self.shadow,
             "hardware_key": self.hardware_key,
             "checkpoint_path": self.checkpoint_path,
             "calibration_path": self.calibration_path,
@@ -450,7 +410,7 @@ class PredictionSafetyMarginSettings:
 
 @dataclass(slots=True)
 class PredictionSettings:
-    mode: str = "branch_only"
+    mode: str = PREDICTION_MODE_BRANCH_PROFILE
     timeout_ms: int = 1000
     unknown_value_policy: Any | None = None
     fallback_to_exclusive: bool = True
@@ -459,8 +419,8 @@ class PredictionSettings:
     safety_margin: PredictionSafetyMarginSettings | dict[str, Any] = field(default_factory=PredictionSafetyMarginSettings)
 
     def __post_init__(self) -> None:
-        self.mode = str(self.mode or "branch_only").strip().lower().replace("-", "_")
-        if self.mode not in {"branch_only", "ml_shadow", "confidence_first", "ml_primary"}:
+        self.mode = str(self.mode or PREDICTION_MODE_BRANCH_PROFILE).strip().lower().replace("-", "_")
+        if self.mode not in {PREDICTION_MODE_BRANCH_PROFILE, PREDICTION_MODE_ML_PREDICTOR}:
             raise ValueError(f"Unsupported prediction mode: {self.mode}")
         try:
             self.timeout_ms = max(1, int(self.timeout_ms))
@@ -479,10 +439,8 @@ class PredictionSettings:
             self.safety_margin = PredictionSafetyMarginSettings()
         if isinstance(self.safety_margin, dict):
             self.safety_margin = PredictionSafetyMarginSettings.from_dict(self.safety_margin)
-        if self.mode == "ml_shadow":
-            self.ml.shadow = True
-        if self.mode == "ml_primary" and not self.ml.checkpoint_path and not self.fallback_to_exclusive:
-            raise ValueError("prediction.mode=ml_primary requires prediction.ml.checkpoint_path or fallback_to_exclusive=true")
+        if self.mode == PREDICTION_MODE_ML_PREDICTOR and not self.ml.checkpoint_path and not self.fallback_to_exclusive:
+            raise ValueError("prediction.mode=ml_predictor requires prediction.ml.checkpoint_path or fallback_to_exclusive=true")
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "PredictionSettings":
@@ -617,21 +575,17 @@ class SchedulerSubmissionDefaults:
 @dataclass(slots=True)
 class GpuSchedulerSettings:
     enabled: bool = True
-    mode: str = SCHEDULER_MODE_AUTO
+    mode: str = SCHEDULER_MODE_ADAPTIVE
     backend_priority: list[str] = field(default_factory=lambda: ["stream_mps", "stream", "cuda_process", "mps", "exclusive"])
-    max_packed_jobs_per_gpu: int = 2
-    allow_three_way_packing: bool = False
-    candidate_window_size: int = 8
+    max_packed_jobs_per_gpu: int = 8
+    candidate_window_size: int = 16
     device_index: int = 0
     fallback_cooldown_seconds: int = 900
-    concurrent_groups_enabled: bool = False
-    concurrent_backend_allowlist: list[str] = field(default_factory=lambda: ["stream_mps", "stream"])
-    idle_coalescing_window_seconds: float = 2.0
     batch_probe_enabled: bool = True
     batch_probe_target_memory_fraction: float | None = field(default=None, repr=False)
     batch_probe_min_batch_size: int = 1
-    batch_probe_max_search_rounds: int = 12
-    batch_probe_max_batch_size: int | None = None
+    batch_probe_max_search_rounds: int = 14
+    batch_probe_max_batch_size: int | None = 4096
     batch_probe_search_mode: str = BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO
     model_family_probe_enabled: bool = True
     model_family_probe_priority: int = 100
@@ -651,8 +605,7 @@ class GpuSchedulerSettings:
     thresholds: GpuThresholdSettings = field(default_factory=GpuThresholdSettings)
     telemetry: GpuTelemetrySettings = field(default_factory=GpuTelemetrySettings)
     early_stop: EarlyStopSettings = field(default_factory=EarlyStopSettings)
-    auto_pack: AutoPackSettings = field(default_factory=AutoPackSettings)
-    parallel_optimizer: ParallelOptimizerSettings = field(default_factory=ParallelOptimizerSettings)
+    adaptive: AdaptivePlannerSettings | dict[str, Any] = field(default_factory=AdaptivePlannerSettings)
     submission_defaults: SchedulerSubmissionDefaults = field(default_factory=SchedulerSubmissionDefaults)
     mps: MPSSettings = field(default_factory=MPSSettings)
     cuda_process: CudaProcessSettings = field(default_factory=CudaProcessSettings)
@@ -709,10 +662,8 @@ class GpuSchedulerSettings:
             self.backend_priority = ["stream_mps", "stream", "cuda_process", "mps", "exclusive"]
         else:
             self.backend_priority = [str(item) for item in self.backend_priority]
-        if self.concurrent_backend_allowlist is None:
-            self.concurrent_backend_allowlist = ["stream_mps", "stream"]
-        else:
-            self.concurrent_backend_allowlist = [str(item) for item in self.concurrent_backend_allowlist]
+        self.max_packed_jobs_per_gpu = max(1, int(self.max_packed_jobs_per_gpu))
+        self.candidate_window_size = max(1, int(self.candidate_window_size))
         if self.profiling is None:
             self.profiling = GpuProfilingSettings()
         if isinstance(self.profiling, dict):
@@ -733,14 +684,10 @@ class GpuSchedulerSettings:
             self.early_stop = EarlyStopSettings()
         if isinstance(self.early_stop, dict):
             self.early_stop = EarlyStopSettings.from_dict(self.early_stop)
-        if self.auto_pack is None:
-            self.auto_pack = AutoPackSettings()
-        if isinstance(self.auto_pack, dict):
-            self.auto_pack = AutoPackSettings.from_dict(self.auto_pack)
-        if self.parallel_optimizer is None:
-            self.parallel_optimizer = ParallelOptimizerSettings()
-        if isinstance(self.parallel_optimizer, dict):
-            self.parallel_optimizer = ParallelOptimizerSettings.from_dict(self.parallel_optimizer)
+        if self.adaptive is None:
+            self.adaptive = AdaptivePlannerSettings()
+        if isinstance(self.adaptive, dict):
+            self.adaptive = AdaptivePlannerSettings.from_dict(self.adaptive)
         if self.submission_defaults is None:
             self.submission_defaults = SchedulerSubmissionDefaults()
         if isinstance(self.submission_defaults, dict):
@@ -761,23 +708,6 @@ class GpuSchedulerSettings:
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "GpuSchedulerSettings":
         data = dict(payload or {})
-        if "model_family_probe_enabled" not in data and "startpoint_probe_enabled" in data:
-            data["model_family_probe_enabled"] = data.get("startpoint_probe_enabled")
-        memory = dict(data.get("memory") or {})
-        if "vram_budget_fraction" not in memory:
-            for legacy_path, value in (
-                ("batch_probe_target_memory_fraction", data.get("batch_probe_target_memory_fraction")),
-                ("auto_pack.target_vram_fraction", (data.get("auto_pack") or {}).get("target_vram_fraction") if isinstance(data.get("auto_pack"), dict) else None),
-                ("parallel_optimizer.target_vram_fraction", (data.get("parallel_optimizer") or {}).get("target_vram_fraction") if isinstance(data.get("parallel_optimizer"), dict) else None),
-            ):
-                if value is not None:
-                    memory["vram_budget_fraction"] = value
-                    logger.warning(
-                        "gpu_scheduler.%s is deprecated; use gpu_scheduler.memory.vram_budget_fraction.",
-                        legacy_path,
-                    )
-                    break
-        data["memory"] = memory
         return cls(**data)
 
     def to_dict(self) -> dict[str, Any]:
@@ -786,13 +716,9 @@ class GpuSchedulerSettings:
             "mode": self.mode,
             "backend_priority": list(self.backend_priority),
             "max_packed_jobs_per_gpu": self.max_packed_jobs_per_gpu,
-            "allow_three_way_packing": self.allow_three_way_packing,
             "candidate_window_size": self.candidate_window_size,
             "device_index": self.device_index,
             "fallback_cooldown_seconds": self.fallback_cooldown_seconds,
-            "concurrent_groups_enabled": self.concurrent_groups_enabled,
-            "concurrent_backend_allowlist": list(self.concurrent_backend_allowlist),
-            "idle_coalescing_window_seconds": self.idle_coalescing_window_seconds,
             "batch_probe_enabled": self.batch_probe_enabled,
             "batch_probe_min_batch_size": self.batch_probe_min_batch_size,
             "batch_probe_max_search_rounds": self.batch_probe_max_search_rounds,
@@ -814,8 +740,7 @@ class GpuSchedulerSettings:
             "thresholds": self.thresholds.to_dict(),
             "telemetry": self.telemetry.to_dict(),
             "early_stop": self.early_stop.to_dict(),
-            "auto_pack": self.auto_pack.to_dict(),
-            "parallel_optimizer": self.parallel_optimizer.to_dict(),
+            "adaptive": self.adaptive.to_dict(),
             "submission_defaults": self.submission_defaults.to_dict(),
             "mps": self.mps.to_dict(),
             "cuda_process": self.cuda_process.to_dict(),
@@ -922,6 +847,9 @@ class SchedulerConfig:
 
     def job_heartbeat_path(self, job_id: str) -> Path:
         return self.job_runtime_dir(job_id) / "heartbeat.json"
+
+    def job_repack_ack_path(self, job_id: str) -> Path:
+        return self.job_runtime_dir(job_id) / "repack_ack.json"
 
     def checkpoints_for_job(self, job_id: str) -> Path:
         return self.checkpoints_dir / job_id

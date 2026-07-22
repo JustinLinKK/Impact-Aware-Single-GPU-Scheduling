@@ -48,14 +48,13 @@ class LiveGpuSchedulerFullFlowTest(unittest.TestCase):
                 runtime_root=runtime_root,
                 scheduler_poll_interval_seconds=0.05,
                 gpu_scheduler={
-                    "mode": "serial_batch_optimized",
+                    "mode": "adaptive",
                     "backend_priority": ["exclusive"],
-                    "batch_probe_max_search_rounds": 3,
-                    "profiling": {"warmup_steps": 1, "solo_probe_steps": 1},
                     "stream": {"enabled": False},
                     "cuda_process": {"enabled": False},
                     "mps": {"enabled": False},
                 },
+                prediction={"mode": "ml_predictor"},
                 log_db={"enabled": False},
                 redis_cache={"enabled": False},
             )
@@ -96,13 +95,7 @@ class LiveGpuSchedulerFullFlowTest(unittest.TestCase):
                                 estimated_ram_mb=1024,
                             ),
                             checkpoint_policy=CheckpointPolicy(save_every_epoch=True),
-                            batch_probe=BatchProbeSpec(
-                                enabled=True,
-                                probe_target="localml_scheduler.examples.toy_pytorch_runner:probe_toy_training_batch_size",
-                                batch_param_name="batch_size",
-                                model_key=f"live-gpu-toy-{index}",
-                                search_mode="power_of_two",
-                            ),
+                            batch_probe=BatchProbeSpec(enabled=False),
                             packing_family="live_gpu_toy",
                             packing_signature=f"live-gpu-toy-{index}",
                             packing_eligible=False,
@@ -122,19 +115,19 @@ class LiveGpuSchedulerFullFlowTest(unittest.TestCase):
                     self.assertEqual(final_job.status, JobStatus.COMPLETED)
                     self.assertEqual(final_job.metadata["placement_backend"], "exclusive")
                     self.assertEqual(final_job.metadata["placement_mode"], "exclusive")
-                    self.assertEqual(final_job.metadata["batch_probe_source"], "probe")
-                    self.assertIn("batch_probe_key", final_job.metadata)
-
-                    resolved_batch_size = int(final_job.metadata["resolved_batch_size"])
-                    self.assertGreaterEqual(resolved_batch_size, LIVE_GPU_INITIAL_BATCH_SIZE)
-                    expected_steps = LIVE_GPU_EPOCHS * math.ceil(LIVE_GPU_NUM_SAMPLES / resolved_batch_size)
-
-                    profile = api.get_batch_probe_profile(str(final_job.metadata["batch_probe_key"]))
-                    self.assertIsNotNone(profile)
-                    assert profile is not None
-                    self.assertNotEqual(profile.device_type, "cuda-unavailable")
-                    self.assertGreater(profile.memory_total_mb or 0, 0)
-                    self.assertGreater(profile.peak_vram_mb or 0, 0)
+                    self.assertEqual(final_job.authored_batch_size, LIVE_GPU_INITIAL_BATCH_SIZE)
+                    placed_batch = int(final_job.metadata["placement_batch_size"])
+                    self.assertIn(
+                        placed_batch,
+                        {
+                            LIVE_GPU_INITIAL_BATCH_SIZE // 2,
+                            LIVE_GPU_INITIAL_BATCH_SIZE,
+                            LIVE_GPU_INITIAL_BATCH_SIZE * 2,
+                        },
+                    )
+                    expected_steps = LIVE_GPU_EPOCHS * math.ceil(
+                        LIVE_GPU_NUM_SAMPLES / placed_batch
+                    )
 
                     completion_payload = latest_job_completed_payload(api, final_job.job_id)
                     self.assertEqual(completion_payload["device"], "cuda")
@@ -150,7 +143,6 @@ class LiveGpuSchedulerFullFlowTest(unittest.TestCase):
                 self.assertEqual(report["completed_jobs"], 2)
                 self.assertEqual(report["failed_jobs"], 0)
                 self.assertGreaterEqual(len(api.list_events(event_type="job_dispatched")), 2)
-                self.assertGreaterEqual(len(api.list_events(event_type="batch_probe_selected")), 2)
             finally:
                 service.stop()
 
@@ -162,14 +154,14 @@ class LiveGpuSchedulerFullFlowTest(unittest.TestCase):
                 runtime_root=runtime_root,
                 scheduler_poll_interval_seconds=0.05,
                 gpu_scheduler={
-                    "mode": "parallel_default",
+                    "mode": "adaptive",
                     "backend_priority": ["cuda_process", "exclusive"],
                     "max_packed_jobs_per_gpu": 3,
-                    "allow_three_way_packing": True,
                     "stream": {"enabled": False},
                     "mps": {"enabled": False},
                     "cuda_process": {"enabled": True},
                 },
+                prediction={"mode": "ml_predictor"},
                 log_db={"enabled": False},
                 redis_cache={"enabled": False},
             )
@@ -226,7 +218,6 @@ class LiveGpuSchedulerFullFlowTest(unittest.TestCase):
                 packed_payloads = [event["payload"] for event in packed_events]
                 self.assertTrue(any(set(payload["job_ids"]) == submitted_ids for payload in packed_payloads))
 
-                expected_steps = PACKED_GPU_EPOCHS * math.ceil(PACKED_GPU_NUM_SAMPLES / PACKED_GPU_BATCH_SIZE)
                 for submitted_job in submitted:
                     final_job = api.inspect(submitted_job.job_id)
                     self.assertIsNotNone(final_job)
@@ -235,7 +226,10 @@ class LiveGpuSchedulerFullFlowTest(unittest.TestCase):
                     self.assertEqual(final_job.metadata["placement_backend"], "cuda_process")
                     self.assertEqual(final_job.metadata["placement_mode"], "packed_group")
                     self.assertIn(final_job.metadata["placement_role"], {"slot-0", "slot-1", "slot-2"})
-                    self.assertEqual(final_job.metadata["placement_batch_size"], PACKED_GPU_BATCH_SIZE)
+                    self.assertEqual(final_job.authored_batch_size, PACKED_GPU_BATCH_SIZE)
+                    placed_batch = int(final_job.metadata["placement_batch_size"])
+                    self.assertIn(placed_batch, {PACKED_GPU_BATCH_SIZE // 2, PACKED_GPU_BATCH_SIZE, PACKED_GPU_BATCH_SIZE * 2})
+                    expected_steps = PACKED_GPU_EPOCHS * math.ceil(PACKED_GPU_NUM_SAMPLES / placed_batch)
 
                     completion_payload = latest_job_completed_payload(api, final_job.job_id)
                     self.assertEqual(completion_payload["device"], "cuda")

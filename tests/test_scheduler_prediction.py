@@ -1,202 +1,96 @@
 from __future__ import annotations
 
 from pathlib import Path
-import tempfile
-import unittest
+
+import pytest
 
 from localml_scheduler.config import SchedulerSettings
-from localml_scheduler.domain import BatchProbeProfile, BatchProbeSpec, ResourceRequirements, TrainingJob
+from localml_scheduler.domain import ResourceRequirements, TrainingJob
 from localml_scheduler.hardware import HardwareProfile, build_hardware_key
 from localml_scheduler.scheduler.resource_estimator import ResourceEstimator
-from localml_scheduler.storage import StateStore
 
 
-def _fake_hardware_profile(name: str = "prediction-gpu") -> HardwareProfile:
+def _hardware() -> HardwareProfile:
     return HardwareProfile(
         hardware_key=build_hardware_key(
             os_name="linux",
-            gpu_name=name,
-            total_vram_mb=24576,
+            gpu_name="prediction-gpu",
+            total_vram_mb=24_576,
             compute_capability="9.0",
             cuda_runtime="12.8",
             torch_version="2.8.0",
         ),
         os_name="linux",
-        gpu_name=name,
-        total_vram_mb=24576,
+        gpu_name="prediction-gpu",
+        total_vram_mb=24_576,
         compute_capability="9.0",
         cuda_runtime="12.8",
         torch_version="2.8.0",
     )
 
 
-class _NoLegacyProfileRepo:
-    def __init__(self) -> None:
-        self._hardware = _fake_hardware_profile()
-
+class MinimalRepo:
     def hardware_profile(self) -> HardwareProfile:
-        return self._hardware
+        return _hardware()
 
     def hardware_key(self) -> str:
-        return self._hardware.hardware_key
+        return _hardware().hardware_key
 
-    def get_batch_probe_profile(self, probe_key: str) -> BatchProbeProfile | None:
-        raise AssertionError(f"legacy batch probe lookup should not run for explicit estimates: {probe_key}")
+    def get_pair_profile(self, *args, **kwargs):
+        return None
 
-    def get_batch_size_observation(self, **kwargs):
-        raise AssertionError(f"legacy batch observation lookup should not run for explicit estimates: {kwargs}")
-
-    def list_batch_size_observations(self, **kwargs):
-        raise AssertionError(f"legacy batch observation scan should not run for explicit estimates: {kwargs}")
+    def best_combination_profile(self, **kwargs):
+        return None
 
 
-class SchedulerPredictionTest(unittest.TestCase):
-    def test_prediction_settings_parse_rollout_modes(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = SchedulerSettings(
-                runtime_root=tmpdir,
-                prediction={
-                    "mode": "ml_shadow",
-                    "ml": {"enabled": True, "hardware_key": "rtx5090"},
-                },
-            )
-
-            self.assertEqual(settings.prediction.mode, "ml_shadow")
-            self.assertTrue(settings.prediction.ml.shadow)
-            self.assertEqual(settings.prediction.safety_margin.branch, 1.20)
-
-    def test_branch_metadata_maps_to_resource_prediction(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = SchedulerSettings(runtime_root=tmpdir)
-            repo = _NoLegacyProfileRepo()
-            estimator = ResourceEstimator(settings, repo)
-            job = TrainingJob.create(
-                "pkg.runner:train",
-                "branch-job",
-                "/tmp/branch.pt",
-                runner_kwargs={"batch_size": 4, "steps_per_epoch": 10},
-                metadata={
-                    "branch_prediction": {
-                        "epoch_time_ms": 5000.0,
-                        "peak_torch_reserved_mib": 2048.0,
-                        "avg_sm_util_percent": 35.0,
-                        "predictor_version": "branch-test",
-                    }
-                },
-            )
-
-            prediction = estimator.resource_prediction(job, 4, "cuda_process")
-
-            self.assertIsNotNone(prediction)
-            self.assertEqual(prediction.source.value, "branch")
-            self.assertEqual(prediction.step_time_ms.mean, 500.0)
-            self.assertEqual(estimator.estimate_sm_utilization(job, 4, "cuda_process"), 0.35)
-            self.assertEqual(estimator.estimate_peak_vram_mb(job, 4, "cuda_process"), 2048.0 * 1.20)
-
-    def test_explicit_estimate_does_not_query_legacy_profile_tables(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = SchedulerSettings(runtime_root=tmpdir)
-            estimator = ResourceEstimator(settings, _NoLegacyProfileRepo())
-            job = TrainingJob.create(
-                "pkg.runner:train",
-                "explicit-job",
-                "/tmp/explicit.pt",
-                runner_kwargs={"batch_size": 8},
-                resource_requirements=ResourceRequirements(requires_gpu=True, estimated_vram_mb=1024),
-            )
-
-            estimate = estimator.estimate_peak_vram_mb(job, 8, "cuda_process")
-
-            self.assertEqual(estimate, 1024.0 * 1.30)
-
-    def test_job_local_probe_prediction_requires_same_job_identity(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = SchedulerSettings(runtime_root=tmpdir)
-            store = StateStore(settings)
-            store._hardware_profile = _fake_hardware_profile("job-local-probe")
-            estimator = ResourceEstimator(settings, store)
-            job = TrainingJob.create(
-                "pkg.runner:train",
-                "probe-job",
-                "/tmp/probe.pt",
-                runner_kwargs={"batch_size": 4},
-                metadata={"batch_probe_key": "probe-1"},
-            )
-            store.upsert_batch_probe_profile(
-                BatchProbeProfile(
-                    probe_key="probe-1",
-                    model_key="probe-job",
-                    device_type=store.hardware_profile().gpu_name,
-                    shape_signature="shape",
-                    batch_param_name="batch_size",
-                    resolved_batch_size=4,
-                    peak_vram_mb=1024,
-                    last_job_id="other-job",
-                )
-            )
-
-            self.assertIsNone(estimator.estimate_peak_vram_mb(job, 4, "cuda_process"))
-
-            store.upsert_batch_probe_profile(
-                BatchProbeProfile(
-                    probe_key="probe-1",
-                    model_key="probe-job",
-                    device_type=store.hardware_profile().gpu_name,
-                    shape_signature="shape",
-                    batch_param_name="batch_size",
-                    resolved_batch_size=4,
-                    peak_vram_mb=1024,
-                    last_job_id=job.job_id,
-                )
-            )
-
-            self.assertEqual(estimator.estimate_peak_vram_mb(job, 4, "cuda_process"), 1024.0 * 1.10)
-
-    def test_compatible_branch_batch_probe_profile_reuses_across_jobs(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = SchedulerSettings(runtime_root=tmpdir)
-            store = StateStore(settings)
-            store._hardware_profile = _fake_hardware_profile("branch-profile-reuse")
-            estimator = ResourceEstimator(settings, store)
-            job = TrainingJob.create(
-                "pkg.runner:train",
-                "same-family-job",
-                "/tmp/family.pt",
-                runner_kwargs={"batch_size": 8},
-                batch_probe=BatchProbeSpec(
-                    enabled=True,
-                    model_key="efficientnet-b0",
-                    profile_namespace="branch-profile:efficientnet-b0",
-                    shape_signature_override="shape-efficientnet-b0",
-                    search_mode=settings.gpu_scheduler.batch_probe_search_mode,
-                    contract_version=2,
-                ),
-            )
-            store.upsert_batch_probe_profile(
-                BatchProbeProfile(
-                    probe_key="probe-from-other-job",
-                    model_key="efficientnet-b0",
-                    device_type=store.hardware_profile().gpu_name,
-                    profile_namespace="branch-profile:efficientnet-b0",
-                    hardware_key=store.hardware_key(),
-                    shape_signature="shape-efficientnet-b0",
-                    search_mode=settings.gpu_scheduler.batch_probe_search_mode,
-                    contract_version=2,
-                    batch_param_name="batch_size",
-                    resolved_batch_size=4,
-                    peak_vram_mb=1024,
-                    last_job_id="calibration-job",
-                    metadata={"avg_step_time_ms": 12.5},
-                )
-            )
-
-            prediction = estimator.resource_prediction(job, 8, "cuda_process")
-
-            self.assertIsNotNone(prediction)
-            self.assertEqual(prediction.source.value, "branch")
-            self.assertEqual(prediction.step_time_ms.mean, 12.5)
-            self.assertEqual(estimator.estimate_peak_vram_mb(job, 8, "cuda_process"), 2048.0 * 1.20)
+def test_prediction_settings_accept_only_branch_profile_and_ml_predictor(tmp_path: Path) -> None:
+    assert SchedulerSettings(runtime_root=tmp_path / "branch").prediction.mode == "branch_profile"
+    settings = SchedulerSettings(
+        runtime_root=tmp_path / "ml",
+        prediction={"mode": "ml_predictor", "ml": {"enabled": True, "hardware_key": "rtx5090"}},
+    )
+    assert settings.prediction.mode == "ml_predictor"
+    assert settings.prediction.ml.enabled is True
+    for old in ("branch_only", "ml_shadow", "ml_primary", "confidence_first", "hybrid"):
+        with pytest.raises(ValueError, match="Unsupported prediction mode"):
+            SchedulerSettings(runtime_root=tmp_path / old, prediction={"mode": old})
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_branch_metadata_maps_to_resource_prediction(tmp_path: Path) -> None:
+    settings = SchedulerSettings(runtime_root=tmp_path)
+    estimator = ResourceEstimator(settings, MinimalRepo())
+    job = TrainingJob.create(
+        "pkg.runner:train",
+        "branch-job",
+        "/tmp/branch.pt",
+        runner_kwargs={"batch_size": 4, "steps_per_epoch": 10},
+        metadata={
+            "branch_prediction": {
+                "epoch_time_ms": 5000.0,
+                "peak_torch_reserved_mib": 2048.0,
+                "avg_sm_util_percent": 35.0,
+                "predictor_version": "branch-test",
+            }
+        },
+    )
+    prediction = estimator.resource_prediction(job, 4, "cuda_process")
+    assert prediction is not None and prediction.source.value == "branch"
+    assert prediction.step_time_ms.mean == 500.0
+    assert estimator.estimate_sm_utilization(job, 4, "cuda_process") == 0.35
+    assert estimator.estimate_peak_vram_mb(job, 4, "cuda_process") == 2048.0 * 1.20
+
+
+def test_ml_mode_can_use_explicit_fallback_when_predictor_is_unavailable(tmp_path: Path) -> None:
+    settings = SchedulerSettings(
+        runtime_root=tmp_path,
+        prediction={"mode": "ml_predictor", "fallback_to_exclusive": True},
+    )
+    estimator = ResourceEstimator(settings, MinimalRepo())
+    job = TrainingJob.create(
+        "pkg.runner:train",
+        "explicit-job",
+        "/tmp/explicit.pt",
+        runner_kwargs={"batch_size": 8},
+        resource_requirements=ResourceRequirements(requires_gpu=True, estimated_vram_mb=1024),
+    )
+    assert estimator.estimate_peak_vram_mb(job, 8, "cuda_process") == 1024.0 * 1.30

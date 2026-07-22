@@ -107,6 +107,8 @@ class BatchProbeTrialResult:
     peak_vram_mb: int | None = None
     memory_total_mb: int | None = None
     avg_step_time_ms: float | None = None
+    samples_per_second: float | None = None
+    step_time_dispersion: float | None = None
     message: str | None = None
     failure_kind: str | None = None
     returncode: int | None = None
@@ -120,6 +122,86 @@ class BatchProbeTrialResult:
         payload = dict(payload)
         payload["diagnostic"] = FailureDiagnostic.from_dict(payload.get("diagnostic"))
         return cls(**payload)
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_primitive(self)
+
+
+@dataclass(slots=True)
+class BatchProfilePoint:
+    point_key: str
+    curve_key: str
+    batch_size: int
+    peak_vram_mb: int
+    samples_per_second: float
+    median_step_time_ms: float
+    step_time_dispersion: float = 0.0
+    observations: int = 1
+    last_job_id: str | None = None
+    updated_at: str = field(default_factory=utc_now)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "BatchProfilePoint":
+        return cls(
+            point_key=row["point_key"],
+            curve_key=row["curve_key"],
+            batch_size=int(row["batch_size"]),
+            peak_vram_mb=int(row["peak_vram_mb"]),
+            samples_per_second=float(row["samples_per_second"]),
+            median_step_time_ms=float(row["median_step_time_ms"]),
+            step_time_dispersion=float(row.get("step_time_dispersion") or 0.0),
+            observations=int(row.get("observations") or 1),
+            last_job_id=row.get("last_job_id"),
+            updated_at=row["updated_at"],
+            metadata=json.loads(row["metadata_json"]) if row.get("metadata_json") else {},
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_primitive(self)
+
+
+@dataclass(slots=True)
+class BatchProfileCurve:
+    curve_key: str
+    model_key: str
+    shape_signature: str
+    hardware_key: str
+    backend_name: str = "exclusive"
+    profile_namespace: str | None = None
+    contract_version: int = 3
+    batch_param_name: str = "batch_size"
+    minimum_batch_size: int = 1
+    maximum_feasible_batch_size: int | None = None
+    first_oom_batch_size: int | None = None
+    right_censored: bool = False
+    observations: int = 1
+    last_job_id: str | None = None
+    updated_at: str = field(default_factory=utc_now)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    points: list[BatchProfilePoint] = field(default_factory=list)
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any], *, points: list[BatchProfilePoint] | None = None) -> "BatchProfileCurve":
+        return cls(
+            curve_key=row["curve_key"],
+            model_key=row["model_key"],
+            shape_signature=row["shape_signature"],
+            hardware_key=row["hardware_key"],
+            backend_name=row["backend_name"],
+            profile_namespace=row.get("profile_namespace"),
+            contract_version=int(row.get("contract_version") or 3),
+            batch_param_name=row["batch_param_name"],
+            minimum_batch_size=int(row.get("minimum_batch_size") or 1),
+            maximum_feasible_batch_size=row.get("maximum_feasible_batch_size"),
+            first_oom_batch_size=row.get("first_oom_batch_size"),
+            right_censored=bool(row.get("right_censored")),
+            observations=int(row.get("observations") or 1),
+            last_job_id=row.get("last_job_id"),
+            updated_at=row["updated_at"],
+            metadata=json.loads(row["metadata_json"]) if row.get("metadata_json") else {},
+            points=list(points or []),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return to_primitive(self)

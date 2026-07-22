@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 import json
+import time
 
 from ..checkpointing.manager import CheckpointManager
 from ..observability.events import EventLogger
@@ -32,6 +33,7 @@ class ControlCommand:
     requested_at: str | None = None
     reason: str | None = None
     hold: bool = False
+    transaction_id: str | None = None
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "ControlCommand":
@@ -44,6 +46,7 @@ class ControlCommand:
             "requested_at": self.requested_at,
             "reason": self.reason,
             "hold": self.hold,
+            "transaction_id": self.transaction_id,
         }
 
 
@@ -93,6 +96,40 @@ class ControlPlane:
             self.settings.job_command_path(job_id),
             ControlCommand(action="early_stop", requested_at=utc_now(), reason=reason, hold=True).to_dict(),
         )
+
+    def request_repack_prepare(self, job_id: str, *, transaction_id: str, reason: str) -> None:
+        self.settings.job_repack_ack_path(job_id).unlink(missing_ok=True)
+        _atomic_json_dump(
+            self.settings.job_command_path(job_id),
+            ControlCommand(
+                action="prepare_repack",
+                requested_at=utc_now(),
+                reason=reason,
+                transaction_id=transaction_id,
+            ).to_dict(),
+        )
+
+    def request_repack_commit(self, job_id: str, *, transaction_id: str) -> None:
+        _atomic_json_dump(
+            self.settings.job_command_path(job_id),
+            ControlCommand(action="commit_repack", requested_at=utc_now(), transaction_id=transaction_id).to_dict(),
+        )
+
+    def request_repack_abort(self, job_id: str, *, transaction_id: str) -> None:
+        _atomic_json_dump(
+            self.settings.job_command_path(job_id),
+            ControlCommand(action="abort_repack", requested_at=utc_now(), transaction_id=transaction_id).to_dict(),
+        )
+
+    def read_repack_ack(self, job_id: str) -> dict[str, Any] | None:
+        path = self.settings.job_repack_ack_path(job_id)
+        if not path.exists():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                return dict(json.load(handle))
+        except (OSError, ValueError, TypeError):
+            return None
 
     def write_heartbeat(self, snapshot: ProgressSnapshot) -> None:
         _atomic_json_dump(self.settings.job_heartbeat_path(snapshot.job_id), snapshot.to_dict())
@@ -162,7 +199,11 @@ class TrainingControlHook:
         )
         self.control_plane.write_heartbeat(snapshot)
         metadata_updates: dict[str, Any] | None = None
-        if estimated_total_runtime_seconds is not None or remaining_runtime_seconds is not None:
+        if (
+            estimated_total_runtime_seconds is not None
+            or remaining_runtime_seconds is not None
+            or avg_step_time_ms is not None
+        ):
             metadata_updates = {}
             if estimated_total_runtime_seconds is not None:
                 metadata_updates["runtime_estimated_total_runtime_seconds"] = float(estimated_total_runtime_seconds)
@@ -197,10 +238,12 @@ class TrainingControlHook:
             )
 
         pause_requested = command.action == "pause"
+        repack_requested = command.action == "prepare_repack"
         cancel_requested = command.action == "cancel"
         early_stop_requested = command.action == "early_stop"
         should_checkpoint = (
             pause_requested
+            or repack_requested
             or (early_stop_requested and state_factory is not None)
             or self._should_checkpoint(safe_point_type, epoch=epoch, global_step=global_step)
         )
@@ -209,6 +252,7 @@ class TrainingControlHook:
         if should_checkpoint:
             if state_factory is None:
                 raise RuntimeError("A checkpoint state_factory is required at checkpoint-capable safe points")
+            checkpoint_started_at = time.perf_counter()
             checkpoint_path = self.checkpoint_manager.save_checkpoint(
                 self.store.get_job(self.job.job_id) or self.job,
                 state=state_factory(),
@@ -217,6 +261,9 @@ class TrainingControlHook:
                 global_step=global_step,
                 reason=command.reason or ("scheduled checkpoint" if not pause_requested else "pause requested"),
             )
+            checkpoint_overhead_seconds = max(0.0, time.perf_counter() - checkpoint_started_at)
+            metadata_updates = dict(metadata_updates or {})
+            metadata_updates["scheduler_checkpoint_overhead_seconds"] = checkpoint_overhead_seconds
             snapshot.checkpoint_path = checkpoint_path
             self.control_plane.write_heartbeat(snapshot)
             self.store.update_job(
@@ -240,6 +287,55 @@ class TrainingControlHook:
                 payload={"checkpoint_path": checkpoint_path, "epoch": epoch, "global_step": global_step, "hold": command.hold},
             )
             raise PauseRequested(command.reason or "pause requested")
+
+        if repack_requested:
+            if not command.transaction_id:
+                raise RuntimeError("repack preparation requires a transaction id")
+            _atomic_json_dump(
+                self.control_plane.settings.job_repack_ack_path(self.job.job_id),
+                {
+                    "transaction_id": command.transaction_id,
+                    "checkpoint_path": checkpoint_path,
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "acknowledged_at": utc_now(),
+                },
+            )
+            self.event_logger.emit(
+                "repack_checkpoint_ready",
+                job_id=self.job.job_id,
+                payload={
+                    "transaction_id": command.transaction_id,
+                    "checkpoint_path": checkpoint_path,
+                    "epoch": epoch,
+                    "global_step": global_step,
+                },
+            )
+            while True:
+                next_command = self.control_plane.read_command(self.job.job_id)
+                if next_command.transaction_id != command.transaction_id:
+                    time.sleep(0.05)
+                    continue
+                if next_command.action == "abort_repack":
+                    self.control_plane.clear_command(self.job.job_id)
+                    self.control_plane.settings.job_repack_ack_path(self.job.job_id).unlink(missing_ok=True)
+                    self.event_logger.emit(
+                        "repack_aborted",
+                        job_id=self.job.job_id,
+                        payload={"transaction_id": command.transaction_id},
+                    )
+                    return
+                if next_command.action == "commit_repack":
+                    self.control_plane.clear_command(self.job.job_id)
+                    self.control_plane.settings.job_repack_ack_path(self.job.job_id).unlink(missing_ok=True)
+                    self.store.set_job_status(
+                        self.job.job_id,
+                        JobStatus.PAUSED,
+                        reason="adaptive repack committed",
+                        hold=False,
+                    )
+                    raise PauseRequested("adaptive repack committed")
+                time.sleep(0.05)
 
         if cancel_requested:
             self.control_plane.clear_command(self.job.job_id)

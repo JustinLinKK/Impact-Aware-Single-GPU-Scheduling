@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 from ..domain import (
+    BatchProfileCurve,
     BatchProbeProfile,
     BatchResolution,
     BatchSizeObservation,
@@ -13,10 +14,12 @@ from ..domain import (
     ResourcePrediction,
     TrainingJob,
     build_batch_probe_shape_signature,
+    build_group_signature,
     prediction_timestamp,
 )
 from ..prediction import PredictionRouter, PredictionRouterResult, build_prediction_request
 from ..config import SchedulerSettings
+from ..config import PREDICTION_MODE_BRANCH_PROFILE
 from .planning_repository import PlanningRepository
 
 
@@ -26,6 +29,37 @@ class ResourceEstimator:
         self.repository = repository
         self.prediction_router = PredictionRouter.from_settings(settings)
         self.last_prediction_results: dict[tuple[str, str, int], dict[str, Any]] = {}
+        self._curve_cache: dict[tuple[str, str, str, str], BatchProfileCurve] = {}
+        self._pair_cache: dict[tuple[str, str, str], Any] = {}
+        self._combination_cache: dict[tuple[str, str, tuple[tuple[str, int], ...]], Any] = {}
+        self._pairs_prefetched = False
+
+    def begin_planning_cycle(self) -> None:
+        """Refresh event-sensitive data, then cache it within one planner run."""
+        self._curve_cache.clear()
+        self._pair_cache.clear()
+        self._combination_cache.clear()
+        self._pairs_prefetched = False
+        pair_lister = getattr(self.repository, "list_pair_profiles", None)
+        if callable(pair_lister):
+            self._pairs_prefetched = True
+            for profile in pair_lister(hardware_key=self.repository.hardware_key()):
+                signatures = sorted((profile.left_signature, profile.right_signature))
+                self._pair_cache[(signatures[0], signatures[1], profile.backend_name)] = profile
+        combination_lister = getattr(self.repository, "list_combination_profiles", None)
+        if callable(combination_lister):
+            for profile in combination_lister(
+                hardware_key=self.repository.hardware_key(),
+                scheduler_mode=self.settings.gpu_scheduler.mode,
+            ):
+                key = (
+                    profile.group_signature,
+                    profile.backend_name,
+                    tuple(sorted((str(job_id), int(batch)) for job_id, batch in profile.batch_vector.items())),
+                )
+                incumbent = self._combination_cache.get(key)
+                if incumbent is None or (profile.resolved_optimal and not incumbent.resolved_optimal):
+                    self._combination_cache[key] = profile
 
     def safe_budget_mb(self) -> float:
         hardware = self.repository.hardware_profile()
@@ -33,6 +67,9 @@ class ResourceEstimator:
 
     def resolved_batch_size(self, job: TrainingJob) -> int:
         return BatchResolution.resolved_batch_size(job)
+
+    def authored_batch_size(self, job: TrainingJob) -> int:
+        return BatchResolution.authored_batch_size(job)
 
     def shape_signature(self, job: TrainingJob) -> str:
         return build_batch_probe_shape_signature(job)
@@ -74,6 +111,13 @@ class ResourceEstimator:
         return self.estimate_peak_vram_mb(job, self.resolved_batch_size(job), backend_name) is not None
 
     def estimate_peak_vram_mb(self, job: TrainingJob, batch_size: int, backend_name: str) -> float | None:
+        # Curve points are measured peaks. The device-level safe budget already
+        # supplies their headroom, so do not apply a second prediction margin.
+        curve = self.compatible_batch_profile_curve(job)
+        if curve is not None:
+            point = next((item for item in curve.points if int(item.batch_size) == int(batch_size)), None)
+            if point is not None:
+                return float(point.peak_vram_mb)
         prediction = self.resource_prediction(job, batch_size, backend_name)
         if prediction is None:
             return None
@@ -111,12 +155,31 @@ class ResourceEstimator:
         if live_prediction is not None:
             return live_prediction
 
+        curve = self.compatible_batch_profile_curve(job)
+        if curve is not None:
+            point = next((item for item in curve.points if int(item.batch_size) == int(batch_size)), None)
+            if point is not None:
+                return self._prediction_from_scalars(
+                    job=job,
+                    batch_size=batch_size,
+                    backend_name=backend_name,
+                    source=PredictionSource.BRANCH,
+                    predictor_version="branch_batch_profile_curve_v3",
+                    peak_vram_used_mib=float(point.peak_vram_mb),
+                    step_time_ms=float(point.median_step_time_ms),
+                    confidence=0.95,
+                    warnings=("branch_batch_profile_curve",),
+                )
+
         hardware_key = self.repository.hardware_key()
         request = build_prediction_request(job, hardware_key=hardware_key, backend=backend_name, batch_size=batch_size)
         router_result = self.prediction_router.predict(request)
         self._record_prediction_result(job, batch_size, backend_name, router_result)
         if router_result.selected is not None:
             return router_result.selected
+
+        if self.settings.prediction.mode == PREDICTION_MODE_BRANCH_PROFILE:
+            return None
 
         compatible_profile = self._compatible_batch_probe_profile(job)
         if compatible_profile is not None:
@@ -139,6 +202,122 @@ class ResourceEstimator:
         if local_prediction is not None:
             return local_prediction
         return None
+
+    def compatible_batch_profile_curve(self, job: TrainingJob) -> BatchProfileCurve | None:
+        getter = getattr(self.repository, "get_compatible_batch_profile_curve", None)
+        if not callable(getter):
+            return None
+        profile_namespace = (
+            job.batch_probe.profile_namespace
+            or job.metadata.get("batch_probe_profile_namespace")
+            or job.metadata.get("branch_profile_key")
+            or job.metadata.get("model_family_profile_key")
+        )
+        if not profile_namespace:
+            return None
+        shape_signature = (
+            job.batch_probe.shape_signature_override
+            or job.metadata.get("branch_shape_signature")
+            or job.metadata.get("model_family_shape_signature")
+            or self.shape_signature(job)
+        )
+        cache_key = (
+            str(profile_namespace),
+            self.repository.hardware_key(),
+            str(shape_signature),
+            "exclusive",
+        )
+        if cache_key in self._curve_cache:
+            return self._curve_cache[cache_key]
+        try:
+            curve = getter(
+                profile_namespace=str(profile_namespace),
+                hardware_key=cache_key[1],
+                shape_signature=str(shape_signature),
+                contract_version=3,
+                backend_name="exclusive",
+            )
+        except Exception:
+            return None
+        if curve is not None:
+            self._curve_cache[cache_key] = curve
+        return curve
+
+    def predicted_samples_per_second(self, job: TrainingJob, batch_size: int) -> float | None:
+        curve = self.compatible_batch_profile_curve(job)
+        if curve is None:
+            return None
+        point = next((item for item in curve.points if int(item.batch_size) == int(batch_size)), None)
+        return float(point.samples_per_second) if point is not None else None
+
+    def predicted_group_samples_per_second(
+        self,
+        jobs: list[TrainingJob],
+        batch_choices: Mapping[str, int],
+        *,
+        backend_name: str,
+    ) -> float:
+        """Prefer exact combination throughput, then apply worst pair slowdown."""
+        if not jobs:
+            return 0.0
+        standalone = {
+            job.job_id: float(self.predicted_samples_per_second(job, int(batch_choices[job.job_id])) or 0.0)
+            for job in jobs
+        }
+        if len(jobs) == 1:
+            return next(iter(standalone.values()))
+
+        group_signature = build_group_signature([job.packing.signature or job.job_id for job in jobs])
+        expected_vector = {str(job_id): int(batch) for job_id, batch in batch_choices.items()}
+        combination_key = (group_signature, backend_name, tuple(sorted(expected_vector.items())))
+        exact = self._combination_cache.get(combination_key)
+        if exact is not None and exact.compatible:
+            for key in ("aggregate_samples_per_second", "samples_per_second", "throughput_samples_per_second"):
+                try:
+                    measured = float((exact.metadata or {}).get(key))
+                except (TypeError, ValueError):
+                    continue
+                if measured > 0:
+                    return measured
+
+        unknown_slowdown = float(self.settings.gpu_scheduler.thresholds.pack_reject_max_slowdown)
+        total = 0.0
+        for job in jobs:
+            worst = 1.0
+            for other in jobs:
+                if other.job_id == job.job_id:
+                    continue
+                signatures = sorted((job.packing.signature or "", other.packing.signature or ""))
+                pair_key = (signatures[0], signatures[1], backend_name)
+                if pair_key not in self._pair_cache and not self._pairs_prefetched:
+                    self._pair_cache[pair_key] = self.repository.get_pair_profile(
+                        signatures[0], signatures[1], backend_name=backend_name
+                    ) or False
+                pair = self._pair_cache.get(pair_key, False)
+                if pair is False:
+                    pair = None
+                slowdown = pair.slowdown_ratio if pair is not None else None
+                worst = max(worst, float(slowdown) if slowdown is not None else unknown_slowdown)
+            total += standalone[job.job_id] / max(1.0, worst)
+        return total
+
+    def combination_is_compatible(
+        self,
+        jobs: list[TrainingJob],
+        batch_choices: Mapping[str, int],
+        *,
+        backend_name: str,
+    ) -> bool:
+        if len(jobs) < 2 or not self._combination_cache:
+            return True
+        group_signature = build_group_signature([job.packing.signature or job.job_id for job in jobs])
+        key = (
+            group_signature,
+            backend_name,
+            tuple(sorted((str(job_id), int(batch)) for job_id, batch in batch_choices.items())),
+        )
+        profile = self._combination_cache.get(key)
+        return profile is None or bool(profile.compatible)
 
     def reserved_vram_upper_mib(self, prediction: ResourcePrediction) -> float | None:
         scalar = prediction.peak_torch_reserved_mib or prediction.peak_vram_used_mib
@@ -165,6 +344,8 @@ class ResourceEstimator:
         self.last_prediction_results[(job.job_id, backend_name, int(batch_size))] = result.to_dict()
 
     def _live_memory_prediction(self, job: TrainingJob, batch_size: int, backend_name: str) -> ResourcePrediction | None:
+        if int(batch_size) != self.resolved_batch_size(job):
+            return None
         reserved = self._metadata_float(job, "runtime_peak_torch_reserved_mib", "runtime_peak_torch_reserved_mb")
         vram = self._metadata_float(job, "runtime_peak_vram_used_mib", "runtime_peak_vram_mb")
         if reserved is None and vram is None:

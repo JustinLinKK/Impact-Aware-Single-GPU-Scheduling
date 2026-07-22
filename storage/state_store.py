@@ -10,6 +10,12 @@ from .sqlite_store import SQLiteStateStore
 
 
 _PROFILE_METHODS = {
+    "upsert_batch_profile_curve",
+    "get_batch_profile_curve",
+    "get_compatible_batch_profile_curve",
+    "list_batch_profile_curves",
+    "upsert_batch_profile_point",
+    "list_batch_profile_points",
     "upsert_solo_profile",
     "get_solo_profile",
     "list_solo_profiles",

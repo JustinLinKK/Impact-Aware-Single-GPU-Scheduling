@@ -1,334 +1,148 @@
-# localml_scheduler
-
-`localml_scheduler` is a reusable local-first ML job manager for single-machine agent workflows. The current version focuses on:
-
-- a single-GPU scheduler with priority queueing, safe-point pause/resume, persistence, and restart recovery
-
-- a RAM-backed baseline-model cache with optional LRU entry-capacity and RAM-percent limits that keeps immutable CPU-side baselines warm and serves isolated copies to worker subprocesses
-
-- packed GPU scheduling including fixed-width packed groups and a `parallel_auto_pack` admission path that targets VRAM or SM utilization
-
-- four execution backends (exclusive, MPS, stream, cuda_process) selectable per pack
-
-- optional Linux hybrid overlap across `mps` and `stream` backend groups on one GPU when concurrent groups are enabled
-
-- optional batch-size probing with SQLite-backed reuse for repeated model/device/shape combinations
-
-- one-epoch runtime profiling that makes new job families pack-eligible after the first exclusive calibration run
-
-- a SchedulerKnowledgeBase + FastMCP server that exposes read-only graph queries and Qdrant-backed hardware feature search to external agents
-
-It is packaged as a root-level module so it can be used by MLEvolve or detached and integrated into other agent pipelines.
-
-## Package Layout (verified against HEAD)
-
-- `__init__.py` (top): re-exports `SchedulerClient` from `client.py:1`, `SchedulerConfig` from `config/__init__.py`, `SchedulerEngine` from `engine.py`, plus domain types and DTOs (`__init__.py:1`-30)
-
-- `client.py`: thin RPC-style client surface for submitting jobs and querying state (`client.py:1`-180)
-
-- `engine.py`: factory that wires `SchedulerConfig` into `SchedulerService` plus stores (`engine.py:1`-50)
-
-- `dto.py`: serializable request/response models (`JobCommandRequest`, `JobQuery`, `PreloadRequest`, `ReportQuery`, `SubmitJobRequest`)
-
-- `cli.py`: argparse-driven CLI used for `scheduler start`, `scheduler mcp`, `hardware-features ingest`, `submit`, `list`, `status`, `pause`, `resume`, `cancel`, `preload`
-
-- `mcp_server.py`: `build_mcp_server()` registers tools on FastMCP (see MCP Graph Surface section)
-
-- `graph_knowledge.py`: `SchedulerKnowledgeBase` (`graph_knowledge.py:26`) is the read-only query layer used by `mcp_server.py`
-
-- `hardware.py`: `HardwareProfile` data class plus host-side detection helpers
-
-- `scheduler/`: planner, queue, service loop, supervisor (see Scheduler Internals)
-
-- `domain/`: domain models (`TrainingJob`, profiles, identity helpers, progress snapshots)
-
-- `execution/`: subprocess launcher, backends, file-based control plane, worker entry, stream host
-
-- `storage/`: `StateStore` facade plus scheduler SQLite, branch-profile SQLite, and Postgres log-store backends
-
-- `profiling/`: `batch_probe.py` and `runtime_probe.py`
-
-- `model_cache/`: in-memory LRU baseline cache plus a local socket server for worker access
-
-- `observability/`: event logger, metrics collector, scheduler-logger setup
-
-- `checkpointing/`: atomic local checkpoint save/load
-
-- `adapters/`: `mlevolve.py` builds `TrainingJob` from MLEvolve runner specs
-
-- `../hardware_knowledge_graph/`: standalone hardware knowledge graph config, client, records, and Neo4j store
-
-- `configs/`: example YAML settings (single-machine, nautilus, full-stack variants)
-
-- `runtime/`: per-run runtime artifacts created at start-up
-
-- `examples/`: toy PyTorch runner plus demo submission scripts
-
-- `tests/`: scheduler, profile, cache, hardware knowledge, and integration tests
-
-## Scheduler Internals (`scheduler/`)
-
-- `service.py` `class SchedulerService` (`service.py:49`) owns the main loop. `run_forever()` (`service.py:153`) repeats: `_poll_active_workers`, `_process_commands`, `_warm_cache`, `_poll_telemetry`, `_enforce_packed_safety`, `_maybe_preempt`, `_dispatch_pending_work` per `scheduler_poll_interval_seconds`
-
-- `placement_planner.py` `class PlacementPlanner` (`placement_planner.py:26`) composes `ResourceEstimator`, `CompatibilityEvaluator`, `RuntimeGuardrail`, `CandidateGenerator`, `ObjectiveScorer` (`placement_planner.py:33`-44). `choose_plan()` (`placement_planner.py:61`) returns a `DispatchPlan` or `None`
-
-- `candidate_generator.py` `class CandidateGenerator` yields candidate job groups via `candidate_groups()` and per-job power-of-two batch-size grids via `candidate_batch_sizes()`
-
-- `group_sizing.py` resolves mode-specific candidate group width: fixed parallel modes use `max_packed_jobs_per_gpu` plus the legacy `allow_three_way_packing` widening, while `parallel_auto_pack` can size up to `candidate_window_size` and includes singleton admission candidates. The resolved policy is emitted in planner traces as `candidate_group_sizing`
-
-- `compatibility.py` `class CompatibilityEvaluator` (`compatibility.py:50`). `compatible_group()` (`compatibility.py:63`) rejects packs when any pair has `SoloProfile.avg_gpu_utilization` above `pack_reject_sm_active_ge` or when a `PairProfile` is on cooldown / over `pack_reject_max_slowdown`. Pair scoring lives in `compatibility_score()` (`compatibility.py:13`-39)
-
-- `objective.py` `class ObjectiveScorer` (`objective.py:17`). Three scorers: `evaluate_fixed_group()` (`objective.py:34`) for `PARALLEL_DEFAULT`, `evaluate_optimized_group()` (`objective.py:56`) for `PARALLEL_BATCH_OPTIMIZED` (caches via `CombinationProfile`), `evaluate_auto_pack_group()` (`objective.py:126`) for `PARALLEL_AUTO_PACK`
-
-- `resource_estimator.py` `class ResourceEstimator` (`resource_estimator.py:11`). VRAM fallback chain in `estimate_peak_vram_mb()` (`resource_estimator.py:52`-91): exact `BatchSizeObservation` → nearest-batch interpolation → `BatchProbeProfile` → `SoloProfile` → `job.resource_requirements.estimated_vram_mb` → `0.0`. SM estimate uses a shorter chain (`resource_estimator.py:93`-117)
-
-- `runtime_guardrail.py` `class RuntimeGuardrail` (`runtime_guardrail.py:11`). `runtime_penalty()` (`runtime_guardrail.py:16`) returns `(penalty: float, hard_reject: bool)`. Hard-reject fires (`runtime_guardrail.py:35`) only when every job in the group has a `source="probe"` profile and the ratio `max / min` exceeds `auto_pack.runtime_skew_guardrail_ratio`
-
-- `planning_repository.py` `class PlanningRepository` (Protocol) wraps the store reads the planner needs: `hardware_profile`, `get_solo_profile`, `get_pair_profile`, `get_batch_probe_profile`, `get_batch_size_observation`, `best_combination_profile`
-
-- `policies.py`: scheduling policies (priority/age ordering) consumed by `RunnableJobQueue`
-
-- `queue.py` `class RunnableJobQueue`: orders queued jobs per policy
-
-- `supervisor.py` `class WorkerSupervisor` (`supervisor.py:50`). Dispatches a `DispatchPlan` to the right backend via `BackendRegistry` (`supervisor.py:64`). Returns a `PlacementGroupHandle` (`supervisor.py:35`) that tracks worker processes
-
-- `recovery.py`: scans persisted job state on start and reconciles recoverable jobs
-
-- `telemetry.py`: lightweight `nvidia-smi` sampler used by `service.py:_poll_telemetry`
-
-- `planner_types.py`: `DispatchPlan`, `EvaluatedGroup` dataclasses returned by the planner
-
-## Scheduler Modes (`config/models.py:13`-17)
-
-- `SCHEDULER_MODE_SERIAL_BASIC = "serial_basic"` — single job at a time, exclusive backend
-
-- `SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED = "serial_batch_optimized"` — single job plus exclusive-path batch probe
-
-- `SCHEDULER_MODE_PARALLEL_DEFAULT = "parallel_default"` — fixed-width packed groups, scored by `evaluate_fixed_group`
-
-- `SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED = "parallel_batch_optimized"` — packed groups with per-job batch search, scored by `evaluate_optimized_group`, cached in `CombinationProfile`
-
-- `SCHEDULER_MODE_PARALLEL_AUTO_PACK = "parallel_auto_pack"` — admission targets `auto_pack.target_metric` (`vram` or `sm`), guarded by `RuntimeGuardrail`
-
-## Execution Backends (`execution/backends.py`)
-
-- `ExclusiveBackend` (`backends.py:54`): single-job launch, sets `CUDA_VISIBLE_DEVICES`, one subprocess per job, one CUDA context
-
-- `CudaProcessBackend` (`backends.py:73`): N-job pack, each job in its own subprocess and CUDA context, sets `OMP_NUM_THREADS` and `MKL_NUM_THREADS` per the `CudaProcessSettings`. Driver time-slices the contexts
-
-- `MPSBackend` (`backends.py:93`): N-job pack, starts `nvidia-cuda-mps-control -d` (`backends.py:142`-148), allocates `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` per job (`backends.py:121`-140), one MPS-merged CUDA context shared across subprocesses
-
-- `StreamBackend` (`backends.py:161`): N-job pack spawned as one host process running `python -m localml_scheduler.execution.stream_host` (`backends.py:179`-187). Inside the host, `_run_job_in_thread()` (`stream_host.py:23`) runs each job in its own `threading.Thread` (`stream_host.py:64`) with its own `torch.cuda.Stream()` (`stream_host.py:32`-35), all sharing one Python interpreter and one CUDA context
-
-- `BackendRegistry` (`execution/backend_registry.py`) selects the active backend per `DispatchPlan` and reports availability to `WorkerSupervisor`
-
-## Domain Models (`domain/`)
-
-- `domain/jobs.py`: `JobStatus` enum (`jobs.py:13`), `SafePointType` (`jobs.py:29`), `CommandType` (`jobs.py:37`), `ResourceRequirements` (`jobs.py:70`), `PackingSpec` (`jobs.py:86`), `BatchProbeSpec` (`jobs.py:111`), and the main `TrainingJob` dataclass
-
-- `domain/profiles.py`: `SoloProfile` (`profiles.py:39`), `BatchProbeTrialResult` (`profiles.py:72`), `BatchProbeProfile` (`profiles.py:88`), `BatchSizeObservation` (`profiles.py:127`), `PairProfile` (`profiles.py:172`), `CombinationProfile` (`profiles.py:236`), `RuntimeProfile` (`profiles.py:308`), `RunProfile` (`profiles.py:382`), `JobCommand` (`profiles.py:468`)
-
-- `domain/identity.py`: signature builders such as `build_group_signature`, `build_backend_scoped_pair_key`, `build_combination_key`, `build_runtime_profile_key`
-
-- `domain/batching.py`: `BatchResolution.resolved_batch_size()` consumed by both planner and runtime probe
-
-- `domain/common.py`: timestamp parsing and primitive conversion helpers
-
-- `domain/progress.py`: `JobProgress`, `PlacementAssignment`, `ProgressSnapshot`
-
-## Storage (`storage/`)
-
-- `state_store.py`: `class StateStore` (`state_store.py:123`) is the canonical writable facade and `_MirrorStateStore` (`state_store.py:15`) layers SQLite primary + best-effort Neo4j mirror
-
-- `sqlite_store.py`: `class SQLiteStateStore` (`sqlite_store.py:32`) — persistent SQLite source of truth for jobs, profiles, commands, cache metadata
-
-- `neo4j_store.py`: `class Neo4jStateStore` (`neo4j_store.py:73`) — optional Neo4j mirror that keeps a property-graph view of jobs and profiles for the MCP knowledge surface
-
-- `log_store.py`: `class SchedulerLogStore` (`log_store.py:21`) — append-only Postgres analytics for sessions, events, metrics
-
-See [`docs/scheduler_observability.md`](../docs/scheduler_observability.md) for Postgres setup, `LOCALML_SCHEDULER_LOG_DSN`, and query examples that reconstruct a scheduler run from startup through probing, planning, dispatch, and worker execution.
-
-- `repositories.py`: concrete `PlanningRepository` implementations backed by the stores above
-
-- `models.py`: shared row schemas used by the SQL backends
-
-- `sqlite_bundle.py`: bundles the SQLite schema migration entry points
-
-## Execution Detail (`execution/`)
-
-- `executor.py` `class SubprocessExecutor` (`executor.py:24`): `start(job)` (`executor.py:31`) calls `subprocess.Popen(...)` (`executor.py:47`) with `python -m localml_scheduler.execution.worker_entry --runtime-root <root> --job-id <id>` and returns a `WorkerProcessHandle` (`executor.py:16`)
-
-- `worker_entry.py` `_run_job(runtime_root, job_id)` (`worker_entry.py:17`): loads settings + state store, runs `run_batch_probe_preflight()` (`worker_entry.py:28`), resolves the runner target, executes it, and handles `PauseRequested` / `CancelRequested`
-
-- `worker_runtime.py`: shared helpers, including `create_runner_context()` that wires the `RunnerContext` exposed to user runners
-
-- `runner_protocol.py`: `RunnerContext` dataclass (`runner_protocol.py:45`-56) carrying `job`, `settings`, `store`, `event_logger`, `control_hook`, `checkpoint_manager`, `cache_client`
-
-- `control.py`: file-based pause/cancel signalling. The worker reads a JSON command file at `job_command_path(job_id)` and raises `PauseRequested` / `CancelRequested` (`control.py:17`-21)
-
-- `stream_host.py`: one Python process for all jobs in a stream-backend pack. Each job runs in its own thread with a private `torch.cuda.Stream()` inside one shared CUDA context (`stream_host.py:32`-35, `stream_host.py:64`)
-
-- `backend_registry.py`: maps backend names to backend instances and reports availability for the supervisor and planner
-
-## Profiling (`profiling/`)
-
-- `batch_probe.py`: `run_batch_probe_preflight(context)` decides between cache hit / cache miss for the job's `BatchProbeProfile`. MLEvolve model-family probe jobs populate reusable profiles from real generated scripts; derivative jobs set `BatchProbeSpec.reuse_only` with that family `profile_key` and do not probe every modified model. New probes use power-of-two search only. Events emitted include `batch_probe_started`, `batch_probe_cache_hit`, `batch_probe_cache_miss`, `batch_probe_reuse_miss`, `batch_probe_trial`, `batch_probe_failed`, `batch_probe_selected`, `batch_probe_warning`
-
-- `runtime_probe.py`: `runtime_profile_for_job(store, job, backend_name)` (`runtime_probe.py:21`) looks up the persisted `RuntimeProfile` for `(packing.signature, resolved_batch_size, backend_name)`. The `RuntimeProfile` (`profiles.py:308`) stores `startup_seconds`, `epoch_1_seconds`, `steps_per_epoch`, `avg_step_time_ms`, `estimated_total_runtime_seconds`, `confidence`, `observations`, `source`
-
-## Observability (`observability/`)
-
-- `events.py` `class EventLogger`: `emit(event_type, job_id, payload)` writes to JSONL plus `StateStore` plus `SchedulerLogStore`
-
-- `metrics.py` `class MetricsCollector`: `build_report()` aggregates scheduler state into a `SchedulerReport`
-
-- `logging_utils.py` `setup_scheduler_logger()`: configures dual stream + file handlers for the scheduler log path
-
-## Model Cache (`model_cache/`)
-
-- `cache_server.py`: small Unix-domain (or TCP) socket server, length-prefixed pickle framing, threading server class with `CacheRequestHandler` for worker access
-
-- `baseline_cache.py`: LRU RAM cache keyed by model id. Eviction triggers when `memory_budget_bytes` or `max_ram_percent` is exceeded, skipping pinned entries
-
-- `warming.py`: `select_models_to_warm(jobs, top_k=2, selection_policy="top_k")` chooses which baselines to preload before dispatch
-
-## MCP Graph Surface (`mcp_server.py`)
-
-`build_mcp_server(settings)` (`mcp_server.py:13`) constructs a FastMCP server fed by `SchedulerKnowledgeBase`. The registered tools are:
-
-- `get_job_graph_context(job_id)`
-
-- `search_hardware(query=None, limit=10)`
-
-- `get_hardware_context(hardware_key="current", include_scheduler_limits=True)`
-
-- `get_job_design_context(candidate, limit=5)`
-
-- `search_profiles(...)`
-
-- `get_runtime_estimate(...)`
-
-- `recommend_batch_size(...)`
-
-- `recommend_epochs(...)`
-
-- `get_packet_compatibility(...)`
-
-- `search_profile_summaries(query, limit=20)`
-
-- `search_hardware_features(...)`
-
-- `get_hardware_feature_context(...)`
-
-All tools are read-only. They summarize graph evidence and config-derived scheduler limits but do not mutate jobs, profiles, or event history.
-
-The hardware feature tools read the standalone hardware knowledge graph. For
-local development, start the hardware Neo4j service and ingest the graph JSON:
-
-```bash
-./docker_host_databases.sh up
-python -m hardware_knowledge_graph.cli ingest --config config.yaml --schema-root schema
+# MLEvolve adaptive GPU scheduler
+
+The local scheduler provides event-driven, single-GPU packing for elastic MLEvolve training jobs. There is one scheduler mode: `adaptive`. Set `gpu_scheduler.enabled: false` when jobs should execute directly without scheduler placement.
+
+Prediction has two strict modes:
+
+- `branch_profile` uses measured v3 batch curves and end-to-end samples/second.
+- `ml_predictor` predicts VRAM and SM for authored half/base/double batches. SM is a safety guardrail; occupancy is used only after admission and fairness.
+
+Old scheduler and prediction mode names are rejected. This is intentionally a cold rollout: old queued jobs must be resubmitted and old profile contracts remain stored only for audit.
+
+## Realtime workflow
+
+```mermaid
+flowchart TD
+    E[Submit, complete, fail, cancel, profile, or recovery event] --> DB[Coalesce events for replan debounce]
+    DB --> M{Prediction mode}
+    M -->|branch_profile| P{All candidate curves ready?}
+    P -->|No| L[Latch profile drain and stop admissions]
+    L --> A{Active pack empty?}
+    A -->|No| A
+    A -->|Yes| Q[Probe each distinct missing profile key exclusively]
+    Q --> P
+    P -->|Yes| C[Build up to three measured batch choices]
+    M -->|ml_predictor| ML[Predict authored half, base, and double]
+    ML --> S
+    C --> S[Combine pinned active jobs with queued window]
+    S --> X{Candidates at most exact cutoff?}
+    X -->|Yes| B[Exact branch-and-bound]
+    X -->|No| D[Bounded multiple-choice knapsack DP]
+    B --> V[Validate exact resource and compatibility constraints]
+    D --> V
+    V --> I{Placement improves incumbent?}
+    I -->|No| K[Keep active pack]
+    I -->|Yes, no active changes| R[Launch placement]
+    I -->|Yes, active batches change| CP[Checkpoint and park all affected jobs]
+    CP --> ACK{Every checkpoint durable?}
+    ACK -->|No or timeout| AB[Abort and unpark incumbent]
+    ACK -->|Yes| COMMIT[Commit batch vector and restart]
+    COMMIT --> R
+    R --> O{Launch or runtime OOM?}
+    O -->|Yes| RB[Mark exact combination incompatible, restore old pack, requeue new jobs]
+    O -->|No| T[Collect throughput, slowdown, VRAM, and checkpoint cost]
+    T --> E
 ```
 
-Use `--dry-run` to validate and summarize graph records without writing to
-Neo4j. MCP search/context calls return empty results instead of failing the
-scheduler when the hardware graph is disabled or unavailable.
+Healthy active jobs are pinned. A plan may resize them and admit waiting work, but it cannot evict them in favor of another healthy job.
 
-## How To Run
+## Batch and profile contract
 
-Start the scheduler:
+Every job has two batch identities:
 
-```bash
-python -m localml_scheduler.cli scheduler start --config config.yaml
+- `authored_batch_size` is the immutable power-of-two value submitted by generated code.
+- `current_batch_size` is the mutable scheduler placement value.
+
+The scheduler never rewrites `runner_kwargs` or generated source when it changes a placement.
+
+Branch profiles use `BatchProfileCurve` and `BatchProfilePoint` contract version 3. A curve is keyed by profile namespace, model/branch, shape, hardware, backend, and contract version. Successful points store batch size, peak VRAM, median throughput, median step time, dispersion, and observation count. The first OOM is a curve boundary, not a feasible point.
+
+Profiling starts at the authored batch and downshifts until it finds a feasible point. It then fills missing powers of two from the configured minimum through the first OOM or batch 4096 cap. Each point uses two warmup and five measured optimizer steps by default, with a clean process per point.
+
+Profile states are `READY`, `WAITING_FOR_DRAIN`, `PROBING`, and `UNAVAILABLE`. Missing keys are deduplicated. Once any key is missing, existing jobs drain naturally, no new training is admitted, and all accumulated missing keys are probed serially. If no point succeeds, dependent jobs become exclusive at the minimum batch; a failed training attempt is terminal.
+
+## Placement and repacking
+
+Hard checks run before scoring: safe VRAM, SM guardrail in ML mode, backend eligibility, explicit incompatibilities, active pinning, and maximum group size.
+
+Branch-profile plans are ordered lexicographically by:
+
+1. Number of waiting jobs admitted.
+2. Waiting-job priority and age.
+3. Aggregate predicted samples/second.
+4. Checkpoint/restart cost and distance from authored batches.
+5. Safe VRAM occupancy.
+
+Exact measured combination throughput is preferred. Otherwise, standalone curve throughput is divided by the worst measured pair slowdown; unknown pairs use the configured maximum acceptable slowdown, normally 1.3.
+
+ML plans use the same admission and fairness ordering, then VRAM occupancy and batch deviation. Active ML packs are not interrupted solely to improve occupancy because that mode has no throughput signal.
+
+An active pack is repacked when it admits waiting work after the 15-second minimum runtime and 60-second cooldown, or when branch-profile throughput improves by at least 5% and estimated time saved exceeds both 15 seconds and twice measured checkpoint/restart cost.
+
+Repacking is transactional. All affected jobs checkpoint after a completed optimizer step and park. The new vector commits only after every checkpoint is durable. A barrier timeout aborts without batch mutation. Launch or runtime OOM marks the exact vector incompatible, restores the prior active vector from durable checkpoints, and returns newly admitted jobs to the queue.
+
+## Search bounds
+
+Each queued job has exclusion plus at most three batch choices; active jobs have no exclusion choice. The unconstrained space is therefore up to `4^N - 1` plans.
+
+- Up to eight candidates: exact branch-and-bound with incremental compatibility checks and capacity/admission/throughput pruning.
+- Larger windows: conservative 128 MiB multiple-choice-knapsack buckets, at most 32 nondominated states per bucket, and exact validation of the best 64 finalists.
+
+With GPU capacity, frontier width, and group size bounded, the DP cost grows approximately linearly with the 16-job candidate window. Per-profile choices, predictions, and compatibility evidence are cached for a planning cycle.
+
+## Elastic generated-code API
+
+Scheduler-managed generated code must use `ElasticTrainingSession`:
+
+```python
+from localml_scheduler.elastic import ElasticTrainingSession
+
+session = ElasticTrainingSession.from_env()
+train_loader = session.make_dataloader(train_dataset, shuffle=True)
+session.register_training_state(
+    model,
+    optimizer,
+    lr_scheduler=scheduler,
+    scaler=scaler,
+    extra_state=extra_state,
+)
+progress = session.restore_if_present()
+
+# After optimizer.step(), never during partial accumulation:
+session.optimizer_step_completed(
+    samples=len(inputs),
+    epoch=epoch,
+    batch_index=batch_index,
+    global_step=global_step,
+    metrics={"loss": float(loss.item())},
+)
 ```
 
-Run the MCP stdio server:
+Atomic checkpoints include model, optimizer, scheduler, scaler, Python/NumPy/Torch CPU and CUDA RNG, sampler position, epoch/global step, accumulation state supplied through extra state, and metrics. Generated code is validated before submission, receives one repair attempt, and is rejected if the contract remains incomplete. There is no AST rewriting or legacy generated-runner fallback.
 
-```bash
-python -m localml_scheduler.cli scheduler mcp
-```
-
-Submit a job:
-
-```bash
-python -m localml_scheduler.cli submit localml_scheduler/examples/job.example.yaml --config config.yaml
-```
-
-Inspect state:
-
-```bash
-python -m localml_scheduler.cli list
-python -m localml_scheduler.cli status <job_id>
-```
-
-Control commands:
-
-```bash
-python -m localml_scheduler.cli pause <job_id>
-python -m localml_scheduler.cli resume <job_id>
-python -m localml_scheduler.cli cancel <job_id>
-python -m localml_scheduler.cli preload <spec.yaml>
-```
-
-Run the demos:
-
-```bash
-python -m localml_scheduler.examples.demo_submit_jobs
-python -m localml_scheduler.examples.demo_mlevolve_bridge
-```
-
-## Custom PyTorch Integration
-
-Point a job at a runner target in `module:function` form:
+## Default configuration
 
 ```yaml
-config:
-  runner_target: "my_pkg.training:run_training_job"
+prediction:
+  mode: branch_profile
+
+gpu_scheduler:
+  enabled: true
+  mode: adaptive
+  candidate_window_size: 16
+  max_packed_jobs_per_gpu: 8
+  memory:
+    vram_budget_fraction: 0.95
+  adaptive:
+    exact_search_max_jobs: 8
+    vram_bucket_mb: 128
+    frontier_width: 32
+    finalist_limit: 64
+    replan_debounce_seconds: 1.0
 ```
 
-The target receives a `RunnerContext` with `job`, `settings`, `store`, `event_logger`, `control_hook`, `checkpoint_manager`, and `cache_client` (see `execution/runner_protocol.py:45`).
+Configuration examples are in `config.example.yaml` and `localml_scheduler/examples/job.example.yaml`.
 
-Structured runners can expose:
+## Verification
 
-- a batch-probe hook used when `batch_probe.enabled: true` is set on a GPU job running through the exclusive backend; probed results are persisted in SQLite and reused for matching jobs
-
-- a runtime-probe contract via `runtime_probe.enabled: true`. The default `epoch_1` strategy treats the first exclusive epoch as calibration, persists a `RuntimeProfile` keyed by workload signature, hardware, backend, and resolved batch size, and then uses that estimate to reject badly skewed packed groups. Jobs without reliable epoch semantics can use `runtime_probe.strategy: "step_window"` instead
-
-- a `preload_source` with `model_id`, `model_path`, and `loader_target`. When present, the scheduler warms that shared source in RAM instead of the job's normal baseline target
-
-The pause flow is:
-
-- scheduler requests pause
-
-- worker reaches the next safe point
-
-- checkpoint is saved atomically
-
-- worker exits cleanly
-
-- scheduler later redispatches the paused job from checkpoint
-
-## Packed Execution Notes
-
-- `parallel_default` and `parallel_batch_optimized` use fixed-width packed groups and fall back to exclusive execution when compatibility or memory evidence is missing
-
-- `parallel_auto_pack` ignores `max_packed_jobs_per_gpu` and keeps admitting work until the configured `auto_pack.target_metric` (`vram` or `sm`) is close to its target threshold
-
-- `planner_decision_trace.candidate_group_sizing` records the effective window size, max candidate group size, and whether singleton candidates were included for the active scheduler mode
-
-- packing is opt-in per job via `packing.eligible: true` and a stable `packing.signature`
-
-- backend compatibility is tracked per backend, so an MPS failure does not poison a stream pairing
-
-- Linux deployments can enable `concurrent_groups_enabled: true` with `concurrent_backend_allowlist: ["mps", "stream"]` to overlap an MPS group and a stream group on the same GPU
-
-- raw MLEvolve snippet execution is conservative; without an explicit runtime-probe hook, jobs stay exclusive-only for runtime-aware packing
-
-## Tests
-
-```bash
-python -m unittest discover localml_scheduler/tests
-```
-
-Newer tests cover branch-profile SQLite storage, scheduler replay, and the
-standalone hardware knowledge graph.
+Focused scheduler tests cover A/B/C resizing and admission, infeasible admission without interruption, drain/probe deduplication, full curves and OOM boundaries, exact search versus exhaustive enumeration, bounded-DP safety, checkpoint timeout, launch and runtime-OOM rollback, recovery, and a 16-candidate planner p95 below 100 ms.

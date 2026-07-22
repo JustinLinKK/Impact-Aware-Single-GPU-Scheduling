@@ -19,14 +19,13 @@ from ..observability.events import EventLogger
 from ..observability.logging_utils import setup_scheduler_logger
 from ..observability.metrics import MetricsCollector
 from ..profiling.runtime_probe import runtime_profile_for_job, successful_runtime_profile_for_packing
-from ..domain import BatchResolution, CombinationProfile, JobStatus, PairProfile, PreloadSource, SoloProfile, TrainingJob, build_group_signature, parse_timestamp, utc_now
-from ..config import SCHEDULER_MODE_AUTO, SCHEDULER_MODE_PARALLEL_AUTO_PACK, SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED, SchedulerSettings, effective_scheduler_mode
+from ..domain import BatchProbeSpec, BatchResolution, CombinationProfile, JobStatus, PackingSpec, PairProfile, PreloadSource, ProfileState, ResourceRequirements, RuntimeProbeSpec, SoloProfile, TrainingJob, build_group_signature, parse_timestamp, utc_now
+from ..config import PREDICTION_MODE_BRANCH_PROFILE, SchedulerSettings
 from ..storage.log_store import SchedulerLogStore
 from ..storage.state_store import StateStore
 from .placement_planner import PlacementPlanner
 from .planner_types import DispatchPlan
 from .policies import PriorityFifoPolicy, SchedulingPolicy
-from .queue import RunnableJobQueue
 from .early_stop import EarlyStopDecision, analyze_metric_plateau
 from .recovery import reconcile_recoverable_jobs
 from .supervisor import WorkerSnapshot, WorkerSupervisor
@@ -35,7 +34,11 @@ from .training_plot import render_training_process
 
 
 RAW_MLEVOLVE_RUNNER_TARGET = "localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job"
-NON_PREEMPTIBLE_PROBE_TASK_TYPES = {"mlevolve_model_family_probe", "mlevolve_startpoint_probe"}
+NON_PREEMPTIBLE_PROBE_TASK_TYPES = {
+    "mlevolve_model_family_probe",
+    "mlevolve_startpoint_probe",
+    "mlevolve_branch_profile_probe",
+}
 EVENT_CANDIDATE_SAMPLE_LIMIT = 8
 EVENT_JOB_ID_SAMPLE_LIMIT = 12
 
@@ -55,6 +58,18 @@ class ActiveRun:
     fallback_triggered: bool = False
     fallback_reason: str | None = None
     overlapped: bool = False
+    repack_transaction: PendingRepack | None = None
+
+
+@dataclass(slots=True)
+class PendingRepack:
+    transaction_id: str
+    target_plan: DispatchPlan
+    rollback_plan: DispatchPlan
+    active_job_ids: tuple[str, ...]
+    prior_batch_sizes: dict[str, int]
+    requested_at_monotonic: float
+    phase: str = "preparing"
 
 
 class SchedulerService:
@@ -83,7 +98,7 @@ class SchedulerService:
             enable_priority_aging=settings.enable_priority_aging,
         )
         self.supervisor = supervisor or WorkerSupervisor(settings, store=self.store)
-        self._configure_auto_mode_backend_policy()
+        self._configure_adaptive_backend_policy()
         self.planner = PlacementPlanner(settings, self.store, self.policy)
         self.telemetry_sampler = telemetry_sampler or NvidiaSmiTelemetrySampler(settings.gpu_scheduler.device_index)
         self.cache = BaselineModelCache(
@@ -98,7 +113,10 @@ class SchedulerService:
         self._active_runs: dict[str, ActiveRun] = {}
         self._device_samples: list[GpuTelemetrySample] = []
         self._last_telemetry_poll_at = 0.0
-        self._idle_coalescing_started_at: float | None = None
+        self._last_adaptive_replan_at = 0.0
+        self._profile_drain_latched = False
+        self._profile_probe_jobs: dict[str, str] = {}
+        self._pending_repack: PendingRepack | None = None
         self._event_throttle_last_emitted: dict[tuple[Any, ...], float] = {}
         self.event_logger.emit(
             "scheduler_session_started",
@@ -108,35 +126,24 @@ class SchedulerService:
             },
         )
 
-    def _configure_auto_mode_backend_policy(self) -> None:
-        if self.settings.gpu_scheduler.mode != SCHEDULER_MODE_AUTO:
-            return
+    def _configure_adaptive_backend_policy(self) -> None:
         gpu = self.settings.gpu_scheduler
-        gpu.mps.enabled = True
-        gpu.stream.enabled = True
-        gpu.cuda_process.enabled = True
         availability = self.supervisor.available_backends()
-        priority: list[str] = [
-            backend_name
-            for backend_name in ("stream_mps", "stream", "cuda_process", "mps")
-            if availability.get(backend_name)
-        ]
+        priority: list[str] = []
         for backend_name in gpu.backend_priority:
             if backend_name != "exclusive" and backend_name not in priority and availability.get(backend_name):
                 priority.append(backend_name)
         priority.append("exclusive")
         gpu.backend_priority = priority
-        gpu.concurrent_backend_allowlist = [name for name in ("stream_mps", "stream") if name in priority]
         event_payload = {
             "configured_mode": gpu.mode,
-            "effective_scheduler_mode": effective_scheduler_mode(gpu.mode),
+            "effective_scheduler_mode": gpu.mode,
             "backend_availability": availability,
             "backend_priority": list(priority),
-            "concurrent_backend_allowlist": list(gpu.concurrent_backend_allowlist),
         }
-        self.event_logger.emit("scheduler_auto_backend_probe", payload=event_payload)
+        self.event_logger.emit("scheduler_adaptive_backend_probe", payload=event_payload)
         self.logger.info(
-            "Auto scheduler backend probe resolved mode=%s priority=%s availability=%s",
+            "Adaptive scheduler backend probe resolved mode=%s priority=%s availability=%s",
             event_payload["effective_scheduler_mode"],
             event_payload["backend_priority"],
             event_payload["backend_availability"],
@@ -245,6 +252,17 @@ class SchedulerService:
         job = self.store.get_job(job_id)
         if job is None or job.status.is_terminal:
             return
+        if self.settings.prediction.mode == PREDICTION_MODE_BRANCH_PROFILE and job.batch_probe.enabled:
+            if not job.batch_probe.profile_namespace:
+                job.batch_probe.profile_namespace = job.packing.signature or f"branch-profile:{job.baseline_model_id}"
+            if job.task_type in NON_PREEMPTIBLE_PROBE_TASK_TYPES or job.task_type == "mlevolve_branch_profile_probe":
+                job.profile_state = ProfileState.PROBING
+            elif self.planner.profile_ready(job):
+                job.profile_state = ProfileState.READY
+            else:
+                job.profile_state = ProfileState.WAITING_FOR_DRAIN
+                self._profile_drain_latched = True
+            self.store.save_job(job)
         if job.status != JobStatus.READY:
             self.store.set_job_status(job_id, JobStatus.READY, reason="job accepted by scheduler", hold=False)
         self.event_logger.emit("job_ready", job_id=job_id, payload={"priority": job.priority})
@@ -479,6 +497,13 @@ class SchedulerService:
     def _handle_worker_exit(self, snapshot: WorkerSnapshot, *, run_context: ActiveRun | None) -> None:
         job = self.store.get_job(snapshot.job_id)
         if job is None:
+            return
+        if (
+            run_context is not None
+            and run_context.repack_transaction is not None
+            and self._worker_exit_indicates_oom(job, snapshot)
+        ):
+            self._rollback_launched_repack(run_context, failed_job_id=job.job_id, reason=job.status_reason or "OOM")
             return
         self._finalize_scheduler_preemption_on_exit(job)
         if snapshot.reported_by == "store":
@@ -737,15 +762,20 @@ class SchedulerService:
             group_signature=group_signature,
             hardware_key=run.hardware_key or self.store.hardware_key(),
             backend_name=run.backend_name,
-            scheduler_mode=effective_scheduler_mode(self.settings.gpu_scheduler.mode),
+            scheduler_mode=self.settings.gpu_scheduler.mode,
         )
         compatible = not run.fallback_triggered and all(job.status != JobStatus.FAILED for job in materialized_jobs)
+        observed_throughputs = {
+            job.job_id: self._metadata_float(job, "runtime_samples_per_second")
+            for job in materialized_jobs
+        }
+        aggregate_samples_per_second = sum(value or 0.0 for value in observed_throughputs.values()) or None
         self.store.upsert_combination_profile(
             CombinationProfile.create(
                 group_signature=group_signature,
                 hardware_key=run.hardware_key or self.store.hardware_key(),
                 backend_name=run.backend_name,
-                scheduler_mode=effective_scheduler_mode(self.settings.gpu_scheduler.mode),
+                scheduler_mode=self.settings.gpu_scheduler.mode,
                 batch_vector=run.batch_overrides,
                 compatible=compatible,
                 observations=(existing.observations + 1) if existing else 1,
@@ -756,10 +786,15 @@ class SchedulerService:
                 avg_step_time_ms=None,
                 objective_score=(summary.peak_vram_mb or 0)
                 / max(1.0, self.settings.gpu_scheduler.memory.budget_mb(run.samples[-1].memory_total_mb if run.samples else None)),
-                resolved_optimal=(effective_scheduler_mode(self.settings.gpu_scheduler.mode) == SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED),
+                resolved_optimal=True,
                 last_failure_reason=run.fallback_reason,
                 fallback_order=run.fallback_order,
-                metadata={"backend_name": run.backend_name, "job_ids": list(run.job_ids)},
+                metadata={
+                    "backend_name": run.backend_name,
+                    "job_ids": list(run.job_ids),
+                    "aggregate_samples_per_second": aggregate_samples_per_second,
+                    "per_job_samples_per_second": observed_throughputs,
+                },
             )
         )
         if len(materialized_jobs) != 2:
@@ -781,6 +816,16 @@ class SchedulerService:
             )
             return
         existing_pair = self.store.get_pair_profile(left_job.packing.signature, right_job.packing.signature, backend_name=run.backend_name)
+        slowdown_ratios: list[float] = []
+        for job in materialized_jobs:
+            observed = observed_throughputs.get(job.job_id)
+            standalone = self.planner.estimator.predicted_samples_per_second(
+                job,
+                run.batch_overrides.get(job.job_id, BatchResolution.resolved_batch_size(job)),
+            )
+            if observed and standalone and observed > 0:
+                slowdown_ratios.append(max(1.0, float(standalone) / float(observed)))
+        measured_slowdown = max(slowdown_ratios) if slowdown_ratios else None
         self.store.upsert_pair_profile(
             PairProfile.create(
                 left_job.packing.signature,
@@ -792,16 +837,16 @@ class SchedulerService:
                 peak_vram_mb=summary.peak_vram_mb,
                 avg_gpu_utilization=summary.avg_gpu_utilization,
                 avg_memory_utilization=summary.avg_memory_utilization,
-                slowdown_ratio=None,
+                slowdown_ratio=measured_slowdown,
                 cooldown_until=None,
                 last_failure_reason=None,
-                metadata={"backend_name": run.backend_name},
+                metadata={
+                    "backend_name": run.backend_name,
+                    "aggregate_samples_per_second": aggregate_samples_per_second,
+                    "per_job_samples_per_second": observed_throughputs,
+                },
             )
         )
-
-    def _next_job(self) -> TrainingJob | None:
-        queue = RunnableJobQueue(policy=self.policy, jobs=self._runnable_jobs())
-        return queue.peek()
 
     def _resolved_batch_size_for_job_id(self, job_id: str) -> int:
         job = self.store.get_job(job_id)
@@ -838,95 +883,7 @@ class SchedulerService:
         return updated_job
 
     def _maybe_preempt(self) -> None:
-        if not self.settings.gpu_scheduler.checkpoint_preemption_enabled:
-            return
         self._enforce_scheduler_preemption_timeouts()
-        if self._has_pending_scheduler_preemption():
-            return
-        if self._maybe_priority_preempt():
-            return
-        self._maybe_resource_replan_preempt()
-
-    def _maybe_priority_preempt(self) -> bool:
-        if len(self._active_runs) != 1:
-            return False
-        active_run = next(iter(self._active_runs.values()))
-        if active_run.mode != "exclusive":
-            return False
-        active_job_id = active_run.job_ids[0] if active_run.job_ids else None
-        if active_job_id is None:
-            return False
-        active_job = self.store.get_job(active_job_id)
-        candidate_job = self._next_job()
-        if active_job is None or candidate_job is None:
-            return False
-        if candidate_job.job_id == active_job.job_id:
-            return False
-        if not self.policy.should_preempt(active_job, candidate_job):
-            return False
-        if not self._supports_safe_preemption(candidate_job):
-            return False
-        if not self._can_preempt_active_job(active_job, active_run, strategy="priority", enforce_runtime_gate=False):
-            return False
-        reason = f"preempted by higher-priority job {candidate_job.job_id}"
-        return self._request_scheduler_preemption(
-            active_job,
-            reason=reason,
-            strategy="priority",
-            preempting_job_ids=[candidate_job.job_id],
-            estimated_gain_seconds=None,
-        )
-
-    def _maybe_resource_replan_preempt(self) -> bool:
-        if effective_scheduler_mode(self.settings.gpu_scheduler.mode) != SCHEDULER_MODE_PARALLEL_AUTO_PACK:
-            return False
-        active_job_ids = set(self._supervisor_active_job_ids())
-        if not active_job_ids:
-            return False
-        runnable = [job for job in self._runnable_jobs() if job.job_id not in active_job_ids]
-        if len(runnable) < 2:
-            return False
-
-        best: tuple[float, TrainingJob, DispatchPlan] | None = None
-        for _group_id, active_run, active_job in self._active_job_records():
-            if not self._can_preempt_active_job(active_job, active_run, strategy="resource_replan", enforce_runtime_gate=True):
-                continue
-            active_vram_mb, active_sm_utilization = self._active_occupancy_excluding({active_job.job_id})
-            plan = self.planner.choose_plan(
-                runnable,
-                backend_available=self.supervisor.available_backends(),
-                active_vram_mb=active_vram_mb,
-                active_sm_utilization=active_sm_utilization,
-            )
-            if plan is None:
-                continue
-            if self._active_jobs_remain_after_excluding({active_job.job_id}) and plan.backend_name == "exclusive":
-                continue
-            if len(plan.job_ids) < 2:
-                continue
-            estimated_gain = self._estimated_packed_runtime_gain_seconds(plan)
-            if not self._preemption_benefit_is_large_enough(
-                active_job,
-                active_run,
-                estimated_gain_seconds=estimated_gain,
-                require_known_gain=True,
-            ):
-                continue
-            score = float(estimated_gain if estimated_gain is not None else len(plan.job_ids))
-            if best is None or score > best[0]:
-                best = (score, active_job, plan)
-
-        if best is None:
-            return False
-        _score, active_job, plan = best
-        reason = f"preempted to run better packed plan {','.join(plan.job_ids)}"
-        return self._request_scheduler_preemption(
-            active_job,
-            reason=reason,
-            strategy="resource_replan",
-            preempting_job_ids=list(plan.job_ids),
-            estimated_gain_seconds=self._estimated_packed_runtime_gain_seconds(plan),
-        )
 
     def _maybe_early_stop(self) -> None:
         early_stop_settings = self.settings.gpu_scheduler.early_stop
@@ -1022,7 +979,7 @@ class SchedulerService:
         if self._is_scheduler_protected_job(job):
             return False
         if job.config.runner_target == RAW_MLEVOLVE_RUNNER_TARGET or job.task_type == "mlevolve_script":
-            return bool(job.metadata.get("supports_checkpoint_resume"))
+            return bool(job.metadata.get("elastic_contract_validated"))
         policy = job.checkpoint_policy
         return bool(job.resume_from_checkpoint or job.latest_checkpoint_path or policy.save_every_epoch or policy.save_every_n_steps)
 
@@ -1263,95 +1220,6 @@ class SchedulerService:
             return max(0.1, avg_step_ms / 1000.0)
         return 1.0
 
-    def _preemption_benefit_is_large_enough(
-        self,
-        job: TrainingJob,
-        run: ActiveRun,
-        *,
-        estimated_gain_seconds: float | None,
-        require_known_gain: bool,
-    ) -> bool:
-        del run
-        if estimated_gain_seconds is None:
-            if require_known_gain:
-                self._emit_scheduler_preemption_skipped(job, reason="estimated gain unavailable", payload={"strategy": "resource_replan"})
-                return False
-            return True
-        threshold = max(
-            float(self.settings.gpu_scheduler.checkpoint_preemption_min_estimated_gain_seconds),
-            self._checkpoint_overhead_seconds(job) * float(self.settings.gpu_scheduler.checkpoint_preemption_overhead_multiplier),
-        )
-        if estimated_gain_seconds < threshold:
-            self._emit_scheduler_preemption_skipped(
-                job,
-                reason="estimated gain below checkpoint overhead threshold",
-                payload={
-                    "estimated_gain_seconds": estimated_gain_seconds,
-                    "required_gain_seconds": threshold,
-                },
-            )
-            return False
-        return True
-
-    def _estimated_packed_runtime_gain_seconds(self, plan: DispatchPlan) -> float | None:
-        estimates: list[float] = []
-        for job_id in plan.job_ids:
-            job = self.store.get_job(job_id)
-            if job is None:
-                return None
-            estimate = self.planner.predicted_remaining_runtime_seconds(job, backend_name=plan.backend_name)
-            if estimate is None:
-                return None
-            estimates.append(float(estimate))
-        if len(estimates) < 2:
-            return None
-        return max(0.0, sum(estimates) - max(estimates))
-
-    def _request_scheduler_preemption(
-        self,
-        job: TrainingJob,
-        *,
-        reason: str,
-        strategy: str,
-        preempting_job_ids: list[str],
-        estimated_gain_seconds: float | None,
-    ) -> bool:
-        if not self.supervisor.request_pause(job.job_id, reason=reason, hold=False):
-            self._emit_scheduler_preemption_skipped(job, reason="pause request rejected by supervisor", payload={"strategy": strategy})
-            return False
-        requested_at = utc_now()
-        count = self._metadata_int(job, "scheduler_preemption_count") + 1
-        metadata_updates = {
-            "scheduler_preemption_pending": True,
-            "scheduler_preemption_requested_at": requested_at,
-            "scheduler_preemption_last_at": requested_at,
-            "scheduler_preemption_count": count,
-            "scheduler_preemption_reason": reason,
-            "scheduler_preemption_strategy": strategy,
-            "scheduler_preemption_preempting_job_ids": list(preempting_job_ids),
-            "scheduler_preemption_estimated_gain_seconds": estimated_gain_seconds,
-            "scheduler_preemption_timeout_reported": False,
-            "scheduler_preemption_resume_emitted": False,
-        }
-        self.store.update_job(
-            job.job_id,
-            status=JobStatus.PAUSING,
-            reason=reason,
-            hold=False,
-            metadata_updates=metadata_updates,
-        )
-        payload = {
-            "reason": reason,
-            "strategy": strategy,
-            "preempting_job_ids": list(preempting_job_ids),
-            "estimated_gain_seconds": estimated_gain_seconds,
-            "count": count,
-            "hold": False,
-        }
-        self.event_logger.emit("scheduler_preemption_requested", job_id=job.job_id, payload=payload)
-        self.event_logger.emit("pause_requested", job_id=job.job_id, payload=payload)
-        return True
-
     def _preemption_resume_updates(
         self,
         job: TrainingJob,
@@ -1456,86 +1324,39 @@ class SchedulerService:
         self.event_logger.emit("planner_decision_trace", payload=event_trace)
 
     def _emit_packing_probe_order_events(self, runnable: list[TrainingJob], plan: DispatchPlan | None) -> None:
-        if effective_scheduler_mode(self.settings.gpu_scheduler.mode) != SCHEDULER_MODE_PARALLEL_AUTO_PACK:
-            return
         trace = getattr(self.planner, "last_decision_trace", None)
-        candidates = list(trace.get("candidates") or []) if isinstance(trace, dict) else []
-        if len(runnable) > 1:
-            runnable_job_ids = [job.job_id for job in runnable]
-            if self._should_emit_throttled_event(
-                ("packing_attempted_before_probe", tuple(runnable_job_ids), len(candidates))
-            ):
-                self.event_logger.emit(
-                    "packing_attempted_before_probe",
-                    payload={
-                        "scheduler_session_id": self.settings.scheduler_session_id,
-                        "runnable_job_ids": runnable_job_ids,
-                        "candidate_count": len(candidates),
-                    },
-                )
-        missing_prediction_candidates = [
-            candidate
-            for candidate in candidates
-            if str(candidate.get("rejection_reason") or "").startswith("VRAM estimate unavailable")
-        ]
-        if missing_prediction_candidates:
-            active_job_ids = self._supervisor_active_job_ids()
-            summary_payload = {
-                "scheduler_session_id": self.settings.scheduler_session_id,
-                "reason": "VRAM estimate unavailable; exclusive calibration probe required",
-                "runnable_job_count": len(runnable),
-                "active_job_ids": active_job_ids,
-                "active_run_count": len(self._active_runs),
-            }
-            summary_payload.update(self._candidate_summary_for_event(missing_prediction_candidates))
-            key = (
-                "packing_skipped_prediction_missing",
-                tuple(active_job_ids),
-                len(runnable),
-                summary_payload.get("candidate_count"),
-                tuple(sorted((summary_payload.get("candidate_backend_counts") or {}).items())),
-                str(summary_payload.get("reason")),
-            )
-            if self._should_emit_throttled_event(key, cooldown_seconds=30.0):
-                self.event_logger.emit("packing_skipped_prediction_missing", payload=summary_payload)
-            if self._active_runs and plan is not None and len(plan.job_ids) == 1 and plan.backend_name == "exclusive":
-                return
-        if plan is not None and len(plan.job_ids) > 1:
+        missing = list(trace.get("missing_profile_job_ids") or []) if isinstance(trace, dict) else []
+        if missing and self._should_emit_throttled_event(("adaptive_profile_wait", tuple(missing)), cooldown_seconds=5.0):
             self.event_logger.emit(
-                "packing_selected_before_probe",
+                "adaptive_profile_wait",
                 payload={
                     "scheduler_session_id": self.settings.scheduler_session_id,
+                    "job_ids": missing,
+                    "active_job_ids": self._supervisor_active_job_ids(),
+                    "drain_latched": self._profile_drain_latched,
+                },
+            )
+        if plan is not None:
+            self.event_logger.emit(
+                "adaptive_plan_selected",
+                payload={
                     "job_ids": list(plan.job_ids),
+                    "active_job_ids": list(plan.active_job_ids),
                     "backend_name": plan.backend_name,
                     "batch_overrides": dict(plan.batch_overrides),
+                    "solver_kind": plan.solver_kind,
+                    "objective_vector": list(plan.objective_vector),
                     "reason": plan.reason,
                 },
             )
-        if (
-            plan is not None
-            and len(plan.job_ids) == 1
-            and plan.backend_name == "exclusive"
-            and missing_prediction_candidates
-        ):
-            job = self.store.get_job(plan.job_ids[0])
-            if job is not None and job.batch_probe.enabled:
-                self.event_logger.emit(
-                    "batch_probe_after_prediction_miss",
-                    job_id=job.job_id,
-                    payload={
-                        "scheduler_session_id": self.settings.scheduler_session_id,
-                        "job_id": job.job_id,
-                        "reason": plan.reason,
-                        "missed_packed_candidates": self._candidate_summary_for_event(missing_prediction_candidates)[
-                            "sample_candidates"
-                        ],
-                        "missed_packed_candidate_count": len(missing_prediction_candidates),
-                        "missed_packed_candidates_truncated": len(missing_prediction_candidates)
-                        > EVENT_CANDIDATE_SAMPLE_LIMIT,
-                    },
-                )
 
-    def _dispatch_plan(self, plan: DispatchPlan) -> bool:
+    def _dispatch_plan(
+        self,
+        plan: DispatchPlan,
+        *,
+        allow_exclusive_fallback: bool = True,
+        repack_transaction: PendingRepack | None = None,
+    ) -> bool:
         selected_jobs = []
         for job_id in plan.job_ids:
             job = self.store.get_job(job_id)
@@ -1581,7 +1402,7 @@ class SchedulerService:
             )
         except Exception as exc:
             self.logger.warning("Dispatch failed for jobs %s: %s", ",".join(plan.job_ids), exc)
-            if plan.backend_name != "exclusive" and selected_jobs and not self._active_runs:
+            if allow_exclusive_fallback and plan.backend_name != "exclusive" and selected_jobs and not self._active_runs:
                 fallback_job = selected_jobs[0]
                 self.logger.warning(
                     "Falling back to exclusive dispatch for %s after backend %s failed",
@@ -1667,6 +1488,7 @@ class SchedulerService:
             fallback_order=list(plan.fallback_order),
             hardware_key=self.store.hardware_key(),
             group_signature=build_group_signature(signatures),
+            repack_transaction=repack_transaction,
         )
         self._log_run_group_open(self._active_runs[group_id], selected_jobs, reason=plan.reason)
         self._emit_worker_launch_events(group_id=group_id, run=self._active_runs[group_id], jobs=selected_jobs, reason=plan.reason)
@@ -1761,6 +1583,117 @@ class SchedulerService:
             )
         return True
 
+    def _mark_plan_incompatible(self, plan: DispatchPlan, *, reason: str) -> None:
+        if len(plan.job_ids) < 2:
+            return
+        jobs = [self.store.get_job(job_id) for job_id in plan.job_ids]
+        materialized = [job for job in jobs if job is not None]
+        if len(materialized) != len(plan.job_ids):
+            return
+        signatures = [job.packing.signature or job.job_id for job in materialized]
+        group_signature = build_group_signature(signatures)
+        self.store.upsert_combination_profile(
+            CombinationProfile.create(
+                group_signature=group_signature,
+                hardware_key=self.store.hardware_key(),
+                backend_name=plan.backend_name,
+                scheduler_mode=self.settings.gpu_scheduler.mode,
+                batch_vector=plan.batch_overrides,
+                compatible=False,
+                observations=1,
+                resolved_optimal=False,
+                last_failure_reason=reason,
+                fallback_order=plan.fallback_order,
+                metadata={"job_ids": list(plan.job_ids), "adaptive_repack_failure": True},
+            )
+        )
+        if len(materialized) == 2:
+            self.store.mark_pair_incompatible(
+                signatures[0],
+                signatures[1],
+                backend_name=plan.backend_name,
+                reason=reason,
+                cooldown_seconds=self.settings.gpu_scheduler.fallback_cooldown_seconds,
+                metadata={"batch_vector": dict(plan.batch_overrides), "adaptive_repack_failure": True},
+            )
+
+    @staticmethod
+    def _worker_exit_indicates_oom(job: TrainingJob, snapshot: WorkerSnapshot) -> bool:
+        evidence = [str(job.status_reason or "")]
+        if snapshot.stderr_path is not None:
+            try:
+                evidence.append(snapshot.stderr_path.read_text(encoding="utf-8", errors="replace")[-16_384:])
+            except OSError:
+                pass
+        lowered = "\n".join(evidence).lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "out of memory",
+                "cuda oom",
+                "cublas_status_alloc_failed",
+                "hip out of memory",
+            )
+        )
+
+    def _rollback_launched_repack(self, run: ActiveRun, *, failed_job_id: str, reason: str) -> None:
+        transaction = run.repack_transaction
+        if transaction is None:
+            return
+        failure_reason = f"adaptive repack runtime OOM: {reason}"
+        self._mark_plan_incompatible(transaction.target_plan, reason=failure_reason)
+        stop_group = getattr(self.supervisor, "stop_group", None)
+        if callable(stop_group):
+            stop_group(run.group_id)
+        self._active_runs.pop(run.group_id, None)
+        self.log_store.close_run_group(
+            group_id=run.group_id,
+            closed_at=utc_now(),
+            overlapped=run.overlapped,
+            fallback_triggered=True,
+            fallback_reason=failure_reason,
+            exit_reason="adaptive_repack_oom_rollback",
+        )
+
+        rollback_ids = set(transaction.rollback_plan.job_ids)
+        for job_id in transaction.target_plan.job_ids:
+            prior_batch = transaction.prior_batch_sizes.get(job_id)
+            job = self.store.get_job(job_id)
+            if job is None:
+                continue
+            if prior_batch is not None:
+                job = self._apply_batch_override(job, prior_batch)
+            self.store.update_job(
+                job_id,
+                status=JobStatus.READY,
+                reason=(
+                    "restored from durable pre-repack checkpoint"
+                    if job_id in rollback_ids
+                    else "new admission returned to queue after repack OOM"
+                ),
+                hold=False,
+                metadata_updates={
+                    "scheduler_repack_runtime_rollback": True,
+                    "scheduler_repack_runtime_rollback_reason": failure_reason,
+                    "scheduler_repack_transaction_id": transaction.transaction_id,
+                },
+            )
+
+        rollback_launched = self._dispatch_plan(transaction.rollback_plan, allow_exclusive_fallback=False)
+        self.event_logger.emit(
+            "adaptive_repack_rolled_back",
+            payload={
+                "transaction_id": transaction.transaction_id,
+                "failed_job_ids": [failed_job_id],
+                "rollback_job_ids": list(transaction.rollback_plan.job_ids),
+                "queued_job_ids": [
+                    job_id for job_id in transaction.target_plan.job_ids if job_id not in rollback_ids
+                ],
+                "reason": failure_reason,
+                "rollback_launched": rollback_launched,
+            },
+        )
+
     def _log_run_group_open(self, run: ActiveRun, jobs: list[TrainingJob], *, reason: str) -> None:
         self.log_store.open_run_group(
             group_id=run.group_id,
@@ -1806,48 +1739,351 @@ class SchedulerService:
                 },
             )
 
+    def _profile_gate_key(self, job: TrainingJob) -> str:
+        namespace = job.batch_probe.profile_namespace or job.packing.signature or job.baseline_model_id
+        shape_signature = self.planner.estimator.shape_signature(job)
+        return f"{namespace}|{shape_signature}|{self.store.hardware_key()}|v3"
+
+    def _set_profile_disposition(
+        self,
+        job: TrainingJob,
+        state: ProfileState,
+        *,
+        force_exclusive: bool = False,
+    ) -> TrainingJob:
+        updated = job.copy()
+        updated.profile_state = state
+        updated.force_exclusive = bool(force_exclusive)
+        if force_exclusive:
+            updated.current_batch_size = max(
+                1,
+                int(updated.batch_probe.minimum_batch_size or self.settings.gpu_scheduler.batch_probe_min_batch_size),
+            )
+            updated.packing.eligible = False
+            updated.packing.backend_allowlist = ["exclusive"]
+        self.store.save_job(updated)
+        return updated
+
+    def _build_profile_probe_job(self, source: TrainingJob, gate_key: str) -> TrainingJob:
+        probe_spec = BatchProbeSpec.from_dict(source.batch_probe.to_dict())
+        probe_spec.contract_version = 3
+        probe_spec.reuse_only = False
+        runner_kwargs = dict(source.config.runner_kwargs)
+        runner_kwargs[BatchResolution.param_name(source)] = source.authored_batch_size
+        runner_kwargs["probe_max_batch_size"] = int(
+            runner_kwargs.get("probe_max_batch_size")
+            or self.settings.gpu_scheduler.batch_probe_max_batch_size
+            or 4096
+        )
+        probe = TrainingJob.create(
+            runner_target="localml_scheduler.profiling.batch_probe:run_branch_profile_probe_job",
+            baseline_model_id=source.baseline_model_id,
+            baseline_model_path=source.baseline_model_path,
+            job_id=f"profile-{uuid.uuid4().hex[:20]}",
+            workflow_id=source.workflow_id,
+            task_type="mlevolve_branch_profile_probe",
+            priority=max(source.priority, int(self.settings.gpu_scheduler.model_family_probe_priority)),
+            runner_kwargs=runner_kwargs,
+            resource_requirements=ResourceRequirements(requires_gpu=True),
+            packing=PackingSpec(eligible=False, signature=gate_key, family="branch_profile_probe", backend_allowlist=["exclusive"]),
+            batch_probe=probe_spec,
+            runtime_probe=RuntimeProbeSpec(enabled=False),
+            checkpoint_policy=source.checkpoint_policy,
+            metadata={
+                "kind": "mlevolve_branch_profile_probe",
+                "exclusive_probe": True,
+                "profile_gate_key": gate_key,
+                "source_job_id": source.job_id,
+            },
+            python_executable=source.config.python_executable,
+            env=dict(source.config.env),
+        )
+        probe.profile_state = ProfileState.PROBING
+        return probe
+
+    def _profile_drain_blocks_dispatch(self, runnable: list[TrainingJob]) -> bool:
+        if self.settings.prediction.mode != PREDICTION_MODE_BRANCH_PROFILE:
+            self._profile_drain_latched = False
+            return False
+        normal_jobs = [
+            job
+            for job in runnable
+            if job.task_type not in NON_PREEMPTIBLE_PROBE_TASK_TYPES and job.task_type != "mlevolve_branch_profile_probe"
+        ]
+        for job in normal_jobs:
+            if (
+                job.batch_probe.enabled
+                and not job.force_exclusive
+                and self.planner.profile_ready(job)
+                and job.profile_state != ProfileState.READY
+            ):
+                self._set_profile_disposition(job, ProfileState.READY)
+        missing = [job for job in normal_jobs if job.batch_probe.enabled and not self.planner.profile_ready(job) and not job.force_exclusive]
+        if missing:
+            self._profile_drain_latched = True
+            for job in missing:
+                if job.profile_state != ProfileState.WAITING_FOR_DRAIN:
+                    self._set_profile_disposition(job, ProfileState.WAITING_FOR_DRAIN)
+        if not self._profile_drain_latched:
+            return False
+        if self._supervisor_active_job_ids():
+            return True
+
+        all_jobs = self.store.list_jobs()
+        by_gate: dict[str, list[TrainingJob]] = {}
+        for job in missing:
+            by_gate.setdefault(self._profile_gate_key(job), []).append(job)
+
+        for gate_key, dependents in by_gate.items():
+            existing = next(
+                (job for job in all_jobs if job.task_type == "mlevolve_branch_profile_probe" and job.metadata.get("profile_gate_key") == gate_key),
+                None,
+            )
+            if existing is None:
+                probe = self._build_profile_probe_job(dependents[0], gate_key)
+                self.store.submit_job(probe)
+                self._profile_probe_jobs[gate_key] = probe.job_id
+                self.event_logger.emit(
+                    "branch_profile_probe_queued",
+                    job_id=probe.job_id,
+                    payload={"profile_gate_key": gate_key, "dependent_job_ids": [job.job_id for job in dependents]},
+                )
+                return True
+            self._profile_probe_jobs[gate_key] = existing.job_id
+            if not existing.status.is_terminal:
+                return False
+            if all(self.planner.profile_ready(job) for job in dependents):
+                for job in dependents:
+                    self._set_profile_disposition(job, ProfileState.READY)
+                continue
+            if existing.status == JobStatus.FAILED:
+                for job in dependents:
+                    self._set_profile_disposition(job, ProfileState.UNAVAILABLE, force_exclusive=True)
+
+        refreshed = self._runnable_jobs()
+        remaining = [
+            job
+            for job in refreshed
+            if job.task_type != "mlevolve_branch_profile_probe"
+            and job.batch_probe.enabled
+            and not job.force_exclusive
+            and not self.planner.profile_ready(job)
+        ]
+        if remaining:
+            return True
+        self._profile_drain_latched = False
+        self.event_logger.emit("branch_profile_drain_released", payload={})
+        return False
+
+    def _active_jobs(self) -> list[TrainingJob]:
+        jobs = [self.store.get_job(job_id) for job_id in self._supervisor_active_job_ids()]
+        return [job for job in jobs if job is not None]
+
+    def _current_active_plan(self, active_jobs: list[TrainingJob]) -> DispatchPlan:
+        run = next(iter(self._active_runs.values()))
+        return DispatchPlan(
+            mode=run.mode,
+            backend_name=run.backend_name,
+            job_ids=tuple(job.job_id for job in active_jobs),
+            reason="rollback to pre-repack placement",
+            batch_overrides={job.job_id: BatchResolution.resolved_batch_size(job) for job in active_jobs},
+            fallback_order=list(run.fallback_order),
+        )
+
+    @staticmethod
+    def _same_placement(left: DispatchPlan, right: DispatchPlan) -> bool:
+        return set(left.job_ids) == set(right.job_ids) and {
+            key: int(value) for key, value in left.batch_overrides.items()
+        } == {key: int(value) for key, value in right.batch_overrides.items()}
+
+    def _repack_qualifies(self, plan: DispatchPlan, active_jobs: list[TrainingJob]) -> bool:
+        active_ids = {job.job_id for job in active_jobs}
+        admitted = set(plan.job_ids) - active_ids
+        active_run = next(iter(self._active_runs.values()))
+        if any(
+            not self._can_preempt_active_job(job, active_run, strategy="adaptive_repack", enforce_runtime_gate=True)
+            for job in active_jobs
+        ):
+            return False
+        if admitted:
+            return True
+        if self.settings.prediction.mode != PREDICTION_MODE_BRANCH_PROFILE or plan.predicted_throughput is None:
+            return False
+        old_throughput = sum(
+            self.planner.estimator.predicted_samples_per_second(job, BatchResolution.resolved_batch_size(job)) or 0.0
+            for job in active_jobs
+        )
+        if old_throughput <= 0:
+            return False
+        gain_fraction = (float(plan.predicted_throughput) - old_throughput) / old_throughput
+        if gain_fraction < self.settings.gpu_scheduler.adaptive.minimum_throughput_gain_fraction:
+            return False
+        remaining = max(
+            (
+                self.planner.predicted_remaining_runtime_seconds(job, backend_name=active_run.backend_name) or 0.0
+                for job in active_jobs
+            ),
+            default=0.0,
+        )
+        estimated_saved = remaining * max(0.0, 1.0 - (old_throughput / float(plan.predicted_throughput)))
+        required = max(
+            float(self.settings.gpu_scheduler.checkpoint_preemption_min_estimated_gain_seconds),
+            sum(self._checkpoint_overhead_seconds(job) for job in active_jobs)
+            * float(self.settings.gpu_scheduler.checkpoint_preemption_overhead_multiplier),
+        )
+        return estimated_saved >= required
+
+    def _begin_repack(self, plan: DispatchPlan, active_jobs: list[TrainingJob]) -> bool:
+        if self._pending_repack is not None or not active_jobs:
+            return False
+        transaction_id = uuid.uuid4().hex
+        reason = f"adaptive repack to admit {','.join(sorted(set(plan.job_ids) - {job.job_id for job in active_jobs}))}"
+        requested: list[str] = []
+        for job in active_jobs:
+            if not self.supervisor.request_repack_prepare(job.job_id, transaction_id=transaction_id, reason=reason):
+                for requested_job_id in requested:
+                    self.supervisor.request_repack_abort(requested_job_id, transaction_id=transaction_id)
+                return False
+            requested.append(job.job_id)
+        requested_at = utc_now()
+        for job in active_jobs:
+            self.store.update_job(
+                job.job_id,
+                metadata_updates={
+                    "scheduler_preemption_last_at": requested_at,
+                    "scheduler_preemption_count": self._metadata_int(job, "scheduler_preemption_count") + 1,
+                    "scheduler_preemption_strategy": "adaptive_repack",
+                    "scheduler_repack_transaction_id": transaction_id,
+                },
+            )
+        self._pending_repack = PendingRepack(
+            transaction_id=transaction_id,
+            target_plan=plan,
+            rollback_plan=self._current_active_plan(active_jobs),
+            active_job_ids=tuple(requested),
+            prior_batch_sizes={
+                job_id: BatchResolution.resolved_batch_size(job)
+                for job_id in plan.job_ids
+                if (job := self.store.get_job(job_id)) is not None
+            },
+            requested_at_monotonic=time.monotonic(),
+        )
+        self.event_logger.emit(
+            "adaptive_repack_preparing",
+            payload={
+                "transaction_id": transaction_id,
+                "active_job_ids": requested,
+                "target_job_ids": list(plan.job_ids),
+                "target_batch_overrides": dict(plan.batch_overrides),
+            },
+        )
+        return True
+
+    def _advance_pending_repack(self) -> bool:
+        transaction = self._pending_repack
+        if transaction is None:
+            return False
+        timeout = float(self.settings.gpu_scheduler.checkpoint_preemption_pause_timeout_seconds)
+        elapsed = time.monotonic() - transaction.requested_at_monotonic
+        if transaction.phase == "preparing":
+            acknowledgements = {
+                job_id: self.supervisor.repack_ack(job_id)
+                for job_id in transaction.active_job_ids
+            }
+            ready = all(
+                payload is not None
+                and payload.get("transaction_id") == transaction.transaction_id
+                and payload.get("checkpoint_path")
+                for payload in acknowledgements.values()
+            )
+            if ready:
+                for job_id, payload in acknowledgements.items():
+                    assert payload is not None
+                    self.store.update_job(job_id, latest_checkpoint_path=str(payload["checkpoint_path"]))
+                    self.supervisor.request_repack_commit(job_id, transaction_id=transaction.transaction_id)
+                transaction.phase = "committing"
+                self.event_logger.emit(
+                    "adaptive_repack_committing",
+                    payload={"transaction_id": transaction.transaction_id, "job_ids": list(transaction.active_job_ids)},
+                )
+                return True
+            if elapsed >= timeout:
+                for job_id in transaction.active_job_ids:
+                    self.supervisor.request_repack_abort(job_id, transaction_id=transaction.transaction_id)
+                self.event_logger.emit(
+                    "adaptive_repack_aborted",
+                    payload={"transaction_id": transaction.transaction_id, "reason": "checkpoint barrier timeout"},
+                )
+                self._pending_repack = None
+                return True
+            return True
+
+        if self._supervisor_active_job_ids():
+            return True
+        target = transaction.target_plan
+        if self._dispatch_plan(
+            target,
+            allow_exclusive_fallback=False,
+            repack_transaction=transaction,
+        ):
+            self.event_logger.emit(
+                "adaptive_repack_committed",
+                payload={"transaction_id": transaction.transaction_id, "job_ids": list(target.job_ids)},
+            )
+            self._pending_repack = None
+            return True
+
+        failure_reason = "adaptive repack target launch failed"
+        self._mark_plan_incompatible(target, reason=failure_reason)
+        for job_id, batch_size in transaction.prior_batch_sizes.items():
+            job = self.store.get_job(job_id)
+            if job is not None:
+                self._apply_batch_override(job, batch_size)
+        self._dispatch_plan(transaction.rollback_plan, allow_exclusive_fallback=False)
+        self.event_logger.emit(
+            "adaptive_repack_rolled_back",
+            payload={
+                "transaction_id": transaction.transaction_id,
+                "failed_job_ids": list(target.job_ids),
+                "rollback_job_ids": list(transaction.rollback_plan.job_ids),
+            },
+        )
+        self._pending_repack = None
+        return True
+
     def _dispatch_pending_work(self) -> None:
-        scheduler_mode = effective_scheduler_mode(self.settings.gpu_scheduler.mode)
-        if scheduler_mode != SCHEDULER_MODE_PARALLEL_AUTO_PACK and self._active_runs:
-            self._idle_coalescing_started_at = None
+        if self._advance_pending_repack():
+            return
+        active_jobs = self._active_jobs()
+        active_ids = {job.job_id for job in active_jobs}
+        runnable = [job for job in self._runnable_jobs() if job.job_id not in active_ids]
+        if self._profile_drain_blocks_dispatch(runnable):
+            return
+        if self._profile_drain_latched:
+            runnable = [job for job in runnable if job.task_type == "mlevolve_branch_profile_probe"]
+        if not runnable and not active_jobs:
             return
 
-        while True:
-            active_job_ids = set(self._supervisor_active_job_ids())
-            runnable = [job for job in self._runnable_jobs() if job.job_id not in active_job_ids]
-            if not runnable:
-                self._idle_coalescing_started_at = None
+        now = time.monotonic()
+        if active_jobs and (now - self._last_adaptive_replan_at) < self.settings.gpu_scheduler.adaptive.replan_debounce_seconds:
+            return
+        self._last_adaptive_replan_at = now
+        plan = self.planner.choose_plan(
+            runnable,
+            active_jobs=active_jobs,
+            backend_available=self.supervisor.available_backends(),
+        )
+        self._emit_planner_decision_trace(plan)
+        self._emit_packing_probe_order_events(runnable, plan)
+        if plan is None:
+            return
+        if active_jobs:
+            current = self._current_active_plan(active_jobs)
+            if self._same_placement(current, plan) or not self._repack_qualifies(plan, active_jobs):
                 return
-            if (
-                scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK
-                and not self._active_runs
-                and len(runnable) == 1
-                and float(getattr(self.settings.gpu_scheduler, "idle_coalescing_window_seconds", 0.0) or 0.0) > 0.0
-            ):
-                now = time.monotonic()
-                if self._idle_coalescing_started_at is None:
-                    self._idle_coalescing_started_at = now
-                    return
-                if (now - self._idle_coalescing_started_at) < float(self.settings.gpu_scheduler.idle_coalescing_window_seconds):
-                    return
-            else:
-                self._idle_coalescing_started_at = None
-            active_vram_mb, active_sm_utilization = self._active_occupancy()
-            plan = self.planner.choose_plan(
-                runnable,
-                backend_available=self.supervisor.available_backends(),
-                active_vram_mb=active_vram_mb,
-                active_sm_utilization=active_sm_utilization,
-            )
-            self._emit_planner_decision_trace(plan)
-            self._emit_packing_probe_order_events(runnable, plan)
-            if plan is None:
-                return
-            if scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK and self._active_runs and plan.backend_name == "exclusive":
-                return
-            dispatched = self._dispatch_plan(plan)
-            if not dispatched or scheduler_mode != SCHEDULER_MODE_PARALLEL_AUTO_PACK:
-                return
+            self._begin_repack(plan, active_jobs)
+            return
+        self._dispatch_plan(plan)
 
     def _dispatch_if_idle(self) -> None:
         """Backward-compatible alias for older tests and call sites."""

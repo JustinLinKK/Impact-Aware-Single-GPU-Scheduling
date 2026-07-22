@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
@@ -21,48 +20,8 @@ import humanize
 from ..execution.runner_protocol import RunnerContext
 from ..scheduler.telemetry import GpuTelemetrySample, NvidiaSmiTelemetrySampler
 from ..domain import BatchProbeTrialResult, BatchResolution, FailureDiagnostic, JobStatus, ProgressSnapshot, utc_now
-from ..runtime_environment import repair_generated_training_code
-from engine.script_introspection import TrainingBatchContract, analyze_training_batch_contract
-from utils.candidate_timing import materialize_phase_instrumented_file, parse_phase_timing_log
-
-_BATCH_SIZE_NAMES = {
-    "batch_size",
-    "train_batch_size",
-    "eval_batch_size",
-    "per_device_train_batch_size",
-    "per_device_eval_batch_size",
-}
-_BATCH_OVERRIDE_VAR = "_MLEVOLVE_BATCH_SIZE_OVERRIDE"
-_EPOCH_COUNT_NAMES = {
-    "epochs",
-    "num_epochs",
-    "n_epochs",
-    "max_epochs",
-    "train_epochs",
-}
-_EPOCH_OVERRIDE_VAR = "_MLEVOLVE_PROBE_MAX_EPOCHS"
-_PROBE_MODE_VAR = "_MLEVOLVE_PROBE_MODE"
-_TRAIN_BATCH_OVERRIDE_VAR = "_MLEVOLVE_PROBE_MAX_TRAIN_BATCHES"
-_PROBE_EVENT_PATH_VAR = "_MLEVOLVE_PROBE_EVENT_PATH"
-_PROBE_OPTIMIZER_STEPS_VAR = "_MLEVOLVE_PROBE_OPTIMIZER_STEPS"
-_GRADIENT_ACCUMULATION_NAMES = {
-    "gradient_accumulation_steps",
-    "grad_accum_steps",
-    "accumulation_steps",
-    "GRADIENT_ACCUMULATION_STEPS",
-    "GRAD_ACCUM_STEPS",
-    "ACCUMULATION_STEPS",
-}
-
-
-@dataclass(slots=True)
-class InstrumentedScript:
-    path: Path
-    had_batch_rewrite: bool
-    syntax_error: str | None = None
-    precision_repair_count: int = 0
-    batch_contract: TrainingBatchContract | None = None
-
+from ..runtime_environment import validate_generated_training_code
+from utils.candidate_timing import parse_phase_timing_log
 
 @dataclass(slots=True)
 class ProbeSubprocessResult:
@@ -147,232 +106,6 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     tmp_path.replace(path)
 
 
-def _override_batch_expr(original_value: ast.expr) -> ast.expr:
-    override_name = ast.Name(id=_BATCH_OVERRIDE_VAR, ctx=ast.Load())
-    return ast.IfExp(
-        test=ast.Compare(left=override_name, ops=[ast.IsNot()], comparators=[ast.Constant(value=None)]),
-        body=ast.Call(func=ast.Name(id="int", ctx=ast.Load()), args=[override_name], keywords=[]),
-        orelse=original_value,
-    )
-
-
-def _override_epoch_expr(original_value: ast.expr) -> ast.expr:
-    override_name = ast.Name(id=_EPOCH_OVERRIDE_VAR, ctx=ast.Load())
-    return ast.IfExp(
-        test=ast.Compare(left=override_name, ops=[ast.IsNot()], comparators=[ast.Constant(value=None)]),
-        body=ast.Call(
-            func=ast.Name(id="min", ctx=ast.Load()),
-            args=[
-                ast.Call(func=ast.Name(id="int", ctx=ast.Load()), args=[override_name], keywords=[]),
-                original_value,
-            ],
-            keywords=[],
-        ),
-        orelse=original_value,
-    )
-
-
-class _BatchOverrideTransformer(ast.NodeTransformer):
-    def __init__(self, contract: TrainingBatchContract) -> None:
-        self.modified = False
-        self.batch_modified = False
-        self._train_sites = {(site.lineno, site.col_offset): site.argument for site in contract.train_sites}
-
-    def visit_Assign(self, node: ast.Assign) -> ast.Assign:
-        node = self.generic_visit(node)
-        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            target_name = node.targets[0].id
-            if target_name in _EPOCH_COUNT_NAMES:
-                node.value = _override_epoch_expr(node.value)
-                self.modified = True
-            elif target_name in _GRADIENT_ACCUMULATION_NAMES:
-                node.value = ast.IfExp(
-                    test=ast.Name(id=_PROBE_MODE_VAR, ctx=ast.Load()),
-                    body=ast.Constant(value=1),
-                    orelse=node.value,
-                )
-                self.modified = True
-        return node
-
-    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AnnAssign:
-        node = self.generic_visit(node)
-        if isinstance(node.target, ast.Name) and node.value is not None:
-            target_name = node.target.id
-            if target_name in _EPOCH_COUNT_NAMES:
-                node.value = _override_epoch_expr(node.value)
-                self.modified = True
-            elif target_name in _GRADIENT_ACCUMULATION_NAMES:
-                node.value = ast.IfExp(
-                    test=ast.Name(id=_PROBE_MODE_VAR, ctx=ast.Load()),
-                    body=ast.Constant(value=1),
-                    orelse=node.value,
-                )
-                self.modified = True
-        return node
-
-    def visit_Call(self, node: ast.Call) -> ast.Call:
-        node = self.generic_visit(node)
-        argument = self._train_sites.get((int(getattr(node, "lineno", 0)), int(getattr(node, "col_offset", 0))))
-        if argument is None:
-            return node
-        if argument.startswith("keyword:"):
-            keyword_name = argument.split(":", 1)[1]
-            for keyword in node.keywords:
-                if keyword.arg == keyword_name:
-                    keyword.value = _override_batch_expr(keyword.value)
-                    self.modified = True
-                    self.batch_modified = True
-                    break
-        elif argument.startswith("positional:"):
-            try:
-                position = int(argument.split(":", 1)[1])
-            except ValueError:
-                return node
-            if len(node.args) > position:
-                node.args[position] = _override_batch_expr(node.args[position])
-                self.modified = True
-                self.batch_modified = True
-        return node
-
-    def visit_For(self, node: ast.For) -> ast.For:
-        node = self.generic_visit(node)
-        if (
-            isinstance(node.target, ast.Name)
-            and node.target.id in {"epoch", "ep", "epoch_idx"}
-            and isinstance(node.iter, ast.Call)
-            and isinstance(node.iter.func, ast.Name)
-            and node.iter.func.id == "range"
-            and node.iter.args
-        ):
-            node.iter.args[0] = _override_epoch_expr(node.iter.args[0])
-            self.modified = True
-        return node
-
-
-def _prepend_after_module_preamble(module: ast.Module, statements: list[ast.stmt]) -> None:
-    """Keep the module docstring and future imports in their required leading positions."""
-    insertion_index = 0
-    if module.body and isinstance(module.body[0], ast.Expr):
-        value = module.body[0].value
-        if isinstance(value, ast.Constant) and isinstance(value.value, str):
-            insertion_index = 1
-    while insertion_index < len(module.body):
-        node = module.body[insertion_index]
-        if not isinstance(node, ast.ImportFrom) or node.module != "__future__":
-            break
-        insertion_index += 1
-    module.body[insertion_index:insertion_index] = statements
-
-
-def _materialize_instrumented_script(script_path: Path, working_dir: Path) -> InstrumentedScript:
-    source = script_path.read_text(encoding="utf-8")
-    repair_result = repair_generated_training_code(source, stage="scheduler_materialize")
-    source = str(repair_result.get("code") or source)
-    precision_repair_count = int(repair_result.get("replacement_count", 0) or 0)
-    try:
-        module = ast.parse(source, filename=str(script_path))
-    except SyntaxError as exc:
-        return InstrumentedScript(
-            path=script_path,
-            had_batch_rewrite=False,
-            syntax_error=str(exc),
-            precision_repair_count=precision_repair_count,
-        )
-
-    batch_contract = analyze_training_batch_contract(source)
-    transformer = _BatchOverrideTransformer(batch_contract)
-    module = transformer.visit(module)
-    ast.fix_missing_locations(module)
-    instrumented_dir = working_dir / "working" / "instrumented_scripts"
-    instrumented_dir.mkdir(parents=True, exist_ok=True)
-
-    if not transformer.modified:
-        if precision_repair_count <= 0:
-            return InstrumentedScript(path=script_path, had_batch_rewrite=False, batch_contract=batch_contract)
-        guarded_path = instrumented_dir / f"{script_path.stem}_precision_guarded.py"
-        guarded_path.write_text(source, encoding="utf-8")
-        return InstrumentedScript(
-            path=guarded_path,
-            had_batch_rewrite=False,
-            precision_repair_count=precision_repair_count,
-            batch_contract=batch_contract,
-        )
-
-    helper_source = (
-        "import json as _mlevolve_json\n"
-        "import os\n"
-        "import time as _mlevolve_time\n"
-        f"{_BATCH_OVERRIDE_VAR} = os.environ.get('MLEVOLVE_BATCH_SIZE_OVERRIDE')\n"
-        f"{_PROBE_MODE_VAR} = os.environ.get('MLEVOLVE_PROBE_MODE') == '1'\n"
-        f"{_EPOCH_OVERRIDE_VAR} = int(os.environ['MLEVOLVE_PROBE_MAX_EPOCHS']) if os.environ.get('MLEVOLVE_PROBE_MAX_EPOCHS') else None\n"
-        f"{_PROBE_EVENT_PATH_VAR} = os.environ.get('MLEVOLVE_PROBE_EVENT_PATH')\n"
-        f"{_PROBE_OPTIMIZER_STEPS_VAR} = max(1, int(os.environ.get('MLEVOLVE_PROBE_OPTIMIZER_STEPS', '1')))\n"
-        "_mlevolve_probe_step_started = None\n"
-        "_mlevolve_probe_steps_completed = 0\n"
-        "def _mlevolve_probe_emit(event_type, **payload):\n"
-        f"    if not {_PROBE_EVENT_PATH_VAR}:\n"
-        "        return\n"
-        "    record = {'event': event_type, 'monotonic': _mlevolve_time.monotonic(), **payload}\n"
-        f"    with open({_PROBE_EVENT_PATH_VAR}, 'a', encoding='utf-8') as _probe_handle:\n"
-        "        _probe_handle.write(_mlevolve_json.dumps(record, sort_keys=True) + '\\n')\n"
-        "        _probe_handle.flush()\n"
-        "def _mlevolve_install_optimizer_probe():\n"
-        f"    if not {_PROBE_MODE_VAR}:\n"
-        "        return\n"
-        "    import torch as _mlevolve_torch\n"
-        "    try:\n"
-        "        if _mlevolve_torch.cuda.is_available():\n"
-        "            _mlevolve_torch.cuda.reset_peak_memory_stats()\n"
-        "    except Exception:\n"
-        "        pass\n"
-        "    _mlevolve_probe_emit('probe_started')\n"
-        "    def _probe_pre_hook(_optimizer, _args, _kwargs):\n"
-        "        global _mlevolve_probe_step_started\n"
-        "        _mlevolve_probe_step_started = _mlevolve_time.monotonic()\n"
-        "        _mlevolve_probe_emit('optimizer_step_started')\n"
-        "    def _probe_post_hook(_optimizer, _args, _kwargs):\n"
-        "        global _mlevolve_probe_steps_completed\n"
-        "        if _mlevolve_torch.cuda.is_available():\n"
-        "            _mlevolve_torch.cuda.synchronize()\n"
-        "            allocated = int(_mlevolve_torch.cuda.max_memory_allocated())\n"
-        "            reserved = int(_mlevolve_torch.cuda.max_memory_reserved())\n"
-        "            total = int(_mlevolve_torch.cuda.get_device_properties(_mlevolve_torch.cuda.current_device()).total_memory)\n"
-        "        else:\n"
-        "            allocated = reserved = total = 0\n"
-        "        elapsed_ms = None if _mlevolve_probe_step_started is None else (_mlevolve_time.monotonic() - _mlevolve_probe_step_started) * 1000.0\n"
-        "        _mlevolve_probe_steps_completed += 1\n"
-        "        _mlevolve_probe_emit('optimizer_step_completed', step=_mlevolve_probe_steps_completed, peak_allocated_bytes=allocated, peak_reserved_bytes=reserved, memory_total_bytes=total, optimizer_step_time_ms=elapsed_ms)\n"
-        f"        if _mlevolve_probe_steps_completed >= {_PROBE_OPTIMIZER_STEPS_VAR}:\n"
-        "            raise SystemExit(0)\n"
-        "    _optimizer_module = getattr(_mlevolve_torch.optim, 'optimizer', None)\n"
-        "    _register_pre = getattr(_optimizer_module, 'register_optimizer_step_pre_hook', None)\n"
-        "    _register_post = getattr(_optimizer_module, 'register_optimizer_step_post_hook', None)\n"
-        "    if callable(_register_pre) and callable(_register_post):\n"
-        "        _register_pre(_probe_pre_hook)\n"
-        "        _register_post(_probe_post_hook)\n"
-        "        return\n"
-        "    _original_init = _mlevolve_torch.optim.Optimizer.__init__\n"
-        "    def _probe_optimizer_init(self, *args, **kwargs):\n"
-        "        _original_init(self, *args, **kwargs)\n"
-        "        self.register_step_pre_hook(_probe_pre_hook)\n"
-        "        self.register_step_post_hook(_probe_post_hook)\n"
-        "    _mlevolve_torch.optim.Optimizer.__init__ = _probe_optimizer_init\n"
-        "_mlevolve_install_optimizer_probe()\n"
-    )
-    helper_module = ast.parse(helper_source, filename=str(script_path))
-    _prepend_after_module_preamble(module, helper_module.body)
-    ast.fix_missing_locations(module)
-
-    instrumented_path = instrumented_dir / f"{script_path.stem}_instrumented.py"
-    instrumented_path.write_text(ast.unparse(module), encoding="utf-8")
-    return InstrumentedScript(
-        path=instrumented_path,
-        had_batch_rewrite=transformer.batch_modified,
-        precision_repair_count=precision_repair_count,
-        batch_contract=batch_contract,
-    )
-
-
 def _base_script_env(
     batch_size_override: int | None = None,
     *,
@@ -381,8 +114,17 @@ def _base_script_env(
     probe_max_train_batches: int | None = None,
     probe_event_path: Path | None = None,
     probe_optimizer_steps: int | None = None,
+    runtime_root: Path | None = None,
+    job_id: str | None = None,
+    probe_warmup_steps: int | None = None,
+    probe_measure_steps: int | None = None,
 ) -> dict[str, str]:
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    repository_root = str(Path(__file__).resolve().parents[2])
+    inherited_pythonpath = str(env.get("PYTHONPATH") or "").strip()
+    env["PYTHONPATH"] = os.pathsep.join(
+        item for item in (repository_root, inherited_pythonpath) if item
+    )
     for key in (
         "MLEVOLVE_BATCH_SIZE_OVERRIDE",
         "MLEVOLVE_PROBE_MODE",
@@ -390,6 +132,10 @@ def _base_script_env(
         "MLEVOLVE_PROBE_MAX_TRAIN_BATCHES",
         "MLEVOLVE_PROBE_EVENT_PATH",
         "MLEVOLVE_PROBE_OPTIMIZER_STEPS",
+        "MLEVOLVE_PROBE_WARMUP_STEPS",
+        "MLEVOLVE_PROBE_MEASURE_STEPS",
+        "LOCALML_SCHEDULER_RUNTIME_ROOT",
+        "LOCALML_SCHEDULER_JOB_ID",
     ):
         env.pop(key, None)
     if batch_size_override is not None:
@@ -404,13 +150,18 @@ def _base_script_env(
         env["MLEVOLVE_PROBE_EVENT_PATH"] = str(probe_event_path)
     if probe_optimizer_steps is not None:
         env["MLEVOLVE_PROBE_OPTIMIZER_STEPS"] = str(max(1, int(probe_optimizer_steps)))
+    if probe_warmup_steps is not None:
+        env["MLEVOLVE_PROBE_WARMUP_STEPS"] = str(max(0, int(probe_warmup_steps)))
+    if probe_measure_steps is not None:
+        env["MLEVOLVE_PROBE_MEASURE_STEPS"] = str(max(1, int(probe_measure_steps)))
+    if runtime_root is not None:
+        env["LOCALML_SCHEDULER_RUNTIME_ROOT"] = str(runtime_root)
+    if job_id is not None:
+        env["LOCALML_SCHEDULER_JOB_ID"] = str(job_id)
     return env
 
 
 def _resolved_batch_size(context: RunnerContext) -> int | None:
-    raw_value = context.job.metadata.get("resolved_batch_size")
-    if raw_value is None:
-        return None
     return BatchResolution.resolved_batch_size(context.job)
 
 
@@ -726,6 +477,10 @@ def _run_probe_subprocess(
     probe_max_train_batches: int,
     probe_optimizer_steps: int = 1,
     step_timeout_seconds: int | None = None,
+    runtime_root: Path | None = None,
+    job_id: str | None = None,
+    warmup_steps: int = 2,
+    measure_steps: int = 5,
 ) -> ProbeSubprocessResult:
     stdout_path = working_dir / "working" / f"probe_stdout_bs_{batch_size}.log"
     stderr_path = working_dir / "working" / f"probe_stderr_bs_{batch_size}.log"
@@ -749,6 +504,10 @@ def _run_probe_subprocess(
                 probe_max_train_batches=probe_max_train_batches,
                 probe_event_path=event_path,
                 probe_optimizer_steps=probe_optimizer_steps,
+                runtime_root=runtime_root,
+                job_id=job_id,
+                probe_warmup_steps=warmup_steps,
+                probe_measure_steps=measure_steps,
             ),
         )
 
@@ -795,7 +554,7 @@ def _run_probe_subprocess(
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if event.get("event") == "optimizer_step_completed":
+            if event.get("event") in {"optimizer_step_completed", "elastic_probe_completed"}:
                 completion_event = event
     fits = proc.returncode == 0 and completion_event is not None and not timed_out
     return ProbeSubprocessResult(
@@ -821,36 +580,22 @@ def probe_mlevolve_script_job(
     script_path = Path(kwargs["script_path"]).resolve()
     working_dir = Path(kwargs["working_dir"]).resolve()
     python_executable = context.job.config.python_executable or sys.executable
-    instrumented = _materialize_instrumented_script(script_path, working_dir)
-
-    if instrumented.syntax_error:
+    validation = validate_generated_training_code(
+        script_path.read_text(encoding="utf-8"),
+        stage="branch_profile_probe",
+        require_elastic_contract=True,
+    )
+    if not validation["ok"]:
         return BatchProbeTrialResult(
             fits=False,
             peak_vram_mb=None,
             memory_total_mb=None,
             avg_step_time_ms=None,
-            message=instrumented.syntax_error,
-            failure_kind="syntax_error",
+            message=validation["summary"],
+            failure_kind="probe_unsupported",
             returncode=None,
             stdout_excerpt=None,
-            stderr_excerpt=instrumented.syntax_error,
-        )
-
-    contract = instrumented.batch_contract or TrainingBatchContract(unsupported_reason="batch contract unavailable")
-    if not instrumented.had_batch_rewrite or not contract.supported:
-        return BatchProbeTrialResult(
-            fits=False,
-            peak_vram_mb=None,
-            memory_total_mb=None,
-            avg_step_time_ms=None,
-            message=contract.unsupported_reason or "no safe training batch-size knob found",
-            failure_kind="probe_unsupported",
-            diagnostic=FailureDiagnostic(
-                kind="probe_unsupported",
-                phase="instrumentation",
-                exception_message=contract.unsupported_reason or "no safe training batch-size knob found",
-                batch_size=int(batch_size),
-            ),
+            stderr_excerpt=json.dumps(validation["issues"], sort_keys=True),
         )
 
     timeout_seconds = int(kwargs.get("probe_startup_timeout_seconds", kwargs.get("probe_timeout_seconds", max(20, warmup_steps + measure_steps))))
@@ -861,7 +606,7 @@ def probe_mlevolve_script_job(
     probe_optimizer_steps = max(1, int(kwargs.get("probe_optimizer_steps", 1)))
     probe_result = _run_probe_subprocess(
         python_executable=python_executable,
-        script_path=instrumented.path,
+        script_path=script_path,
         working_dir=working_dir,
         batch_size=int(batch_size),
         timeout_seconds=timeout_seconds,
@@ -871,6 +616,10 @@ def probe_mlevolve_script_job(
         probe_max_train_batches=probe_max_train_batches,
         probe_optimizer_steps=probe_optimizer_steps,
         step_timeout_seconds=step_timeout_seconds,
+        runtime_root=context.settings.runtime_root,
+        job_id=context.job.job_id,
+        warmup_steps=warmup_steps,
+        measure_steps=measure_steps,
     )
     failure_kind, failure_reason = _parse_batch_size_failure(
         probe_result.stderr_text,
@@ -924,7 +673,14 @@ def probe_mlevolve_script_job(
         fits=bool(fits),
         peak_vram_mb=peak_vram_mb,
         memory_total_mb=memory_total_mb,
-        avg_step_time_ms=_as_float(completion.get("optimizer_step_time_ms")),
+        avg_step_time_ms=_as_float(completion.get("median_step_time_ms") or completion.get("optimizer_step_time_ms")),
+        samples_per_second=_as_float(completion.get("samples_per_second")),
+        step_time_dispersion=(
+            (max(completion.get("step_durations_ms") or [0.0]) - min(completion.get("step_durations_ms") or [0.0]))
+            / max(1e-9, _as_float(completion.get("median_step_time_ms")) or 1.0)
+            if completion.get("step_durations_ms")
+            else None
+        ),
         message=failure_reason
         or (
             "optimizer step completed"
@@ -938,7 +694,7 @@ def probe_mlevolve_script_job(
         stdout_excerpt=stdout_tail,
         stderr_excerpt=stderr_tail,
         diagnostic=diagnostic,
-        probe_completed=completion.get("event") == "optimizer_step_completed",
+        probe_completed=completion.get("event") in {"optimizer_step_completed", "elastic_probe_completed"},
     )
 
 
@@ -958,15 +714,17 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
         except (TypeError, ValueError):
             timeout = None
     python_executable = context.job.config.python_executable or sys.executable
-    instrumented = _materialize_instrumented_script(script_path, working_dir)
-    phase_log_path = working_dir / "working" / "phase_timings" / f"phase_{context.job.job_id}.jsonl"
-    phase_output_path = working_dir / "working" / "instrumented_scripts" / f"{instrumented.path.stem}_phase.py"
-    executable_script, phase_metadata = materialize_phase_instrumented_file(
-        instrumented.path,
-        phase_output_path,
-        phase_log_path,
+    validation = validate_generated_training_code(
+        script_path.read_text(encoding="utf-8"),
+        stage="mlevolve_execution",
+        require_elastic_contract=True,
     )
-    batch_size_override = _resolved_batch_size(context) if instrumented.had_batch_rewrite else None
+    if not validation["ok"]:
+        raise RuntimeError(f"elastic training contract validation failed: {validation['summary']}")
+    executable_script = script_path
+    phase_log_path = working_dir / "working" / "phase_timings" / f"phase_{context.job.job_id}.jsonl"
+    phase_metadata: dict[str, Any] = {"elastic_contract_version": 1}
+    batch_size_override = _resolved_batch_size(context)
     max_epochs_override = _max_epochs_override(context)
 
     start_time = time.time()
@@ -977,7 +735,12 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
-        env=_base_script_env(batch_size_override=batch_size_override, probe_max_epochs=max_epochs_override),
+        env=_base_script_env(
+            batch_size_override=batch_size_override,
+            probe_max_epochs=max_epochs_override,
+            runtime_root=context.settings.runtime_root,
+            job_id=context.job.job_id,
+        ),
     )
 
     exc_type: str | None = None
@@ -1095,11 +858,6 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
             stderr_tail=stderr_tail,
         )
         instrumentation["failure_diagnostic"] = failure_diagnostic.to_dict()
-    if instrumented.precision_repair_count:
-        instrumentation["precision_numpy_export_repair"] = {
-            "replacement_count": instrumented.precision_repair_count,
-            "script_path": str(instrumented.path),
-        }
     if early_stop_reason is not None:
         samples = context.store.list_job_metric_samples(context.job.job_id) if hasattr(context.store, "list_job_metric_samples") else []
         artifact_payload: dict[str, Any] = {}

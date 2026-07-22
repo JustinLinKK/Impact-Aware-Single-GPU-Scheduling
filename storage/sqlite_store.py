@@ -9,6 +9,8 @@ import json
 import sqlite3
 
 from ..domain import (
+    BatchProfileCurve,
+    BatchProfilePoint,
     BatchSizeObservation,
     BatchProbeProfile,
     CombinationProfile,
@@ -96,6 +98,9 @@ class SQLiteStateStore:
             connection.commit()
 
     def submit_job(self, job: TrainingJob) -> TrainingJob:
+        from ..domain import BatchResolution
+
+        BatchResolution.validate_authored_batch_size(job)
         if not job.queue_sequence:
             job.queue_sequence = self.next_queue_sequence()
         job.mark_status(JobStatus.PENDING, reason=job.status_reason)
@@ -665,6 +670,131 @@ class SQLiteStateStore:
         with self._connect() as connection:
             rows = connection.execute(query, params).fetchall()
         return [RuntimeProfile.from_row(dict(row)) for row in rows]
+
+    def upsert_batch_profile_curve(self, curve: BatchProfileCurve) -> BatchProfileCurve:
+        curve.updated_at = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO batch_profile_curves(
+                    curve_key, model_key, shape_signature, hardware_key, backend_name,
+                    profile_namespace, contract_version, batch_param_name,
+                    minimum_batch_size, maximum_feasible_batch_size,
+                    first_oom_batch_size, right_censored, observations, last_job_id,
+                    updated_at, metadata_json
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(curve_key) DO UPDATE SET
+                    model_key=excluded.model_key,
+                    shape_signature=excluded.shape_signature,
+                    hardware_key=excluded.hardware_key,
+                    backend_name=excluded.backend_name,
+                    profile_namespace=excluded.profile_namespace,
+                    contract_version=excluded.contract_version,
+                    batch_param_name=excluded.batch_param_name,
+                    minimum_batch_size=excluded.minimum_batch_size,
+                    maximum_feasible_batch_size=excluded.maximum_feasible_batch_size,
+                    first_oom_batch_size=excluded.first_oom_batch_size,
+                    right_censored=excluded.right_censored,
+                    observations=excluded.observations,
+                    last_job_id=excluded.last_job_id,
+                    updated_at=excluded.updated_at,
+                    metadata_json=excluded.metadata_json
+                """,
+                (
+                    curve.curve_key, curve.model_key, curve.shape_signature, curve.hardware_key,
+                    curve.backend_name, curve.profile_namespace, curve.contract_version,
+                    curve.batch_param_name, curve.minimum_batch_size,
+                    curve.maximum_feasible_batch_size, curve.first_oom_batch_size,
+                    int(curve.right_censored), curve.observations, curve.last_job_id,
+                    curve.updated_at, json.dumps(curve.metadata or {}, sort_keys=True),
+                ),
+            )
+            connection.commit()
+        for point in curve.points:
+            self.upsert_batch_profile_point(point)
+        return curve
+
+    def upsert_batch_profile_point(self, point: BatchProfilePoint) -> BatchProfilePoint:
+        point.updated_at = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO batch_profile_points(
+                    point_key, curve_key, batch_size, peak_vram_mb, samples_per_second,
+                    median_step_time_ms, step_time_dispersion, observations, last_job_id,
+                    updated_at, metadata_json
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(point_key) DO UPDATE SET
+                    curve_key=excluded.curve_key,
+                    batch_size=excluded.batch_size,
+                    peak_vram_mb=excluded.peak_vram_mb,
+                    samples_per_second=excluded.samples_per_second,
+                    median_step_time_ms=excluded.median_step_time_ms,
+                    step_time_dispersion=excluded.step_time_dispersion,
+                    observations=excluded.observations,
+                    last_job_id=excluded.last_job_id,
+                    updated_at=excluded.updated_at,
+                    metadata_json=excluded.metadata_json
+                """,
+                (
+                    point.point_key, point.curve_key, point.batch_size, point.peak_vram_mb,
+                    point.samples_per_second, point.median_step_time_ms,
+                    point.step_time_dispersion, point.observations, point.last_job_id,
+                    point.updated_at, json.dumps(point.metadata or {}, sort_keys=True),
+                ),
+            )
+            connection.commit()
+        return point
+
+    def list_batch_profile_points(self, curve_key: str) -> list[BatchProfilePoint]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM batch_profile_points WHERE curve_key = ? ORDER BY batch_size ASC",
+                (curve_key,),
+            ).fetchall()
+        return [BatchProfilePoint.from_row(dict(row)) for row in rows]
+
+    def get_batch_profile_curve(self, curve_key: str) -> BatchProfileCurve | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM batch_profile_curves WHERE curve_key = ?",
+                (curve_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return BatchProfileCurve.from_row(dict(row), points=self.list_batch_profile_points(curve_key))
+
+    def get_compatible_batch_profile_curve(
+        self,
+        *,
+        profile_namespace: str,
+        hardware_key: str,
+        shape_signature: str,
+        contract_version: int = 3,
+        backend_name: str = "exclusive",
+    ) -> BatchProfileCurve | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM batch_profile_curves
+                WHERE profile_namespace = ? AND hardware_key = ? AND shape_signature = ?
+                  AND contract_version = ? AND backend_name = ?
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (profile_namespace, hardware_key, shape_signature, int(contract_version), backend_name),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = dict(row)
+        return BatchProfileCurve.from_row(payload, points=self.list_batch_profile_points(payload["curve_key"]))
+
+    def list_batch_profile_curves(self) -> list[BatchProfileCurve]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM batch_profile_curves ORDER BY updated_at DESC").fetchall()
+        return [
+            BatchProfileCurve.from_row(dict(row), points=self.list_batch_profile_points(str(row["curve_key"])))
+            for row in rows
+        ]
 
     def upsert_batch_probe_profile(self, profile: BatchProbeProfile) -> BatchProbeProfile:
         profile.updated_at = utc_now()

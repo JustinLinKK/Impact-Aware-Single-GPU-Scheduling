@@ -21,7 +21,7 @@ def wait_for(predicate, timeout: float = 20.0, interval: float = 0.1) -> None:
 
 
 class PauseResumeIntegrationTest(unittest.TestCase):
-    def test_preemption_and_auto_resume(self) -> None:
+    def test_healthy_active_job_is_pinned_until_completion(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir)
             settings = SchedulerSettings(
@@ -61,9 +61,11 @@ class PauseResumeIntegrationTest(unittest.TestCase):
                     )
                 )
 
+                time.sleep(0.1)
+                self.assertIn(api.inspect(high.job_id).status.value, {"PENDING", "READY"})
                 wait_for(lambda: api.inspect(high.job_id).status.is_terminal and api.inspect(low.job_id).status.is_terminal, timeout=30.0)
                 pause_events = api.store.list_events(job_id=low.job_id, event_type="job_paused")
-                self.assertTrue(pause_events, "expected low-priority job to pause at least once")
+                self.assertEqual(pause_events, [])
                 self.assertEqual(api.inspect(low.job_id).status.value, "COMPLETED")
                 self.assertEqual(api.inspect(high.job_id).status.value, "COMPLETED")
             finally:

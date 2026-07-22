@@ -144,6 +144,7 @@ def validate_generated_training_code(
     *,
     stage: str = "code_review",
     model_contracts: list[dict[str, Any]] | None = None,
+    require_elastic_contract: bool = False,
 ) -> dict[str, Any]:
     """Statically flag generated-code patterns known to fail in this runtime."""
     code_text = str(code or "")
@@ -157,6 +158,8 @@ def validate_generated_training_code(
     issues.extend(_detect_zip_extractall_directory_mismatch(code_text))
     issues.extend(_detect_deprecated_cuda_amp(code_text))
     issues.extend(validate_model_api_contracts(code_text, model_contracts or []))
+    if require_elastic_contract:
+        issues.extend(_detect_elastic_training_contract_violations(code_text))
 
     critical_count = sum(1 for issue in issues if issue.get("severity") == "critical")
     warning_count = sum(1 for issue in issues if issue.get("severity") == "warning")
@@ -404,7 +407,12 @@ def _attribute_chain(node: ast.AST) -> list[str]:
     return list(reversed(parts))
 
 
-def repair_generated_training_code(code: str, *, stage: str = "code_review") -> dict[str, Any]:
+def repair_generated_training_code(
+    code: str,
+    *,
+    stage: str = "code_review",
+    require_elastic_contract: bool = False,
+) -> dict[str, Any]:
     """Deterministically repair prediction-like low-precision Tensor -> NumPy exports."""
     original_code = str(code or "")
     repaired_code, model_source_repair_count = _repair_known_hf_model_source_ids(original_code)
@@ -417,7 +425,11 @@ def repair_generated_training_code(code: str, *, stage: str = "code_review") -> 
     if replacements and "torch.float32" in repaired_code and not _has_torch_import(repaired_code):
         repaired_code = _insert_torch_import(repaired_code)
 
-    validation = validate_generated_training_code(repaired_code, stage=stage)
+    validation = validate_generated_training_code(
+        repaired_code,
+        stage=stage,
+        require_elastic_contract=require_elastic_contract,
+    )
     return {
         "code": repaired_code,
         "changed": repaired_code != original_code,
@@ -429,6 +441,30 @@ def repair_generated_training_code(code: str, *, stage: str = "code_review") -> 
         "stage": stage,
         "validation": validation,
     }
+
+
+def _detect_elastic_training_contract_violations(code: str) -> list[dict[str, Any]]:
+    required = {
+        "ElasticTrainingSession": "import and create an ElasticTrainingSession",
+        ".from_env(": "create the session with ElasticTrainingSession.from_env()",
+        ".make_dataloader(": "construct the training DataLoader through session.make_dataloader(...) ",
+        ".register_training_state(": "register model, optimizer, scheduler, scaler, and extra state",
+        ".restore_if_present(": "restore the scheduler checkpoint before training",
+        ".optimizer_step_completed(": "report every completed optimizer step as a safe point",
+    }
+    issues: list[dict[str, Any]] = []
+    for token, instruction in required.items():
+        if token in code:
+            continue
+        issues.append(
+            {
+                "severity": "critical",
+                "code": "elastic_training_contract_missing",
+                "message": f"Mandatory elastic training contract is missing `{token}`.",
+                "hint": instruction,
+            }
+        )
+    return issues
 
 
 _DIFF_OR_CONFLICT_MARKER_RE = re.compile(

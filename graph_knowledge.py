@@ -658,7 +658,7 @@ class SchedulerKnowledgeBase:
         gpu_scheduler = getattr(settings, "gpu_scheduler", None)
         if gpu_scheduler is None:
             return {}
-        probe_payload = self._latest_auto_backend_probe_payload()
+        probe_payload = self._latest_adaptive_backend_probe_payload()
         memory = getattr(gpu_scheduler, "memory", None)
         thresholds = getattr(gpu_scheduler, "thresholds", None)
         submission_defaults = getattr(gpu_scheduler, "submission_defaults", None)
@@ -670,11 +670,11 @@ class SchedulerKnowledgeBase:
             "memory": memory.to_dict() if hasattr(memory, "to_dict") else {},
             "thresholds": thresholds.to_dict() if hasattr(thresholds, "to_dict") else {},
             "backend_priority": self._probe_payload_list_or_setting(probe_payload, "backend_priority", gpu_scheduler),
-            "concurrent_backend_allowlist": self._probe_payload_list_or_setting(
-                probe_payload,
-                "concurrent_backend_allowlist",
-                gpu_scheduler,
-            ),
+            "candidate_window_size": getattr(gpu_scheduler, "candidate_window_size", None),
+            "max_packed_jobs_per_gpu": getattr(gpu_scheduler, "max_packed_jobs_per_gpu", None),
+            "adaptive": getattr(gpu_scheduler, "adaptive", None).to_dict()
+            if hasattr(getattr(gpu_scheduler, "adaptive", None), "to_dict")
+            else {},
             "submission_defaults": submission_defaults.to_dict() if hasattr(submission_defaults, "to_dict") else {},
         }
 
@@ -683,7 +683,7 @@ class SchedulerKnowledgeBase:
         gpu_scheduler = getattr(settings, "gpu_scheduler", None)
         if gpu_scheduler is None:
             return {}
-        probe_payload = self._latest_auto_backend_probe_payload()
+        probe_payload = self._latest_adaptive_backend_probe_payload()
         mode = probe_payload.get("configured_mode", getattr(gpu_scheduler, "mode", None))
         backend_availability = dict(probe_payload.get("backend_availability") or {})
         stream_enabled = bool(getattr(getattr(gpu_scheduler, "stream", None), "enabled", False))
@@ -723,14 +723,8 @@ class SchedulerKnowledgeBase:
             "stream_available": bool(backend_availability.get("stream", stream_enabled)),
             "mps_available": bool(backend_availability.get("mps", mps_enabled)),
             "cuda_process_available": bool(backend_availability.get("cuda_process", cuda_process_enabled)),
-            "concurrent_groups_enabled": bool(getattr(gpu_scheduler, "concurrent_groups_enabled", False)),
-            "concurrent_backend_allowlist": self._probe_payload_list_or_setting(
-                probe_payload,
-                "concurrent_backend_allowlist",
-                gpu_scheduler,
-            ),
             "max_packed_jobs_per_gpu": getattr(gpu_scheduler, "max_packed_jobs_per_gpu", None),
-            "allow_three_way_packing": bool(getattr(gpu_scheduler, "allow_three_way_packing", False)),
+            "candidate_window_size": getattr(gpu_scheduler, "candidate_window_size", None),
         }
 
     @staticmethod
@@ -739,12 +733,12 @@ class SchedulerKnowledgeBase:
             return list(probe_payload.get(key) or [])
         return list(getattr(settings, key, []) or [])
 
-    def _latest_auto_backend_probe_payload(self) -> dict[str, Any]:
+    def _latest_adaptive_backend_probe_payload(self) -> dict[str, Any]:
         list_events = getattr(self.store, "list_events", None)
         if not callable(list_events):
             return {}
         try:
-            events = list(list_events(event_type="scheduler_auto_backend_probe"))
+            events = list(list_events(event_type="scheduler_adaptive_backend_probe"))
         except Exception:
             return {}
         if not events:

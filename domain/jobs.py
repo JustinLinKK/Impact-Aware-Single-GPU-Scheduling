@@ -30,6 +30,13 @@ class JobStatus(str, Enum):
         return self in {self.EARLY_STOPPED, self.COMPLETED, self.FAILED, self.CANCELLED}
 
 
+class ProfileState(str, Enum):
+    READY = "READY"
+    WAITING_FOR_DRAIN = "WAITING_FOR_DRAIN"
+    PROBING = "PROBING"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
 class SafePointType(str, Enum):
     MANUAL = "manual"
     STEP = "step"
@@ -127,7 +134,7 @@ class BatchProbeSpec:
     profile_namespace: str | None = None
     shape_signature_override: str | None = None
     minimum_batch_size: int | None = None
-    contract_version: int = 2
+    contract_version: int = 3
     reuse_only: bool = False
 
     @classmethod
@@ -232,6 +239,7 @@ class JobSpec:
     max_epochs: int | None = None
     resume_from_checkpoint: str | None = None
     preload_source: PreloadSource | None = None
+    authored_batch_size: int = 1
 
     @classmethod
     def from_training_job(cls, job: "TrainingJob") -> "JobSpec":
@@ -253,6 +261,7 @@ class JobSpec:
             max_epochs=job.max_epochs,
             resume_from_checkpoint=job.resume_from_checkpoint,
             preload_source=job.preload_source,
+            authored_batch_size=job.authored_batch_size,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -273,6 +282,10 @@ class JobRun:
     started_at: str | None = None
     finished_at: str | None = None
     hold: bool = False
+    current_batch_size: int = 1
+    profile_state: ProfileState = ProfileState.READY
+    force_exclusive: bool = False
+    placement_generation: int = 0
 
     @classmethod
     def from_training_job(cls, job: "TrainingJob") -> "JobRun":
@@ -289,6 +302,10 @@ class JobRun:
             started_at=job.started_at,
             finished_at=job.finished_at,
             hold=job.hold,
+            current_batch_size=job.current_batch_size,
+            profile_state=job.profile_state,
+            force_exclusive=job.force_exclusive,
+            placement_generation=job.placement_generation,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -316,6 +333,7 @@ class TrainingJob:
     max_epochs: int | None = None
     resume_from_checkpoint: str | None = None
     preload_source: PreloadSource | None = None
+    authored_batch_size: int = 1
     metadata: dict[str, Any] = field(default_factory=dict)
     queue_sequence: int = 0
     status_reason: str | None = None
@@ -326,6 +344,10 @@ class TrainingJob:
     started_at: str | None = None
     finished_at: str | None = None
     hold: bool = False
+    current_batch_size: int = 1
+    profile_state: ProfileState = ProfileState.READY
+    force_exclusive: bool = False
+    placement_generation: int = 0
 
     @classmethod
     def create(
@@ -365,6 +387,12 @@ class TrainingJob:
             python_executable=python_executable,
             env=env or {},
         )
+        batch_param_name = (batch_probe.batch_param_name if batch_probe is not None else "batch_size") or "batch_size"
+        raw_batch_size = config.runner_kwargs.get(batch_param_name, 1)
+        try:
+            authored_batch_size = max(1, int(raw_batch_size))
+        except (TypeError, ValueError):
+            authored_batch_size = 1
         job = cls(
             job_id=stable_job_id(job_id),
             agent_id=agent_id,
@@ -384,6 +412,8 @@ class TrainingJob:
             max_epochs=max_epochs,
             resume_from_checkpoint=resume_from_checkpoint,
             preload_source=preload_source,
+            authored_batch_size=authored_batch_size,
+            current_batch_size=authored_batch_size,
             metadata=metadata or {},
         )
         job.mark_status(JobStatus.PENDING)
@@ -393,6 +423,7 @@ class TrainingJob:
     def from_dict(cls, payload: dict[str, Any]) -> "TrainingJob":
         payload = dict(payload)
         payload["status"] = JobStatus(payload.get("status", JobStatus.PENDING.value))
+        payload["profile_state"] = ProfileState(payload.get("profile_state", ProfileState.READY.value))
         payload["config"] = JobConfig.from_dict(payload["config"])
         payload["resource_requirements"] = ResourceRequirements.from_dict(payload.get("resource_requirements"))
         payload["packing"] = PackingSpec.from_dict(payload.get("packing"))
@@ -400,6 +431,13 @@ class TrainingJob:
         payload["runtime_probe"] = RuntimeProbeSpec.from_dict(payload.get("runtime_probe"))
         payload["checkpoint_policy"] = CheckpointPolicy.from_dict(payload.get("checkpoint_policy"))
         payload["preload_source"] = PreloadSource.from_dict(payload.get("preload_source"))
+        batch_param_name = payload["batch_probe"].batch_param_name or "batch_size"
+        fallback_batch = payload["config"].runner_kwargs.get(batch_param_name, 1)
+        payload["authored_batch_size"] = max(1, int(payload.get("authored_batch_size", fallback_batch)))
+        payload["current_batch_size"] = max(
+            1,
+            int(payload.get("current_batch_size", payload.get("metadata", {}).get("resolved_batch_size", payload["authored_batch_size"]))),
+        )
         return cls(**payload)
 
     @classmethod
@@ -424,6 +462,7 @@ class TrainingJob:
             max_epochs=spec.max_epochs,
             resume_from_checkpoint=spec.resume_from_checkpoint,
             preload_source=spec.preload_source,
+            authored_batch_size=spec.authored_batch_size,
             metadata=run.metadata,
             queue_sequence=run.queue_sequence,
             status_reason=run.status_reason,
@@ -434,6 +473,10 @@ class TrainingJob:
             started_at=run.started_at,
             finished_at=run.finished_at,
             hold=run.hold,
+            current_batch_size=run.current_batch_size,
+            profile_state=run.profile_state,
+            force_exclusive=run.force_exclusive,
+            placement_generation=run.placement_generation,
         )
 
     def to_job_spec(self) -> JobSpec:

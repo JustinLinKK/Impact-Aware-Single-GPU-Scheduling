@@ -15,6 +15,16 @@ class DispatchPlan:
     reason: str
     batch_overrides: dict[str, int] = field(default_factory=dict)
     fallback_order: list[str] = field(default_factory=list)
+    estimated_vram_mb: float = 0.0
+    estimated_sm_utilization: float = 0.0
+    predicted_throughput: float | None = None
+    solver_kind: str = "exact"
+    objective_vector: tuple[float, ...] = ()
+    active_job_ids: tuple[str, ...] = ()
+
+    @property
+    def requires_repack(self) -> bool:
+        return bool(self.active_job_ids)
 
 
 @dataclass(slots=True)
@@ -32,4 +42,3 @@ class EvaluatedGroup:
     batch_overrides: dict[str, int]
     fallback_order: list[str]
     reason: str
-

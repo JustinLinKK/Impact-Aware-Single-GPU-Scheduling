@@ -100,7 +100,6 @@ def probe_toy_training_batch_size(
         "probe_max_batch_size": None,
     }
     params.update(context.job.config.runner_kwargs)
-
     limit = params.get("probe_max_batch_size")
     synthetic_memory_total_mb = int(params.get("probe_memory_total_mb", 4096))
     synthetic_peak_vram_mb = int(params.get("probe_base_memory_mb", 256)) + (int(batch_size) * int(params.get("probe_memory_per_sample_mb", 32)))
@@ -209,6 +208,12 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
         "reported_accuracy_override": None,
     }
     params.update(context.job.config.runner_kwargs)
+    # Scheduler-owned placement never mutates the authored runner arguments.
+    # Hand-written runners consume the mutable placement batch explicitly;
+    # generated MLEvolve programs do this through ElasticTrainingSession.
+    params["batch_size"] = int(
+        context.job.current_batch_size or context.job.authored_batch_size or params["batch_size"]
+    )
 
     seed = context.job.config.seed if context.job.config.seed is not None else int(params.get("seed", 7))
     random.seed(seed)

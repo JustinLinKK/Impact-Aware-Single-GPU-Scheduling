@@ -95,6 +95,51 @@ CONTROL_SCHEMA_STATEMENTS = [
 
 BRANCH_PROFILE_SCHEMA_STATEMENTS = [
     """
+    CREATE TABLE IF NOT EXISTS batch_profile_curves (
+        curve_key TEXT PRIMARY KEY,
+        model_key TEXT NOT NULL,
+        shape_signature TEXT NOT NULL,
+        hardware_key TEXT NOT NULL,
+        backend_name TEXT NOT NULL DEFAULT 'exclusive',
+        profile_namespace TEXT,
+        contract_version INTEGER NOT NULL DEFAULT 3,
+        batch_param_name TEXT NOT NULL,
+        minimum_batch_size INTEGER NOT NULL DEFAULT 1,
+        maximum_feasible_batch_size INTEGER,
+        first_oom_batch_size INTEGER,
+        right_censored INTEGER NOT NULL DEFAULT 0,
+        observations INTEGER NOT NULL DEFAULT 1,
+        last_job_id TEXT,
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS batch_profile_points (
+        point_key TEXT PRIMARY KEY,
+        curve_key TEXT NOT NULL,
+        batch_size INTEGER NOT NULL,
+        peak_vram_mb INTEGER NOT NULL,
+        samples_per_second REAL NOT NULL,
+        median_step_time_ms REAL NOT NULL,
+        step_time_dispersion REAL NOT NULL DEFAULT 0,
+        observations INTEGER NOT NULL DEFAULT 1,
+        last_job_id TEXT,
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT,
+        FOREIGN KEY(curve_key) REFERENCES batch_profile_curves(curve_key) ON DELETE CASCADE,
+        UNIQUE(curve_key, batch_size)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_batch_profile_curves_compatibility
+    ON batch_profile_curves(profile_namespace, hardware_key, shape_signature, contract_version, updated_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_batch_profile_points_curve
+    ON batch_profile_points(curve_key, batch_size)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS solo_profiles (
         signature TEXT NOT NULL,
         hardware_key TEXT NOT NULL DEFAULT '',
@@ -252,6 +297,8 @@ BRANCH_PROFILE_SCHEMA_STATEMENTS = [
 SCHEMA_STATEMENTS = CONTROL_SCHEMA_STATEMENTS
 
 PROFILE_TABLE_NAMES = (
+    "batch_profile_curves",
+    "batch_profile_points",
     "solo_profiles",
     "pair_profiles",
     "batch_probe_profiles",

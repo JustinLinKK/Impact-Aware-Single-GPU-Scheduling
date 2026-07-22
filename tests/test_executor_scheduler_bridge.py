@@ -12,6 +12,21 @@ from localml_scheduler.domain import BatchProbeProfile, JobStatus, TrainingJob
 from localml_scheduler.config import SchedulerSettings
 
 
+def _elastic_source(batch_size: int, body: str = "") -> str:
+    return "\n".join(
+        [
+            "from localml_scheduler.elastic import ElasticTrainingSession",
+            f"batch_size = {batch_size}",
+            "session = ElasticTrainingSession.from_env()",
+            "loader = session.make_dataloader(dataset)",
+            "session.register_training_state(model, optimizer)",
+            "session.restore_if_present()",
+            "session.optimizer_step_completed(batch_size, 0, 0, 1)",
+            body,
+        ]
+    )
+
+
 class _FakeStore:
     def list_events(self, *, job_id: str | None = None) -> list[dict[str, object]]:
         return []
@@ -192,7 +207,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             interpreter.attach_scheduler(fake_api, bridge_cfg)
 
             result = interpreter._run_scheduler_job(
-                code="batch_size = 3\nprint('hello from bridge')\n",
+                code=_elastic_source(4, "print('hello from bridge')"),
                 id="node-1",
                 working_dir=str(workdir),
             )
@@ -209,7 +224,8 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertEqual(submitted.packing.family, "scheduler-owned-family")
             self.assertEqual(submitted.packing.max_slowdown_ratio, 1.15)
             self.assertEqual(submitted.packing.backend_allowlist, ["cuda_process"])
-            self.assertFalse(submitted.batch_probe.enabled)
+            self.assertTrue(submitted.batch_probe.enabled)
+            self.assertEqual(submitted.batch_probe.contract_version, 3)
             self.assertEqual(submitted.batch_probe.model_key, "scheduler-model-key")
             self.assertEqual(submitted.batch_probe.search_mode, "power_of_two")
             self.assertEqual(submitted.config.runner_kwargs["probe_timeout_seconds"], 11)
@@ -256,7 +272,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
 
             result = interpreter._run_scheduler_job(
-                code="MODEL_FAMILY = 'safe-family'\nbatch_size = 6\nprint('family reuse')\n",
+                code="MODEL_FAMILY = 'safe-family'\n" + _elastic_source(8, "print('family reuse')"),
                 id="node-family",
                 working_dir=str(workdir),
             )
@@ -266,7 +282,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertEqual(submitted.batch_probe.model_key, "safe-family")
             self.assertEqual(submitted.batch_probe.profile_namespace, profile_key)
             self.assertFalse(submitted.batch_probe.reuse_only)
-            self.assertEqual(submitted.config.runner_kwargs["batch_size"], 6)
+            self.assertEqual(submitted.config.runner_kwargs["batch_size"], 8)
             self.assertNotIn("resolved_batch_size", submitted.metadata)
             self.assertFalse(submitted.metadata["model_family_profile_available"])
 
@@ -289,7 +305,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
 
             result = interpreter._run_scheduler_job(
-                code="MODEL_FAMILY = 'new-family'\nbatch_size = 6\nprint('new family')\n",
+                code="MODEL_FAMILY = 'new-family'\n" + _elastic_source(8, "print('new family')"),
                 id="node-new-family",
                 working_dir=str(workdir),
             )
@@ -321,7 +337,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
 
             result = interpreter._run_scheduler_job(
-                code="MODEL_FAMILY = 'blocked-family'\nbatch_size = 6\nprint('blocked')\n",
+                code="MODEL_FAMILY = 'blocked-family'\n" + _elastic_source(8, "print('blocked')"),
                 id="node-blocked-family",
                 working_dir=str(workdir),
             )
@@ -342,7 +358,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             interpreter.attach_scheduler(fake_api, legacy_cfg)
 
             result = interpreter._run_scheduler_job(
-                code="print('bridge fallback service')\n",
+                code=_elastic_source(2, "print('bridge fallback service')"),
                 id="node-2",
                 working_dir=str(workdir),
             )
@@ -372,7 +388,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
 
             result = interpreter._run_scheduler_job(
-                code="batch_size = 2\nprint('stream only raw packing config')\n",
+                code=_elastic_source(2, "print('stream only raw packing config')"),
                 id="node-3",
                 working_dir=str(workdir),
             )
@@ -401,7 +417,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
 
             result = interpreter._run_scheduler_job(
-                code="batch_size = 2\nprint('empty allowlist')\n",
+                code=_elastic_source(2, "print('empty allowlist')"),
                 id="node-4",
                 working_dir=str(workdir),
             )
@@ -432,8 +448,8 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
 
             results = interpreter.run_many(
                 [
-                    ("batch_size = 2\nprint('round a')\n", "node-a"),
-                    ("batch_size = 4\nprint('round b')\n", "node-b"),
+                    (_elastic_source(2, "print('round a')"), "node-a"),
+                    (_elastic_source(4, "print('round b')"), "node-b"),
                 ],
                 working_dir=str(workdir),
             )
@@ -470,7 +486,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
 
             handles = interpreter.submit_scheduler(
-                [{"code": "batch_size = 2\nprint('stream')\n", "id": "node-stream"}],
+                [{"code": _elastic_source(2, "print('stream')"), "id": "node-stream"}],
                 working_dir=str(workdir),
                 submission_label="stream",
             )
@@ -508,8 +524,8 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
 
             handles = interpreter.submit_scheduler(
                 [
-                    ("batch_size = 2\nprint('a')\n", "node-a"),
-                    ("batch_size = 4\nprint('b')\n", "node-b"),
+                    (_elastic_source(2, "print('a')"), "node-a"),
+                    (_elastic_source(4, "print('b')"), "node-b"),
                 ],
                 working_dir=str(workdir),
                 submission_label="stream",
@@ -543,7 +559,13 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01))
 
             handles = interpreter.submit_scheduler(
-                [{"code": "MODEL_FAMILY = 'blocked-family'\nbatch_size = 4\nprint('blocked')\n", "id": "node-blocked"}],
+                [
+                    {
+                        "code": "MODEL_FAMILY = 'blocked-family'\n"
+                        + _elastic_source(4, "print('blocked')"),
+                        "id": "node-blocked",
+                    }
+                ],
                 working_dir=str(workdir),
                 submission_label="stream",
             )
@@ -582,8 +604,8 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
 
             results = interpreter.run_many(
                 [
-                    ("batch_size = 2\nprint('same workload')\n", "node-a"),
-                    ("batch_size = 4\nprint('same workload')\n", "node-b"),
+                    (_elastic_source(2, "print('same workload')"), "node-a"),
+                    (_elastic_source(4, "print('same workload')"), "node-b"),
                 ],
                 working_dir=str(workdir),
             )
@@ -614,12 +636,22 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             interpreter = Interpreter(working_dir=workdir, timeout=None, max_parallel_run=1, cfg=cfg)
             fake_api = _FakeSchedulerClient(settings)
             interpreter.attach_scheduler(fake_api, SimpleNamespace(wait_timeout_seconds=None, wait_poll_interval_seconds=0.01))
+            elastic_code = "\n".join(
+                [
+                    "from localml_scheduler.elastic import ElasticTrainingSession",
+                    "session = ElasticTrainingSession.from_env()",
+                    "loader = session.make_dataloader(dataset)",
+                    "session.register_training_state(model, optimizer)",
+                    "session.restore_if_present()",
+                    "session.optimizer_step_completed(1, 0, 0, 1)",
+                ]
+            )
 
             results = interpreter.run_many(
                 [
-                    ("print('a')\n", "node-a"),
-                    ("print('b')\n", "node-b"),
-                    ("print('c')\n", "node-c"),
+                    (elastic_code + "\nprint('a')\n", "node-a"),
+                    (elastic_code + "\nprint('b')\n", "node-b"),
+                    (elastic_code + "\nprint('c')\n", "node-c"),
                 ],
                 working_dir=str(workdir),
             )

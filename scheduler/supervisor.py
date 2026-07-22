@@ -12,7 +12,7 @@ from ..execution.backends import ExecutionBackend
 from ..execution.control import ControlPlane
 from ..execution.executor import SubprocessExecutor, WorkerProcessHandle
 from ..domain import JobStatus, PlacementDecision, TrainingJob
-from ..config import SchedulerSettings, SCHEDULER_MODE_PARALLEL_AUTO_PACK, effective_scheduler_mode
+from ..config import SchedulerSettings
 from ..execution.process_utils import terminate_process_tree
 from ..storage.state_store import StateStore
 
@@ -76,15 +76,6 @@ class WorkerSupervisor:
         self.executor = SubprocessExecutor(settings)
         self.backend_registry = BackendRegistry(settings, self.executor, backends=backends)
         self._groups: dict[str, PlacementGroupHandle] = {}
-
-    def _concurrency_enabled(self) -> bool:
-        return (
-            effective_scheduler_mode(self.settings.gpu_scheduler.mode) == SCHEDULER_MODE_PARALLEL_AUTO_PACK
-            and self.settings.gpu_scheduler.concurrent_groups_enabled
-        )
-
-    def _overlap_allowed_for_backend(self, backend_name: str) -> bool:
-        return backend_name in set(self.settings.gpu_scheduler.concurrent_backend_allowlist)
 
     def available_backends(self) -> dict[str, bool]:
         return self.backend_registry.availability()
@@ -180,59 +171,9 @@ class WorkerSupervisor:
                 fallback_order=fallback_order or [],
             )
 
-        if not self._concurrency_enabled():
-            active_jobs = self.active_job_ids()
-            return PlacementDecision(
-                can_run=False,
-                reason=f"GPU busy with jobs {', '.join(active_jobs)}",
-                gpu_slot=0,
-                mode=plan_mode,
-                backend_name=plan_backend_name,
-                job_ids=active_jobs,
-                batch_overrides=batch_overrides or {},
-                fallback_order=fallback_order or [],
-            )
-
-        if plan_backend_name == "exclusive":
-            return PlacementDecision(
-                can_run=False,
-                reason="exclusive groups cannot overlap with active groups",
-                gpu_slot=0,
-                mode=plan_mode,
-                backend_name=plan_backend_name,
-                job_ids=job_ids,
-                batch_overrides=batch_overrides or {},
-                fallback_order=fallback_order or [],
-            )
-
-        if not self._overlap_allowed_for_backend(plan_backend_name):
-            return PlacementDecision(
-                can_run=False,
-                reason=f"backend {plan_backend_name} is not enabled for overlapping groups",
-                gpu_slot=0,
-                mode=plan_mode,
-                backend_name=plan_backend_name,
-                job_ids=job_ids,
-                batch_overrides=batch_overrides or {},
-                fallback_order=fallback_order or [],
-            )
-
-        for active_group in self._groups.values():
-            if not self._overlap_allowed_for_backend(active_group.backend_name):
-                return PlacementDecision(
-                    can_run=False,
-                    reason=f"active backend {active_group.backend_name} blocks concurrent dispatch",
-                    gpu_slot=0,
-                    mode=plan_mode,
-                    backend_name=plan_backend_name,
-                    job_ids=active_group.active_job_ids(),
-                    batch_overrides=batch_overrides or {},
-                    fallback_order=fallback_order or [],
-                )
-
         return PlacementDecision(
-            can_run=True,
-            reason="concurrent group slot available",
+            can_run=False,
+            reason=f"GPU busy with jobs {', '.join(self.active_job_ids())}",
             gpu_slot=0,
             mode=plan_mode,
             backend_name=plan_backend_name,
@@ -355,6 +296,40 @@ class WorkerSupervisor:
             self.control_plane.request_pause(job_id, reason=reason, hold=False)
             return True
         return False
+
+    def request_repack_prepare(self, job_id: str, *, transaction_id: str, reason: str) -> bool:
+        if job_id not in self.active_job_ids():
+            return False
+        self.control_plane.request_repack_prepare(job_id, transaction_id=transaction_id, reason=reason)
+        return True
+
+    def request_repack_commit(self, job_id: str, *, transaction_id: str) -> bool:
+        if job_id not in self.active_job_ids():
+            return False
+        self.control_plane.request_repack_commit(job_id, transaction_id=transaction_id)
+        return True
+
+    def request_repack_abort(self, job_id: str, *, transaction_id: str) -> bool:
+        if job_id not in self.active_job_ids():
+            return False
+        self.control_plane.request_repack_abort(job_id, transaction_id=transaction_id)
+        return True
+
+    def repack_ack(self, job_id: str) -> dict[str, object] | None:
+        return self.control_plane.read_repack_ack(job_id)
+
+    def stop_group(self, group_id: str) -> None:
+        """Synchronously stop a placement group during transactional rollback."""
+        group = self._groups.pop(group_id, None)
+        if group is None:
+            return
+        seen_processes: set[int] = set()
+        for worker in group.workers.values():
+            process = worker.handle.process
+            if process.pid in seen_processes or process.poll() is not None:
+                continue
+            seen_processes.add(process.pid)
+            terminate_process_tree(process, timeout=2.0)
 
     def shutdown(self) -> None:
         seen_processes: set[int] = set()

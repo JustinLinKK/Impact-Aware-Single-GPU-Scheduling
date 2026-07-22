@@ -6,7 +6,6 @@ import argparse
 
 from ..observability.events import EventLogger
 from ..observability.logging_utils import setup_scheduler_logger
-from ..profiling.batch_probe import run_batch_probe_preflight
 from ..config import SchedulerSettings
 from ..storage.log_store import SchedulerLogStore
 from ..storage.state_store import StateStore
@@ -25,7 +24,6 @@ def _run_job(runtime_root: str, job_id: str) -> int:
     mark_job_started(settings, store, event_logger, job_id, backend_name="exclusive")
 
     try:
-        context.job = run_batch_probe_preflight(context)
         result = resolve_runner(context)(context)
     except PauseRequested:
         logger.info("Job %s paused cleanly at a safe point", job_id)

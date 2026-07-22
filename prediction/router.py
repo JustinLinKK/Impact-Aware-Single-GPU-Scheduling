@@ -9,6 +9,7 @@ from ..domain import PredictionRequest, PredictionSource, ResourcePrediction
 from .branch_adapter import BranchPredictionAdapter
 from .ml_adapter import PerfSeerMLAdapter
 from .providers import ResourcePredictionProvider
+from ..config import PREDICTION_MODE_BRANCH_PROFILE, PREDICTION_MODE_ML_PREDICTOR
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,7 +18,7 @@ class PredictionRouterResult:
     candidates: tuple[ResourcePrediction, ...] = ()
     shadow_predictions: tuple[ResourcePrediction, ...] = ()
     failures: tuple[str, ...] = ()
-    mode: str = "branch_only"
+    mode: str = PREDICTION_MODE_BRANCH_PROFILE
     selection_reason: str = "no_prediction"
 
     def to_dict(self) -> dict[str, Any]:
@@ -33,7 +34,7 @@ class PredictionRouterResult:
 
 @dataclass(slots=True)
 class PredictionRouter:
-    mode: str = "branch_only"
+    mode: str = PREDICTION_MODE_BRANCH_PROFILE
     branch_provider: ResourcePredictionProvider | None = None
     ml_provider: ResourcePredictionProvider | None = None
     fallback_to_exclusive: bool = True
@@ -43,7 +44,7 @@ class PredictionRouter:
     @classmethod
     def from_settings(cls, settings: Any) -> "PredictionRouter":
         prediction_settings = getattr(settings, "prediction", None)
-        mode = str(getattr(prediction_settings, "mode", "branch_only") or "branch_only")
+        mode = str(getattr(prediction_settings, "mode", PREDICTION_MODE_BRANCH_PROFILE) or PREDICTION_MODE_BRANCH_PROFILE)
         branch_settings = getattr(prediction_settings, "branch", None)
         ml_settings = getattr(prediction_settings, "ml", None)
         branch_enabled = bool(getattr(branch_settings, "enabled", True))
@@ -73,32 +74,12 @@ class PredictionRouter:
 
     def predict(self, request: PredictionRequest) -> PredictionRouterResult:
         mode = self._normalized_mode()
-        branch, branch_failure = self._try_provider(self.branch_provider, request)
-        ml, ml_failure = self._try_provider(self.ml_provider, request)
-        failures = tuple(item for item in (branch_failure, ml_failure) if item)
-        candidates = tuple(candidate for candidate in (branch, ml) if candidate is not None)
+        provider = self.branch_provider if mode == PREDICTION_MODE_BRANCH_PROFILE else self.ml_provider
+        selected, failure = self._try_provider(provider, request)
+        failures = (failure,) if failure else ()
+        candidates = (selected,) if selected is not None else ()
         shadow: tuple[ResourcePrediction, ...] = ()
-        selected: ResourcePrediction | None = None
-        reason = "no_prediction"
-
-        if mode == "branch_only":
-            selected = branch
-            reason = "branch_selected" if selected is not None else "branch_unavailable"
-        elif mode == "ml_shadow":
-            selected = branch
-            shadow = (ml,) if ml is not None else ()
-            reason = "branch_selected_ml_shadowed" if selected is not None else "branch_unavailable"
-        elif mode == "ml_primary":
-            selected = ml or branch
-            if selected is ml and ml is not None:
-                reason = "ml_selected"
-            elif selected is branch and branch is not None:
-                reason = "ml_unavailable_branch_fallback"
-            else:
-                reason = "all_providers_unavailable"
-        elif mode == "confidence_first":
-            selected = max(candidates, key=lambda item: item.confidence, default=None)
-            reason = f"{selected.source.value}_highest_confidence" if selected is not None else "all_providers_unavailable"
+        reason = f"{mode}_selected" if selected is not None else f"{mode}_unavailable"
 
         result = PredictionRouterResult(
             selected=selected,
@@ -112,9 +93,9 @@ class PredictionRouter:
         return result
 
     def _normalized_mode(self) -> str:
-        mode = str(self.mode or "branch_only").strip().lower().replace("-", "_")
-        if mode not in {"branch_only", "ml_shadow", "confidence_first", "ml_primary"}:
-            return "branch_only"
+        mode = str(self.mode or PREDICTION_MODE_BRANCH_PROFILE).strip().lower().replace("-", "_")
+        if mode not in {PREDICTION_MODE_BRANCH_PROFILE, PREDICTION_MODE_ML_PREDICTOR}:
+            raise ValueError(f"Unsupported prediction mode: {self.mode}")
         return mode
 
     def _try_provider(

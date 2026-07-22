@@ -562,7 +562,7 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
             self.assertEqual(context["stage_hardware_features"]["stage_filter"], ["training_parameters"])
             self.assertEqual(context["stage_hardware_features"]["features"][0]["feature_id"], "bf16")
 
-    def test_batch_resolution_apply_updates_runner_kwargs_and_metadata(self) -> None:
+    def test_batch_resolution_apply_preserves_authored_batch_and_updates_current(self) -> None:
         job = TrainingJob.create(
             "module:runner",
             "baseline-a",
@@ -572,8 +572,9 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
 
         updated = BatchResolution.apply(job, 8)
 
-        self.assertEqual(updated.config.runner_kwargs["batch_size"], 8)
-        self.assertEqual(updated.metadata["resolved_batch_size"], 8)
+        self.assertEqual(updated.config.runner_kwargs["batch_size"], 2)
+        self.assertEqual(updated.authored_batch_size, 2)
+        self.assertEqual(updated.current_batch_size, 8)
         self.assertEqual(updated.metadata["placement_batch_param_name"], "batch_size")
         self.assertEqual(BatchResolution.resolved_batch_size(updated), 8)
 
@@ -654,16 +655,15 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
         self.assertGreater(calls_after_first_read, 0)
         self.assertEqual(store.hardware_calls, calls_after_first_read)
 
-    def test_graph_knowledge_preserves_empty_auto_probe_backend_lists(self) -> None:
+    def test_graph_knowledge_preserves_empty_adaptive_probe_backend_lists(self) -> None:
         store = _FakeGraphStore()
         store.events = [
             {
-                "event_type": "scheduler_auto_backend_probe",
+                "event_type": "scheduler_adaptive_backend_probe",
                 "payload": {
-                    "configured_mode": "auto",
-                    "effective_scheduler_mode": "parallel_auto_pack",
+                    "configured_mode": "adaptive",
+                    "effective_scheduler_mode": "adaptive",
                     "backend_priority": [],
-                    "concurrent_backend_allowlist": [],
                 },
             }
         ]
@@ -673,9 +673,8 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
         capabilities = knowledge._backend_capabilities()
 
         self.assertEqual(limits["backend_priority"], [])
-        self.assertEqual(limits["concurrent_backend_allowlist"], [])
         self.assertEqual(capabilities["backend_priority"], [])
-        self.assertEqual(capabilities["concurrent_backend_allowlist"], [])
+        self.assertEqual(limits["candidate_window_size"], 16)
 
 
 if __name__ == "__main__":
