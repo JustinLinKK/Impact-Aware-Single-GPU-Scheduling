@@ -22,6 +22,7 @@ class GpuTelemetrySample:
 @dataclass(slots=True)
 class GpuTelemetrySummary:
     peak_vram_mb: int | None = None
+    avg_vram_mb: float | None = None
     avg_gpu_utilization: float | None = None
     avg_memory_utilization: float | None = None
     sample_count: int = 0
@@ -32,6 +33,7 @@ class GpuTelemetrySummary:
             return cls()
         return cls(
             peak_vram_mb=max(sample.memory_used_mb for sample in samples),
+            avg_vram_mb=sum(sample.memory_used_mb for sample in samples) / len(samples),
             avg_gpu_utilization=sum(sample.gpu_utilization for sample in samples) / len(samples),
             avg_memory_utilization=sum(sample.memory_utilization for sample in samples) / len(samples),
             sample_count=len(samples),

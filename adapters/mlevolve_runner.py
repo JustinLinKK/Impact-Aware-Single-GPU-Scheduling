@@ -383,11 +383,17 @@ def probe_mlevolve_script_job(
         fits = False
 
     peak_vram_mb = max((sample.memory_used_mb for sample in samples), default=None)
+    avg_vram_mb = (
+        sum(sample.memory_used_mb for sample in samples) / len(samples)
+        if samples
+        else None
+    )
     memory_total_mb = max((sample.memory_total_mb for sample in samples), default=None)
     elapsed_ms = (time.time() - started_at) * 1000.0
     return BatchProbeTrialResult(
         fits=bool(fits),
         peak_vram_mb=peak_vram_mb,
+        avg_vram_mb=avg_vram_mb,
         memory_total_mb=memory_total_mb,
         avg_step_time_ms=elapsed_ms / max(1, len(samples)) if samples else None,
         message=failure_reason or ("probe window completed" if fits else stderr_text.strip()[:400]),

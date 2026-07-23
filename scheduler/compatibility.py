@@ -34,16 +34,16 @@ def compatibility_score(
     priority_bonus = 0.01 * max(0, partner_job.priority)
     memory_budget_mb = settings.gpu_scheduler.memory.safe_vram_budget_gib * 1024.0
     memory_penalty = (
-        _profile_peak_vram_mb(primary_job, primary_profile) + _profile_peak_vram_mb(partner_job, partner_profile)
+        _profile_avg_vram_mb(primary_job, primary_profile) + _profile_avg_vram_mb(partner_job, partner_profile)
     ) / memory_budget_mb if memory_budget_mb > 0 else 0.0
     return 1.0 + util_headroom + priority_bonus - memory_penalty
 
 
-def _profile_peak_vram_mb(job: TrainingJob, profile: SoloProfile | None) -> int:
-    if profile and profile.peak_vram_mb is not None:
-        return int(profile.peak_vram_mb)
-    if job.resource_requirements.estimated_vram_mb is not None:
-        return int(job.resource_requirements.estimated_vram_mb)
+def _profile_avg_vram_mb(job: TrainingJob, profile: SoloProfile | None) -> int:
+    if profile and profile.avg_vram_mb is not None:
+        return int(profile.avg_vram_mb)
+    if job.resource_requirements.estimated_avg_vram_mb is not None:
+        return int(job.resource_requirements.estimated_avg_vram_mb)
     return 0
 
 
@@ -82,4 +82,3 @@ class CompatibilityEvaluator:
             if pair_profile and pair_profile.slowdown_ratio is not None and pair_profile.slowdown_ratio > thresholds.pack_reject_max_slowdown:
                 return False
         return True
-

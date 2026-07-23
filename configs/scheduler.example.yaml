@@ -15,6 +15,16 @@ cache_server_host: "127.0.0.1"
 cache_server_port: 8765
 cache_socket_name: "cache_server.sock"
 auto_resume_recoverable: false
+prediction:
+  # "branch_profile" uses observations/probes; "ml_predictor" first tries PerfSeer.
+  mode: "branch_profile"
+  ml:
+    registry_path: null
+    source_conversion_timeout_seconds: 15
+    cache_size: 1024
+    # Test-only cross-hardware bypass. Both fields are required to activate it.
+    test_override_enabled: false
+    test_model_path: null
 graph_db:
   enabled: true
   mode: "primary"
@@ -95,6 +105,7 @@ gpu_scheduler:
   submission_defaults:
     requires_gpu: true
     estimated_vram_mb: null
+    estimated_avg_vram_mb: null
     estimated_ram_mb: null
     packing_eligible: false
     packing_family: "mlevolve_script"

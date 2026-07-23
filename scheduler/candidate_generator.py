@@ -78,7 +78,7 @@ class CandidateGenerator:
             key=lambda job: (
                 job.priority,
                 -(self.estimator.predicted_remaining_runtime_seconds(job, backend_name=backend_name) or 0.0),
-                -self.estimator.estimate_peak_vram_mb(job, batch_overrides.get(job.job_id, self.estimator.resolved_batch_size(job)), backend_name),
+                -self.estimator.estimate_avg_vram_mb(job, batch_overrides.get(job.job_id, self.estimator.resolved_batch_size(job)), backend_name),
                 job.queue_sequence,
             ),
         )
@@ -107,4 +107,3 @@ class CandidateGenerator:
             else:
                 groups.append(window[:size])
         return groups
-

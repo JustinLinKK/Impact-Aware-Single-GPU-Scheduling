@@ -5,6 +5,8 @@ from __future__ import annotations
 from ..profiling.runtime_probe import runtime_profile_for_job
 from ..domain import BatchResolution, SoloProfile, TrainingJob, build_batch_probe_key, build_batch_probe_shape_signature, normalize_batch_probe_search_mode
 from ..config import SchedulerSettings
+from ..config import PREDICTION_MODE_ML_PREDICTOR
+from ..prediction import JobPredictionError, MLVramPredictor
 from .planning_repository import PlanningRepository
 
 
@@ -12,6 +14,11 @@ class ResourceEstimator:
     def __init__(self, settings: SchedulerSettings, repository: PlanningRepository):
         self.settings = settings
         self.repository = repository
+        self.ml_predictor = (
+            MLVramPredictor(settings.prediction, repository.hardware_profile())
+            if settings.prediction.mode == PREDICTION_MODE_ML_PREDICTOR
+            else None
+        )
 
     def safe_budget_mb(self) -> float:
         return self.settings.gpu_scheduler.memory.safe_vram_budget_gib * 1024.0
@@ -47,7 +54,60 @@ class ResourceEstimator:
         return self.repository.get_solo_profile(job.packing.signature)
 
     def has_memory_estimate(self, job: TrainingJob, backend_name: str) -> bool:
-        return self.estimate_peak_vram_mb(job, self.resolved_batch_size(job), backend_name) > 0.0
+        return self.estimate_avg_vram_mb(job, self.resolved_batch_size(job), backend_name) > 0.0
+
+    def estimate_avg_vram_mb(self, job: TrainingJob, batch_size: int, backend_name: str) -> float:
+        if self.ml_predictor is not None:
+            try:
+                value = self.ml_predictor.predict_avg_vram_mb(job, batch_size)
+                job.metadata["vram_prediction_source"] = "ml_predictor"
+                job.metadata.pop("vram_prediction_error", None)
+                return value
+            except JobPredictionError as exc:
+                job.metadata["vram_prediction_source"] = "branch_profile"
+                job.metadata["vram_prediction_error"] = str(exc)
+        return self._estimate_branch_avg_vram_mb(job, batch_size, backend_name)
+
+    def _estimate_branch_avg_vram_mb(self, job: TrainingJob, batch_size: int, backend_name: str) -> float:
+        hardware = self.repository.hardware_profile()
+        observation = self.repository.get_batch_size_observation(
+            model_key=self.model_key(job),
+            shape_signature=self.shape_signature(job),
+            hardware_key=hardware.hardware_key,
+            backend_name=backend_name,
+            batch_size=batch_size,
+        )
+        if observation and observation.avg_vram_mb is not None:
+            return float(observation.avg_vram_mb)
+
+        related = self.repository.list_batch_size_observations(
+            model_key=self.model_key(job),
+            shape_signature=self.shape_signature(job),
+            hardware_key=hardware.hardware_key,
+            backend_name=backend_name,
+        )
+        candidates = [item for item in related if item.avg_vram_mb is not None and item.batch_size > 0]
+        if candidates:
+            nearest = min(candidates, key=lambda item: abs(item.batch_size - batch_size))
+            return float(nearest.avg_vram_mb) * (float(batch_size) / float(max(1, nearest.batch_size)))
+
+        device_type = hardware.gpu_name
+        search_mode = normalize_batch_probe_search_mode(job.batch_probe.search_mode or self.settings.gpu_scheduler.batch_probe_search_mode)
+        probe_key = build_batch_probe_key(self.model_key(job), device_type, self.shape_signature(job), search_mode=search_mode)
+        batch_profile = self.repository.get_batch_probe_profile(probe_key)
+        if batch_profile and batch_profile.avg_vram_mb is not None:
+            base_batch = max(1, int(batch_profile.resolved_batch_size))
+            return float(batch_profile.avg_vram_mb) * (float(batch_size) / float(base_batch))
+
+        solo_profile = self.solo_profile(job)
+        if solo_profile and solo_profile.avg_vram_mb is not None:
+            base_batch = max(1, self.resolved_batch_size(job))
+            return float(solo_profile.avg_vram_mb) * (float(batch_size) / float(base_batch))
+
+        if job.resource_requirements.estimated_avg_vram_mb is not None:
+            base_batch = max(1, self.resolved_batch_size(job))
+            return float(job.resource_requirements.estimated_avg_vram_mb) * (float(batch_size) / float(base_batch))
+        return 0.0
 
     def estimate_peak_vram_mb(self, job: TrainingJob, batch_size: int, backend_name: str) -> float:
         hardware = self.repository.hardware_profile()
@@ -117,8 +177,15 @@ class ResourceEstimator:
         return 0.0
 
     def predicted_group_vram_mb(self, jobs: list[TrainingJob], *, backend_name: str) -> float:
-        return sum(self.estimate_peak_vram_mb(job, self.resolved_batch_size(job), backend_name) for job in jobs)
+        return sum(self.estimate_avg_vram_mb(job, self.resolved_batch_size(job), backend_name) for job in jobs)
 
     def predicted_group_sm_utilization(self, jobs: list[TrainingJob], *, backend_name: str) -> float:
         return sum(self.estimate_sm_utilization(job, self.resolved_batch_size(job), backend_name) for job in jobs)
 
+    def prediction_metadata(self, job_id: str) -> dict[str, str | None]:
+        if self.ml_predictor is None:
+            return {"vram_prediction_source": "branch_profile", "vram_prediction_error": None}
+        return {
+            "vram_prediction_source": self.ml_predictor.last_sources.get(job_id, "branch_profile"),
+            "vram_prediction_error": self.ml_predictor.last_errors.get(job_id),
+        }

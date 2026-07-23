@@ -345,11 +345,12 @@ class SQLiteStateStore:
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO solo_profiles(signature, hardware_key, family, peak_vram_mb, avg_gpu_utilization, avg_memory_utilization, sample_count, last_job_id, updated_at, metadata_json)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO solo_profiles(signature, hardware_key, family, peak_vram_mb, avg_vram_mb, avg_gpu_utilization, avg_memory_utilization, sample_count, last_job_id, updated_at, metadata_json)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(signature, hardware_key) DO UPDATE SET
                     family=excluded.family,
                     peak_vram_mb=excluded.peak_vram_mb,
+                    avg_vram_mb=excluded.avg_vram_mb,
                     avg_gpu_utilization=excluded.avg_gpu_utilization,
                     avg_memory_utilization=excluded.avg_memory_utilization,
                     sample_count=excluded.sample_count,
@@ -362,6 +363,7 @@ class SQLiteStateStore:
                     profile.hardware_key,
                     profile.family,
                     profile.peak_vram_mb,
+                    profile.avg_vram_mb,
                     profile.avg_gpu_utilization,
                     profile.avg_memory_utilization,
                     profile.sample_count,
@@ -400,8 +402,8 @@ class SQLiteStateStore:
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO pair_profiles(pair_key, hardware_key, left_signature, right_signature, backend_name, compatible, observations, peak_vram_mb, avg_gpu_utilization, avg_memory_utilization, slowdown_ratio, cooldown_until, last_failure_reason, updated_at, metadata_json)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO pair_profiles(pair_key, hardware_key, left_signature, right_signature, backend_name, compatible, observations, peak_vram_mb, avg_vram_mb, avg_gpu_utilization, avg_memory_utilization, slowdown_ratio, cooldown_until, last_failure_reason, updated_at, metadata_json)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(pair_key, hardware_key) DO UPDATE SET
                     left_signature=excluded.left_signature,
                     right_signature=excluded.right_signature,
@@ -409,6 +411,7 @@ class SQLiteStateStore:
                     compatible=excluded.compatible,
                     observations=excluded.observations,
                     peak_vram_mb=excluded.peak_vram_mb,
+                    avg_vram_mb=excluded.avg_vram_mb,
                     avg_gpu_utilization=excluded.avg_gpu_utilization,
                     avg_memory_utilization=excluded.avg_memory_utilization,
                     slowdown_ratio=excluded.slowdown_ratio,
@@ -426,6 +429,7 @@ class SQLiteStateStore:
                     1 if profile.compatible else 0,
                     profile.observations,
                     profile.peak_vram_mb,
+                    profile.avg_vram_mb,
                     profile.avg_gpu_utilization,
                     profile.avg_memory_utilization,
                     profile.slowdown_ratio,
@@ -611,6 +615,7 @@ class SQLiteStateStore:
                     batch_param_name,
                     resolved_batch_size,
                     peak_vram_mb,
+                    avg_vram_mb,
                     memory_total_mb,
                     target_budget_mb,
                     observations,
@@ -618,7 +623,7 @@ class SQLiteStateStore:
                     updated_at,
                     metadata_json
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(probe_key) DO UPDATE SET
                     model_key=excluded.model_key,
                     device_type=excluded.device_type,
@@ -626,6 +631,7 @@ class SQLiteStateStore:
                     batch_param_name=excluded.batch_param_name,
                     resolved_batch_size=excluded.resolved_batch_size,
                     peak_vram_mb=excluded.peak_vram_mb,
+                    avg_vram_mb=excluded.avg_vram_mb,
                     memory_total_mb=excluded.memory_total_mb,
                     target_budget_mb=excluded.target_budget_mb,
                     observations=excluded.observations,
@@ -641,6 +647,7 @@ class SQLiteStateStore:
                     profile.batch_param_name,
                     profile.resolved_batch_size,
                     profile.peak_vram_mb,
+                    profile.avg_vram_mb,
                     profile.memory_total_mb,
                     profile.target_budget_mb,
                     profile.observations,
@@ -676,6 +683,7 @@ class SQLiteStateStore:
                     batch_param_name,
                     batch_size,
                     peak_vram_mb,
+                    avg_vram_mb,
                     memory_total_mb,
                     avg_step_time_ms,
                     avg_gpu_utilization,
@@ -685,7 +693,7 @@ class SQLiteStateStore:
                     updated_at,
                     metadata_json
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(observation_key) DO UPDATE SET
                     model_key=excluded.model_key,
                     shape_signature=excluded.shape_signature,
@@ -694,6 +702,7 @@ class SQLiteStateStore:
                     batch_param_name=excluded.batch_param_name,
                     batch_size=excluded.batch_size,
                     peak_vram_mb=excluded.peak_vram_mb,
+                    avg_vram_mb=excluded.avg_vram_mb,
                     memory_total_mb=excluded.memory_total_mb,
                     avg_step_time_ms=excluded.avg_step_time_ms,
                     avg_gpu_utilization=excluded.avg_gpu_utilization,
@@ -712,6 +721,7 @@ class SQLiteStateStore:
                     observation.batch_param_name,
                     observation.batch_size,
                     observation.peak_vram_mb,
+                    observation.avg_vram_mb,
                     observation.memory_total_mb,
                     observation.avg_step_time_ms,
                     observation.avg_gpu_utilization,
@@ -788,6 +798,7 @@ class SQLiteStateStore:
                     compatible,
                     observations,
                     peak_vram_mb,
+                    avg_vram_mb,
                     memory_total_mb,
                     avg_gpu_utilization,
                     avg_memory_utilization,
@@ -799,7 +810,7 @@ class SQLiteStateStore:
                     updated_at,
                     metadata_json
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(combination_key) DO UPDATE SET
                     group_signature=excluded.group_signature,
                     hardware_key=excluded.hardware_key,
@@ -809,6 +820,7 @@ class SQLiteStateStore:
                     compatible=excluded.compatible,
                     observations=excluded.observations,
                     peak_vram_mb=excluded.peak_vram_mb,
+                    avg_vram_mb=excluded.avg_vram_mb,
                     memory_total_mb=excluded.memory_total_mb,
                     avg_gpu_utilization=excluded.avg_gpu_utilization,
                     avg_memory_utilization=excluded.avg_memory_utilization,
@@ -830,6 +842,7 @@ class SQLiteStateStore:
                     1 if profile.compatible else 0,
                     profile.observations,
                     profile.peak_vram_mb,
+                    profile.avg_vram_mb,
                     profile.memory_total_mb,
                     profile.avg_gpu_utilization,
                     profile.avg_memory_utilization,
@@ -901,6 +914,7 @@ class SQLiteStateStore:
         reason: str,
         cooldown_seconds: int,
         peak_vram_mb: int | None = None,
+        avg_vram_mb: float | None = None,
         avg_gpu_utilization: float | None = None,
         avg_memory_utilization: float | None = None,
         metadata: dict[str, Any] | None = None,
@@ -918,6 +932,7 @@ class SQLiteStateStore:
             compatible=False,
             observations=(existing.observations + 1) if existing else 1,
             peak_vram_mb=peak_vram_mb if peak_vram_mb is not None else (existing.peak_vram_mb if existing else None),
+            avg_vram_mb=avg_vram_mb if avg_vram_mb is not None else (existing.avg_vram_mb if existing else None),
             avg_gpu_utilization=avg_gpu_utilization if avg_gpu_utilization is not None else (existing.avg_gpu_utilization if existing else None),
             avg_memory_utilization=avg_memory_utilization if avg_memory_utilization is not None else (existing.avg_memory_utilization if existing else None),
             slowdown_ratio=existing.slowdown_ratio if existing else None,

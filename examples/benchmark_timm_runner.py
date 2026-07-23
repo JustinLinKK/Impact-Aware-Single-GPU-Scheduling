@@ -118,6 +118,7 @@ def probe_timm_benchmark_batch_size(
         return {
             "fits": False,
             "peak_vram_mb": synthetic_peak,
+            "avg_vram_mb": synthetic_peak,
             "memory_total_mb": None,
             "message": f"batch size {batch_size} exceeds configured probe_max_batch_size {probe_limit}",
         }
@@ -130,6 +131,7 @@ def probe_timm_benchmark_batch_size(
         return {
             "fits": True,
             "peak_vram_mb": synthetic_peak,
+            "avg_vram_mb": synthetic_peak,
             "memory_total_mb": None,
             "avg_step_time_ms": 1.0,
             "message": "synthetic CPU probe result",
@@ -163,6 +165,7 @@ def probe_timm_benchmark_batch_size(
         criterion = nn.CrossEntropyLoss()
 
         start_time = None
+        measured_vram_mb: list[float] = []
         for step_index in range(total_steps):
             features = torch.randn(int(batch_size), 3, 224, 224, device=device)
             labels = torch.randint(0, num_classes, (int(batch_size),), device=device)
@@ -174,11 +177,20 @@ def probe_timm_benchmark_batch_size(
             if step_index == warmup:
                 torch.cuda.synchronize(device)
                 start_time = time.perf_counter()
+            if step_index >= warmup:
+                measured_vram_mb.append(
+                    float(torch.cuda.memory_allocated(device)) / (1024 * 1024)
+                )
         torch.cuda.synchronize(device)
         elapsed_ms = ((time.perf_counter() - start_time) * 1000.0) if start_time is not None else None
         return {
             "fits": True,
             "peak_vram_mb": int(torch.cuda.max_memory_allocated(device) / (1024 * 1024)),
+            "avg_vram_mb": (
+                sum(measured_vram_mb) / len(measured_vram_mb)
+                if measured_vram_mb
+                else None
+            ),
             "memory_total_mb": int(torch.cuda.get_device_properties(device).total_memory / (1024 * 1024)),
             "avg_step_time_ms": (elapsed_ms / measured) if elapsed_ms is not None else None,
             "message": "cuda probe completed",
@@ -189,6 +201,7 @@ def probe_timm_benchmark_batch_size(
         return {
             "fits": False,
             "peak_vram_mb": int(torch.cuda.max_memory_allocated(device) / (1024 * 1024)),
+            "avg_vram_mb": float(torch.cuda.memory_allocated(device)) / (1024 * 1024),
             "memory_total_mb": int(torch.cuda.get_device_properties(device).total_memory / (1024 * 1024)),
             "message": str(exc),
         }

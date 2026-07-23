@@ -70,8 +70,14 @@ def normalize_runtime_probe_strategy(value: str | None) -> str:
 class ResourceRequirements:
     requires_gpu: bool = True
     estimated_vram_mb: int | None = None
+    estimated_avg_vram_mb: int | None = None
     estimated_ram_mb: int | None = None
     gpu_slots: int = 1
+
+    def __post_init__(self) -> None:
+        # Backward compatibility for clients that supplied the old ambiguous field.
+        if self.estimated_avg_vram_mb is None and self.estimated_vram_mb is not None:
+            self.estimated_avg_vram_mb = int(self.estimated_vram_mb)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "ResourceRequirements":
@@ -474,4 +480,3 @@ class TrainingJob:
         if reference is None or waiting_since is None:
             return 0.0
         return max(0.0, (reference - waiting_since).total_seconds())
-

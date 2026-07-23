@@ -1,6 +1,8 @@
 """Public configuration surface for the local ML scheduler."""
 
 from .models import (
+    PREDICTION_MODE_BRANCH_PROFILE,
+    PREDICTION_MODE_ML_PREDICTOR,
     AutoPackSettings,
     BaselineCacheSettings,
     CudaProcessSettings,
@@ -14,6 +16,7 @@ from .models import (
     LogDBSettings,
     MPSSettings,
     ParallelOptimizerSettings,
+    PredictionSettings,
     SCHEDULER_MODE_PARALLEL_AUTO_PACK,
     SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
     SCHEDULER_MODE_PARALLEL_DEFAULT,
@@ -23,10 +26,13 @@ from .models import (
     SchedulerSettings,
     SchedulerSubmissionDefaults,
     StreamSettings,
+    normalize_prediction_mode,
     normalize_scheduler_mode,
 )
 
 __all__ = [
+    "PREDICTION_MODE_BRANCH_PROFILE",
+    "PREDICTION_MODE_ML_PREDICTOR",
     "AutoPackSettings",
     "BaselineCacheSettings",
     "CudaProcessSettings",
@@ -40,6 +46,7 @@ __all__ = [
     "LogDBSettings",
     "MPSSettings",
     "ParallelOptimizerSettings",
+    "PredictionSettings",
     "SCHEDULER_MODE_PARALLEL_AUTO_PACK",
     "SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED",
     "SCHEDULER_MODE_PARALLEL_DEFAULT",
@@ -49,5 +56,6 @@ __all__ = [
     "SchedulerSettings",
     "SchedulerSubmissionDefaults",
     "StreamSettings",
+    "normalize_prediction_mode",
     "normalize_scheduler_mode",
 ]

@@ -41,6 +41,7 @@ class SoloProfile:
     hardware_key: str = ""
     family: str | None = None
     peak_vram_mb: int | None = None
+    avg_vram_mb: float | None = None
     avg_gpu_utilization: float | None = None
     avg_memory_utilization: float | None = None
     sample_count: int = 0
@@ -56,6 +57,7 @@ class SoloProfile:
             hardware_key=row.get("hardware_key") or "",
             family=row["family"],
             peak_vram_mb=row["peak_vram_mb"],
+            avg_vram_mb=row.get("avg_vram_mb"),
             avg_gpu_utilization=row["avg_gpu_utilization"],
             avg_memory_utilization=row["avg_memory_utilization"],
             sample_count=row["sample_count"],
@@ -72,6 +74,7 @@ class SoloProfile:
 class BatchProbeTrialResult:
     fits: bool
     peak_vram_mb: int | None = None
+    avg_vram_mb: float | None = None
     memory_total_mb: int | None = None
     avg_step_time_ms: float | None = None
     message: str | None = None
@@ -93,6 +96,7 @@ class BatchProbeProfile:
     batch_param_name: str
     resolved_batch_size: int
     peak_vram_mb: int | None = None
+    avg_vram_mb: float | None = None
     memory_total_mb: int | None = None
     target_budget_mb: int | None = None
     observations: int = 1
@@ -111,6 +115,7 @@ class BatchProbeProfile:
             batch_param_name=row["batch_param_name"],
             resolved_batch_size=row["resolved_batch_size"],
             peak_vram_mb=row["peak_vram_mb"],
+            avg_vram_mb=row.get("avg_vram_mb"),
             memory_total_mb=row["memory_total_mb"],
             target_budget_mb=row["target_budget_mb"],
             observations=row["observations"],
@@ -133,6 +138,7 @@ class BatchSizeObservation:
     batch_param_name: str
     batch_size: int
     peak_vram_mb: int | None = None
+    avg_vram_mb: float | None = None
     memory_total_mb: int | None = None
     avg_step_time_ms: float | None = None
     avg_gpu_utilization: float | None = None
@@ -154,6 +160,7 @@ class BatchSizeObservation:
             batch_param_name=row["batch_param_name"],
             batch_size=row["batch_size"],
             peak_vram_mb=row["peak_vram_mb"],
+            avg_vram_mb=row.get("avg_vram_mb"),
             memory_total_mb=row["memory_total_mb"],
             avg_step_time_ms=row["avg_step_time_ms"],
             avg_gpu_utilization=row["avg_gpu_utilization"],
@@ -178,6 +185,7 @@ class PairProfile:
     compatible: bool = True
     observations: int = 0
     peak_vram_mb: int | None = None
+    avg_vram_mb: float | None = None
     avg_gpu_utilization: float | None = None
     avg_memory_utilization: float | None = None
     slowdown_ratio: float | None = None
@@ -215,6 +223,7 @@ class PairProfile:
             compatible=bool(row["compatible"]),
             observations=row["observations"],
             peak_vram_mb=row["peak_vram_mb"],
+            avg_vram_mb=row.get("avg_vram_mb"),
             avg_gpu_utilization=row["avg_gpu_utilization"],
             avg_memory_utilization=row["avg_memory_utilization"],
             slowdown_ratio=row["slowdown_ratio"],
@@ -243,6 +252,7 @@ class CombinationProfile:
     compatible: bool = True
     observations: int = 0
     peak_vram_mb: int | None = None
+    avg_vram_mb: float | None = None
     memory_total_mb: int | None = None
     avg_gpu_utilization: float | None = None
     avg_memory_utilization: float | None = None
@@ -288,6 +298,7 @@ class CombinationProfile:
             compatible=bool(row["compatible"]),
             observations=row["observations"],
             peak_vram_mb=row["peak_vram_mb"],
+            avg_vram_mb=row.get("avg_vram_mb"),
             memory_total_mb=row["memory_total_mb"],
             avg_gpu_utilization=row["avg_gpu_utilization"],
             avg_memory_utilization=row["avg_memory_utilization"],
@@ -404,6 +415,7 @@ class RunProfile:
     avg_ram_utilization: float | None = None
     avg_memory_utilization: float | None = None
     peak_vram_mb: int | None = None
+    avg_vram_mb: float | None = None
     memory_total_mb: int | None = None
     target_budget_mb: int | None = None
     slowdown_ratio: float | None = None
@@ -446,6 +458,7 @@ class RunProfile:
             avg_ram_utilization=row.get("avg_ram_utilization"),
             avg_memory_utilization=row.get("avg_memory_utilization"),
             peak_vram_mb=row.get("peak_vram_mb"),
+            avg_vram_mb=row.get("avg_vram_mb"),
             memory_total_mb=row.get("memory_total_mb"),
             target_budget_mb=row.get("target_budget_mb"),
             slowdown_ratio=row.get("slowdown_ratio"),

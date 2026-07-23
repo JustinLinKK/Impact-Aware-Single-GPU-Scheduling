@@ -108,6 +108,7 @@ def probe_toy_training_batch_size(
         return {
             "fits": False,
             "peak_vram_mb": synthetic_peak_vram_mb,
+            "avg_vram_mb": synthetic_peak_vram_mb,
             "memory_total_mb": synthetic_memory_total_mb,
             "message": f"batch size {batch_size} exceeds configured probe_max_batch_size {limit}",
         }
@@ -116,6 +117,7 @@ def probe_toy_training_batch_size(
         return {
             "fits": True,
             "peak_vram_mb": synthetic_peak_vram_mb,
+            "avg_vram_mb": synthetic_peak_vram_mb,
             "memory_total_mb": synthetic_memory_total_mb,
             "avg_step_time_ms": 1.0,
             "message": "synthetic CPU probe result",
@@ -132,6 +134,7 @@ def probe_toy_training_batch_size(
     criterion = None
     start_time = None
     measured_steps = 0
+    measured_vram_mb: list[float] = []
     try:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
@@ -165,11 +168,19 @@ def probe_toy_training_batch_size(
                 start_time = time.perf_counter()
             if step_index >= int(warmup_steps):
                 measured_steps += 1
+                measured_vram_mb.append(
+                    float(torch.cuda.memory_allocated(device)) / (1024 * 1024)
+                )
         torch.cuda.synchronize(device)
         elapsed_ms = ((time.perf_counter() - start_time) * 1000.0) if start_time is not None and measured_steps > 0 else None
         return {
             "fits": True,
             "peak_vram_mb": int(torch.cuda.max_memory_allocated(device) / (1024 * 1024)),
+            "avg_vram_mb": (
+                sum(measured_vram_mb) / len(measured_vram_mb)
+                if measured_vram_mb
+                else None
+            ),
             "memory_total_mb": int(torch.cuda.get_device_properties(device).total_memory / (1024 * 1024)),
             "avg_step_time_ms": (elapsed_ms / measured_steps) if elapsed_ms is not None and measured_steps > 0 else None,
             "message": "cuda probe completed",
@@ -180,6 +191,7 @@ def probe_toy_training_batch_size(
         return {
             "fits": False,
             "peak_vram_mb": int(torch.cuda.max_memory_allocated(device) / (1024 * 1024)),
+            "avg_vram_mb": float(torch.cuda.memory_allocated(device)) / (1024 * 1024),
             "memory_total_mb": int(torch.cuda.get_device_properties(device).total_memory / (1024 * 1024)),
             "message": str(exc),
         }

@@ -324,9 +324,9 @@ class GpuSchedulerUnitTest(unittest.TestCase):
         settings = SchedulerSettings(runtime_root=Path(tempfile.mkdtemp()))
         primary = TrainingJob.create("pkg.runner:train", "baseline-a", "/tmp/a.pt", priority=9)
         partner = TrainingJob.create("pkg.runner:train", "baseline-b", "/tmp/b.pt", priority=3)
-        primary_profile = SoloProfile(signature="a", peak_vram_mb=2048, avg_gpu_utilization=0.25)
-        low_util = SoloProfile(signature="b", peak_vram_mb=2048, avg_gpu_utilization=0.20)
-        high_util = SoloProfile(signature="c", peak_vram_mb=2048, avg_gpu_utilization=0.78)
+        primary_profile = SoloProfile(signature="a", peak_vram_mb=2048, avg_vram_mb=1800, avg_gpu_utilization=0.25)
+        low_util = SoloProfile(signature="b", peak_vram_mb=2048, avg_vram_mb=1800, avg_gpu_utilization=0.20)
+        high_util = SoloProfile(signature="c", peak_vram_mb=2048, avg_vram_mb=1800, avg_gpu_utilization=0.78)
         low_score = compatibility_score(primary, partner, primary_profile, low_util, None, settings)
         high_score = compatibility_score(primary, partner, primary_profile, high_util, None, settings)
         self.assertGreater(low_score, high_score)
@@ -497,6 +497,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                             batch_param_name="batch_size",
                             batch_size=batch_size,
                             peak_vram_mb=peak,
+                            avg_vram_mb=peak,
                             last_job_id=job.job_id,
                         )
                     )
@@ -559,6 +560,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                             batch_param_name="batch_size",
                             batch_size=batch_size,
                             peak_vram_mb=peak,
+                            avg_vram_mb=peak,
                             last_job_id=job.job_id,
                         )
                     )
@@ -662,6 +664,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                     resolved_optimal=True,
                     objective_score=0.98,
                     peak_vram_mb=900,
+                    avg_vram_mb=850,
                     fallback_order=[jobs[1].job_id, jobs[0].job_id],
                 )
             )
@@ -690,6 +693,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                 batch_param_name="batch_size",
                 batch_size=4,
                 peak_vram_mb=2048,
+                avg_vram_mb=1800,
                 observations=2,
             )
             other_observation = BatchSizeObservation(
@@ -701,6 +705,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                 batch_param_name="batch_size",
                 batch_size=4,
                 peak_vram_mb=4096,
+                avg_vram_mb=3600,
             )
             store.upsert_batch_size_observation(observation)
             store.upsert_batch_size_observation(other_observation)

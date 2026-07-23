@@ -8,6 +8,8 @@
 - optional Linux hybrid overlap across `mps` and `stream` backend groups on one GPU when concurrent groups are enabled
 - optional exclusive-path batch-size probing with SQLite-backed reuse for repeated model/device/shape combinations
 - one-epoch runtime profiling that makes new job families pack-eligible after the first exclusive calibration run
+- optional hardware-selected PerfSeer student prediction, with CPU-only
+  TorchScript inference and per-job branch-profile fallback
 
 It is intentionally packaged as a root-level module so it can be used by MLEvolve or detached and integrated into other agent pipelines.
 
@@ -24,6 +26,8 @@ It is intentionally packaged as a root-level module so it can be used by MLEvolv
 - `storage/`: SQLite-backed jobs, commands, checkpoints, cache metadata, and event history
 - `observability/`: JSONL events, log files, and aggregate reports
 - `profiling/`: exclusive-path batch probe controller plus runtime profile helpers
+- `prediction/`: scheduler integration for isolated source conversion and the
+  PerfSeer submodule's CPU runtime
 - `examples/`: toy PyTorch training runner and a demo script
 - `adapters/`: thin helpers for wiring job submission from MLEvolve or other systems
 
@@ -112,6 +116,38 @@ Structured runners can also expose an optional batch probe hook in `module:funct
 
 Structured runners can also opt into runtime probing with `runtime_probe.enabled: true`. The default `epoch_1` strategy treats the first exclusive epoch as calibration, persists a runtime profile keyed by workload signature, hardware, backend, and resolved batch size, and then uses that estimate to reject badly skewed packed groups. Jobs without reliable epoch semantics can use `runtime_probe.strategy: "step_window"` instead.
 
+## PerfSeer ML Prediction
+
+Set `prediction.mode: ml_predictor` to select a registered student model using
+the detected GPU name, compute capability, and VRAM. The current registry
+contains the NVIDIA A10 model. If the current hardware has no matching artifact,
+the scheduler remains operational and uses branch-profile prediction for every
+job. The `test_override_enabled` and `test_model_path` fields provide an
+explicit test-only cross-hardware bypass.
+
+Predictable jobs may supply:
+
+```yaml
+metadata:
+  perfseer_model:
+    source_path: "/absolute/path/to/model.py"
+    entry: "build_model"
+    input_shapes: [["$batch", 3, 224, 224]]
+    input_dtypes: ["float32"]
+    precision: "fp32_ieee"
+    constructor_args: []
+    constructor_kwargs: {}
+```
+
+When this block is absent, the scheduler tries the job source with
+`build_model` and `metadata.input_shape`. Import, FX tracing, and shape
+propagation run in a timed subprocess with GPU visibility disabled. An
+unsupported source, timeout, or invalid result falls back only that job.
+
+All placement modes use average used GPU VRAM in MiB (`avg_vram_mb`) for
+packing. Peak VRAM remains observable and the live memory hard-stop continues
+to protect active runs.
+
 Jobs may optionally include a `preload_source` with `model_id`, `model_path`, and `loader_target`. When present, the scheduler warms that shared source in RAM instead of the job's normal baseline target. This is useful for raw MLEvolve runs where many sibling jobs share one immutable starting checkpoint but still execute different generated scripts.
 
 The normal pause flow is:
@@ -133,22 +169,13 @@ The normal pause flow is:
 
 ## Limitations In V1
 
-- no three-way packing, distributed scheduling, or automatic interception of arbitrary generated Python snippets
+- no distributed scheduling or automatic interception of arbitrary generated Python snippets
 - queued command intent is durable in SQLite, but CLI actions rely on the scheduler loop to consume them
 - cache payloads assume `torch.save` / `torch.load` compatibility unless a custom loader target is provided
-
-## Path To V2
-
-The current design keeps resource requirements, placement decisions, scheduling policy, and worker supervision separate so future work can add:
-
-- co-run compatibility prediction
-- two-job GPU packing and richer placement logic
-- interference-aware dispatch and profiling feedback
-
-Those changes should fit without replacing the job schema, storage model, or training runner contract.
 
 ## Tests
 
 ```bash
 python -m unittest discover localml_scheduler/tests
+python -m unittest localml_scheduler.tests.test_ml_stress -v
 ```

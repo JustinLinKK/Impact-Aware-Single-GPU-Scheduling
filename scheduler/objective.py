@@ -35,7 +35,7 @@ class ObjectiveScorer:
         if not self.compatibility.compatible_group(jobs, backend_name=backend_name):
             return None
         batch_overrides = {job.job_id: self.estimator.resolved_batch_size(job) for job in jobs}
-        estimated_vram_mb = sum(self.estimator.estimate_peak_vram_mb(job, batch_overrides[job.job_id], backend_name) for job in jobs)
+        estimated_vram_mb = sum(self.estimator.estimate_avg_vram_mb(job, batch_overrides[job.job_id], backend_name) for job in jobs)
         safe_budget_mb = self.estimator.safe_budget_mb()
         if estimated_vram_mb > safe_budget_mb:
             return None
@@ -64,8 +64,8 @@ class ObjectiveScorer:
             backend_name=backend_name,
             scheduler_mode=SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
         )
-        if cached is not None and cached.batch_vector:
-            estimated_vram_mb = float(cached.peak_vram_mb or 0)
+        if cached is not None and cached.batch_vector and cached.avg_vram_mb is not None:
+            estimated_vram_mb = float(cached.avg_vram_mb or 0)
             return EvaluatedGroup(
                 jobs=jobs,
                 backend_name=backend_name,
@@ -95,7 +95,7 @@ class ObjectiveScorer:
 
         for batch_vector in search_space:
             overrides = {job.job_id: int(batch_size) for job, batch_size in zip(jobs, batch_vector, strict=True)}
-            estimated_vram_mb = sum(self.estimator.estimate_peak_vram_mb(job, overrides[job.job_id], backend_name) for job in jobs)
+            estimated_vram_mb = sum(self.estimator.estimate_avg_vram_mb(job, overrides[job.job_id], backend_name) for job in jobs)
             if estimated_vram_mb > safe_budget_mb:
                 continue
             utilization = estimated_vram_mb / safe_budget_mb if safe_budget_mb > 0 else 0.0
@@ -139,7 +139,7 @@ class ObjectiveScorer:
             return None
 
         batch_overrides = {job.job_id: self.estimator.resolved_batch_size(job) for job in jobs}
-        estimated_vram_mb = sum(self.estimator.estimate_peak_vram_mb(job, batch_overrides[job.job_id], backend_name) for job in jobs)
+        estimated_vram_mb = sum(self.estimator.estimate_avg_vram_mb(job, batch_overrides[job.job_id], backend_name) for job in jobs)
         if (active_vram_mb + estimated_vram_mb) > self.estimator.safe_budget_mb():
             return None
         estimated_sm_utilization = sum(self.estimator.estimate_sm_utilization(job, batch_overrides[job.job_id], backend_name) for job in jobs)
@@ -173,4 +173,3 @@ class ObjectiveScorer:
             fallback_order=self.candidate_generator.fallback_order(jobs, batch_overrides, backend_name),
             reason="auto-pack group selected",
         )
-

@@ -15,6 +15,15 @@ SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED = "serial_batch_optimized"
 SCHEDULER_MODE_PARALLEL_DEFAULT = "parallel_default"
 SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED = "parallel_batch_optimized"
 SCHEDULER_MODE_PARALLEL_AUTO_PACK = "parallel_auto_pack"
+PREDICTION_MODE_BRANCH_PROFILE = "branch_profile"
+PREDICTION_MODE_ML_PREDICTOR = "ml_predictor"
+
+
+def normalize_prediction_mode(value: str | None) -> str:
+    normalized = str(value or PREDICTION_MODE_BRANCH_PROFILE).strip().lower().replace("-", "_")
+    if normalized not in {PREDICTION_MODE_BRANCH_PROFILE, PREDICTION_MODE_ML_PREDICTOR}:
+        raise ValueError(f"Unsupported prediction mode: {value}")
+    return normalized
 
 
 def normalize_scheduler_mode(value: str | None) -> str:
@@ -258,6 +267,49 @@ class BaselineCacheSettings:
 
 
 @dataclass(slots=True)
+class PredictionSettings:
+    mode: str = PREDICTION_MODE_BRANCH_PROFILE
+    registry_path: str | None = None
+    conversion_timeout_seconds: float = 15.0
+    cache_size: int = 1024
+    test_override_enabled: bool = False
+    test_model_path: str | None = None
+
+    def __post_init__(self) -> None:
+        self.mode = normalize_prediction_mode(self.mode)
+        self.conversion_timeout_seconds = max(0.1, float(self.conversion_timeout_seconds))
+        self.cache_size = max(1, int(self.cache_size))
+        if not self.test_override_enabled:
+            self.test_model_path = None
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "PredictionSettings":
+        raw = dict(payload or {})
+        nested = raw.pop("ml", None)
+        if isinstance(nested, dict):
+            aliases = {
+                "source_conversion_timeout_seconds": "conversion_timeout_seconds",
+            }
+            for key, value in nested.items():
+                raw[aliases.get(key, key)] = value
+        if "source_conversion_timeout_seconds" in raw:
+            raw["conversion_timeout_seconds"] = raw.pop("source_conversion_timeout_seconds")
+        return cls(**raw)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "ml": {
+                "registry_path": self.registry_path,
+                "source_conversion_timeout_seconds": self.conversion_timeout_seconds,
+                "cache_size": self.cache_size,
+                "test_override_enabled": self.test_override_enabled,
+                "test_model_path": self.test_model_path,
+            },
+        }
+
+
+@dataclass(slots=True)
 class GraphDBSettings:
     enabled: bool = True
     mode: str = "primary"
@@ -379,6 +431,7 @@ class LogDBSettings:
 class SchedulerSubmissionDefaults:
     requires_gpu: bool = True
     estimated_vram_mb: int | None = None
+    estimated_avg_vram_mb: int | None = None
     estimated_ram_mb: int | None = None
     packing_eligible: bool = False
     packing_family: str = "mlevolve_script"
@@ -410,6 +463,7 @@ class SchedulerSubmissionDefaults:
         return {
             "requires_gpu": self.requires_gpu,
             "estimated_vram_mb": self.estimated_vram_mb,
+            "estimated_avg_vram_mb": self.estimated_avg_vram_mb,
             "estimated_ram_mb": self.estimated_ram_mb,
             "packing_eligible": self.packing_eligible,
             "packing_family": self.packing_family,
@@ -558,6 +612,7 @@ class SchedulerConfig:
     cache_socket_name: str = "cache_server.sock"
     auto_resume_recoverable: bool = False
     gpu_scheduler: GpuSchedulerSettings = field(default_factory=GpuSchedulerSettings)
+    prediction: PredictionSettings | dict[str, Any] = field(default_factory=PredictionSettings)
     graph_db: GraphDBSettings | dict[str, Any] = field(default_factory=GraphDBSettings)
     hardware_feature_db: HardwareFeatureDBSettings | dict[str, Any] = field(default_factory=HardwareFeatureDBSettings)
     log_db: LogDBSettings | dict[str, Any] = field(default_factory=LogDBSettings)
@@ -578,6 +633,10 @@ class SchedulerConfig:
     def __post_init__(self) -> None:
         if isinstance(self.gpu_scheduler, dict):
             self.gpu_scheduler = GpuSchedulerSettings.from_dict(self.gpu_scheduler)
+        if self.prediction is None:
+            self.prediction = PredictionSettings()
+        if isinstance(self.prediction, dict):
+            self.prediction = PredictionSettings.from_dict(self.prediction)
         if self.baseline_cache is None:
             self.baseline_cache = BaselineCacheSettings()
         if isinstance(self.baseline_cache, dict):
@@ -660,6 +719,7 @@ class SchedulerConfig:
             "cache_socket_name": self.cache_socket_name,
             "auto_resume_recoverable": self.auto_resume_recoverable,
             "gpu_scheduler": self.gpu_scheduler.to_dict(),
+            "prediction": self.prediction.to_dict(),
             "graph_db": self.graph_db.to_dict(),
             "hardware_feature_db": self.hardware_feature_db.to_dict(),
             "log_db": self.log_db.to_dict(),

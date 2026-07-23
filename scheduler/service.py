@@ -463,12 +463,16 @@ class SchedulerService:
             peak_vram_mb = summary.peak_vram_mb
             if peak_vram_mb is None:
                 peak_vram_mb = job.resource_requirements.estimated_vram_mb
+            avg_vram_mb = summary.avg_vram_mb
+            if avg_vram_mb is None:
+                avg_vram_mb = job.resource_requirements.estimated_avg_vram_mb
             self.store.upsert_solo_profile(
                 SoloProfile(
                     signature=job.packing.signature,
                     hardware_key=run.hardware_key or self.store.hardware_key(),
                     family=job.packing.family,
                     peak_vram_mb=peak_vram_mb,
+                    avg_vram_mb=avg_vram_mb,
                     avg_gpu_utilization=summary.avg_gpu_utilization if summary.avg_gpu_utilization is not None else 0.0,
                     avg_memory_utilization=summary.avg_memory_utilization if summary.avg_memory_utilization is not None else 0.0,
                     sample_count=summary.sample_count,
@@ -503,11 +507,12 @@ class SchedulerService:
                 compatible=compatible,
                 observations=(existing.observations + 1) if existing else 1,
                 peak_vram_mb=summary.peak_vram_mb,
+                avg_vram_mb=summary.avg_vram_mb,
                 memory_total_mb=run.samples[-1].memory_total_mb if run.samples else None,
                 avg_gpu_utilization=summary.avg_gpu_utilization,
                 avg_memory_utilization=summary.avg_memory_utilization,
                 avg_step_time_ms=None,
-                objective_score=(summary.peak_vram_mb or 0) / max(1.0, self.settings.gpu_scheduler.memory.safe_vram_budget_gib * 1024.0),
+                objective_score=(summary.avg_vram_mb or 0) / max(1.0, self.settings.gpu_scheduler.memory.safe_vram_budget_gib * 1024.0),
                 resolved_optimal=(self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED),
                 last_failure_reason=run.fallback_reason,
                 fallback_order=run.fallback_order,
@@ -527,6 +532,7 @@ class SchedulerService:
                 reason=run.fallback_reason or "packed group failed",
                 cooldown_seconds=self.settings.gpu_scheduler.fallback_cooldown_seconds,
                 peak_vram_mb=summary.peak_vram_mb,
+                avg_vram_mb=summary.avg_vram_mb,
                 avg_gpu_utilization=summary.avg_gpu_utilization,
                 avg_memory_utilization=summary.avg_memory_utilization,
                 metadata={"backend_name": run.backend_name},
@@ -542,6 +548,7 @@ class SchedulerService:
                 compatible=True,
                 observations=(existing_pair.observations + 1) if existing_pair else 1,
                 peak_vram_mb=summary.peak_vram_mb,
+                avg_vram_mb=summary.avg_vram_mb,
                 avg_gpu_utilization=summary.avg_gpu_utilization,
                 avg_memory_utilization=summary.avg_memory_utilization,
                 slowdown_ratio=None,
@@ -641,6 +648,15 @@ class SchedulerService:
             active_sm_utilization += self.planner.predicted_group_sm_utilization(materialized, backend_name=run.backend_name)
         return active_vram_mb, active_sm_utilization
 
+    def _prediction_metadata(self, job_id: str) -> dict[str, str | None]:
+        estimator = getattr(self.planner, "estimator", None)
+        method = getattr(estimator, "prediction_metadata", None)
+        if callable(method):
+            result = method(job_id)
+            if isinstance(result, dict):
+                return result
+        return {"vram_prediction_source": "branch_profile", "vram_prediction_error": None}
+
     def _dispatch_plan(self, plan: DispatchPlan) -> bool:
         selected_jobs = []
         for job_id in plan.job_ids:
@@ -697,6 +713,7 @@ class SchedulerService:
                                 "placement_mode": "exclusive",
                                 "placement_backend": "exclusive",
                                 "placement_role": "solo",
+                                **self._prediction_metadata(fallback_job.job_id),
                             },
                         )
                         return True
@@ -743,6 +760,7 @@ class SchedulerService:
                     "placement_role": role,
                     "placement_batch_size": plan.batch_overrides.get(job.job_id),
                     "placement_group_id": group_id,
+                    **self._prediction_metadata(job.job_id),
                 },
             )
             self.event_logger.emit(
