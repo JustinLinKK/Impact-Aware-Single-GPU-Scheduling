@@ -32,7 +32,7 @@ def compatibility_score(
             return float("-inf")
     util_headroom = max(0.0, 1.0 - max(primary_util, partner_util))
     priority_bonus = 0.01 * max(0, partner_job.priority)
-    memory_budget_mb = settings.gpu_scheduler.memory.budget_mb(None)
+    memory_budget_mb = settings.gpu_scheduler.memory.safe_vram_budget_gib * 1024.0
     memory_penalty = (
         _profile_peak_vram_mb(primary_job, primary_profile) + _profile_peak_vram_mb(partner_job, partner_profile)
     ) / memory_budget_mb if memory_budget_mb > 0 else 0.0
@@ -52,19 +52,6 @@ class CompatibilityEvaluator:
         self.settings = settings
         self.repository = repository
         self.estimator = estimator
-        self._pair_cache: dict[tuple[str, str, str], PairProfile | bool] = {}
-        self._pairs_prefetched = False
-
-    def begin_planning_cycle(self) -> None:
-        self._pair_cache.clear()
-        self._pairs_prefetched = False
-        lister = getattr(self.repository, "list_pair_profiles", None)
-        if not callable(lister):
-            return
-        self._pairs_prefetched = True
-        for profile in lister(hardware_key=self.repository.hardware_key()):
-            signatures = sorted((profile.left_signature, profile.right_signature))
-            self._pair_cache[(signatures[0], signatures[1], profile.backend_name)] = profile
 
     def pack_eligible(self, job: TrainingJob, *, backend_name: str | None = None) -> bool:
         if not (job.packing.eligible and job.packing.signature):
@@ -73,25 +60,26 @@ class CompatibilityEvaluator:
             return True
         return job.packing.allows_backend(backend_name)
 
-    def missing_runtime_profile_jobs(self, jobs: list[TrainingJob], *, backend_name: str) -> list[TrainingJob]:
-        del jobs, backend_name
-        return []
-
     def compatible_group(self, jobs: list[TrainingJob], *, backend_name: str) -> bool:
         if len(jobs) <= 1:
             return True
         thresholds = self.settings.gpu_scheduler.thresholds
         for left_job, right_job in combinations(jobs, 2):
-            signatures = sorted((left_job.packing.signature or "", right_job.packing.signature or ""))
-            key = (signatures[0], signatures[1], backend_name)
-            if key not in self._pair_cache and not self._pairs_prefetched:
-                self._pair_cache[key] = self.repository.get_pair_profile(
-                    signatures[0], signatures[1], backend_name=backend_name
-                ) or False
-            cached = self._pair_cache.get(key, False)
-            pair_profile = cached if isinstance(cached, PairProfile) else None
-            if pair_profile is not None and (pair_profile.on_cooldown() or not pair_profile.compatible):
+            left_profile = self.estimator.solo_profile(left_job)
+            right_profile = self.estimator.solo_profile(right_job)
+            pair_profile = self.repository.get_pair_profile(
+                left_job.packing.signature or "",
+                right_job.packing.signature or "",
+                backend_name=backend_name,
+            )
+            if left_profile is None or right_profile is None:
+                if pair_profile is not None and (pair_profile.on_cooldown() or not pair_profile.compatible):
+                    return False
+                continue
+            score = compatibility_score(left_job, right_job, left_profile, right_profile, pair_profile, self.settings)
+            if score == float("-inf"):
                 return False
             if pair_profile and pair_profile.slowdown_ratio is not None and pair_profile.slowdown_ratio > thresholds.pack_reject_max_slowdown:
                 return False
         return True
+

@@ -1,6 +1,6 @@
-"""Explicit branch profiling helpers."""
+"""Batch-probing helpers for exclusive GPU jobs."""
 
-from .batch_probe import run_branch_profile_probe_job
+from .batch_probe import run_batch_probe_preflight
 from .runtime_probe import runtime_profile_for_job
 
-__all__ = ["run_branch_profile_probe_job", "runtime_profile_for_job"]
+__all__ = ["run_batch_probe_preflight", "runtime_profile_for_job"]

@@ -16,41 +16,34 @@ class BatchResolution:
         return job.batch_probe.batch_param_name or "batch_size"
 
     @staticmethod
-    def authored_batch_size(job: TrainingJob) -> int:
-        try:
-            return max(1, int(job.authored_batch_size))
-        except (TypeError, ValueError):
-            batch_param_name = BatchResolution.param_name(job)
-            return max(1, int(job.config.runner_kwargs.get(batch_param_name, 1)))
-
-    @staticmethod
     def resolved_batch_size(job: TrainingJob) -> int:
+        batch_param_name = BatchResolution.param_name(job)
+        if job.metadata.get("resolved_batch_size") is not None:
+            try:
+                return max(1, int(job.metadata["resolved_batch_size"]))
+            except (TypeError, ValueError):
+                pass
+        raw_value = job.config.runner_kwargs.get(batch_param_name)
         try:
-            return max(1, int(job.current_batch_size))
+            return max(1, int(raw_value))
         except (TypeError, ValueError):
-            return BatchResolution.authored_batch_size(job)
+            return 1
 
     @staticmethod
     def apply(job: TrainingJob, batch_size: int) -> TrainingJob:
         batch_param_name = BatchResolution.param_name(job)
         updated_job = job.copy()
-        updated_job.current_batch_size = int(batch_size)
-        updated_job.placement_generation += 1
-        updated_job.metadata["placement_batch_param_name"] = batch_param_name
+        updated_job.config.runner_kwargs[batch_param_name] = int(batch_size)
+        updated_job.metadata.update(
+            {
+                "resolved_batch_size": int(batch_size),
+                "placement_batch_param_name": batch_param_name,
+            }
+        )
         return updated_job
-
-    @staticmethod
-    def validate_authored_batch_size(job: TrainingJob) -> None:
-        batch_size = BatchResolution.authored_batch_size(job)
-        if batch_size < 1 or batch_size & (batch_size - 1):
-            raise ValueError(
-                f"job {job.job_id} authored batch size must be a positive power of two; got {batch_size}"
-            )
 
 
 def build_batch_probe_shape_signature(job: TrainingJob) -> str:
-    if job.batch_probe.shape_signature_override:
-        return str(job.batch_probe.shape_signature_override)
     batch_param_name = BatchResolution.param_name(job)
     ignored_runner_kwargs = {
         "script_path",
@@ -74,3 +67,4 @@ def build_batch_probe_shape_signature(job: TrainingJob) -> str:
         "shape_hints": job.batch_probe.shape_hints,
     }
     return sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+

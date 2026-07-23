@@ -10,7 +10,6 @@ import sys
 
 from ..domain import TrainingJob
 from ..config import SchedulerSettings
-from .process_utils import start_new_session_kwargs
 
 
 @dataclass(slots=True)
@@ -60,7 +59,6 @@ class SubprocessExecutor:
             stdout=stdout_handle,
             stderr=stderr_handle,
             text=True,
-            **start_new_session_kwargs(),
         )
         stdout_handle.close()
         stderr_handle.close()

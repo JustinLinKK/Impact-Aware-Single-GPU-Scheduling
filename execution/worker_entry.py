@@ -6,10 +6,11 @@ import argparse
 
 from ..observability.events import EventLogger
 from ..observability.logging_utils import setup_scheduler_logger
+from ..profiling.batch_probe import run_batch_probe_preflight
 from ..config import SchedulerSettings
 from ..storage.log_store import SchedulerLogStore
 from ..storage.state_store import StateStore
-from .control import CancelRequested, EarlyStopRequested, PauseRequested
+from .control import CancelRequested, PauseRequested
 from .worker_runtime import create_runner_context, load_runtime_settings, mark_job_completed, mark_job_failed, mark_job_started, resolve_runner
 
 
@@ -21,10 +22,10 @@ def _run_job(runtime_root: str, job_id: str) -> int:
     context, job = create_runner_context(settings, store, event_logger, job_id)
     if context is None or job is None:
         raise KeyError(f"Unknown job_id: {job_id}")
-    backend_name = str(job.metadata.get("placement_backend") or "exclusive")
-    mark_job_started(settings, store, event_logger, job_id, backend_name=backend_name)
+    mark_job_started(settings, store, event_logger, job_id, backend_name="exclusive")
 
     try:
+        context.job = run_batch_probe_preflight(context)
         result = resolve_runner(context)(context)
     except PauseRequested:
         logger.info("Job %s paused cleanly at a safe point", job_id)
@@ -32,13 +33,10 @@ def _run_job(runtime_root: str, job_id: str) -> int:
     except CancelRequested:
         logger.info("Job %s cancelled cleanly at a safe point", job_id)
         return 0
-    except EarlyStopRequested:
-        logger.info("Job %s early-stopped cleanly at a safe point", job_id)
-        return 0
     except Exception as exc:
-        return mark_job_failed(settings, store, event_logger, job_id, exc, backend_name=backend_name)
+        return mark_job_failed(settings, store, event_logger, job_id, exc, backend_name="exclusive")
 
-    return mark_job_completed(settings, store, event_logger, job_id, result, backend_name=backend_name)
+    return mark_job_completed(settings, store, event_logger, job_id, result, backend_name="exclusive")
 
 
 def main() -> int:

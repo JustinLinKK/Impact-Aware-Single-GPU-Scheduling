@@ -9,14 +9,11 @@ import json
 import sqlite3
 
 from ..domain import (
-    BatchProfileCurve,
-    BatchProfilePoint,
     BatchSizeObservation,
     BatchProbeProfile,
     CombinationProfile,
     CommandType,
     JobCommand,
-    JobMetricSample,
     JobStatus,
     PairProfile,
     RuntimeProfile,
@@ -29,7 +26,7 @@ from ..domain import (
 )
 from ..hardware import HardwareProfile, detect_hardware_profile
 from ..config import SchedulerSettings
-from .models import SCHEMA_STATEMENTS
+from .models import MIGRATION_STATEMENTS, SCHEMA_STATEMENTS
 
 
 class SQLiteStateStore:
@@ -52,6 +49,12 @@ class SQLiteStateStore:
         with self._connect() as connection:
             for statement in SCHEMA_STATEMENTS:
                 connection.execute(statement)
+            for statement in MIGRATION_STATEMENTS:
+                try:
+                    connection.execute(statement)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
             connection.commit()
 
     def hardware_profile(self) -> HardwareProfile:
@@ -68,41 +71,36 @@ class SQLiteStateStore:
             return int(row["value"]) + 1
 
     def save_job(self, job: TrainingJob) -> None:
+        payload_json = job.to_json()
+        now = utc_now()
         with self._connect() as connection:
-            self._save_job_on_connection(connection, job)
+            connection.execute(
+                """
+                INSERT INTO jobs(job_id, status, priority, baseline_model_id, submitted_at, queue_sequence, payload_json, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    status=excluded.status,
+                    priority=excluded.priority,
+                    baseline_model_id=excluded.baseline_model_id,
+                    submitted_at=excluded.submitted_at,
+                    queue_sequence=excluded.queue_sequence,
+                    payload_json=excluded.payload_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    job.job_id,
+                    job.status.value,
+                    job.priority,
+                    job.baseline_model_id,
+                    job.submitted_at,
+                    job.queue_sequence,
+                    payload_json,
+                    now,
+                ),
+            )
             connection.commit()
 
-    @staticmethod
-    def _save_job_on_connection(connection: sqlite3.Connection, job: TrainingJob) -> None:
-        connection.execute(
-            """
-            INSERT INTO jobs(job_id, status, priority, baseline_model_id, submitted_at, queue_sequence, payload_json, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(job_id) DO UPDATE SET
-                status=excluded.status,
-                priority=excluded.priority,
-                baseline_model_id=excluded.baseline_model_id,
-                submitted_at=excluded.submitted_at,
-                queue_sequence=excluded.queue_sequence,
-                payload_json=excluded.payload_json,
-                updated_at=excluded.updated_at
-            """,
-            (
-                job.job_id,
-                job.status.value,
-                job.priority,
-                job.baseline_model_id,
-                job.submitted_at,
-                job.queue_sequence,
-                job.to_json(),
-                utc_now(),
-            ),
-        )
-
     def submit_job(self, job: TrainingJob) -> TrainingJob:
-        from ..domain import BatchResolution
-
-        BatchResolution.validate_authored_batch_size(job)
         if not job.queue_sequence:
             job.queue_sequence = self.next_queue_sequence()
         job.mark_status(JobStatus.PENDING, reason=job.status_reason)
@@ -156,36 +154,27 @@ class SQLiteStateStore:
         status_timestamps: dict[str, str] | None = None,
         metadata_updates: dict[str, Any] | None = None,
     ) -> TrainingJob:
-        # Scheduler and worker processes both update the same job record. Keep
-        # the read/merge/write cycle under one SQLite write transaction so a
-        # heartbeat update cannot overwrite a concurrent status or metadata
-        # transition with an object read before that transition committed.
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute("SELECT payload_json FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
-            if row is None:
-                connection.rollback()
-                raise KeyError(f"Unknown job_id: {job_id}")
-            job = TrainingJob.from_dict(json.loads(row["payload_json"]))
-            if status is not None:
-                job.mark_status(status, reason=reason)
-            elif reason is not None:
-                job.status_reason = reason
-            if hold is not None:
-                job.hold = hold
-            if latest_checkpoint_path is not None:
-                job.latest_checkpoint_path = latest_checkpoint_path
-            if last_heartbeat_at is not None:
-                job.last_heartbeat_at = last_heartbeat_at
-            if last_dispatched_at is not None:
-                job.last_dispatched_at = last_dispatched_at
-            if status_timestamps:
-                job.status_timestamps.update(status_timestamps)
-            if metadata_updates:
-                job.metadata.update(metadata_updates)
-            self._save_job_on_connection(connection, job)
-            connection.commit()
-            return job
+        job = self.get_job(job_id)
+        if job is None:
+            raise KeyError(f"Unknown job_id: {job_id}")
+        if status is not None:
+            job.mark_status(status, reason=reason)
+        elif reason is not None:
+            job.status_reason = reason
+        if hold is not None:
+            job.hold = hold
+        if latest_checkpoint_path is not None:
+            job.latest_checkpoint_path = latest_checkpoint_path
+        if last_heartbeat_at is not None:
+            job.last_heartbeat_at = last_heartbeat_at
+        if last_dispatched_at is not None:
+            job.last_dispatched_at = last_dispatched_at
+        if status_timestamps:
+            job.status_timestamps.update(status_timestamps)
+        if metadata_updates:
+            job.metadata.update(metadata_updates)
+        self.save_job(job)
+        return job
 
     def set_job_status(self, job_id: str, status: JobStatus, *, reason: str | None = None, hold: bool | None = None) -> TrainingJob:
         return self.update_job(job_id, status=status, reason=reason, hold=hold)
@@ -291,79 +280,6 @@ class SQLiteStateStore:
             return str(row["checkpoint_path"])
         job = self.get_job(job_id)
         return job.latest_checkpoint_path if job else None
-
-    def record_job_metric_sample(
-        self,
-        *,
-        job_id: str,
-        created_at: str,
-        epoch: int,
-        global_step: int,
-        avg_step_time_ms: float | None = None,
-        estimated_total_runtime_seconds: float | None = None,
-        remaining_runtime_seconds: float | None = None,
-        metrics: dict[str, Any] | None = None,
-    ) -> JobMetricSample:
-        numeric_metrics: dict[str, float] = {}
-        for key, value in dict(metrics or {}).items():
-            if isinstance(value, bool):
-                continue
-            if isinstance(value, (int, float)):
-                numeric_metrics[str(key)] = float(value)
-                continue
-            try:
-                numeric_metrics[str(key)] = float(value)
-            except (TypeError, ValueError):
-                continue
-        with self._connect() as connection:
-            cursor = connection.execute(
-                """
-                INSERT INTO job_metric_samples(
-                    job_id, created_at, epoch, global_step, avg_step_time_ms,
-                    estimated_total_runtime_seconds, remaining_runtime_seconds, metrics_json
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job_id,
-                    created_at,
-                    int(epoch or 0),
-                    int(global_step or 0),
-                    avg_step_time_ms,
-                    estimated_total_runtime_seconds,
-                    remaining_runtime_seconds,
-                    json.dumps(numeric_metrics, sort_keys=True),
-                ),
-            )
-            connection.commit()
-            sample_id = int(cursor.lastrowid)
-        return JobMetricSample(
-            sample_id=sample_id,
-            job_id=job_id,
-            created_at=created_at,
-            epoch=int(epoch or 0),
-            global_step=int(global_step or 0),
-            avg_step_time_ms=avg_step_time_ms,
-            estimated_total_runtime_seconds=estimated_total_runtime_seconds,
-            remaining_runtime_seconds=remaining_runtime_seconds,
-            metrics=numeric_metrics,
-        )
-
-    def list_job_metric_samples(self, job_id: str, *, limit: int | None = None) -> list[JobMetricSample]:
-        query = """
-            SELECT sample_id, job_id, created_at, epoch, global_step, avg_step_time_ms,
-                   estimated_total_runtime_seconds, remaining_runtime_seconds, metrics_json
-            FROM job_metric_samples
-            WHERE job_id = ?
-            ORDER BY created_at ASC, sample_id ASC
-        """
-        params: list[Any] = [job_id]
-        if limit is not None:
-            query += " LIMIT ?"
-            params.append(max(1, int(limit)))
-        with self._connect() as connection:
-            rows = connection.execute(query, params).fetchall()
-        return [JobMetricSample.from_row(dict(row)) for row in rows]
 
     def update_cache_metadata(
         self,
@@ -682,131 +598,6 @@ class SQLiteStateStore:
             rows = connection.execute(query, params).fetchall()
         return [RuntimeProfile.from_row(dict(row)) for row in rows]
 
-    def upsert_batch_profile_curve(self, curve: BatchProfileCurve) -> BatchProfileCurve:
-        curve.updated_at = utc_now()
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO batch_profile_curves(
-                    curve_key, model_key, shape_signature, hardware_key, backend_name,
-                    profile_namespace, contract_version, batch_param_name,
-                    minimum_batch_size, maximum_feasible_batch_size,
-                    first_oom_batch_size, right_censored, observations, last_job_id,
-                    updated_at, metadata_json
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(curve_key) DO UPDATE SET
-                    model_key=excluded.model_key,
-                    shape_signature=excluded.shape_signature,
-                    hardware_key=excluded.hardware_key,
-                    backend_name=excluded.backend_name,
-                    profile_namespace=excluded.profile_namespace,
-                    contract_version=excluded.contract_version,
-                    batch_param_name=excluded.batch_param_name,
-                    minimum_batch_size=excluded.minimum_batch_size,
-                    maximum_feasible_batch_size=excluded.maximum_feasible_batch_size,
-                    first_oom_batch_size=excluded.first_oom_batch_size,
-                    right_censored=excluded.right_censored,
-                    observations=excluded.observations,
-                    last_job_id=excluded.last_job_id,
-                    updated_at=excluded.updated_at,
-                    metadata_json=excluded.metadata_json
-                """,
-                (
-                    curve.curve_key, curve.model_key, curve.shape_signature, curve.hardware_key,
-                    curve.backend_name, curve.profile_namespace, curve.contract_version,
-                    curve.batch_param_name, curve.minimum_batch_size,
-                    curve.maximum_feasible_batch_size, curve.first_oom_batch_size,
-                    int(curve.right_censored), curve.observations, curve.last_job_id,
-                    curve.updated_at, json.dumps(curve.metadata or {}, sort_keys=True),
-                ),
-            )
-            connection.commit()
-        for point in curve.points:
-            self.upsert_batch_profile_point(point)
-        return curve
-
-    def upsert_batch_profile_point(self, point: BatchProfilePoint) -> BatchProfilePoint:
-        point.updated_at = utc_now()
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO batch_profile_points(
-                    point_key, curve_key, batch_size, peak_vram_mb, samples_per_second,
-                    median_step_time_ms, step_time_dispersion, observations, last_job_id,
-                    updated_at, metadata_json
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(point_key) DO UPDATE SET
-                    curve_key=excluded.curve_key,
-                    batch_size=excluded.batch_size,
-                    peak_vram_mb=excluded.peak_vram_mb,
-                    samples_per_second=excluded.samples_per_second,
-                    median_step_time_ms=excluded.median_step_time_ms,
-                    step_time_dispersion=excluded.step_time_dispersion,
-                    observations=excluded.observations,
-                    last_job_id=excluded.last_job_id,
-                    updated_at=excluded.updated_at,
-                    metadata_json=excluded.metadata_json
-                """,
-                (
-                    point.point_key, point.curve_key, point.batch_size, point.peak_vram_mb,
-                    point.samples_per_second, point.median_step_time_ms,
-                    point.step_time_dispersion, point.observations, point.last_job_id,
-                    point.updated_at, json.dumps(point.metadata or {}, sort_keys=True),
-                ),
-            )
-            connection.commit()
-        return point
-
-    def list_batch_profile_points(self, curve_key: str) -> list[BatchProfilePoint]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM batch_profile_points WHERE curve_key = ? ORDER BY batch_size ASC",
-                (curve_key,),
-            ).fetchall()
-        return [BatchProfilePoint.from_row(dict(row)) for row in rows]
-
-    def get_batch_profile_curve(self, curve_key: str) -> BatchProfileCurve | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM batch_profile_curves WHERE curve_key = ?",
-                (curve_key,),
-            ).fetchone()
-        if row is None:
-            return None
-        return BatchProfileCurve.from_row(dict(row), points=self.list_batch_profile_points(curve_key))
-
-    def get_compatible_batch_profile_curve(
-        self,
-        *,
-        profile_namespace: str,
-        hardware_key: str,
-        shape_signature: str,
-        contract_version: int = 3,
-        backend_name: str = "exclusive",
-    ) -> BatchProfileCurve | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT * FROM batch_profile_curves
-                WHERE profile_namespace = ? AND hardware_key = ? AND shape_signature = ?
-                  AND contract_version = ? AND backend_name = ?
-                ORDER BY updated_at DESC LIMIT 1
-                """,
-                (profile_namespace, hardware_key, shape_signature, int(contract_version), backend_name),
-            ).fetchone()
-        if row is None:
-            return None
-        payload = dict(row)
-        return BatchProfileCurve.from_row(payload, points=self.list_batch_profile_points(payload["curve_key"]))
-
-    def list_batch_profile_curves(self) -> list[BatchProfileCurve]:
-        with self._connect() as connection:
-            rows = connection.execute("SELECT * FROM batch_profile_curves ORDER BY updated_at DESC").fetchall()
-        return [
-            BatchProfileCurve.from_row(dict(row), points=self.list_batch_profile_points(str(row["curve_key"])))
-            for row in rows
-        ]
-
     def upsert_batch_probe_profile(self, profile: BatchProbeProfile) -> BatchProbeProfile:
         profile.updated_at = utc_now()
         with self._connect() as connection:
@@ -817,10 +608,6 @@ class SQLiteStateStore:
                     model_key,
                     device_type,
                     shape_signature,
-                    profile_namespace,
-                    hardware_key,
-                    search_mode,
-                    contract_version,
                     batch_param_name,
                     resolved_batch_size,
                     peak_vram_mb,
@@ -831,15 +618,11 @@ class SQLiteStateStore:
                     updated_at,
                     metadata_json
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(probe_key) DO UPDATE SET
                     model_key=excluded.model_key,
                     device_type=excluded.device_type,
                     shape_signature=excluded.shape_signature,
-                    profile_namespace=excluded.profile_namespace,
-                    hardware_key=excluded.hardware_key,
-                    search_mode=excluded.search_mode,
-                    contract_version=excluded.contract_version,
                     batch_param_name=excluded.batch_param_name,
                     resolved_batch_size=excluded.resolved_batch_size,
                     peak_vram_mb=excluded.peak_vram_mb,
@@ -855,10 +638,6 @@ class SQLiteStateStore:
                     profile.model_key,
                     profile.device_type,
                     profile.shape_signature,
-                    profile.profile_namespace,
-                    profile.hardware_key,
-                    profile.search_mode,
-                    profile.contract_version,
                     profile.batch_param_name,
                     profile.resolved_batch_size,
                     profile.peak_vram_mb,
@@ -876,31 +655,6 @@ class SQLiteStateStore:
     def get_batch_probe_profile(self, probe_key: str) -> BatchProbeProfile | None:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM batch_probe_profiles WHERE probe_key = ?", (probe_key,)).fetchone()
-        return BatchProbeProfile.from_row(dict(row)) if row else None
-
-    def get_compatible_batch_probe_profile(
-        self,
-        *,
-        profile_namespace: str,
-        hardware_key: str,
-        shape_signature: str,
-        search_mode: str,
-        contract_version: int = 2,
-    ) -> BatchProbeProfile | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT * FROM batch_probe_profiles
-                WHERE profile_namespace = ?
-                  AND hardware_key = ?
-                  AND shape_signature = ?
-                  AND search_mode = ?
-                  AND contract_version = ?
-                ORDER BY updated_at DESC
-                LIMIT 1
-                """,
-                (profile_namespace, hardware_key, shape_signature, search_mode, int(contract_version)),
-            ).fetchone()
         return BatchProbeProfile.from_row(dict(row)) if row else None
 
     def list_batch_probe_profiles(self) -> list[BatchProbeProfile]:

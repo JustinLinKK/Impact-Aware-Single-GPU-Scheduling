@@ -1,0 +1,157 @@
+records:
+  - schema_version: hardware_feature_record_v1
+    record_id: nvidia.blackwell.rtx5090.capability.overview
+    title: RTX 5090 Blackwell training capability overview
+    summary_text: RTX 5090-class Blackwell GPUs provide high local VRAM and fifth-generation Tensor Cores, making them strong candidates for mixed-precision vision and transformer training when code keeps batch size, precision, and accumulation configurable.
+    detail_text: Use RTX 5090-style Blackwell hardware as a high-throughput single-GPU target. Prefer code that centralizes batch size, precision, image or sequence length, and gradient accumulation so the scheduler can adapt to real VRAM and runtime observations. Treat architecture-specific FP4 guidance mainly as inference-oriented unless the selected framework and training stack explicitly support it for the workload.
+    vendor: nvidia
+    architectures: [blackwell]
+    accelerator_names: [rtx_5090, geforce_rtx_5090]
+    compute_capabilities: ["12.0"]
+    toolkits: [cuda]
+    frameworks: [pytorch]
+    workload_types: [vision_training, transformer_training, generative_ai]
+    features: [tensor_cores, blackwell, gddr7, mixed_precision]
+    recommended_patterns:
+      - Keep batch size, precision, gradient accumulation, and input resolution in a top-level training config.
+      - Prefer scheduler-provided batch and epoch settings over hard-coded constants.
+      - Log peak VRAM, throughput, selected precision, and resolved batch size for graph feedback.
+    avoid_patterns:
+      - Do not assume FP4 is a drop-in training precision for generic PyTorch training loops.
+      - Do not hide memory-critical knobs inside nested model code.
+    source_refs:
+      - title: NVIDIA GeForce RTX 5090 product page
+        url: https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5090/
+        source_type: vendor_product_page
+        retrieved_or_verified_date: "2026-05-15"
+      - title: NVIDIA RTX Blackwell GPU architecture brief
+        url: https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf
+        source_type: vendor_architecture_pdf
+        retrieved_or_verified_date: "2026-05-15"
+    confidence: 0.86
+    last_verified: "2026-05-15"
+    tags: [blackwell, rtx_5090, training, scheduler, vram]
+
+  - schema_version: hardware_feature_record_v1
+    record_id: nvidia.blackwell.tensor_cores.precision_policy
+    title: Blackwell Tensor Core precision policy
+    summary_text: Blackwell Tensor Cores can accelerate low-precision AI math, but generated training code should use framework-supported AMP, bf16, or fp16 paths first and guard experimental precision choices.
+    detail_text: For MLEvolve training code, prefer torch.amp autocast with bf16 or fp16 when the toolkit, model, and loss path are compatible. Keep GradScaler optional because bf16 generally does not require scaling, while fp16 often benefits from it. Treat FP4 and TensorRT-oriented low-precision paths as specialized acceleration features that require explicit framework support and validation.
+    vendor: nvidia
+    architectures: [blackwell]
+    accelerator_names: [rtx_5090, geforce_rtx_5090]
+    compute_capabilities: ["12.0"]
+    toolkits: [cuda]
+    frameworks: [pytorch]
+    workload_types: [vision_training, transformer_training, inference]
+    features: [tensor_cores, amp, bf16, fp16, fp4]
+    recommended_patterns:
+      - Use torch.amp.autocast with an explicit dtype selected from hardware and framework context.
+      - Use GradScaler for fp16 training and make it optional for bf16 training.
+      - Keep a full-precision fallback path for numerically fragile losses or metrics.
+    avoid_patterns:
+      - Do not blindly enable every low-precision mode at once.
+      - Do not use inference-only FP4 paths in training code unless the stack explicitly supports that workflow.
+    source_refs:
+      - title: NVIDIA TensorRT FP4 on Blackwell GeForce RTX 50 Series
+        url: https://developer.nvidia.com/blog/?p=99256
+        source_type: vendor_technical_blog
+        retrieved_or_verified_date: "2026-05-15"
+      - title: NVIDIA CUDA GPU Compute Capability
+        url: https://developer.nvidia.com/cuda-gpus
+        source_type: vendor_reference
+        retrieved_or_verified_date: "2026-05-15"
+    confidence: 0.82
+    last_verified: "2026-05-15"
+    tags: [precision, tensor_cores, amp, bf16, fp16, fp4]
+
+  - schema_version: hardware_feature_record_v1
+    record_id: generic.cuda.dataloader.h2d_throughput
+    title: CUDA dataloader and host-to-device throughput guidance
+    summary_text: GPU-rich training runs often underperform when CPU input pipelines and host-to-device copies are not tuned, so generated code should use pinned memory, non-blocking transfers, and stable worker settings.
+    detail_text: For PyTorch CUDA workloads, enable pin_memory on DataLoader when tensors are copied to GPU, pass non_blocking=True on tensor.to(device), and tune num_workers and persistent_workers based on dataset size. The scheduler can then distinguish model bottlenecks from input pipeline bottlenecks using runtime and telemetry profiles.
+    vendor: generic
+    architectures: [generic_cuda]
+    accelerator_names: []
+    compute_capabilities: []
+    toolkits: [cuda]
+    frameworks: [pytorch]
+    workload_types: [vision_training, tabular_training, transformer_training]
+    features: [dataloader, pinned_memory, non_blocking_transfer, throughput]
+    recommended_patterns:
+      - Set pin_memory=True when DataLoader batches are moved to CUDA.
+      - Use tensor.to(device, non_blocking=True) for batch tensors when pinned memory is enabled.
+      - Use persistent_workers=True when num_workers is greater than zero and the dataset is stable.
+    avoid_patterns:
+      - Do not set excessive num_workers without measuring loader overhead.
+      - Do not perform repeated CPU-to-GPU conversion inside inner model layers.
+    source_refs:
+      - title: PyTorch DataLoader documentation
+        url: https://pytorch.org/docs/stable/data.html
+        source_type: framework_documentation
+        retrieved_or_verified_date: "2026-05-15"
+      - title: PyTorch CUDA semantics
+        url: https://pytorch.org/docs/stable/notes/cuda.html
+        source_type: framework_documentation
+        retrieved_or_verified_date: "2026-05-15"
+    confidence: 0.80
+    last_verified: "2026-05-15"
+    tags: [dataloader, h2d, cuda, throughput, pytorch]
+
+  - schema_version: hardware_feature_record_v1
+    record_id: generic.cuda.oom.fallback_policy
+    title: CUDA OOM fallback and effective batch preservation
+    summary_text: Hardware-aware generated training code should degrade gracefully after CUDA OOM by reducing physical batch size and using gradient accumulation to preserve effective batch size when possible.
+    detail_text: Make the physical batch size adjustable and compute accumulation steps from the target effective batch size. On OOM, clear CUDA cache, lower the physical batch size, increase accumulation if valid for the optimizer schedule, and report the resolved values. This gives the scheduler graph reusable evidence instead of only a failed node.
+    vendor: generic
+    architectures: [generic_cuda]
+    accelerator_names: []
+    compute_capabilities: []
+    toolkits: [cuda]
+    frameworks: [pytorch]
+    workload_types: [vision_training, transformer_training, generative_ai]
+    features: [oom_recovery, gradient_accumulation, batch_size, vram]
+    recommended_patterns:
+      - Separate physical batch size from effective batch size.
+      - Retry with a lower batch size after CUDA OOM only when the task and training loop can safely resume.
+      - Log OOM fallback decisions in machine-readable output.
+    avoid_patterns:
+      - Do not silently continue after OOM without reporting changed batch semantics.
+      - Do not increase accumulation without adjusting optimizer-step and scheduler-step logic.
+    source_refs:
+      - title: PyTorch CUDA memory management
+        url: https://pytorch.org/docs/stable/notes/cuda.html#memory-management
+        source_type: framework_documentation
+        retrieved_or_verified_date: "2026-05-15"
+    confidence: 0.78
+    last_verified: "2026-05-15"
+    tags: [oom, batch_size, gradient_accumulation, vram]
+
+  - schema_version: hardware_feature_record_v1
+    record_id: generic.pytorch.checkpointing.long_runs
+    title: Scheduler-friendly checkpointing for long training runs
+    summary_text: Long-running scheduler jobs should save resumable checkpoints that include model, optimizer, scheduler, scaler, epoch, step, and metric state.
+    detail_text: Generated code should checkpoint at safe points and include all state needed to resume without changing validation behavior. This is especially important when scheduler preemption, pause/resume, runtime probing, or packed execution can interrupt training. Keep checkpoint paths configurable and node-specific so parallel MLEvolve runs do not collide.
+    vendor: generic
+    architectures: [generic]
+    accelerator_names: []
+    compute_capabilities: []
+    toolkits: [cuda, cpu]
+    frameworks: [pytorch]
+    workload_types: [vision_training, transformer_training, tabular_training]
+    features: [checkpointing, resume, scheduler_safe_points]
+    recommended_patterns:
+      - Save model, optimizer, scheduler, scaler, epoch, step, and best metric in checkpoints.
+      - Use node-specific checkpoint paths supplied by the executor or scheduler.
+      - Call scheduler safe points between epochs or controlled step windows.
+    avoid_patterns:
+      - Do not overwrite global best_model.pth paths across parallel nodes.
+      - Do not save model weights without optimizer and progress state for resumable jobs.
+    source_refs:
+      - title: PyTorch saving and loading models
+        url: https://pytorch.org/tutorials/beginner/saving_loading_models.html
+        source_type: framework_documentation
+        retrieved_or_verified_date: "2026-05-15"
+    confidence: 0.84
+    last_verified: "2026-05-15"
+    tags: [checkpointing, resume, long_runs, scheduler]

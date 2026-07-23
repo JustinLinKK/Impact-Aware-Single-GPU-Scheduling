@@ -1,291 +1,988 @@
 from __future__ import annotations
 
-from itertools import product
 from pathlib import Path
-from time import perf_counter
+import tempfile
+import unittest
+from unittest import mock
 
-import pytest
-
+from localml_scheduler.adapters.mlevolve import build_mlevolve_job, build_packing_signature
+from localml_scheduler.execution.backends import MPSBackend
+from localml_scheduler.hardware import HardwareProfile, build_hardware_key
+from localml_scheduler.domain import (
+    BatchSizeObservation,
+    CombinationProfile,
+    PackingSpec,
+    PlacementDecision,
+    PreloadSource,
+    ResourceRequirements,
+    SoloProfile,
+    TrainingJob,
+    build_batch_size_observation_key,
+    build_group_signature,
+)
+from localml_scheduler.scheduler.compatibility import compatibility_score
+from localml_scheduler.scheduler.placement_planner import PlacementPlanner
+from localml_scheduler.scheduler.policies import PriorityFifoPolicy
+from localml_scheduler.scheduler.planner_types import DispatchPlan
+from localml_scheduler.scheduler.service import SchedulerService
 from localml_scheduler.config import (
-    PREDICTION_MODE_BRANCH_PROFILE,
-    SCHEDULER_MODE_ADAPTIVE,
+    SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
+    SCHEDULER_MODE_PARALLEL_DEFAULT,
     SchedulerSettings,
 )
-from localml_scheduler.domain import (
-    BatchProfileCurve,
-    BatchProfilePoint,
-    BatchProbeSpec,
-    JobStatus,
-    PackingSpec,
-    TrainingJob,
-)
-from localml_scheduler.scheduler.placement_planner import PlacementPlanner
-from localml_scheduler.scheduler.adaptive_search import SearchState
-from localml_scheduler.scheduler.policies import PriorityFifoPolicy
-from localml_scheduler.storage import StateStore
+from localml_scheduler.storage.sqlite_store import SQLiteStateStore
 
 
-def _settings(tmp_path: Path, *, exact_cutoff: int = 8) -> SchedulerSettings:
-    return SchedulerSettings(
-        runtime_root=tmp_path / "runtime",
-        prediction={"mode": PREDICTION_MODE_BRANCH_PROFILE},
-        gpu_scheduler={
-            "mode": SCHEDULER_MODE_ADAPTIVE,
-            "backend_priority": ["stream", "exclusive"],
-            "candidate_window_size": 16,
-            "max_packed_jobs_per_gpu": 8,
-            "adaptive": {
-                "exact_search_max_jobs": exact_cutoff,
-                "vram_bucket_mb": 128,
-                "frontier_width": 32,
-                "finalist_limit": 64,
-                "replan_debounce_seconds": 1.0,
-            },
-        },
-    )
-
-
-def _job(job_id: str, *, authored: int = 8, priority: int = 0, queue_sequence: int = 1) -> TrainingJob:
-    namespace = f"branch:{job_id}"
-    job = TrainingJob.create(
-        runner_target="tests.fake:run",
-        baseline_model_id=job_id,
-        baseline_model_path=f"/{job_id}.pt",
-        job_id=job_id,
-        priority=priority,
-        runner_kwargs={"batch_size": authored},
-        packing=PackingSpec(eligible=True, signature=f"sig:{job_id}", backend_allowlist=["stream"]),
-        batch_probe=BatchProbeSpec(
-            enabled=True,
-            model_key=job_id,
-            profile_namespace=namespace,
-            shape_signature_override=namespace,
-            minimum_batch_size=1,
-            contract_version=3,
+def _fake_hardware_profile(name: str) -> HardwareProfile:
+    return HardwareProfile(
+        hardware_key=build_hardware_key(
+            os_name="linux",
+            gpu_name=name,
+            total_vram_mb=24576,
+            compute_capability="9.0",
+            cuda_runtime="12.8",
+            torch_version="2.8.0",
         ),
-        metadata={"elastic_contract_validated": True},
+        os_name="linux",
+        gpu_name=name,
+        total_vram_mb=24576,
+        compute_capability="9.0",
+        cuda_runtime="12.8",
+        torch_version="2.8.0",
     )
-    job.queue_sequence = queue_sequence
-    return job
 
 
-def _profile(
-    store: StateStore,
-    job: TrainingJob,
-    points: dict[int, tuple[int, float]],
-    *,
-    contract_version: int = 3,
-) -> None:
-    curve_key = f"curve:{job.job_id}:v{contract_version}"
-    curve = BatchProfileCurve(
-        curve_key=curve_key,
-        model_key=str(job.batch_probe.model_key),
-        shape_signature=str(job.batch_probe.shape_signature_override),
-        hardware_key=store.hardware_key(),
-        profile_namespace=job.batch_probe.profile_namespace,
-        contract_version=contract_version,
-        minimum_batch_size=min(points),
-        maximum_feasible_batch_size=max(points),
-        right_censored=True,
-    )
-    store.upsert_batch_profile_curve(curve)
-    for batch, (vram_mb, throughput) in points.items():
-        store.upsert_batch_profile_point(
-            BatchProfilePoint(
-                point_key=f"{curve_key}:{batch}",
-                curve_key=curve_key,
-                batch_size=batch,
-                peak_vram_mb=vram_mb,
-                samples_per_second=throughput,
-                median_step_time_ms=(batch / throughput) * 1000.0,
-                observations=5,
+def _planner(settings: SchedulerSettings, store: SQLiteStateStore | None = None) -> tuple[SQLiteStateStore, PlacementPlanner]:
+    scheduler_store = store or SQLiteStateStore(settings)
+    return scheduler_store, PlacementPlanner(settings, scheduler_store, PriorityFifoPolicy(enable_priority_aging=False))
+
+
+class _FakeParallelSupervisor:
+    def __init__(self, *, available_backends: dict[str, bool]):
+        self._available_backends = dict(available_backends)
+        self.dispatched_jobs: list[TrainingJob] = []
+
+    def active_group(self):
+        return None
+
+    def available_backends(self) -> dict[str, bool]:
+        return dict(self._available_backends)
+
+    def dispatch(
+        self,
+        jobs: list[TrainingJob],
+        *,
+        mode: str,
+        backend_name: str,
+        batch_overrides: dict[str, int] | None = None,
+        fallback_order: list[str] | None = None,
+    ) -> PlacementDecision:
+        self.dispatched_jobs = list(jobs)
+        return PlacementDecision(
+            can_run=True,
+            reason="fake dispatch",
+            gpu_slot=0,
+            mode=mode,
+            backend_name=backend_name,
+            job_ids=[job.job_id for job in jobs],
+            batch_overrides=dict(batch_overrides or {}),
+            fallback_order=list(fallback_order or []),
+        )
+
+
+class GpuSchedulerUnitTest(unittest.TestCase):
+    def test_settings_file_parses_nested_gpu_scheduler(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_path = Path(tmpdir) / "scheduler.yaml"
+            settings_path.write_text(
+                "\n".join(
+                    [
+                        f'runtime_root: "{tmpdir}"',
+                        "gpu_scheduler:",
+                        "  enabled: true",
+                        '  backend_priority: ["mps", "exclusive"]',
+                        "  max_packed_jobs_per_gpu: 2",
+                        "  memory:",
+                        "    safe_vram_budget_gib: 12.5",
+                        "  telemetry:",
+                        "    device_poll_ms: 250",
+                        "  mps:",
+                        "    default_primary_active_thread_pct: 55",
+                    ]
+                ),
+                encoding="utf-8",
             )
+            settings = SchedulerSettings.from_file(settings_path)
+            self.assertTrue(settings.gpu_scheduler.enabled)
+            self.assertEqual(settings.gpu_scheduler.memory.safe_vram_budget_gib, 12.5)
+            self.assertEqual(settings.gpu_scheduler.telemetry.device_poll_ms, 250)
+            self.assertEqual(settings.gpu_scheduler.mps.default_primary_active_thread_pct, 55)
+
+    def test_settings_file_parses_modes_optimizer_and_submission_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_path = Path(tmpdir) / "scheduler.yaml"
+            settings_path.write_text(
+                "\n".join(
+                    [
+                        f'runtime_root: "{tmpdir}"',
+                        "gpu_scheduler:",
+                        '  mode: "parallel_batch_optimized"',
+                        "  candidate_window_size: 12",
+                        '  backend_priority: ["stream", "cuda_process", "exclusive"]',
+                        "  parallel_optimizer:",
+                        '    batch_search_mode: "power_of_two"',
+                        "    target_vram_fraction: 0.9",
+                        "    binary_range_up: 10",
+                        "    binary_range_down: 2",
+                        "    power_of_two_range_up: 4",
+                        "    power_of_two_range_down: 1",
+                        "  submission_defaults:",
+                        "    packing_eligible: true",
+                        '    backend_allowlist: ["cuda_process"]',
+                        '    batch_probe_model_key: "scheduler-default"',
+                        "  cuda_process:",
+                        "    default_omp_num_threads: 4",
+                        "  stream:",
+                        "    enabled: true",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            settings = SchedulerSettings.from_file(settings_path)
+            self.assertEqual(settings.gpu_scheduler.mode, SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED)
+            self.assertEqual(settings.gpu_scheduler.candidate_window_size, 12)
+            self.assertEqual(settings.gpu_scheduler.parallel_optimizer.batch_search_mode, "power_of_two")
+            self.assertEqual(settings.gpu_scheduler.parallel_optimizer.target_vram_fraction, 0.9)
+            self.assertEqual(settings.gpu_scheduler.parallel_optimizer.binary_range_up, 10)
+            self.assertEqual(settings.gpu_scheduler.parallel_optimizer.binary_range_down, 2)
+            self.assertEqual(settings.gpu_scheduler.parallel_optimizer.power_of_two_range_up, 4)
+            self.assertEqual(settings.gpu_scheduler.parallel_optimizer.power_of_two_range_down, 1)
+            self.assertTrue(settings.gpu_scheduler.submission_defaults.packing_eligible)
+            self.assertEqual(settings.gpu_scheduler.submission_defaults.backend_allowlist, ["cuda_process"])
+            self.assertEqual(settings.gpu_scheduler.submission_defaults.batch_probe_model_key, "scheduler-default")
+            self.assertTrue(settings.gpu_scheduler.stream.enabled)
+            self.assertEqual(settings.gpu_scheduler.cuda_process.default_omp_num_threads, 4)
+
+    def test_settings_file_tolerates_null_nested_scheduler_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_path = Path(tmpdir) / "scheduler.yaml"
+            settings_path.write_text(
+                "\n".join(
+                    [
+                        f'runtime_root: "{tmpdir}"',
+                        "gpu_scheduler:",
+                        "  submission_defaults: null",
+                        "  parallel_optimizer: null",
+                        "  mps: null",
+                        "  cuda_process: null",
+                        "  stream: null",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            settings = SchedulerSettings.from_file(settings_path)
+            self.assertIsNotNone(settings.gpu_scheduler.submission_defaults)
+            self.assertEqual(settings.gpu_scheduler.submission_defaults.backend_allowlist, ["mps", "cuda_process"])
+            self.assertIsNotNone(settings.gpu_scheduler.parallel_optimizer)
+            self.assertIsNotNone(settings.gpu_scheduler.mps)
+            self.assertIsNotNone(settings.gpu_scheduler.cuda_process)
+            self.assertIsNotNone(settings.gpu_scheduler.stream)
+
+    def test_settings_file_parses_baseline_cache_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_path = Path(tmpdir) / "scheduler.yaml"
+            settings_path.write_text(
+                "\n".join(
+                    [
+                        f'runtime_root: "{tmpdir}"',
+                        "baseline_cache:",
+                        "  warm_queue_policy: budget_only",
+                        "  warm_queue_top_k: 5",
+                        "  entry_capacity: 8",
+                        "  max_ram_percent: 0.2",
+                        "  memory_budget_bytes: 123456",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            settings = SchedulerSettings.from_file(settings_path)
+            self.assertEqual(settings.baseline_cache.warm_queue_policy, "budget_only")
+            self.assertEqual(settings.baseline_cache.warm_queue_top_k, 5)
+            self.assertEqual(settings.baseline_cache.entry_capacity, 8)
+            self.assertEqual(settings.baseline_cache.max_ram_percent, 0.2)
+            self.assertEqual(settings.baseline_cache.memory_budget_bytes, 123456)
+
+    def test_packing_spec_round_trip(self) -> None:
+        job = TrainingJob.create(
+            "module:runner",
+            "baseline-a",
+            "/tmp/a.pt",
+            packing=PackingSpec(eligible=True, signature="family:abcd", family="family", max_slowdown_ratio=1.2),
         )
+        restored = TrainingJob.from_dict(job.to_dict())
+        self.assertTrue(restored.packing.eligible)
+        self.assertEqual(restored.packing.signature, "family:abcd")
+        self.assertEqual(restored.packing.family, "family")
+        self.assertEqual(restored.packing.max_slowdown_ratio, 1.2)
 
-
-def _planner(settings: SchedulerSettings) -> tuple[StateStore, PlacementPlanner]:
-    store = StateStore(settings)
-    planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
-    return store, planner
-
-
-def test_only_adaptive_scheduler_and_new_prediction_modes_are_accepted(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
-    assert settings.gpu_scheduler.mode == "adaptive"
-    assert settings.gpu_scheduler.candidate_window_size == 16
-    assert settings.gpu_scheduler.max_packed_jobs_per_gpu == 8
-    assert settings.gpu_scheduler.adaptive.exact_search_max_jobs == 8
-    with pytest.raises(ValueError, match="Unsupported scheduler mode"):
-        SchedulerSettings(runtime_root=tmp_path / "old", gpu_scheduler={"mode": "parallel_auto_pack"})
-    with pytest.raises(ValueError, match="Unsupported prediction mode"):
-        SchedulerSettings(runtime_root=tmp_path / "old-prediction", prediction={"mode": "branch_only"})
-
-
-def test_submission_snapshots_authored_batch_and_rejects_non_power_of_two(tmp_path: Path) -> None:
-    store = StateStore(_settings(tmp_path))
-    job = _job("power-two", authored=8)
-    store.submit_job(job)
-    job.current_batch_size = 16
-    store.save_job(job)
-    restored = store.get_job(job.job_id)
-    assert restored is not None
-    assert restored.authored_batch_size == 8
-    assert restored.current_batch_size == 16
-    assert restored.config.runner_kwargs["batch_size"] == 8
-
-    invalid = _job("invalid", authored=3)
-    with pytest.raises(ValueError, match="power of two"):
-        store.submit_job(invalid)
-
-
-def test_old_profile_contract_is_preserved_but_not_plannable(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
-    store, planner = _planner(settings)
-    job = _job("legacy")
-    _profile(store, job, {4: (1000, 100.0), 8: (1500, 180.0)}, contract_version=2)
-    assert store.list_batch_profile_curves()
-    assert planner.profile_ready(job) is False
-
-
-def test_branch_candidates_center_on_authored_and_preserve_active_current(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
-    store, planner = _planner(settings)
-    job = _job("candidate", authored=8)
-    _profile(store, job, {1: (500, 10), 2: (700, 20), 4: (900, 40), 8: (1300, 75), 16: (2100, 120), 32: (3500, 150)})
-    assert planner.search.candidate_batches(job, active=False) == [4, 8, 16]
-    job.current_batch_size = 32
-    assert planner.search.candidate_batches(job, active=True) == [8, 16, 32]
-
-
-def test_abc_arrival_shrinks_active_batches_and_admits_all_three(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
-    store, planner = _planner(settings)
-    planner.estimator.safe_budget_mb = lambda: 10_000.0
-    a, b, c = (_job("a", queue_sequence=1), _job("b", queue_sequence=2), _job("c", queue_sequence=3))
-    for job in (a, b):
-        _profile(store, job, {4: (2500, 90), 8: (4000, 160), 16: (6000, 240)})
-        job.current_batch_size = 16
-        job.status = JobStatus.RUNNING
-    _profile(store, c, {4: (2000, 70), 8: (3000, 125), 16: (5000, 190)})
-
-    plan = planner.choose_plan(
-        [c],
-        active_jobs=[a, b],
-        backend_available={"stream": True, "exclusive": True},
-    )
-    assert plan is not None
-    assert set(plan.job_ids) == {"a", "b", "c"}
-    assert plan.batch_overrides["a"] < 16 or plan.batch_overrides["b"] < 16
-    assert plan.estimated_vram_mb <= 10_000
-    assert a.authored_batch_size == b.authored_batch_size == 8
-    assert a.config.runner_kwargs["batch_size"] == b.config.runner_kwargs["batch_size"] == 8
-
-
-def test_infeasible_waiting_job_does_not_evict_or_interrupt_active_jobs(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
-    store, planner = _planner(settings)
-    planner.estimator.safe_budget_mb = lambda: 10_000.0
-    a, b, c = (_job("a"), _job("b", queue_sequence=2), _job("c", queue_sequence=3))
-    for job in (a, b):
-        _profile(store, job, {4: (5000, 100), 8: (6000, 150), 16: (8000, 190)})
-        job.current_batch_size = 4
-        job.status = JobStatus.RUNNING
-    _profile(store, c, {4: (2000, 80), 8: (3000, 130), 16: (5000, 180)})
-
-    plan = planner.choose_plan([c], active_jobs=[a, b], backend_available={"stream": True, "exclusive": True})
-    assert plan is not None
-    assert set(plan.job_ids) == {"a", "b"}
-    assert plan.batch_overrides == {"a": 4, "b": 4}
-
-
-def test_exact_search_matches_exhaustive_enumeration(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
-    store, planner = _planner(settings)
-    planner.estimator.safe_budget_mb = lambda: 9_000.0
-    jobs = [_job(f"j{index}", priority=index % 2, queue_sequence=index + 1) for index in range(6)]
-    for index, job in enumerate(jobs):
-        _profile(
-            store,
-            job,
-            {
-                4: (800 + index * 20, 50 + index),
-                8: (1300 + index * 30, 90 + index),
-                16: (2200 + index * 40, 130 + index),
-            },
+    def test_preload_source_round_trip(self) -> None:
+        job = TrainingJob.create(
+            "module:runner",
+            "baseline-a",
+            "/tmp/a.pt",
+            preload_source=PreloadSource(
+                model_id="startpoint-shared",
+                model_path="/tmp/shared.ckpt",
+                loader_target="localml_scheduler.adapters.mlevolve_runner:load_raw_file",
+            ),
         )
-    planner.estimator.begin_planning_cycle()
-    planner.compatibility.begin_planning_cycle()
-    options = [planner.search.choices_for(job, backend_name="stream", active=False) for job in jobs]
-    brute_best = None
-    for vector in product(*[(None, *choices) for choices in options]):
-        state = SearchState()
-        feasible = True
-        for job, choice in zip(jobs, vector):
-            if choice is None:
-                continue
-            state = planner.search._extend(state, job, choice, active=False, backend_name="stream")
-            if state is None:
-                feasible = False
-                break
-        if feasible and state is not None and state.jobs and (brute_best is None or planner.search.score(state) > planner.search.score(brute_best)):
-            brute_best = state
-    exact, solver = planner.search.solve(jobs, active_job_ids=set(), backend_name="stream")
-    assert solver == "exact_branch_and_bound"
-    assert exact is not None and brute_best is not None
-    assert planner.search.score(exact) == pytest.approx(planner.search.score(brute_best))
+        restored = TrainingJob.from_dict(job.to_dict())
+        self.assertIsNotNone(restored.preload_source)
+        self.assertEqual(restored.preload_source.model_id, "startpoint-shared")
+        self.assertEqual(restored.preload_source.model_path, "/tmp/shared.ckpt")
 
-
-def test_bounded_dp_uses_conservative_buckets_and_never_exceeds_exact_budget(tmp_path: Path) -> None:
-    settings = _settings(tmp_path, exact_cutoff=4)
-    store, planner = _planner(settings)
-    planner.estimator.safe_budget_mb = lambda: 6_000.0
-    jobs = [_job(f"dp{index}", queue_sequence=index + 1) for index in range(12)]
-    for job in jobs:
-        _profile(store, job, {4: (900, 40), 8: (1400, 70), 16: (2300, 100)})
-    plan = planner.choose_plan(jobs, backend_available={"stream": True, "exclusive": True})
-    assert plan is not None
-    assert plan.solver_kind == "bounded_multiple_choice_dp"
-    assert plan.estimated_vram_mb <= 6_000
-    assert len(plan.job_ids) <= settings.gpu_scheduler.max_packed_jobs_per_gpu
-
-
-def test_bounded_dp_rounds_total_vram_once_and_preserves_fifo_fairness(tmp_path: Path) -> None:
-    settings = _settings(tmp_path, exact_cutoff=8)
-    store, planner = _planner(settings)
-    planner.estimator.safe_budget_mb = lambda: 29_888.0
-    jobs = [_job(f"fair{index:02d}", queue_sequence=index) for index in range(1, 13)]
-    for index, job in enumerate(jobs, start=1):
-        vram_mb = 3_601 if index <= 5 else 3_713 if index <= 10 else 3_630
-        _profile(
-            store,
-            job,
-            {4: (vram_mb, 40.0), 8: (vram_mb, 70.0), 16: (vram_mb, 100.0)},
+    def test_signature_generation_is_stable(self) -> None:
+        left = build_packing_signature(
+            runner_target="pkg.runner:train",
+            baseline_model_id="baseline-a",
+            task_type="classification",
+            runner_kwargs={"batch_size": 16, "precision": "bf16"},
+            max_steps=100,
+            max_epochs=3,
+            family="toy-family",
         )
-
-    plan = planner.choose_plan(jobs, backend_available={"stream": True, "exclusive": True})
-
-    assert plan is not None
-    assert plan.solver_kind == "bounded_multiple_choice_dp"
-    assert set(plan.job_ids) == {f"fair{index:02d}" for index in range(1, 9)}
-    assert plan.estimated_vram_mb <= 29_888.0
-
-
-def test_sixteen_candidate_planner_p95_is_below_100_ms(tmp_path: Path) -> None:
-    settings = _settings(tmp_path, exact_cutoff=8)
-    store, planner = _planner(settings)
-    planner.estimator.safe_budget_mb = lambda: 10_000.0
-    jobs = [_job(f"bench{index}", priority=index % 3, queue_sequence=index + 1) for index in range(16)]
-    for index, job in enumerate(jobs):
-        _profile(
-            store,
-            job,
-            {4: (850 + index, 40 + index), 8: (1400 + index, 70 + index), 16: (2300 + index, 100 + index)},
+        right = build_packing_signature(
+            runner_target="pkg.runner:train",
+            baseline_model_id="baseline-a",
+            task_type="classification",
+            runner_kwargs={"precision": "bf16", "batch_size": 16},
+            max_steps=100,
+            max_epochs=3,
+            family="toy-family",
         )
-    latencies_ms = []
-    for _ in range(20):
-        started = perf_counter()
-        plan = planner.choose_plan(jobs, backend_available={"stream": True, "exclusive": True})
-        latencies_ms.append((perf_counter() - started) * 1000.0)
-        assert plan is not None and plan.solver_kind == "bounded_multiple_choice_dp"
-    p95 = sorted(latencies_ms)[int(0.95 * len(latencies_ms)) - 1]
-    assert p95 < 100.0, latencies_ms
+        self.assertEqual(left, right)
+
+    def test_mps_backend_availability_requires_supported_platform_binary_and_cuda(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(runtime_root=tmpdir)
+            backend = MPSBackend(settings, executor=mock.Mock(), mps_binary="/usr/bin/nvidia-cuda-mps-control")
+
+            with mock.patch("localml_scheduler.execution.backends.sys.platform", "win32"), mock.patch(
+                "localml_scheduler.execution.backends._cuda_runtime_visible",
+                return_value=True,
+            ):
+                self.assertFalse(backend.available())
+
+            with mock.patch("localml_scheduler.execution.backends.sys.platform", "linux"), mock.patch(
+                "localml_scheduler.execution.backends._cuda_runtime_visible",
+                return_value=False,
+            ):
+                self.assertFalse(backend.available())
+
+            with mock.patch("localml_scheduler.execution.backends.sys.platform", "linux"), mock.patch(
+                "localml_scheduler.execution.backends._cuda_runtime_visible",
+                return_value=True,
+            ):
+                self.assertTrue(backend.available())
+
+    def test_planner_requires_solo_profiles_and_falls_back_when_mps_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(runtime_root=tmpdir)
+            store = SQLiteStateStore(settings)
+            planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
+
+            primary = build_mlevolve_job(
+                workflow_id="wf",
+                baseline_model_id="baseline-a",
+                baseline_model_path="/tmp/a.pt",
+                runner_target="pkg.runner:train",
+                packing_family="toy",
+                packing_eligible=True,
+                task_type="classification",
+            )
+            secondary = build_mlevolve_job(
+                workflow_id="wf",
+                baseline_model_id="baseline-b",
+                baseline_model_path="/tmp/b.pt",
+                runner_target="pkg.runner:train",
+                packing_family="toy",
+                packing_eligible=True,
+                task_type="classification",
+            )
+            primary.queue_sequence = 1
+            secondary.queue_sequence = 2
+
+            plan = planner.choose_plan([primary, secondary], backend_available={"exclusive": True, "mps": False})
+            self.assertEqual(plan.mode, "exclusive")
+            self.assertIn("unavailable", plan.reason)
+
+            plan = planner.choose_plan([primary, secondary], backend_available={"exclusive": True, "mps": True})
+            self.assertEqual(plan.mode, "exclusive")
+            self.assertIn("solo profile", plan.reason)
+
+    def test_compatibility_score_prefers_lower_utilization_partner(self) -> None:
+        settings = SchedulerSettings(runtime_root=Path(tempfile.mkdtemp()))
+        primary = TrainingJob.create("pkg.runner:train", "baseline-a", "/tmp/a.pt", priority=9)
+        partner = TrainingJob.create("pkg.runner:train", "baseline-b", "/tmp/b.pt", priority=3)
+        primary_profile = SoloProfile(signature="a", peak_vram_mb=2048, avg_gpu_utilization=0.25)
+        low_util = SoloProfile(signature="b", peak_vram_mb=2048, avg_gpu_utilization=0.20)
+        high_util = SoloProfile(signature="c", peak_vram_mb=2048, avg_gpu_utilization=0.78)
+        low_score = compatibility_score(primary, partner, primary_profile, low_util, None, settings)
+        high_score = compatibility_score(primary, partner, primary_profile, high_util, None, settings)
+        self.assertGreater(low_score, high_score)
+
+    def test_planner_prefers_stream_for_structured_jobs_and_reroutes_raw_jobs_to_cuda_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                gpu_scheduler={
+                    "mode": SCHEDULER_MODE_PARALLEL_DEFAULT,
+                    "backend_priority": ["stream", "cuda_process", "exclusive"],
+                },
+            )
+            store, planner = _planner(settings)
+
+            structured_a = build_mlevolve_job(
+                workflow_id="wf",
+                baseline_model_id="structured-a",
+                baseline_model_path="/tmp/a.pt",
+                runner_target="pkg.runner:train",
+                runner_kwargs={"batch_size": 4},
+                resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=512),
+                packing_family="toy",
+                packing_eligible=True,
+                task_type="classification",
+            )
+            structured_b = build_mlevolve_job(
+                workflow_id="wf",
+                baseline_model_id="structured-b",
+                baseline_model_path="/tmp/b.pt",
+                runner_target="pkg.runner:train",
+                runner_kwargs={"batch_size": 4},
+                resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=512),
+                packing_family="toy",
+                packing_eligible=True,
+                task_type="classification",
+            )
+            structured_a.queue_sequence = 1
+            structured_b.queue_sequence = 2
+
+            structured_plan = planner.choose_plan(
+                [structured_a, structured_b],
+                backend_available={"exclusive": True, "stream": True, "cuda_process": True},
+            )
+            self.assertEqual(structured_plan.mode, "packed_pair")
+            self.assertEqual(structured_plan.backend_name, "stream")
+
+            raw_a = build_mlevolve_job(
+                workflow_id="wf",
+                baseline_model_id="raw-a",
+                baseline_model_path="/tmp/raw-a.py",
+                runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                runner_kwargs={"batch_size": 4},
+                resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=512),
+                packing_family="mlevolve_script",
+                packing_eligible=True,
+                packing_backend_allowlist=["mps", "cuda_process"],
+                task_type="mlevolve_script",
+            )
+            raw_b = build_mlevolve_job(
+                workflow_id="wf",
+                baseline_model_id="raw-b",
+                baseline_model_path="/tmp/raw-b.py",
+                runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                runner_kwargs={"batch_size": 4},
+                resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=512),
+                packing_family="mlevolve_script",
+                packing_eligible=True,
+                packing_backend_allowlist=["mps", "cuda_process"],
+                task_type="mlevolve_script",
+            )
+            raw_a.queue_sequence = 1
+            raw_b.queue_sequence = 2
+
+            raw_plan = planner.choose_plan(
+                [raw_a, raw_b],
+                backend_available={"exclusive": True, "stream": True, "cuda_process": True},
+            )
+            self.assertEqual(raw_plan.mode, "packed_pair")
+            self.assertEqual(raw_plan.backend_name, "cuda_process")
+
+    def test_parallel_default_prefers_three_way_cuda_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                gpu_scheduler={
+                    "mode": SCHEDULER_MODE_PARALLEL_DEFAULT,
+                    "backend_priority": ["cuda_process", "exclusive"],
+                    "max_packed_jobs_per_gpu": 3,
+                    "allow_three_way_packing": True,
+                },
+            )
+            _, planner = _planner(settings)
+            jobs: list[TrainingJob] = []
+            for index in range(3):
+                job = build_mlevolve_job(
+                    workflow_id="wf",
+                    baseline_model_id=f"baseline-{index}",
+                    baseline_model_path=f"/tmp/{index}.pt",
+                    runner_target="pkg.runner:train",
+                    runner_kwargs={"batch_size": 4 + index},
+                    resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=384),
+                    packing_family="toy",
+                    packing_eligible=True,
+                    task_type="classification",
+                )
+                job.queue_sequence = index + 1
+                jobs.append(job)
+
+            plan = planner.choose_plan(jobs, backend_available={"exclusive": True, "cuda_process": True})
+            self.assertEqual(plan.mode, "packed_group")
+            self.assertEqual(plan.backend_name, "cuda_process")
+            self.assertEqual(len(plan.job_ids), 3)
+
+    def test_parallel_batch_optimizer_binary_finds_best_safe_batch_vector(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                gpu_scheduler={
+                    "mode": SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
+                    "backend_priority": ["cuda_process", "exclusive"],
+                    "memory": {"safe_vram_budget_gib": 0.75},
+                    "parallel_optimizer": {
+                        "batch_search_mode": "binary",
+                        "target_vram_fraction": 1.0,
+                        "binary_range_up": 3,
+                        "binary_range_down": 1,
+                    },
+                },
+            )
+            store, planner = _planner(settings)
+            store._hardware_profile = _fake_hardware_profile("planner-binary")
+
+            jobs: list[TrainingJob] = []
+            peaks = {
+                "job-a": {1: 100, 2: 200, 3: 300, 4: 400, 5: 500},
+                "job-b": {1: 120, 2: 240, 3: 360, 4: 480, 5: 600},
+            }
+            for index, model_id in enumerate(["job-a", "job-b"], start=1):
+                job = build_mlevolve_job(
+                    workflow_id="wf",
+                    baseline_model_id=model_id,
+                    baseline_model_path=f"/tmp/{model_id}.pt",
+                    runner_target="pkg.runner:train",
+                    runner_kwargs={"batch_size": 2, "probe_max_batch_size": 5},
+                    resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=256),
+                    packing_family="toy",
+                    packing_eligible=True,
+                    task_type="classification",
+                )
+                job.queue_sequence = index
+                jobs.append(job)
+                shape_signature = planner._shape_signature(job)
+                for batch_size, peak in peaks[model_id].items():
+                    store.upsert_batch_size_observation(
+                        BatchSizeObservation(
+                            observation_key=build_batch_size_observation_key(
+                                model_id,
+                                shape_signature,
+                                store.hardware_key(),
+                                "cuda_process",
+                                batch_size,
+                            ),
+                            model_key=model_id,
+                            shape_signature=shape_signature,
+                            hardware_key=store.hardware_key(),
+                            backend_name="cuda_process",
+                            batch_param_name="batch_size",
+                            batch_size=batch_size,
+                            peak_vram_mb=peak,
+                            last_job_id=job.job_id,
+                        )
+                    )
+
+            plan = planner.choose_plan(jobs, backend_available={"exclusive": True, "cuda_process": True})
+            self.assertEqual(plan.mode, "packed_pair")
+            self.assertEqual(plan.backend_name, "cuda_process")
+            self.assertEqual(plan.batch_overrides[jobs[0].job_id], 4)
+            self.assertEqual(plan.batch_overrides[jobs[1].job_id], 3)
+
+    def test_parallel_batch_optimizer_power_of_two_restricts_batch_vector_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                gpu_scheduler={
+                    "mode": SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
+                    "backend_priority": ["cuda_process", "exclusive"],
+                    "memory": {"safe_vram_budget_gib": 0.9},
+                    "parallel_optimizer": {
+                        "batch_search_mode": "power_of_two",
+                        "target_vram_fraction": 1.0,
+                        "power_of_two_range_up": 2,
+                        "power_of_two_range_down": 0,
+                    },
+                },
+            )
+            store, planner = _planner(settings)
+            store._hardware_profile = _fake_hardware_profile("planner-pow2")
+
+            jobs: list[TrainingJob] = []
+            for index, model_id in enumerate(["pow2-a", "pow2-b"], start=1):
+                job = build_mlevolve_job(
+                    workflow_id="wf",
+                    baseline_model_id=model_id,
+                    baseline_model_path=f"/tmp/{model_id}.pt",
+                    runner_target="pkg.runner:train",
+                    runner_kwargs={"batch_size": 2},
+                    resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=220),
+                    packing_family="toy",
+                    packing_eligible=True,
+                    task_type="classification",
+                )
+                job.queue_sequence = index
+                jobs.append(job)
+                shape_signature = planner._shape_signature(job)
+                for batch_size, peak in {1: 110, 2: 220, 4: 440, 8: 880}.items():
+                    store.upsert_batch_size_observation(
+                        BatchSizeObservation(
+                            observation_key=build_batch_size_observation_key(
+                                model_id,
+                                shape_signature,
+                                store.hardware_key(),
+                                "cuda_process",
+                                batch_size,
+                            ),
+                            model_key=model_id,
+                            shape_signature=shape_signature,
+                            hardware_key=store.hardware_key(),
+                            backend_name="cuda_process",
+                            batch_param_name="batch_size",
+                            batch_size=batch_size,
+                            peak_vram_mb=peak,
+                            last_job_id=job.job_id,
+                        )
+                    )
+
+            plan = planner.choose_plan(jobs, backend_available={"exclusive": True, "cuda_process": True})
+            self.assertEqual(plan.mode, "packed_pair")
+            self.assertEqual(plan.batch_overrides[jobs[0].job_id], 4)
+            self.assertEqual(plan.batch_overrides[jobs[1].job_id], 4)
+
+    def test_parallel_batch_optimizer_binary_thresholds_clip_candidate_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                gpu_scheduler={
+                    "parallel_optimizer": {
+                        "batch_search_mode": "binary",
+                        "binary_range_up": 4,
+                        "binary_range_down": 3,
+                    }
+                },
+            )
+            _, planner = _planner(settings)
+            job = build_mlevolve_job(
+                workflow_id="wf",
+                baseline_model_id="binary-threshold",
+                baseline_model_path="/tmp/binary-threshold.pt",
+                runner_target="pkg.runner:train",
+                runner_kwargs={"batch_size": 8, "probe_max_batch_size": 10},
+                resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=256),
+                packing_family="toy",
+                packing_eligible=True,
+                task_type="classification",
+            )
+
+            self.assertEqual(planner._candidate_batch_sizes(job), [5, 6, 7, 8, 9, 10])
+
+    def test_parallel_batch_optimizer_power_of_two_thresholds_clip_candidate_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                gpu_scheduler={
+                    "parallel_optimizer": {
+                        "batch_search_mode": "power_of_two",
+                        "power_of_two_range_up": 2,
+                        "power_of_two_range_down": 1,
+                    }
+                },
+            )
+            _, planner = _planner(settings)
+            job = build_mlevolve_job(
+                workflow_id="wf",
+                baseline_model_id="pow2-threshold",
+                baseline_model_path="/tmp/pow2-threshold.pt",
+                runner_target="pkg.runner:train",
+                runner_kwargs={"batch_size": 12, "probe_max_batch_size": 20},
+                resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=256),
+                packing_family="toy",
+                packing_eligible=True,
+                task_type="classification",
+            )
+
+            self.assertEqual(planner._candidate_batch_sizes(job), [4, 8, 16])
+
+    def test_parallel_batch_optimizer_uses_cached_optimal_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(
+                runtime_root=tmpdir,
+                gpu_scheduler={
+                    "mode": SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
+                    "backend_priority": ["cuda_process", "exclusive"],
+                },
+            )
+            store, planner = _planner(settings)
+            store._hardware_profile = _fake_hardware_profile("planner-cache")
+
+            jobs: list[TrainingJob] = []
+            for index in range(2):
+                job = build_mlevolve_job(
+                    workflow_id="wf",
+                    baseline_model_id=f"cached-{index}",
+                    baseline_model_path=f"/tmp/cached-{index}.pt",
+                    runner_target="pkg.runner:train",
+                    runner_kwargs={"batch_size": 2},
+                    resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=256),
+                    packing_family="toy",
+                    packing_eligible=True,
+                    task_type="classification",
+                )
+                job.queue_sequence = index + 1
+                jobs.append(job)
+
+            group_signature = build_group_signature([job.packing.signature or job.job_id for job in jobs])
+            store.upsert_combination_profile(
+                CombinationProfile.create(
+                    group_signature=group_signature,
+                    hardware_key=store.hardware_key(),
+                    backend_name="cuda_process",
+                    scheduler_mode=SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
+                    batch_vector={jobs[0].job_id: 4, jobs[1].job_id: 8},
+                    compatible=True,
+                    resolved_optimal=True,
+                    objective_score=0.98,
+                    peak_vram_mb=900,
+                    fallback_order=[jobs[1].job_id, jobs[0].job_id],
+                )
+            )
+
+            plan = planner.choose_plan(jobs, backend_available={"exclusive": True, "cuda_process": True})
+            self.assertEqual(plan.mode, "packed_pair")
+            self.assertEqual(plan.reason, "cached optimal packed group selected")
+            self.assertEqual(plan.batch_overrides[jobs[0].job_id], 4)
+            self.assertEqual(plan.batch_overrides[jobs[1].job_id], 8)
+            self.assertEqual(plan.fallback_order, [jobs[1].job_id, jobs[0].job_id])
+
+    def test_batch_size_and_combination_profiles_are_hardware_scoped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(runtime_root=tmpdir)
+            store = SQLiteStateStore(settings)
+            hardware_a = _fake_hardware_profile("gpu-a")
+            hardware_b = _fake_hardware_profile("gpu-b")
+            store._hardware_profile = hardware_a
+
+            observation = BatchSizeObservation(
+                observation_key=build_batch_size_observation_key("model-a", "shape-a", hardware_a.hardware_key, "cuda_process", 4),
+                model_key="model-a",
+                shape_signature="shape-a",
+                hardware_key=hardware_a.hardware_key,
+                backend_name="cuda_process",
+                batch_param_name="batch_size",
+                batch_size=4,
+                peak_vram_mb=2048,
+                observations=2,
+            )
+            other_observation = BatchSizeObservation(
+                observation_key=build_batch_size_observation_key("model-a", "shape-a", hardware_b.hardware_key, "cuda_process", 4),
+                model_key="model-a",
+                shape_signature="shape-a",
+                hardware_key=hardware_b.hardware_key,
+                backend_name="cuda_process",
+                batch_param_name="batch_size",
+                batch_size=4,
+                peak_vram_mb=4096,
+            )
+            store.upsert_batch_size_observation(observation)
+            store.upsert_batch_size_observation(other_observation)
+
+            restored = store.get_batch_size_observation(
+                model_key="model-a",
+                shape_signature="shape-a",
+                hardware_key=hardware_a.hardware_key,
+                backend_name="cuda_process",
+                batch_size=4,
+            )
+            self.assertIsNotNone(restored)
+            self.assertEqual(restored.peak_vram_mb, 2048)
+            self.assertEqual(len(store.list_batch_size_observations(hardware_key=hardware_a.hardware_key)), 1)
+
+            group_signature = build_group_signature(["sig-a", "sig-b"])
+            store.upsert_combination_profile(
+                CombinationProfile.create(
+                    group_signature=group_signature,
+                    hardware_key=hardware_a.hardware_key,
+                    backend_name="cuda_process",
+                    scheduler_mode=SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
+                    batch_vector={"left": 4, "right": 3},
+                    compatible=True,
+                    resolved_optimal=False,
+                    objective_score=0.91,
+                )
+            )
+            store.upsert_combination_profile(
+                CombinationProfile.create(
+                    group_signature=group_signature,
+                    hardware_key=hardware_a.hardware_key,
+                    backend_name="cuda_process",
+                    scheduler_mode=SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
+                    batch_vector={"left": 5, "right": 2},
+                    compatible=True,
+                    resolved_optimal=True,
+                    objective_score=0.87,
+                )
+            )
+            store.upsert_combination_profile(
+                CombinationProfile.create(
+                    group_signature=group_signature,
+                    hardware_key=hardware_b.hardware_key,
+                    backend_name="cuda_process",
+                    scheduler_mode=SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
+                    batch_vector={"left": 8, "right": 1},
+                    compatible=True,
+                    resolved_optimal=True,
+                    objective_score=0.99,
+                )
+            )
+            store.upsert_combination_profile(
+                CombinationProfile.create(
+                    group_signature=group_signature,
+                    hardware_key=hardware_a.hardware_key,
+                    backend_name="cuda_process",
+                    scheduler_mode=SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
+                    batch_vector={"left": 6, "right": 1},
+                    compatible=False,
+                    resolved_optimal=True,
+                    objective_score=1.0,
+                    last_failure_reason="oom",
+                )
+            )
+
+            best = store.best_combination_profile(
+                group_signature=group_signature,
+                hardware_key=hardware_a.hardware_key,
+                backend_name="cuda_process",
+                scheduler_mode=SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
+            )
+            self.assertIsNotNone(best)
+            self.assertEqual(best.batch_vector, {"left": 5, "right": 2})
+            self.assertEqual(len(store.list_combination_profiles(hardware_key=hardware_a.hardware_key)), 3)
+
+    def test_scheduler_warm_cache_prefers_job_preload_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            workdir = Path(tmpdir) / "workspace"
+            workdir.mkdir(parents=True, exist_ok=True)
+            settings = SchedulerSettings(
+                runtime_root=runtime_root,
+                baseline_cache={"warm_queue_top_k": 4, "entry_capacity": 8},
+            )
+            store = SQLiteStateStore(settings)
+            shared_startpoint = workdir / "shared-start.ckpt"
+            shared_startpoint.write_bytes(b"shared-startpoint")
+            script_a = workdir / "candidate_a.py"
+            script_b = workdir / "candidate_b.py"
+            script_a.write_text("print('a')\n", encoding="utf-8")
+            script_b.write_text("print('b')\n", encoding="utf-8")
+
+            preload_source = PreloadSource(
+                model_id="tree-startpoint",
+                model_path=str(shared_startpoint),
+                loader_target="localml_scheduler.adapters.mlevolve_runner:load_raw_file",
+            )
+            for index, script_path in enumerate((script_a, script_b), start=1):
+                job = build_mlevolve_job(
+                    workflow_id="wf",
+                    baseline_model_id=f"mlevolve-script-{index}",
+                    baseline_model_path=str(script_path),
+                    runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                    runner_kwargs={
+                        "script_path": str(script_path),
+                        "working_dir": str(workdir),
+                        "result_path": str(workdir / f"result_{index}.json"),
+                        "timeout": 30,
+                    },
+                    task_type="mlevolve_script",
+                    loader_target="localml_scheduler.adapters.mlevolve_runner:load_raw_file",
+                    preload_source=preload_source,
+                    resource_requirements=ResourceRequirements(requires_gpu=False),
+                    priority=10 - index,
+                )
+                store.submit_job(job)
+
+            service = SchedulerService(settings, store=store)
+            service._warm_cache()
+            entries = service.cache.snapshot_entries()
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["model_id"], "tree-startpoint")
+            self.assertEqual(entries[0]["baseline_model_path"], str(shared_startpoint))
+
+    def test_scheduler_warm_cache_budget_only_fills_by_memory_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            workdir = Path(tmpdir) / "workspace"
+            workdir.mkdir(parents=True, exist_ok=True)
+            settings = SchedulerSettings(
+                runtime_root=runtime_root,
+                baseline_cache={
+                    "warm_queue_policy": "budget_only",
+                    "warm_queue_top_k": 1,
+                    "entry_capacity": 8,
+                    "memory_budget_bytes": 10,
+                },
+            )
+            store = SQLiteStateStore(settings)
+            shared_paths = []
+            for index, size in enumerate((4, 4, 4), start=1):
+                shared_startpoint = workdir / f"shared_{index}.ckpt"
+                shared_startpoint.write_bytes(b"x" * size)
+                shared_paths.append(shared_startpoint)
+                script_path = workdir / f"candidate_{index}.py"
+                script_path.write_text(f"print('{index}')\n", encoding="utf-8")
+                preload_source = PreloadSource(
+                    model_id=f"tree-startpoint-{index}",
+                    model_path=str(shared_startpoint),
+                    loader_target="localml_scheduler.adapters.mlevolve_runner:load_raw_file",
+                )
+                job = build_mlevolve_job(
+                    workflow_id="wf",
+                    baseline_model_id=f"mlevolve-script-{index}",
+                    baseline_model_path=str(script_path),
+                    runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                    runner_kwargs={
+                        "script_path": str(script_path),
+                        "working_dir": str(workdir),
+                        "result_path": str(workdir / f"result_{index}.json"),
+                        "timeout": 30,
+                    },
+                    task_type="mlevolve_script",
+                    loader_target="localml_scheduler.adapters.mlevolve_runner:load_raw_file",
+                    preload_source=preload_source,
+                    resource_requirements=ResourceRequirements(requires_gpu=False),
+                    priority=10 - index,
+                )
+                store.submit_job(job)
+
+            service = SchedulerService(settings, store=store)
+            service._warm_cache()
+            entries = service.cache.snapshot_entries()
+            self.assertEqual(len(entries), 2)
+            self.assertEqual([entry["model_id"] for entry in entries], ["tree-startpoint-1", "tree-startpoint-2"])
+
+    def test_dispatch_preload_uses_resolved_preload_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            workdir = Path(tmpdir) / "workspace"
+            workdir.mkdir(parents=True, exist_ok=True)
+            settings = SchedulerSettings(runtime_root=runtime_root, baseline_cache={"entry_capacity": 8})
+            store = SQLiteStateStore(settings)
+            script_path = workdir / "candidate.py"
+            script_path.write_text("print('script')\n", encoding="utf-8")
+            shared_startpoint = workdir / "shared-start.ckpt"
+            shared_startpoint.write_bytes(b"shared-startpoint")
+            job = build_mlevolve_job(
+                workflow_id="wf",
+                baseline_model_id="mlevolve-script",
+                baseline_model_path=str(script_path),
+                runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                runner_kwargs={
+                    "script_path": str(script_path),
+                    "working_dir": str(workdir),
+                    "result_path": str(workdir / "result.json"),
+                    "timeout": 30,
+                },
+                task_type="mlevolve_script",
+                loader_target="localml_scheduler.adapters.mlevolve_runner:load_raw_file",
+                preload_source=PreloadSource(
+                    model_id="tree-startpoint",
+                    model_path=str(shared_startpoint),
+                    loader_target="localml_scheduler.adapters.mlevolve_runner:load_raw_file",
+                ),
+                resource_requirements=ResourceRequirements(requires_gpu=False),
+            )
+            service = SchedulerService(settings, store=store)
+            service._preload_job_baseline(job)
+            entries = service.cache.snapshot_entries()
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["model_id"], "tree-startpoint")
+            self.assertEqual(entries[0]["baseline_model_path"], str(shared_startpoint))
+
+    def test_parallel_dispatch_prefetches_shared_preload_target_once_for_packed_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            workdir = Path(tmpdir) / "workspace"
+            workdir.mkdir(parents=True, exist_ok=True)
+            settings = SchedulerSettings(
+                runtime_root=runtime_root,
+                gpu_scheduler={"backend_priority": ["cuda_process", "exclusive"]},
+                baseline_cache={"entry_capacity": 8, "warm_queue_top_k": 0},
+            )
+            store = SQLiteStateStore(settings)
+            shared_startpoint = workdir / "shared-start.ckpt"
+            shared_startpoint.write_bytes(b"shared-startpoint")
+            preload_source = PreloadSource(
+                model_id="tree-startpoint",
+                model_path=str(shared_startpoint),
+                loader_target="localml_scheduler.adapters.mlevolve_runner:load_raw_file",
+            )
+            jobs: list[TrainingJob] = []
+            for index in range(2):
+                script_path = workdir / f"candidate_{index}.py"
+                script_path.write_text(f"print('{index}')\n", encoding="utf-8")
+                job = build_mlevolve_job(
+                    workflow_id="wf",
+                    baseline_model_id=f"mlevolve-script-{index}",
+                    baseline_model_path=str(script_path),
+                    runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                    runner_kwargs={
+                        "script_path": str(script_path),
+                        "working_dir": str(workdir),
+                        "result_path": str(workdir / f"result_{index}.json"),
+                        "timeout": 30,
+                    },
+                    task_type="mlevolve_script",
+                    loader_target="localml_scheduler.adapters.mlevolve_runner:load_raw_file",
+                    preload_source=preload_source,
+                    resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=256),
+                    packing_family="mlevolve_script",
+                    packing_eligible=True,
+                )
+                store.submit_job(job)
+                jobs.append(job)
+
+            fake_supervisor = _FakeParallelSupervisor(available_backends={"exclusive": True, "cuda_process": True})
+            service = SchedulerService(settings, store=store, supervisor=fake_supervisor)
+            service.planner = mock.Mock()
+            service.planner.choose_plan.return_value = DispatchPlan(
+                mode="packed_pair",
+                backend_name="cuda_process",
+                job_ids=tuple(job.job_id for job in jobs),
+                reason="test packed prefetch",
+                batch_overrides={},
+                fallback_order=[jobs[1].job_id],
+            )
+
+            service._dispatch_if_idle()
+
+            entries = service.cache.snapshot_entries()
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["model_id"], "tree-startpoint")
+            self.assertEqual(fake_supervisor.dispatched_jobs[0].job_id, jobs[0].job_id)
+            self.assertEqual(fake_supervisor.dispatched_jobs[1].job_id, jobs[1].job_id)
+            cache_touch_events = store.list_events(event_type="cache_touched")
+            self.assertEqual(len(cache_touch_events), 1)
+            cache_loaded_events = store.list_events(event_type="cache_loaded")
+            self.assertEqual(len(cache_loaded_events), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

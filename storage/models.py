@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-CONTROL_SCHEMA_STATEMENTS = [
+SCHEMA_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS jobs (
         job_id TEXT PRIMARY KEY,
@@ -45,19 +45,6 @@ CONTROL_SCHEMA_STATEMENTS = [
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS job_metric_samples (
-        sample_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        job_id TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        epoch INTEGER,
-        global_step INTEGER,
-        avg_step_time_ms REAL,
-        estimated_total_runtime_seconds REAL,
-        remaining_runtime_seconds REAL,
-        metrics_json TEXT NOT NULL
-    )
-    """,
-    """
     CREATE TABLE IF NOT EXISTS cache_entries (
         model_id TEXT PRIMARY KEY,
         baseline_model_path TEXT NOT NULL,
@@ -69,75 +56,6 @@ CONTROL_SCHEMA_STATEMENTS = [
         last_accessed_at TEXT,
         metadata_json TEXT
     )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_jobs_status_priority
-    ON jobs(status, priority DESC, queue_sequence ASC)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_commands_processed_created
-    ON commands(processed_at, created_at)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_events_created_at
-    ON events(created_at)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_checkpoints_job_created
-    ON checkpoints(job_id, created_at DESC)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_job_metric_samples_job_created
-    ON job_metric_samples(job_id, created_at, sample_id)
-    """,
-]
-
-
-BRANCH_PROFILE_SCHEMA_STATEMENTS = [
-    """
-    CREATE TABLE IF NOT EXISTS batch_profile_curves (
-        curve_key TEXT PRIMARY KEY,
-        model_key TEXT NOT NULL,
-        shape_signature TEXT NOT NULL,
-        hardware_key TEXT NOT NULL,
-        backend_name TEXT NOT NULL DEFAULT 'exclusive',
-        profile_namespace TEXT,
-        contract_version INTEGER NOT NULL DEFAULT 3,
-        batch_param_name TEXT NOT NULL,
-        minimum_batch_size INTEGER NOT NULL DEFAULT 1,
-        maximum_feasible_batch_size INTEGER,
-        first_oom_batch_size INTEGER,
-        right_censored INTEGER NOT NULL DEFAULT 0,
-        observations INTEGER NOT NULL DEFAULT 1,
-        last_job_id TEXT,
-        updated_at TEXT NOT NULL,
-        metadata_json TEXT
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS batch_profile_points (
-        point_key TEXT PRIMARY KEY,
-        curve_key TEXT NOT NULL,
-        batch_size INTEGER NOT NULL,
-        peak_vram_mb INTEGER NOT NULL,
-        samples_per_second REAL NOT NULL,
-        median_step_time_ms REAL NOT NULL,
-        step_time_dispersion REAL NOT NULL DEFAULT 0,
-        observations INTEGER NOT NULL DEFAULT 1,
-        last_job_id TEXT,
-        updated_at TEXT NOT NULL,
-        metadata_json TEXT,
-        FOREIGN KEY(curve_key) REFERENCES batch_profile_curves(curve_key) ON DELETE CASCADE,
-        UNIQUE(curve_key, batch_size)
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_batch_profile_curves_compatibility
-    ON batch_profile_curves(profile_namespace, hardware_key, shape_signature, contract_version, updated_at DESC)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_batch_profile_points_curve
-    ON batch_profile_points(curve_key, batch_size)
     """,
     """
     CREATE TABLE IF NOT EXISTS solo_profiles (
@@ -180,10 +98,6 @@ BRANCH_PROFILE_SCHEMA_STATEMENTS = [
         model_key TEXT NOT NULL,
         device_type TEXT NOT NULL,
         shape_signature TEXT NOT NULL,
-        profile_namespace TEXT,
-        hardware_key TEXT,
-        search_mode TEXT,
-        contract_version INTEGER NOT NULL DEFAULT 1,
         batch_param_name TEXT NOT NULL,
         resolved_batch_size INTEGER NOT NULL,
         peak_vram_mb INTEGER,
@@ -260,6 +174,22 @@ BRANCH_PROFILE_SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE INDEX IF NOT EXISTS idx_jobs_status_priority
+    ON jobs(status, priority DESC, queue_sequence ASC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_commands_processed_created
+    ON commands(processed_at, created_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_events_created_at
+    ON events(created_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_checkpoints_job_created
+    ON checkpoints(job_id, created_at DESC)
+    """,
+    """
     CREATE INDEX IF NOT EXISTS idx_solo_profiles_family
     ON solo_profiles(family, hardware_key, updated_at DESC)
     """,
@@ -276,10 +206,6 @@ BRANCH_PROFILE_SCHEMA_STATEMENTS = [
     ON batch_probe_profiles(model_key, device_type, updated_at DESC)
     """,
     """
-    CREATE INDEX IF NOT EXISTS idx_batch_probe_profiles_compatibility
-    ON batch_probe_profiles(profile_namespace, hardware_key, shape_signature, search_mode, contract_version, updated_at DESC)
-    """,
-    """
     CREATE INDEX IF NOT EXISTS idx_batch_size_observations_lookup
     ON batch_size_observations(model_key, shape_signature, hardware_key, backend_name, batch_size, updated_at DESC)
     """,
@@ -294,25 +220,8 @@ BRANCH_PROFILE_SCHEMA_STATEMENTS = [
 ]
 
 
-SCHEMA_STATEMENTS = CONTROL_SCHEMA_STATEMENTS
-
-PROFILE_TABLE_NAMES = (
-    "batch_profile_curves",
-    "batch_profile_points",
-    "solo_profiles",
-    "pair_profiles",
-    "batch_probe_profiles",
-    "batch_size_observations",
-    "combination_profiles",
-    "runtime_profiles",
-)
-
 MIGRATION_STATEMENTS = [
     "ALTER TABLE solo_profiles ADD COLUMN hardware_key TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE pair_profiles ADD COLUMN hardware_key TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE pair_profiles ADD COLUMN backend_name TEXT NOT NULL DEFAULT 'exclusive'",
-    "ALTER TABLE batch_probe_profiles ADD COLUMN profile_namespace TEXT",
-    "ALTER TABLE batch_probe_profiles ADD COLUMN hardware_key TEXT",
-    "ALTER TABLE batch_probe_profiles ADD COLUMN search_mode TEXT",
-    "ALTER TABLE batch_probe_profiles ADD COLUMN contract_version INTEGER NOT NULL DEFAULT 1",
 ]

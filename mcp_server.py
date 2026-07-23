@@ -128,75 +128,34 @@ def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
         return client.search_profile_summaries(query=query, limit=limit)
 
     @server.tool()
-    def get_runtime_environment(
-        include_package_versions: bool = True,
-        include_precision_checks: bool = True,
-    ) -> dict[str, Any]:
-        return client.get_runtime_environment(
-            include_package_versions=include_package_versions,
-            include_precision_checks=include_precision_checks,
+    def search_code_knowledge(
+        query: str,
+        filters: dict[str, Any] | None = None,
+        record_types: list[str] | None = None,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        return client.search_code_knowledge(
+            query=query,
+            filters=filters or {},
+            record_types=record_types,
+            limit=limit,
         )
 
     @server.tool()
-    def validate_generated_training_code(
-        code: str,
-        stage: str = "code_review",
-        require_scheduler_submission_contract: bool = False,
+    def get_code_optimization_context(
+        candidate: dict[str, Any],
+        graph_context: dict[str, Any] | None = None,
+        limit: int = 8,
     ) -> dict[str, Any]:
-        """Validate generated code, optionally enforcing the scheduler submission contract."""
-        return client.validate_generated_training_code(
-            code=code,
-            stage=stage,
-            require_scheduler_submission_contract=require_scheduler_submission_contract,
+        return client.get_code_optimization_context(
+            candidate=candidate,
+            graph_context=graph_context,
+            limit=limit,
         )
 
     @server.tool()
     def get_optimization_context(candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
         return client.get_optimization_context(candidate=candidate, limit=limit)
-
-    @server.tool()
-    def plan_job_packet(candidates: list[dict[str, Any]], limit: int = 8) -> dict[str, Any]:
-        return client.plan_job_packet(candidates=candidates, limit=limit)
-
-    @server.tool()
-    def optimize_job_packet(candidates: list[dict[str, Any]], limit: int = 8) -> dict[str, Any]:
-        return client.optimize_job_packet(candidates=candidates, limit=limit)
-
-    @server.tool()
-    def get_model_design_hardware_context(
-        workload_type: str | None = None,
-        task_type: str | None = None,
-        candidate_families: list[str] | None = None,
-        hardware_key: str = "current",
-        limit: int = 8,
-    ) -> dict[str, Any]:
-        return client.get_model_design_hardware_context(
-            workload_type=workload_type,
-            task_type=task_type,
-            candidate_families=candidate_families,
-            hardware_key=hardware_key,
-            limit=limit,
-        )
-
-    @server.tool()
-    def get_hardware_feature_index(hardware_id: str = "current", limit: int = 256) -> dict[str, Any]:
-        return client.get_hardware_feature_index(hardware_id=hardware_id, limit=limit)
-
-    @server.tool()
-    def get_hardware_feature_details(
-        feature_ids: list[str],
-        hardware_id: str = "current",
-        limit: int = 64,
-    ) -> dict[str, Any]:
-        return client.get_hardware_feature_details(
-            hardware_id=hardware_id,
-            feature_ids=feature_ids,
-            limit=limit,
-        )
-
-    @server.tool()
-    def prewarm_current_hardware_neighborhood(hardware_id: str = "current", limit: int = 256) -> dict[str, Any]:
-        return client.prewarm_current_hardware_neighborhood(hardware_id=hardware_id, limit=limit)
 
     @server.tool()
     def search_hardware_features(
@@ -259,6 +218,6 @@ def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
     return server
 
 
-def run_stdio(settings_path: str | None = None, settings: SchedulerConfig | None = None) -> None:
-    settings = settings or (SchedulerConfig.from_file(settings_path) if settings_path else SchedulerConfig())
+def run_stdio(settings_path: str | None = None) -> None:
+    settings = SchedulerConfig.from_file(settings_path) if settings_path else SchedulerConfig()
     build_mcp_server(settings).run("stdio")

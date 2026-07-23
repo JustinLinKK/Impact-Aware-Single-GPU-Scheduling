@@ -5,21 +5,10 @@ from __future__ import annotations
 from typing import Protocol
 
 from ..hardware import HardwareProfile
-from ..domain import BatchProfileCurve, BatchProbeProfile, BatchSizeObservation, CombinationProfile, PairProfile, SoloProfile
+from ..domain import BatchProbeProfile, BatchSizeObservation, CombinationProfile, PairProfile, SoloProfile
 
 
 class PlanningRepository(Protocol):
-    def get_compatible_batch_profile_curve(
-        self,
-        *,
-        profile_namespace: str,
-        hardware_key: str,
-        shape_signature: str,
-        contract_version: int = 3,
-        backend_name: str = "exclusive",
-    ) -> BatchProfileCurve | None:
-        ...
-
     def hardware_profile(self) -> HardwareProfile:
         ...
 
@@ -39,21 +28,7 @@ class PlanningRepository(Protocol):
     ) -> PairProfile | None:
         ...
 
-    def list_pair_profiles(self, *, hardware_key: str | None = None, backend_name: str | None = None) -> list[PairProfile]:
-        ...
-
     def get_batch_probe_profile(self, probe_key: str) -> BatchProbeProfile | None:
-        ...
-
-    def get_compatible_batch_probe_profile(
-        self,
-        *,
-        profile_namespace: str,
-        hardware_key: str,
-        shape_signature: str,
-        search_mode: str,
-        contract_version: int = 2,
-    ) -> BatchProbeProfile | None:
         ...
 
     def get_batch_size_observation(
@@ -87,12 +62,3 @@ class PlanningRepository(Protocol):
     ) -> CombinationProfile | None:
         ...
 
-    def list_combination_profiles(
-        self,
-        *,
-        group_signature: str | None = None,
-        hardware_key: str | None = None,
-        backend_name: str | None = None,
-        scheduler_mode: str | None = None,
-    ) -> list[CombinationProfile]:
-        ...
