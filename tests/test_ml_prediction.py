@@ -15,6 +15,13 @@ from localml_scheduler.scheduler.resource_estimator import ResourceEstimator
 
 ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT = ROOT / "PerfSeer-predictor" / "models" / "nvidia_a10" / "student_a10_cpu.torchscript.pt"
+BLACKWELL_ARTIFACT = (
+    ROOT
+    / "PerfSeer-predictor"
+    / "models"
+    / "nvidia_rtx_pro_6000_blackwell"
+    / "student_rtx_pro_6000_blackwell_cpu.torchscript.pt"
+)
 SUPPORTED_SOURCE = ROOT / "PerfSeer-predictor" / "tests" / "fixtures" / "tiny_conv.py"
 UNSUPPORTED_SOURCE = Path(__file__).parent / "fixtures" / "perfseer_unsupported.py"
 TIMEOUT_SOURCE = Path(__file__).parent / "fixtures" / "perfseer_timeout.py"
@@ -82,6 +89,25 @@ class MLPredictionTest(unittest.TestCase):
         self.assertGreater(value, 0)
         self.assertEqual(predictor.last_sources["predict-job"], "ml_predictor")
 
+    def test_auto_selects_rtx_pro_6000_blackwell_and_runs_cpu_prediction(self) -> None:
+        predictor = MLVramPredictor(
+            PredictionSettings(mode="ml_predictor"),
+            hardware(
+                "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+                "12.0",
+                98304,
+            ),
+        )
+        self.assertTrue(predictor.available, predictor.unavailable_reason)
+        self.assertEqual(
+            predictor.model_id,
+            "nvidia_rtx_pro_6000_blackwell_student_v1",
+        )
+        self.assertEqual(predictor._runtime.artifact_path, BLACKWELL_ARTIFACT)
+        value = predictor.predict_avg_vram_mb(model_job(SUPPORTED_SOURCE), 2)
+        self.assertGreater(value, 0)
+        self.assertEqual(predictor.last_sources["predict-job"], "ml_predictor")
+
     def test_rejects_non_a10_without_override(self) -> None:
         predictor = MLVramPredictor(
             PredictionSettings(mode="ml_predictor"),
@@ -92,16 +118,21 @@ class MLPredictionTest(unittest.TestCase):
             predictor.predict_avg_vram_mb(model_job(SUPPORTED_SOURCE), 2)
 
     def test_explicit_test_override_runs_on_other_hardware(self) -> None:
-        predictor = MLVramPredictor(
-            PredictionSettings(
-                mode="ml_predictor",
-                test_override_enabled=True,
-                test_model_path=str(ARTIFACT),
-            ),
-            hardware("NVIDIA GeForce RTX 5090", "12.0", 32607),
-        )
-        self.assertTrue(predictor.available, predictor.unavailable_reason)
-        self.assertGreater(predictor.predict_avg_vram_mb(model_job(SUPPORTED_SOURCE), 2), 0)
+        for artifact in (ARTIFACT, BLACKWELL_ARTIFACT):
+            with self.subTest(artifact=artifact.name):
+                predictor = MLVramPredictor(
+                    PredictionSettings(
+                        mode="ml_predictor",
+                        test_override_enabled=True,
+                        test_model_path=str(artifact),
+                    ),
+                    hardware("NVIDIA GeForce RTX 5090", "12.0", 32607),
+                )
+                self.assertTrue(predictor.available, predictor.unavailable_reason)
+                self.assertGreater(
+                    predictor.predict_avg_vram_mb(model_job(SUPPORTED_SOURCE), 2),
+                    0,
+                )
 
     def test_override_rejects_incompatible_torchscript_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
