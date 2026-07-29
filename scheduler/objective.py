@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from itertools import combinations, product
+from collections.abc import Iterable
+from itertools import product
 
-from ..domain import CombinationProfile, TrainingJob, build_group_signature
-from ..config import SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED, SchedulerSettings
+from ..domain import TrainingJob
+from ..config import SchedulerSettings
 from .candidate_generator import CandidateGenerator
 from .compatibility import CompatibilityEvaluator
-from .planning_repository import PlanningRepository
 from .planner_types import EvaluatedGroup
 from .resource_estimator import ResourceEstimator
 from .runtime_guardrail import RuntimeGuardrail
@@ -18,14 +18,12 @@ class ObjectiveScorer:
     def __init__(
         self,
         settings: SchedulerSettings,
-        repository: PlanningRepository,
         estimator: ResourceEstimator,
         compatibility: CompatibilityEvaluator,
         candidate_generator: CandidateGenerator,
         runtime_guardrail: RuntimeGuardrail,
     ):
         self.settings = settings
-        self.repository = repository
         self.estimator = estimator
         self.compatibility = compatibility
         self.candidate_generator = candidate_generator
@@ -56,31 +54,11 @@ class ObjectiveScorer:
     def evaluate_optimized_group(self, jobs: list[TrainingJob], backend_name: str) -> EvaluatedGroup | None:
         if not self.compatibility.compatible_group(jobs, backend_name=backend_name):
             return None
-        hardware_key = self.repository.hardware_key()
-        group_signature = build_group_signature([job.packing.signature or job.job_id for job in jobs])
-        cached = self.repository.best_combination_profile(
-            group_signature=group_signature,
-            hardware_key=hardware_key,
-            backend_name=backend_name,
-            scheduler_mode=SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
-        )
-        if cached is not None and cached.batch_vector and cached.avg_vram_mb is not None:
-            estimated_vram_mb = float(cached.avg_vram_mb or 0)
-            return EvaluatedGroup(
-                jobs=jobs,
-                backend_name=backend_name,
-                estimated_vram_mb=estimated_vram_mb,
-                estimated_sm_utilization=self.estimator.predicted_group_sm_utilization(jobs, backend_name=backend_name),
-                objective_score=float(cached.objective_score or 0.0),
-                batch_overrides=dict(cached.batch_vector),
-                fallback_order=list(cached.fallback_order),
-                reason="cached optimal packed group selected",
-            )
-
         per_job_candidates = [self.candidate_generator.candidate_batch_sizes(job) for job in jobs]
         safe_budget_mb = self.estimator.safe_budget_mb() * float(self.settings.gpu_scheduler.parallel_optimizer.target_vram_fraction)
         best: EvaluatedGroup | None = None
 
+        search_space: Iterable[tuple[int, ...]]
         if len(jobs) <= 3:
             search_space = product(*per_job_candidates)
         else:
@@ -99,22 +77,12 @@ class ObjectiveScorer:
             if estimated_vram_mb > safe_budget_mb:
                 continue
             utilization = estimated_vram_mb / safe_budget_mb if safe_budget_mb > 0 else 0.0
-            slowdown_penalty = 0.0
-            for left_job, right_job in combinations(jobs, 2):
-                pair_profile = self.repository.get_pair_profile(
-                    left_job.packing.signature or "",
-                    right_job.packing.signature or "",
-                    backend_name=backend_name,
-                )
-                if pair_profile and pair_profile.slowdown_ratio is not None:
-                    slowdown_penalty += max(0.0, pair_profile.slowdown_ratio - 1.0)
-            objective = utilization - slowdown_penalty
             candidate = EvaluatedGroup(
                 jobs=jobs,
                 backend_name=backend_name,
                 estimated_vram_mb=estimated_vram_mb,
                 estimated_sm_utilization=self.estimator.predicted_group_sm_utilization(jobs, backend_name=backend_name),
-                objective_score=objective,
+                objective_score=utilization,
                 batch_overrides=overrides,
                 fallback_order=self.candidate_generator.fallback_order(jobs, overrides, backend_name),
                 reason="optimized packed group selected",

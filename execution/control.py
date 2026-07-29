@@ -12,6 +12,7 @@ from ..observability.events import EventLogger
 from ..domain import JobStatus, ProgressSnapshot, SafePointType, TrainingJob, utc_now
 from ..config import SchedulerSettings
 from ..storage.state_store import StateStore
+from ..scheduler.early_stopping import EarlyStoppingState, EarlyStoppingWatchdog
 
 
 class PauseRequested(RuntimeError):
@@ -20,6 +21,14 @@ class PauseRequested(RuntimeError):
 
 class CancelRequested(RuntimeError):
     """Raised inside a worker when the scheduler requested cancellation."""
+
+
+class EarlyStopRequested(RuntimeError):
+    """Normal worker control flow when validation progress has plateaued."""
+
+    def __init__(self, result: dict[str, Any]):
+        super().__init__("early_stopped_no_improvement")
+        self.result = result
 
 
 @dataclass(slots=True)
@@ -111,6 +120,7 @@ class TrainingControlHook:
         self.checkpoint_manager = checkpoint_manager
         self.store = store
         self.event_logger = event_logger
+        self.early_stopping = EarlyStoppingWatchdog(self.control_plane.settings.early_stopping)
 
     def _should_checkpoint(self, safe_point_type: SafePointType, *, epoch: int, global_step: int) -> bool:
         policy = self.job.checkpoint_policy
@@ -162,7 +172,14 @@ class TrainingControlHook:
                 metadata_updates["runtime_steps_per_epoch"] = int(steps_per_epoch)
             if avg_step_time_ms is not None:
                 metadata_updates["runtime_avg_step_time_ms"] = float(avg_step_time_ms)
-        self.store.update_job(self.job.job_id, last_heartbeat_at=snapshot.heartbeat_at, metadata_updates=metadata_updates)
+        if safe_point_type == SafePointType.EPOCH:
+            metadata_updates = metadata_updates or {}
+            metadata_updates["last_completed_epoch"] = int(epoch)
+        self.store.update_job(
+            self.job.job_id,
+            last_heartbeat_at=snapshot.heartbeat_at,
+            metadata_updates=metadata_updates,
+        )
         if getattr(self.event_logger, "log_store", None) is not None:
             self.event_logger.log_store.record_job_metric_sample(
                 job_id=self.job.job_id,
@@ -175,9 +192,28 @@ class TrainingControlHook:
                 metrics=snapshot.metrics,
             )
 
+        early_decision = None
+        early_state = EarlyStoppingState.from_dict(self.job.metadata.get("early_stopping_state"))
+        if self.control_plane.settings.early_stopping.enabled and safe_point_type == SafePointType.EPOCH:
+            early_decision = self.early_stopping.evaluate(epoch=epoch, metrics=snapshot.metrics, state=early_state)
+            early_state = early_decision.state
+            state_updates: dict[str, Any] = {
+                "early_stopping_state": early_state.to_dict(),
+                "last_completed_epoch": int(epoch),
+            }
+            self.job.metadata.update(state_updates)
+            self.store.update_job(self.job.job_id, metadata_updates=state_updates)
+            if early_decision.warning:
+                self.event_logger.emit(
+                    "early_stopping_metric_warning",
+                    job_id=self.job.job_id,
+                    payload={"epoch": epoch, "warning": early_decision.warning},
+                )
+
         pause_requested = command.action == "pause"
         cancel_requested = command.action == "cancel"
-        should_checkpoint = pause_requested or self._should_checkpoint(safe_point_type, epoch=epoch, global_step=global_step)
+        save_best = bool(early_decision and early_decision.improved and self.control_plane.settings.early_stopping.save_best_checkpoint)
+        should_checkpoint = pause_requested or save_best or self._should_checkpoint(safe_point_type, epoch=epoch, global_step=global_step)
         checkpoint_path: str | None = None
 
         if should_checkpoint:
@@ -199,6 +235,13 @@ class TrainingControlHook:
                 last_heartbeat_at=snapshot.heartbeat_at,
                 metadata_updates=metadata_updates,
             )
+            if save_best:
+                best_updates = {
+                    "early_stopping_best_checkpoint_path": checkpoint_path,
+                    "early_stopping_state": early_state.to_dict(),
+                }
+                self.job.metadata.update(best_updates)
+                self.store.update_job(self.job.job_id, metadata_updates=best_updates)
 
         if pause_requested:
             self.control_plane.clear_command(self.job.job_id)
@@ -211,16 +254,55 @@ class TrainingControlHook:
             self.event_logger.emit(
                 "job_paused",
                 job_id=self.job.job_id,
-                payload={"checkpoint_path": checkpoint_path, "epoch": epoch, "global_step": global_step, "hold": command.hold},
+                payload={
+                    "checkpoint_path": checkpoint_path,
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "hold": command.hold,
+                },
             )
             raise PauseRequested(command.reason or "pause requested")
 
         if cancel_requested:
             self.control_plane.clear_command(self.job.job_id)
-            self.store.set_job_status(self.job.job_id, JobStatus.CANCELLED, reason=command.reason or "cancel requested", hold=True)
+            self.store.set_job_status(
+                self.job.job_id,
+                JobStatus.CANCELLED,
+                reason=command.reason or "cancel requested",
+                hold=True,
+            )
             self.event_logger.emit(
                 "job_cancelled",
                 job_id=self.job.job_id,
                 payload={"epoch": epoch, "global_step": global_step},
             )
             raise CancelRequested(command.reason or "cancel requested")
+
+        if early_decision is not None and early_decision.should_stop:
+            total_epochs = self.job.max_epochs or self.job.config.max_epochs or epoch
+            epochs_saved = max(0, int(total_epochs) - int(epoch))
+            if remaining_runtime_seconds is not None:
+                wall_time_saved_seconds = max(0.0, float(remaining_runtime_seconds))
+            elif steps_per_epoch is not None and avg_step_time_ms is not None:
+                wall_time_saved_seconds = max(0.0, epochs_saved * int(steps_per_epoch) * float(avg_step_time_ms) / 1000.0)
+            else:
+                wall_time_saved_seconds = 0.0
+            result = {
+                "reason": "early_stopped_no_improvement",
+                "early_stopped_successfully": True,
+                "best_metric": early_state.best_metric,
+                "best_epoch": early_state.best_epoch,
+                "stop_epoch": epoch,
+                "patience_epochs": self.control_plane.settings.early_stopping.patience_epochs,
+                "epochs_saved": epochs_saved,
+                "estimated_wall_time_saved_seconds": wall_time_saved_seconds,
+            }
+            self.store.update_job(
+                self.job.job_id,
+                metadata_updates={
+                    "early_stopping_result": result,
+                    "last_completed_epoch": int(epoch),
+                },
+            )
+            self.event_logger.emit("job_early_stopped", job_id=self.job.job_id, payload=result)
+            raise EarlyStopRequested(result)

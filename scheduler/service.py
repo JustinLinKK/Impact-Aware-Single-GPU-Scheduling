@@ -16,8 +16,25 @@ from ..model_cache.warming import select_models_to_warm
 from ..observability.events import EventLogger
 from ..observability.logging_utils import setup_scheduler_logger
 from ..observability.metrics import MetricsCollector
-from ..domain import BatchResolution, CombinationProfile, JobStatus, PairProfile, PreloadSource, SoloProfile, TrainingJob, build_group_signature, utc_now
-from ..config import SCHEDULER_MODE_PARALLEL_AUTO_PACK, SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED, SchedulerSettings
+from ..domain import (
+    BatchResolution,
+    CombinationProfile,
+    JobStatus,
+    PairProfile,
+    PreloadSource,
+    SchedulingClass,
+    SoloProfile,
+    TrainingJob,
+    build_group_signature,
+    parse_timestamp,
+    utc_now,
+)
+from ..config import (
+    SCHEDULER_MODE_PARALLEL_AUTO_PACK,
+    SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
+    SCHEDULER_MODE_PARALLEL_TIME_AWARE,
+    SchedulerSettings,
+)
 from ..storage.log_store import SchedulerLogStore
 from ..storage.state_store import StateStore
 from .placement_planner import PlacementPlanner
@@ -26,7 +43,12 @@ from .policies import PriorityFifoPolicy, SchedulingPolicy
 from .queue import RunnableJobQueue
 from .recovery import reconcile_recoverable_jobs
 from .supervisor import WorkerSnapshot, WorkerSupervisor
-from .telemetry import GpuTelemetrySample, GpuTelemetrySummary, NvidiaSmiTelemetrySampler
+from .telemetry import (
+    GpuTelemetrySample,
+    GpuTelemetrySummary,
+    MemoryAdmissionGate,
+    NvidiaSmiTelemetrySampler,
+)
 
 
 @dataclass(slots=True)
@@ -44,6 +66,9 @@ class ActiveRun:
     fallback_triggered: bool = False
     fallback_reason: str | None = None
     overlapped: bool = False
+    objective_breakdown: dict[str, object] = field(default_factory=dict)
+    objective_version: str | None = None
+    mandatory_anchor_job_id: str | None = None
 
 
 class SchedulerService:
@@ -85,6 +110,65 @@ class SchedulerService:
         self._active_runs: dict[str, ActiveRun] = {}
         self._device_samples: list[GpuTelemetrySample] = []
         self._last_telemetry_poll_at = 0.0
+        memory = settings.gpu_scheduler.memory
+        self._admission_gate = MemoryAdmissionGate(
+            stop_fraction=memory.live_admission_stop_fraction,
+            resume_fraction=memory.live_admission_resume_fraction,
+            window_seconds=memory.admission_average_window_seconds,
+        )
+        self._exclusive_probe_job_id: str | None = None
+        self._restore_scheduler_decision_state()
+
+    @property
+    def _decision_state_path(self) -> Path:
+        return self.settings.runtime_root / "scheduler_decision_state.json"
+
+    def _persist_scheduler_decision_state(self) -> None:
+        payload = {
+            "admission_open": self._admission_gate.is_open,
+            "admission_average_fraction": self._admission_gate.average_fraction,
+            "admission_below_resume_since": (
+                self._admission_gate.below_resume_since.isoformat() if self._admission_gate.below_resume_since is not None else None
+            ),
+            "admission_samples": [
+                {
+                    "captured_at": sample.captured_at,
+                    "memory_used_mb": sample.memory_used_mb,
+                    "memory_total_mb": sample.memory_total_mb,
+                    "gpu_utilization": sample.gpu_utilization,
+                    "memory_utilization": sample.memory_utilization,
+                }
+                for sample in self._admission_gate.samples
+            ],
+            "exclusive_probe_job_id": self._exclusive_probe_job_id,
+            "updated_at": utc_now(),
+        }
+        tmp_path = self._decision_state_path.with_suffix(".json.tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+        tmp_path.replace(self._decision_state_path)
+
+    def _restore_scheduler_decision_state(self) -> None:
+        if not self._decision_state_path.exists():
+            return
+        try:
+            with self._decision_state_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            self._admission_gate.is_open = bool(payload.get("admission_open", True))
+            average = payload.get("admission_average_fraction")
+            self._admission_gate.average_fraction = float(average) if average is not None else None
+            self._admission_gate.below_resume_since = parse_timestamp(payload.get("admission_below_resume_since"))
+            self._admission_gate.samples = [GpuTelemetrySample(**sample) for sample in payload.get("admission_samples", []) if isinstance(sample, dict)]
+            reserved = payload.get("exclusive_probe_job_id")
+            if self.settings.gpu_scheduler.exclusive_probe.enabled:
+                self._exclusive_probe_job_id = str(reserved) if reserved else None
+            else:
+                # A reservation is meaningful only while exclusive-probe
+                # draining is enabled.  Do not let stale restart state close
+                # normal admission after the feature has been turned off.
+                self._exclusive_probe_job_id = None
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.logger.warning("Ignoring invalid scheduler decision state: %s", exc)
 
     def _persist_runtime_settings(self) -> None:
         path = self.settings.runtime_root / "scheduler_settings.json"
@@ -117,7 +201,14 @@ class SchedulerService:
             last_accessed_at=entry.last_accessed_at,
             metadata=entry.metadata,
         )
-        self.event_logger.emit(event_name, payload={"model_id": entry.model_id, **(payload or {}), **entry.to_stats_dict()})
+        self.event_logger.emit(
+            event_name,
+            payload={
+                "model_id": entry.model_id,
+                **(payload or {}),
+                **entry.to_stats_dict(),
+            },
+        )
 
     def start(self, *, background: bool = False) -> "SchedulerService":
         self._persist_runtime_settings()
@@ -131,7 +222,11 @@ class SchedulerService:
             started_at=utc_now(),
         )
         self.cache_server.start()
-        reconcile_recoverable_jobs(self.store, self.event_logger, auto_resume=self.settings.auto_resume_recoverable)
+        reconcile_recoverable_jobs(
+            self.store,
+            self.event_logger,
+            auto_resume=self.settings.auto_resume_recoverable,
+        )
         if background:
             if self._thread is not None and self._thread.is_alive():
                 return self
@@ -158,7 +253,6 @@ class SchedulerService:
             self._process_commands()
             self._warm_cache()
             self._poll_telemetry()
-            self._enforce_packed_safety()
             self._maybe_preempt()
             self._dispatch_pending_work()
             self._stop_event.wait(self.settings.scheduler_poll_interval_seconds)
@@ -211,7 +305,12 @@ class SchedulerService:
         job = self.store.get_job(job_id)
         if job is None or job.status.is_terminal:
             return
-        if job.status in {JobStatus.PAUSED, JobStatus.RECOVERABLE, JobStatus.PENDING, JobStatus.READY}:
+        if job.status in {
+            JobStatus.PAUSED,
+            JobStatus.RECOVERABLE,
+            JobStatus.PENDING,
+            JobStatus.READY,
+        }:
             self.store.set_job_status(job_id, JobStatus.READY, reason="resume requested", hold=False)
             self.event_logger.emit("job_resume_requested", job_id=job_id, payload={})
 
@@ -242,7 +341,10 @@ class SchedulerService:
             pin=pin,
             metadata={"source": "command"},
         )
-        self.event_logger.emit("cache_preload_requested", payload={"model_id": target.model_id, "ok": ok, "pin": pin})
+        self.event_logger.emit(
+            "cache_preload_requested",
+            payload={"model_id": target.model_id, "ok": ok, "pin": pin},
+        )
 
     def _runnable_jobs(self) -> list[TrainingJob]:
         jobs = self.store.runnable_jobs()
@@ -265,7 +367,10 @@ class SchedulerService:
         cached_model_ids = {entry["model_id"] for entry in self.cache.snapshot_entries()}
         available_budget_bytes = None
         if cache_stats.effective_memory_budget_bytes is not None:
-            available_budget_bytes = max(0, int(cache_stats.effective_memory_budget_bytes) - int(cache_stats.used_bytes))
+            available_budget_bytes = max(
+                0,
+                int(cache_stats.effective_memory_budget_bytes) - int(cache_stats.used_bytes),
+            )
         for target in select_models_to_warm(
             jobs,
             top_k=self.settings.baseline_cache.warm_queue_top_k,
@@ -296,6 +401,18 @@ class SchedulerService:
         if sample is None:
             return
         self._device_samples.append(sample)
+        transition = self._admission_gate.update(sample)
+        self._persist_scheduler_decision_state()
+        if transition is not None:
+            self.event_logger.emit(
+                "packed_admission_gate_changed",
+                payload={
+                    "state": transition,
+                    "average_memory_fraction": self._admission_gate.average_fraction,
+                    "stop_fraction": self._admission_gate.stop_fraction,
+                    "resume_fraction": self._admission_gate.resume_fraction,
+                },
+            )
         if len(self._active_runs) == 1:
             only_run = next(iter(self._active_runs.values()))
             only_run.samples.append(sample)
@@ -325,49 +442,6 @@ class SchedulerService:
                     job_ids=list(run.job_ids),
                 )
 
-    def _pick_fallback_candidate(self) -> tuple[str, str] | None:
-        candidates: list[tuple[int, float, int, str, str]] = []
-        for group_id, run in self._active_runs.items():
-            for job_id in self._supervisor_active_job_ids_by_group().get(group_id, []):
-                job = self.store.get_job(job_id)
-                if job is None:
-                    continue
-                remaining_runtime = self.planner.predicted_remaining_runtime_seconds(job, backend_name=run.backend_name) or 0.0
-                candidates.append((job.priority, -remaining_runtime, -job.queue_sequence, group_id, job_id))
-        if not candidates:
-            return None
-        _, _, _, group_id, job_id = sorted(candidates)[0]
-        return group_id, job_id
-
-    def _enforce_packed_safety(self) -> None:
-        if not self._active_runs or not self._device_samples:
-            return
-        latest = self._device_samples[-1]
-        if latest.memory_total_mb <= 0:
-            return
-        memory_fraction = latest.memory_used_mb / latest.memory_total_mb
-        if memory_fraction < self.settings.gpu_scheduler.memory.hard_stop_memory_fraction:
-            return
-        target = self._pick_fallback_candidate()
-        if target is None:
-            return
-        group_id, target_job_id = target
-        reason = f"packed groups exceeded hard memory threshold ({memory_fraction:.2%})"
-        if not self.supervisor.request_fallback_pause(target_job_id, reason=reason):
-            return
-        self.store.set_job_status(target_job_id, JobStatus.PAUSING, reason=reason, hold=False)
-        run = self._active_runs.get(group_id)
-        if run is not None:
-            self._register_packed_fallback(
-                run,
-                reason,
-                payload={
-                    "paused_job_id": target_job_id,
-                    "memory_used_mb": latest.memory_used_mb,
-                    "memory_total_mb": latest.memory_total_mb,
-                },
-            )
-
     def _poll_active_workers(self) -> None:
         snapshots = self.supervisor.poll()
         if not snapshots:
@@ -394,6 +468,15 @@ class SchedulerService:
                     exit_reason=run.fallback_reason or "group_complete",
                 )
                 self._active_runs.pop(group_id, None)
+                if self._exclusive_probe_job_id in run.job_ids:
+                    completed_probe = self._exclusive_probe_job_id
+                    self._exclusive_probe_job_id = None
+                    self._persist_scheduler_decision_state()
+                    self.event_logger.emit(
+                        "exclusive_probe_drain_cleared",
+                        job_id=completed_probe,
+                        payload={"reason": "probe finished"},
+                    )
                 continue
             if tuple(remaining_job_ids) != run.job_ids:
                 removed_job_ids = [job_id for job_id in run.job_ids if job_id not in remaining_job_ids]
@@ -404,11 +487,7 @@ class SchedulerService:
                 run.job_ids = tuple(remaining_job_ids)
                 run.fallback_order = [job_id for job_id in run.fallback_order if job_id in remaining_job_ids]
                 run.group_signature = build_group_signature(
-                    [
-                        (self.store.get_job(job_id).packing.signature or job_id)
-                        for job_id in remaining_job_ids
-                        if self.store.get_job(job_id) is not None
-                    ]
+                    [(self.store.get_job(job_id).packing.signature or job_id) for job_id in remaining_job_ids if self.store.get_job(job_id) is not None]
                 )
 
     def _handle_worker_exit(self, snapshot: WorkerSnapshot, *, run_context: ActiveRun | None) -> None:
@@ -417,26 +496,62 @@ class SchedulerService:
             return
         if snapshot.reported_by == "store":
             if run_context is not None and len(run_context.job_ids) > 1 and job.status == JobStatus.FAILED:
-                self._register_packed_fallback(run_context, job.status_reason or "stream-backed worker failed", payload={"failed_job_id": snapshot.job_id})
+                self._register_packed_fallback(
+                    run_context,
+                    job.status_reason or "stream-backed worker failed",
+                    payload={"failed_job_id": snapshot.job_id},
+                )
             return
         if snapshot.returncode == 0:
-            if job.status in {JobStatus.COMPLETED, JobStatus.PAUSED, JobStatus.CANCELLED, JobStatus.READY}:
+            if job.status in {
+                JobStatus.COMPLETED,
+                JobStatus.PAUSED,
+                JobStatus.CANCELLED,
+                JobStatus.READY,
+            }:
                 return
-            self.store.set_job_status(job.job_id, JobStatus.FAILED, reason="worker exited without terminal status update", hold=True)
-            self.event_logger.emit("job_failed", job_id=job.job_id, payload={"reason": "worker exited cleanly without terminal status"})
+            self.store.set_job_status(
+                job.job_id,
+                JobStatus.FAILED,
+                reason="worker exited without terminal status update",
+                hold=True,
+            )
+            self.event_logger.emit(
+                "job_failed",
+                job_id=job.job_id,
+                payload={"reason": "worker exited cleanly without terminal status"},
+            )
             return
 
         if not job.status.is_terminal:
             reason = f"worker exited with code {snapshot.returncode}"
             self.store.set_job_status(job.job_id, JobStatus.FAILED, reason=reason, hold=True)
-            self.event_logger.emit("job_failed", job_id=job.job_id, payload={"returncode": snapshot.returncode})
+            self.event_logger.emit(
+                "job_failed",
+                job_id=job.job_id,
+                payload={"returncode": snapshot.returncode},
+            )
             if run_context is not None and len(run_context.job_ids) > 1:
-                self._register_packed_fallback(run_context, reason, payload={"failed_job_id": snapshot.job_id, "returncode": snapshot.returncode})
+                self._register_packed_fallback(
+                    run_context,
+                    reason,
+                    payload={
+                        "failed_job_id": snapshot.job_id,
+                        "returncode": snapshot.returncode,
+                    },
+                )
             return
 
         if run_context is not None and len(run_context.job_ids) > 1 and job.status == JobStatus.FAILED:
             reason = job.status_reason or f"worker exited with code {snapshot.returncode}"
-            self._register_packed_fallback(run_context, reason, payload={"failed_job_id": snapshot.job_id, "returncode": snapshot.returncode})
+            self._register_packed_fallback(
+                run_context,
+                reason,
+                payload={
+                    "failed_job_id": snapshot.job_id,
+                    "returncode": snapshot.returncode,
+                },
+            )
 
     def _register_packed_fallback(self, run: ActiveRun, reason: str, *, payload: dict[str, Any]) -> None:
         if len(run.job_ids) < 2 or run.fallback_triggered:
@@ -473,11 +588,14 @@ class SchedulerService:
                     family=job.packing.family,
                     peak_vram_mb=peak_vram_mb,
                     avg_vram_mb=avg_vram_mb,
-                    avg_gpu_utilization=summary.avg_gpu_utilization if summary.avg_gpu_utilization is not None else 0.0,
-                    avg_memory_utilization=summary.avg_memory_utilization if summary.avg_memory_utilization is not None else 0.0,
+                    avg_gpu_utilization=(summary.avg_gpu_utilization if summary.avg_gpu_utilization is not None else 0.0),
+                    avg_memory_utilization=(summary.avg_memory_utilization if summary.avg_memory_utilization is not None else 0.0),
                     sample_count=summary.sample_count,
                     last_job_id=job.job_id,
-                    metadata={"source": "exclusive_run", "backend_name": run.backend_name},
+                    metadata={
+                        "source": "exclusive_run",
+                        "backend_name": run.backend_name,
+                    },
                 )
             )
 
@@ -497,6 +615,10 @@ class SchedulerService:
             scheduler_mode=self.settings.gpu_scheduler.mode,
         )
         compatible = not run.fallback_triggered and all(job.status != JobStatus.FAILED for job in materialized_jobs)
+        objective_score = run.objective_breakdown.get("score")
+        if objective_score is None and self.settings.gpu_scheduler.mode != SCHEDULER_MODE_PARALLEL_TIME_AWARE:
+            objective_score = (summary.avg_vram_mb or 0) / max(1.0, self.planner.estimator.safe_budget_mb())
+        numeric_objective_score = float(objective_score) if isinstance(objective_score, (int, float)) else None
         self.store.upsert_combination_profile(
             CombinationProfile.create(
                 group_signature=group_signature,
@@ -508,15 +630,21 @@ class SchedulerService:
                 observations=(existing.observations + 1) if existing else 1,
                 peak_vram_mb=summary.peak_vram_mb,
                 avg_vram_mb=summary.avg_vram_mb,
-                memory_total_mb=run.samples[-1].memory_total_mb if run.samples else None,
+                memory_total_mb=(run.samples[-1].memory_total_mb if run.samples else None),
                 avg_gpu_utilization=summary.avg_gpu_utilization,
                 avg_memory_utilization=summary.avg_memory_utilization,
                 avg_step_time_ms=None,
-                objective_score=(summary.avg_vram_mb or 0) / max(1.0, self.settings.gpu_scheduler.memory.safe_vram_budget_gib * 1024.0),
+                objective_score=numeric_objective_score,
                 resolved_optimal=(self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED),
                 last_failure_reason=run.fallback_reason,
                 fallback_order=run.fallback_order,
-                metadata={"backend_name": run.backend_name, "job_ids": list(run.job_ids)},
+                metadata={
+                    "backend_name": run.backend_name,
+                    "job_ids": list(run.job_ids),
+                    "objective_version": run.objective_version,
+                    "objective_breakdown": run.objective_breakdown,
+                    "mandatory_anchor_job_id": run.mandatory_anchor_job_id,
+                },
             )
         )
         if len(materialized_jobs) != 2:
@@ -538,7 +666,98 @@ class SchedulerService:
                 metadata={"backend_name": run.backend_name},
             )
             return
-        existing_pair = self.store.get_pair_profile(left_job.packing.signature, right_job.packing.signature, backend_name=run.backend_name)
+        existing_pair = self.store.get_pair_profile(
+            left_job.packing.signature,
+            right_job.packing.signature,
+            backend_name=run.backend_name,
+        )
+        opened_at = parse_timestamp(run.opened_at)
+        elapsed_seconds = max(0.0, (parse_timestamp(utc_now()) - opened_at).total_seconds()) if opened_at else 0.0
+        per_member_slowdown: dict[str, float] = {}
+        slowdown_sources: dict[str, str] = {}
+        for member in materialized_jobs:
+            batch_size = run.batch_overrides.get(
+                member.job_id,
+                BatchResolution.resolved_batch_size(member),
+            )
+            # A concurrent runtime profile is not a solo baseline. Only an
+            # exclusive profile at the same selected batch can support a
+            # measured slowdown ratio. The scheduler intentionally does not
+            # invent a slowdown value when that evidence is unavailable.
+            solo_profile = self.store.get_runtime_profile(
+                member.packing.signature or member.job_id,
+                resolved_batch_size=batch_size,
+                backend_name="exclusive",
+            )
+            solo_seconds = (
+                float(solo_profile.estimated_total_runtime_seconds)
+                if solo_profile is not None
+                and solo_profile.estimated_total_runtime_seconds is not None
+                and solo_profile.estimated_total_runtime_seconds > 0
+                else 0.0
+            )
+            if member.status.is_terminal and solo_seconds > 0 and elapsed_seconds > 0:
+                per_member_slowdown[member.job_id] = max(1.0, elapsed_seconds / solo_seconds)
+                slowdown_sources[member.job_id] = "measured_against_exclusive_profile"
+
+        if per_member_slowdown:
+            recorded_slowdown = max(per_member_slowdown.values())
+            per_signature_slowdown = {
+                member.packing.signature: per_member_slowdown[member.job_id]
+                for member in materialized_jobs
+                if member.packing.signature and member.job_id in per_member_slowdown
+            }
+            slowdown_batch_vector = dict(run.batch_overrides)
+        else:
+            existing_metadata = dict(existing_pair.metadata or {}) if existing_pair else {}
+            existing_sources = existing_metadata.get("slowdown_sources")
+            measured_sources = (
+                {
+                    str(job_id): str(source)
+                    for job_id, source in existing_sources.items()
+                    if source == "measured_against_exclusive_profile"
+                }
+                if isinstance(existing_sources, dict)
+                else {}
+            )
+            has_measured_evidence = bool(measured_sources)
+            if existing_pair is not None and has_measured_evidence:
+                recorded_slowdown = existing_pair.slowdown_ratio
+                raw_per_member = existing_metadata.get("per_member_slowdown")
+                raw_per_signature = existing_metadata.get("per_signature_slowdown")
+                per_member_slowdown = (
+                    {
+                        str(job_id): float(value)
+                        for job_id, value in raw_per_member.items()
+                        if isinstance(value, (int, float))
+                    }
+                    if isinstance(raw_per_member, dict)
+                    else {}
+                )
+                per_signature_slowdown = (
+                    {
+                        str(signature): float(value)
+                        for signature, value in raw_per_signature.items()
+                        if isinstance(value, (int, float))
+                    }
+                    if isinstance(raw_per_signature, dict)
+                    else {}
+                )
+                slowdown_sources = measured_sources
+                raw_batch_vector = existing_metadata.get("batch_vector")
+                slowdown_batch_vector = (
+                    {
+                        str(job_id): int(batch_size)
+                        for job_id, batch_size in raw_batch_vector.items()
+                        if isinstance(batch_size, int)
+                    }
+                    if isinstance(raw_batch_vector, dict)
+                    else {}
+                )
+            else:
+                recorded_slowdown = None
+                per_signature_slowdown = {}
+                slowdown_batch_vector = {}
         self.store.upsert_pair_profile(
             PairProfile.create(
                 left_job.packing.signature,
@@ -551,10 +770,16 @@ class SchedulerService:
                 avg_vram_mb=summary.avg_vram_mb,
                 avg_gpu_utilization=summary.avg_gpu_utilization,
                 avg_memory_utilization=summary.avg_memory_utilization,
-                slowdown_ratio=None,
+                slowdown_ratio=recorded_slowdown,
                 cooldown_until=None,
                 last_failure_reason=None,
-                metadata={"backend_name": run.backend_name},
+                metadata={
+                    "backend_name": run.backend_name,
+                    "batch_vector": slowdown_batch_vector,
+                    "per_member_slowdown": per_member_slowdown,
+                    "per_signature_slowdown": per_signature_slowdown,
+                    "slowdown_sources": slowdown_sources,
+                },
             )
         )
 
@@ -585,7 +810,7 @@ class SchedulerService:
         active_group = getattr(self.supervisor, "active_group", lambda: None)()
         if active_group is None:
             return {}
-        group_id = str(getattr(active_group, "group_id", "legacy-active-group"))
+        group_id = str(getattr(active_group, "group_id", "untracked-active-group"))
         if hasattr(active_group, "active_job_ids"):
             return {group_id: list(active_group.active_job_ids())}
         workers = getattr(active_group, "workers", {}) or {}
@@ -597,6 +822,10 @@ class SchedulerService:
         return updated_job
 
     def _maybe_preempt(self) -> None:
+        if self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE:
+            # Time-aware scheduling uses drain boundaries; exclusive probes and
+            # newly urgent work do not preempt active training.
+            return
         if len(self._active_runs) != 1:
             return
         active_run = next(iter(self._active_runs.values()))
@@ -621,7 +850,11 @@ class SchedulerService:
             self.event_logger.emit(
                 "pause_requested",
                 job_id=active_job.job_id,
-                payload={"reason": reason, "preempting_job_id": candidate_job.job_id, "hold": False},
+                payload={
+                    "reason": reason,
+                    "preempting_job_id": candidate_job.job_id,
+                    "hold": False,
+                },
             )
 
     def _preload_job_baseline(self, job: TrainingJob) -> None:
@@ -634,7 +867,12 @@ class SchedulerService:
                 metadata={"source": "dispatch", "job_id": job.job_id},
             )
         except Exception as exc:
-            self.logger.warning("Baseline preload failed for job %s (%s): %s", job.job_id, target.model_id, exc)
+            self.logger.warning(
+                "Baseline preload failed for job %s (%s): %s",
+                job.job_id,
+                target.model_id,
+                exc,
+            )
 
     def _active_occupancy(self) -> tuple[float, float]:
         active_vram_mb = 0.0
@@ -648,6 +886,20 @@ class SchedulerService:
             active_sm_utilization += self.planner.predicted_group_sm_utilization(materialized, backend_name=run.backend_name)
         return active_vram_mb, active_sm_utilization
 
+    def _active_vram_occupancy(self) -> float:
+        active_vram_mb = 0.0
+        for group_id, run in self._active_runs.items():
+            jobs = [self.store.get_job(job_id) for job_id in self._supervisor_active_job_ids_by_group().get(group_id, [])]
+            materialized = [job for job in jobs if job is not None]
+            if materialized:
+                active_vram_mb += self.planner.predicted_group_vram_mb(materialized, backend_name=run.backend_name)
+        return active_vram_mb
+
+    def _active_jobs(self) -> list[TrainingJob]:
+        active_ids = self._supervisor_active_job_ids()
+        jobs = [self.store.get_job(job_id) for job_id in active_ids]
+        return [job for job in jobs if job is not None]
+
     def _prediction_metadata(self, job_id: str) -> dict[str, str | None]:
         estimator = getattr(self.planner, "estimator", None)
         method = getattr(estimator, "prediction_metadata", None)
@@ -655,7 +907,10 @@ class SchedulerService:
             result = method(job_id)
             if isinstance(result, dict):
                 return result
-        return {"vram_prediction_source": "branch_profile", "vram_prediction_error": None}
+        return {
+            "vram_prediction_source": "branch_profile",
+            "vram_prediction_error": None,
+        }
 
     def _dispatch_plan(self, plan: DispatchPlan) -> bool:
         selected_jobs = []
@@ -666,7 +921,10 @@ class SchedulerService:
             selected_jobs.append(job)
         if plan.batch_overrides:
             selected_jobs = [
-                self._apply_batch_override(job, plan.batch_overrides.get(job.job_id, self._resolved_batch_size_for_job_id(job.job_id)))
+                self._apply_batch_override(
+                    job,
+                    plan.batch_overrides.get(job.job_id, self._resolved_batch_size_for_job_id(job.job_id)),
+                )
                 for job in selected_jobs
             ]
         for job in selected_jobs:
@@ -692,7 +950,7 @@ class SchedulerService:
                 try:
                     fallback_decision = self.supervisor.dispatch([fallback_job], mode="exclusive", backend_name="exclusive")
                     if fallback_decision.can_run:
-                        group_id = fallback_decision.group_id or f"legacy-{fallback_job.job_id}-{time.monotonic_ns()}"
+                        group_id = fallback_decision.group_id or f"fallback-{fallback_job.job_id}-{time.monotonic_ns()}"
                         self._active_runs[group_id] = ActiveRun(
                             group_id=group_id,
                             mode="exclusive",
@@ -702,7 +960,11 @@ class SchedulerService:
                             hardware_key=self.store.hardware_key(),
                             group_signature=build_group_signature([fallback_job.packing.signature or fallback_job.job_id]),
                         )
-                        self._log_run_group_open(self._active_runs[group_id], [fallback_job], reason="backend_fallback_dispatch")
+                        self._log_run_group_open(
+                            self._active_runs[group_id],
+                            [fallback_job],
+                            reason="backend_fallback_dispatch",
+                        )
                         self._last_telemetry_poll_at = 0.0
                         self.store.update_job(
                             fallback_job.job_id,
@@ -718,12 +980,20 @@ class SchedulerService:
                         )
                         return True
                 except Exception as fallback_exc:
-                    self.logger.warning("Exclusive fallback dispatch also failed for %s: %s", fallback_job.job_id, fallback_exc)
+                    self.logger.warning(
+                        "Exclusive fallback dispatch also failed for %s: %s",
+                        fallback_job.job_id,
+                        fallback_exc,
+                    )
             return False
         if not dispatched.can_run:
-            self.logger.info("Skipping dispatch for %s: %s", ",".join(plan.job_ids), dispatched.reason)
+            self.logger.info(
+                "Skipping dispatch for %s: %s",
+                ",".join(plan.job_ids),
+                dispatched.reason,
+            )
             return False
-        group_id = dispatched.group_id or f"legacy-{plan.job_ids[0]}-{time.monotonic_ns()}"
+        group_id = dispatched.group_id or f"dispatch-{plan.job_ids[0]}-{time.monotonic_ns()}"
 
         signatures = [job.packing.signature or job.job_id for job in selected_jobs]
         self._active_runs[group_id] = ActiveRun(
@@ -735,6 +1005,9 @@ class SchedulerService:
             fallback_order=list(plan.fallback_order),
             hardware_key=self.store.hardware_key(),
             group_signature=build_group_signature(signatures),
+            objective_breakdown=dict(plan.objective_breakdown),
+            objective_version=plan.objective_version,
+            mandatory_anchor_job_id=plan.mandatory_anchor_job_id,
         )
         self._log_run_group_open(self._active_runs[group_id], selected_jobs, reason=plan.reason)
         if len(self._active_runs) > 1:
@@ -760,6 +1033,9 @@ class SchedulerService:
                     "placement_role": role,
                     "placement_batch_size": plan.batch_overrides.get(job.job_id),
                     "placement_group_id": group_id,
+                    "placement_objective_version": plan.objective_version,
+                    "placement_objective_breakdown": plan.objective_breakdown,
+                    "placement_mandatory_anchor_job_id": plan.mandatory_anchor_job_id,
                     **self._prediction_metadata(job.job_id),
                 },
             )
@@ -774,6 +1050,9 @@ class SchedulerService:
                     "job_ids": list(plan.job_ids),
                     "batch_overrides": dict(plan.batch_overrides),
                     "reason": plan.reason,
+                    "objective_version": plan.objective_version,
+                    "objective_breakdown": plan.objective_breakdown,
+                    "mandatory_anchor_job_id": plan.mandatory_anchor_job_id,
                 },
             )
         if len(plan.job_ids) == 2:
@@ -832,7 +1111,11 @@ class SchedulerService:
 
     def _dispatch_pending_work(self) -> None:
         scheduler_mode = self.settings.gpu_scheduler.mode
-        if scheduler_mode != SCHEDULER_MODE_PARALLEL_AUTO_PACK and self._active_runs:
+        concurrent_mode = scheduler_mode in {
+            SCHEDULER_MODE_PARALLEL_AUTO_PACK,
+            SCHEDULER_MODE_PARALLEL_TIME_AWARE,
+        }
+        if not concurrent_mode and self._active_runs:
             return
 
         while True:
@@ -840,27 +1123,63 @@ class SchedulerService:
             runnable = [job for job in self._runnable_jobs() if job.job_id not in active_job_ids]
             if not runnable:
                 return
-            active_vram_mb, active_sm_utilization = self._active_occupancy()
+            if scheduler_mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE and self.settings.gpu_scheduler.exclusive_probe.enabled:
+                probes = [job for job in runnable if job.scheduling_class == SchedulingClass.EXCLUSIVE_PROBE]
+                if self._exclusive_probe_job_id is None and probes:
+                    reserved = sorted(probes, key=lambda job: self.policy.sort_key(job))[0]
+                    self._exclusive_probe_job_id = reserved.job_id
+                    self._persist_scheduler_decision_state()
+                    self.event_logger.emit(
+                        "exclusive_probe_drain_requested",
+                        job_id=reserved.job_id,
+                        payload={
+                            "active_job_ids": sorted(active_job_ids),
+                            "draining": bool(active_job_ids),
+                        },
+                    )
+                if self._exclusive_probe_job_id is not None:
+                    if active_job_ids:
+                        return
+                    reserved = next(
+                        (job for job in runnable if job.job_id == self._exclusive_probe_job_id),
+                        None,
+                    )
+                    if reserved is None:
+                        self._exclusive_probe_job_id = None
+                        self._persist_scheduler_decision_state()
+                        continue
+                    runnable = [reserved]
+            if scheduler_mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE:
+                active_vram_mb = self._active_vram_occupancy()
+                active_sm_utilization = 0.0
+            else:
+                active_vram_mb, active_sm_utilization = self._active_occupancy()
+            active_jobs = self._active_jobs()
             plan = self.planner.choose_plan(
                 runnable,
                 backend_available=self.supervisor.available_backends(),
                 active_vram_mb=active_vram_mb,
                 active_sm_utilization=active_sm_utilization,
+                active_jobs=active_jobs,
+                admission_open=self._admission_gate.is_open,
+                exclusive_drain_requested=bool(self._exclusive_probe_job_id and active_jobs),
             )
             if plan is None:
                 return
-            if scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK and self._active_runs and plan.backend_name == "exclusive":
+            if concurrent_mode and self._active_runs and plan.backend_name == "exclusive":
                 return
             dispatched = self._dispatch_plan(plan)
-            if not dispatched or scheduler_mode != SCHEDULER_MODE_PARALLEL_AUTO_PACK:
+            if not dispatched or not concurrent_mode or plan.backend_name == "exclusive":
                 return
 
-    def _dispatch_if_idle(self) -> None:
-        """Backward-compatible alias for older tests and call sites."""
-        self._dispatch_pending_work()
-
     def report(self) -> dict[str, Any]:
-        return self.metrics.as_dict()
+        return {
+            **self.metrics.as_dict(),
+            "packed_admission_open": self._admission_gate.is_open,
+            "average_memory_fraction": self._admission_gate.average_fraction,
+            "exclusive_drain_requested": self._exclusive_probe_job_id is not None,
+            "reserved_exclusive_probe_job_id": self._exclusive_probe_job_id,
+        }
 
     def cache_stats(self) -> dict[str, Any]:
         return {

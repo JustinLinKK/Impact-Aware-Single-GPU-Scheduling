@@ -12,11 +12,24 @@ from ..observability.logging_utils import setup_scheduler_logger
 from ..config import SchedulerSettings
 from ..storage.log_store import SchedulerLogStore
 from ..storage.state_store import StateStore
-from .control import CancelRequested, PauseRequested
-from .worker_runtime import create_runner_context, load_runtime_settings, mark_job_completed, mark_job_failed, mark_job_started, resolve_runner
+from .control import CancelRequested, EarlyStopRequested, PauseRequested
+from .worker_runtime import (
+    create_runner_context,
+    load_runtime_settings,
+    mark_job_completed,
+    mark_job_failed,
+    mark_job_started,
+    resolve_runner,
+)
 
 
-def _run_job_in_thread(settings: SchedulerSettings, store: StateStore, event_logger: EventLogger, job_id: str, results: dict[str, int]) -> None:
+def _run_job_in_thread(
+    settings: SchedulerSettings,
+    store: StateStore,
+    event_logger: EventLogger,
+    job_id: str,
+    results: dict[str, int],
+) -> None:
     logger = setup_scheduler_logger(settings.scheduler_log_path)
     context, job = create_runner_context(settings, store, event_logger, job_id)
     if context is None or job is None:
@@ -42,6 +55,17 @@ def _run_job_in_thread(settings: SchedulerSettings, store: StateStore, event_log
     except CancelRequested:
         logger.info("Job %s cancelled cleanly in stream host", job_id)
         results[job_id] = 0
+        return
+    except EarlyStopRequested as exc:
+        logger.info("Job %s early-stopped successfully in stream host", job_id)
+        results[job_id] = mark_job_completed(
+            settings,
+            store,
+            event_logger,
+            job_id,
+            exc.result,
+            backend_name="stream",
+        )
         return
     except Exception as exc:
         results[job_id] = mark_job_failed(settings, store, event_logger, job_id, exc, backend_name="stream")

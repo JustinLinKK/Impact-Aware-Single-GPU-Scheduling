@@ -26,6 +26,11 @@ class JobStatus(str, Enum):
         return self in {self.COMPLETED, self.FAILED, self.CANCELLED}
 
 
+class SchedulingClass(str, Enum):
+    NORMAL = "normal"
+    EXCLUSIVE_PROBE = "exclusive_probe"
+
+
 class SafePointType(str, Enum):
     MANUAL = "manual"
     STEP = "step"
@@ -213,6 +218,8 @@ class JobSpec:
     baseline_model_path: str = ""
     task_type: str = "generic"
     priority: int = 0
+    scheduling_class: SchedulingClass = SchedulingClass.NORMAL
+    requested_batch_size: int | None = None
     config: JobConfig = field(default_factory=lambda: JobConfig(runner_target=""))
     resource_requirements: ResourceRequirements = field(default_factory=ResourceRequirements)
     packing: PackingSpec = field(default_factory=PackingSpec)
@@ -234,6 +241,8 @@ class JobSpec:
             baseline_model_path=job.baseline_model_path,
             task_type=job.task_type,
             priority=job.priority,
+            scheduling_class=job.scheduling_class,
+            requested_batch_size=job.requested_batch_size,
             config=job.config,
             resource_requirements=job.resource_requirements,
             packing=job.packing,
@@ -295,6 +304,8 @@ class TrainingJob:
     baseline_model_path: str = ""
     task_type: str = "generic"
     priority: int = 0
+    scheduling_class: SchedulingClass = SchedulingClass.NORMAL
+    requested_batch_size: int | None = None
     status: JobStatus = JobStatus.PENDING
     submitted_at: str = field(default_factory=utc_now)
     config: JobConfig = field(default_factory=lambda: JobConfig(runner_target=""))
@@ -330,6 +341,7 @@ class TrainingJob:
         workflow_id: str | None = None,
         task_type: str = "generic",
         priority: int = 0,
+        scheduling_class: SchedulingClass | str = SchedulingClass.NORMAL,
         runner_kwargs: dict[str, Any] | None = None,
         loader_target: str | None = None,
         resource_requirements: ResourceRequirements | None = None,
@@ -356,6 +368,12 @@ class TrainingJob:
             python_executable=python_executable,
             env=env or {},
         )
+        batch_param_name = (batch_probe.batch_param_name if batch_probe is not None else "batch_size") or "batch_size"
+        raw_requested_batch = config.runner_kwargs.get(batch_param_name)
+        try:
+            requested_batch_size = 1 if raw_requested_batch is None else max(1, int(raw_requested_batch))
+        except (TypeError, ValueError):
+            requested_batch_size = 1
         job = cls(
             job_id=stable_job_id(job_id),
             agent_id=agent_id,
@@ -364,6 +382,8 @@ class TrainingJob:
             baseline_model_path=baseline_model_path,
             task_type=task_type,
             priority=priority,
+            scheduling_class=SchedulingClass(scheduling_class),
+            requested_batch_size=requested_batch_size,
             status=JobStatus.PENDING,
             config=config,
             resource_requirements=resource_requirements or ResourceRequirements(),
@@ -384,6 +404,7 @@ class TrainingJob:
     def from_dict(cls, payload: dict[str, Any]) -> "TrainingJob":
         payload = dict(payload)
         payload["status"] = JobStatus(payload.get("status", JobStatus.PENDING.value))
+        payload["scheduling_class"] = SchedulingClass(payload.get("scheduling_class", SchedulingClass.NORMAL.value))
         payload["config"] = JobConfig.from_dict(payload["config"])
         payload["resource_requirements"] = ResourceRequirements.from_dict(payload.get("resource_requirements"))
         payload["packing"] = PackingSpec.from_dict(payload.get("packing"))
@@ -391,6 +412,13 @@ class TrainingJob:
         payload["runtime_probe"] = RuntimeProbeSpec.from_dict(payload.get("runtime_probe"))
         payload["checkpoint_policy"] = CheckpointPolicy.from_dict(payload.get("checkpoint_policy"))
         payload["preload_source"] = PreloadSource.from_dict(payload.get("preload_source"))
+        if payload.get("requested_batch_size") is None:
+            batch_param_name = payload["batch_probe"].batch_param_name or "batch_size"
+            raw_requested = payload["config"].runner_kwargs.get(batch_param_name)
+            try:
+                payload["requested_batch_size"] = max(1, int(raw_requested))
+            except (TypeError, ValueError):
+                payload["requested_batch_size"] = 1
         return cls(**payload)
 
     @classmethod
@@ -403,6 +431,8 @@ class TrainingJob:
             baseline_model_path=spec.baseline_model_path,
             task_type=spec.task_type,
             priority=spec.priority,
+            scheduling_class=spec.scheduling_class,
+            requested_batch_size=spec.requested_batch_size,
             status=run.status,
             submitted_at=run.submitted_at,
             config=spec.config,

@@ -15,7 +15,7 @@ from typing import Any, Sequence
 from ..config import PredictionSettings
 from ..domain import TrainingJob
 from ..hardware import HardwareProfile
-from .source_worker import convert_source_worker
+from .source_worker import convert_source_options_worker, convert_source_worker
 
 
 LOGGER = logging.getLogger(__name__)
@@ -141,8 +141,8 @@ class MLVramPredictor:
         self._runtime: Any | None = None
         self._encoded_type: Any | None = None
         self._cache: OrderedDict[str, Any] = OrderedDict()
-        self._job_values: dict[tuple[str, int], float] = {}
-        self._job_failures: dict[tuple[str, int], str] = {}
+        self._job_values: dict[str, float] = {}
+        self._job_failures: dict[str, str] = {}
         self.last_sources: dict[str, str] = {}
         self.last_errors: dict[str, str] = {}
         self._initialize()
@@ -192,6 +192,8 @@ class MLVramPredictor:
     def _smoke_test_runtime(self) -> None:
         import torch
 
+        assert self._encoded_type is not None
+        assert self._runtime is not None
         encoded = self._encoded_type(
             x=torch.zeros((2, 53), dtype=torch.float32),
             edge_index=torch.tensor([[0], [1]], dtype=torch.long),
@@ -254,6 +256,7 @@ class MLVramPredictor:
         import torch
 
         arrays = response["tensors"]
+        assert self._encoded_type is not None
         encoded = self._encoded_type(
             x=torch.from_numpy(arrays[0]),
             edge_index=torch.from_numpy(arrays[1]),
@@ -266,31 +269,121 @@ class MLVramPredictor:
             self._cache.popitem(last=False)
         return encoded
 
-    def predict_avg_vram_mb(self, job: TrainingJob, batch_size: int) -> float:
+    def _convert_many(self, specifications: list[ModelSpecification]) -> list[Any]:
+        """Convert batch variants in one worker while reusing model tracing."""
+        if not specifications:
+            return []
+        encoded_by_index: dict[int, Any] = {}
+        missing: list[tuple[int, ModelSpecification, str]] = []
+        for index, specification in enumerate(specifications):
+            key = self._cache_key(specification)
+            cached = self._cache.pop(key, None)
+            if cached is not None:
+                self._cache[key] = cached
+                encoded_by_index[index] = cached
+            else:
+                missing.append((index, specification, key))
+        if missing:
+            context = multiprocessing.get_context("spawn")
+            receiver, sender = context.Pipe(duplex=False)
+            process = context.Process(
+                target=convert_source_options_worker,
+                args=(sender, str(PERFSEER_SRC), [spec.worker_request() for _, spec, _ in missing]),
+                daemon=True,
+            )
+            process.start()
+            sender.close()
+            timeout_seconds = self.settings.conversion_timeout_seconds * max(1, len(missing))
+            try:
+                if not receiver.poll(timeout_seconds):
+                    process.terminate()
+                    process.join(timeout=2.0)
+                    raise JobPredictionError(f"batch source conversion exceeded {timeout_seconds:.1f}s")
+                response = receiver.recv()
+            except EOFError as exc:
+                raise JobPredictionError("batch source conversion subprocess exited without a result") from exc
+            finally:
+                receiver.close()
+                if process.is_alive():
+                    process.join(timeout=2.0)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=2.0)
+            if not response.get("ok"):
+                raise JobPredictionError(str(response.get("error") or "batch source conversion failed"))
+            raw_options = list(response.get("tensors_by_option") or [])
+            if len(raw_options) != len(missing):
+                raise JobPredictionError("batch source conversion returned an incomplete option set")
+            import torch
+
+            assert self._encoded_type is not None
+            for (index, _specification, key), arrays in zip(missing, raw_options, strict=True):
+                encoded = self._encoded_type(
+                    x=torch.from_numpy(arrays[0]),
+                    edge_index=torch.from_numpy(arrays[1]),
+                    edge_attr=torch.from_numpy(arrays[2]),
+                    u=torch.from_numpy(arrays[3]),
+                    batch=torch.from_numpy(arrays[4]),
+                )
+                encoded_by_index[index] = encoded
+                self._cache[key] = encoded
+                while len(self._cache) > self.settings.cache_size:
+                    self._cache.popitem(last=False)
+        return [encoded_by_index[index] for index in range(len(specifications))]
+
+    def _prediction_key(self, job: TrainingJob, batch_size: int, specification: ModelSpecification) -> str:
+        payload = {
+            "job_id": job.job_id,
+            "batch_size": int(batch_size),
+            "feature_key": self._cache_key(specification),
+            "hardware": {
+                "gpu_name": self.hardware.gpu_name,
+                "compute_capability": self.hardware.compute_capability,
+                "total_vram_mb": self.hardware.total_vram_mb,
+            },
+            "model_id": self.model_id,
+            "artifact_sha256": self.artifact_hash,
+        }
+        return sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+    def predict_avg_vram_options(self, job: TrainingJob, batch_sizes: Sequence[int]) -> dict[int, float]:
+        """Predict all requested batches with one trace/conversion bundle."""
         if not self.available:
-            error = self.unavailable_reason or "ML predictor unavailable"
+            unavailable_error = self.unavailable_reason or "ML predictor unavailable"
             self.last_sources[job.job_id] = "branch_profile"
-            self.last_errors[job.job_id] = error
-            raise JobPredictionError(error)
-        job_key = (job.job_id, int(batch_size))
-        if job_key in self._job_values:
-            self.last_sources[job.job_id] = "ml_predictor"
-            return self._job_values[job_key]
-        if job_key in self._job_failures:
+            self.last_errors[job.job_id] = unavailable_error
+            raise JobPredictionError(unavailable_error)
+        ordered_sizes = [int(value) for value in dict.fromkeys(batch_sizes)]
+        specifications = [model_specification_for_job(job, batch_size) for batch_size in ordered_sizes]
+        keys = [self._prediction_key(job, batch_size, spec) for batch_size, spec in zip(ordered_sizes, specifications, strict=True)]
+        failed = next((self._job_failures[key] for key in keys if key in self._job_failures), None)
+        if failed is not None:
             self.last_sources[job.job_id] = "branch_profile"
-            raise JobPredictionError(self._job_failures[job_key])
+            self.last_errors[job.job_id] = failed
+            raise JobPredictionError(failed)
+        missing_indices = [index for index, key in enumerate(keys) if key not in self._job_values]
         try:
-            specification = model_specification_for_job(job, batch_size)
-            value = float(self._runtime.predict_train_mem_mb(self._convert(specification)))
-            if not (0.0 < value < float("inf")):
-                raise JobPredictionError(f"invalid train_mem prediction {value}")
+            missing_encoded = (
+                self._convert_many([specifications[index] for index in missing_indices])
+                if missing_indices
+                else []
+            )
+            assert self._runtime is not None
+            for index, encoded in zip(missing_indices, missing_encoded, strict=True):
+                value = float(self._runtime.predict_train_mem_mb(encoded))
+                if not (0.0 < value < float("inf")):
+                    raise JobPredictionError(f"invalid train_mem prediction {value}")
+                self._job_values[keys[index]] = value
         except Exception as exc:
-            error = exc if isinstance(exc, JobPredictionError) else JobPredictionError(f"{type(exc).__name__}: {exc}")
+            prediction_error = exc if isinstance(exc, JobPredictionError) else JobPredictionError(f"{type(exc).__name__}: {exc}")
+            for key in keys:
+                self._job_failures[key] = str(prediction_error)
             self.last_sources[job.job_id] = "branch_profile"
-            self.last_errors[job.job_id] = str(error)
-            self._job_failures[job_key] = str(error)
-            raise error
+            self.last_errors[job.job_id] = str(prediction_error)
+            raise prediction_error
         self.last_sources[job.job_id] = "ml_predictor"
         self.last_errors.pop(job.job_id, None)
-        self._job_values[job_key] = value
-        return value
+        return {batch_size: self._job_values[key] for batch_size, key in zip(ordered_sizes, keys, strict=True)}
+
+    def predict_avg_vram_mb(self, job: TrainingJob, batch_size: int) -> float:
+        return self.predict_avg_vram_options(job, [batch_size])[int(batch_size)]

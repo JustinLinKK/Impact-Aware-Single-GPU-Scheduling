@@ -89,6 +89,28 @@ class MLPredictionTest(unittest.TestCase):
         self.assertGreater(value, 0)
         self.assertEqual(predictor.last_sources["predict-job"], "ml_predictor")
 
+    def test_five_batch_predictions_share_one_conversion_bundle_and_cache(self) -> None:
+        predictor = MLVramPredictor(
+            PredictionSettings(mode="ml_predictor"),
+            hardware("NVIDIA A10", "8.6", 23028),
+        )
+        self.assertTrue(predictor.available, predictor.unavailable_reason)
+        calls: list[int] = []
+        original = predictor._convert_many
+
+        def counted(specifications):
+            calls.append(len(specifications))
+            return original(specifications)
+
+        predictor._convert_many = counted  # type: ignore[method-assign]
+        values = predictor.predict_avg_vram_options(model_job(SUPPORTED_SOURCE), [1, 2, 4, 8, 16])
+        self.assertEqual(set(values), {1, 2, 4, 8, 16})
+        self.assertTrue(all(value > 0 for value in values.values()))
+        self.assertEqual(calls, [5])
+        cached = predictor.predict_avg_vram_options(model_job(SUPPORTED_SOURCE), [1, 2, 4, 8, 16])
+        self.assertEqual(cached, values)
+        self.assertEqual(calls, [5])
+
     def test_auto_selects_rtx_pro_6000_blackwell_and_runs_cpu_prediction(self) -> None:
         predictor = MLVramPredictor(
             PredictionSettings(mode="ml_predictor"),

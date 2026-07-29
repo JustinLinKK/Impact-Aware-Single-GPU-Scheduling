@@ -4,14 +4,27 @@ from __future__ import annotations
 
 from itertools import combinations
 
-from ..domain import BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO, TrainingJob, normalize_batch_probe_search_mode
-from ..config import SCHEDULER_MODE_PARALLEL_AUTO_PACK, SchedulerSettings
+from ..domain import (
+    BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
+    TrainingJob,
+    normalize_batch_probe_search_mode,
+)
+from ..config import (
+    SCHEDULER_MODE_PARALLEL_AUTO_PACK,
+    SCHEDULER_MODE_PARALLEL_TIME_AWARE,
+    SchedulerSettings,
+)
 from .compatibility import CompatibilityEvaluator
 from .resource_estimator import ResourceEstimator
 
 
 class CandidateGenerator:
-    def __init__(self, settings: SchedulerSettings, estimator: ResourceEstimator, compatibility: CompatibilityEvaluator):
+    def __init__(
+        self,
+        settings: SchedulerSettings,
+        estimator: ResourceEstimator,
+        compatibility: CompatibilityEvaluator,
+    ):
         self.settings = settings
         self.estimator = estimator
         self.compatibility = compatibility
@@ -47,9 +60,22 @@ class CandidateGenerator:
                 candidates.append(backend_name)
         return candidates
 
-    def candidate_batch_sizes(self, job: TrainingJob) -> list[int]:
+    def candidate_batch_sizes(self, job: TrainingJob, *, scheduler_mode: str | None = None) -> list[int]:
+        if scheduler_mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE:
+            raw_values = self.time_aware_batch_proposals(job)
+            explicit_cap = job.config.runner_kwargs.get(
+                "probe_max_batch_size",
+                self.settings.gpu_scheduler.batch_probe_max_batch_size,
+            )
+            cap = max(1, int(explicit_cap)) if explicit_cap is not None else None
+            clipped = [min(value, cap) if cap is not None else value for value in raw_values]
+            return list(dict.fromkeys(max(1, int(value)) for value in clipped))
+
         requested = self.estimator.resolved_batch_size(job)
-        explicit_cap = job.config.runner_kwargs.get("probe_max_batch_size", self.settings.gpu_scheduler.batch_probe_max_batch_size)
+        explicit_cap = job.config.runner_kwargs.get(
+            "probe_max_batch_size",
+            self.settings.gpu_scheduler.batch_probe_max_batch_size,
+        )
         cap = max(1, int(explicit_cap)) if explicit_cap is not None else None
         optimizer = self.settings.gpu_scheduler.parallel_optimizer
         search_mode = normalize_batch_probe_search_mode(optimizer.batch_search_mode)
@@ -72,19 +98,38 @@ class CandidateGenerator:
             min_batch = max(1, max_batch)
         return list(range(min_batch, max_batch + 1))
 
-    def fallback_order(self, jobs: list[TrainingJob], batch_overrides: dict[str, int], backend_name: str) -> list[str]:
+    def time_aware_batch_proposals(self, job: TrainingJob) -> list[int]:
+        """Return the five pre-clipping exponent proposals for audit logs."""
+        requested = int(job.requested_batch_size or self.estimator.resolved_batch_size(job))
+        if self.settings.gpu_scheduler.batch_options.require_power_of_two_original and requested & (requested - 1):
+            raise ValueError(f"time-aware scheduling requires a power-of-two requested batch size: {requested}")
+        exponent = requested.bit_length() - 1
+        return [2 ** max(0, exponent + offset) for offset in self.settings.gpu_scheduler.batch_options.exponent_offsets]
+
+    def fallback_order(
+        self,
+        jobs: list[TrainingJob],
+        batch_overrides: dict[str, int],
+        backend_name: str,
+    ) -> list[str]:
         ranked = sorted(
             jobs,
             key=lambda job: (
                 job.priority,
                 -(self.estimator.predicted_remaining_runtime_seconds(job, backend_name=backend_name) or 0.0),
-                -self.estimator.estimate_avg_vram_mb(job, batch_overrides.get(job.job_id, self.estimator.resolved_batch_size(job)), backend_name),
+                -self.estimator.estimate_avg_vram_mb(
+                    job,
+                    batch_overrides.get(job.job_id, self.estimator.resolved_batch_size(job)),
+                    backend_name,
+                ),
                 job.queue_sequence,
             ),
         )
         return [job.job_id for job in ranked]
 
     def candidate_groups(self, ordered: list[TrainingJob], *, scheduler_mode: str) -> list[list[TrainingJob]]:
+        if scheduler_mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE:
+            return self.time_aware_groups(ordered)
         if scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK:
             upper = len(ordered[: max(1, int(self.settings.gpu_scheduler.candidate_window_size))])
             window = ordered[: max(1, int(self.settings.gpu_scheduler.candidate_window_size))]
@@ -100,10 +145,47 @@ class CandidateGenerator:
             max_packed = max(max_packed, 3)
         window = ordered[: max(1, int(self.settings.gpu_scheduler.candidate_window_size))]
         upper = min(max_packed, len(window))
-        groups: list[list[TrainingJob]] = []
+        groups = []
         for size in range(2, upper + 1):
             if size <= 3:
                 groups.extend([list(items) for items in combinations(window, size)])
             else:
                 groups.append(window[:size])
+        return groups
+
+    def time_aware_groups(
+        self,
+        window: list[TrainingJob],
+        *,
+        max_new_jobs: int | None = None,
+        mandatory_anchor: TrainingJob | None = None,
+    ) -> list[list[TrainingJob]]:
+        """Bounded deterministic subset search; every partial state is legal."""
+        if not window:
+            return []
+        upper = min(len(window), max_new_jobs if max_new_jobs is not None else len(window))
+        if upper <= 0:
+            return []
+        groups: list[list[TrainingJob]] = []
+        exact_limit = int(self.settings.gpu_scheduler.exact_search_max_jobs)
+        if upper <= exact_limit:
+            for size in range(1, upper + 1):
+                groups.extend(list(items) for items in combinations(window, size))
+        else:
+            seed = (mandatory_anchor,) if mandatory_anchor is not None else tuple()
+            states: list[tuple[TrainingJob, ...]] = [seed]
+            emitted: dict[tuple[str, ...], tuple[TrainingJob, ...]] = {}
+            if seed:
+                emitted[tuple(member.job_id for member in seed)] = seed
+            for job in (member for member in window if member != mandatory_anchor):
+                expanded = states + [state + (job,) for state in states if len(state) < upper]
+                unique = {tuple(member.job_id for member in state): state for state in expanded}
+                states = [unique[key] for key in sorted(unique, key=lambda ids: (-len(ids), ids))[: self.settings.gpu_scheduler.beam_width]]
+                for state in states:
+                    if state:
+                        emitted[tuple(member.job_id for member in state)] = state
+            groups = [list(state) for state in emitted.values()]
+        if mandatory_anchor is not None:
+            groups = [group for group in groups if mandatory_anchor in group]
+        groups.sort(key=lambda group: (len(group), tuple(job.job_id for job in group)))
         return groups

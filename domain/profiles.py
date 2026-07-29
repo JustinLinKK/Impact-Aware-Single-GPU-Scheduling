@@ -8,7 +8,12 @@ from typing import Any
 import json
 
 from .common import parse_timestamp, to_primitive, utc_now
-from .identity import build_backend_scoped_pair_key, build_combination_key, build_runtime_profile_key, decode_batch_vector
+from .identity import (
+    build_backend_scoped_pair_key,
+    build_combination_key,
+    build_runtime_profile_key,
+    decode_batch_vector,
+)
 from .jobs import CommandType, TrainingJob, normalize_runtime_probe_strategy
 
 
@@ -77,6 +82,8 @@ class BatchProbeTrialResult:
     avg_vram_mb: float | None = None
     memory_total_mb: int | None = None
     avg_step_time_ms: float | None = None
+    steps_per_epoch: int | None = None
+    seconds_per_epoch: float | None = None
     message: str | None = None
 
     @classmethod
@@ -275,7 +282,13 @@ class CombinationProfile:
         **kwargs: Any,
     ) -> "CombinationProfile":
         return cls(
-            combination_key=build_combination_key(group_signature, hardware_key, backend_name, scheduler_mode, batch_vector),
+            combination_key=build_combination_key(
+                group_signature,
+                hardware_key,
+                backend_name,
+                scheduler_mode,
+                batch_vector,
+            ),
             group_signature=group_signature,
             hardware_key=hardware_key,
             backend_name=backend_name,
@@ -523,6 +536,17 @@ class SchedulerReport:
     cancelled_jobs: int = 0
     average_queue_wait_seconds: float = 0.0
     average_runtime_seconds: float = 0.0
+    trace_makespan_seconds: float = 0.0
+    total_flow_time_seconds: float = 0.0
+    mean_flow_time_seconds: float = 0.0
+    weighted_mean_flow_time_seconds: float = 0.0
+    median_flow_time_seconds: float = 0.0
+    p95_flow_time_seconds: float = 0.0
+    max_wait_time_seconds: float = 0.0
+    starvation_count: int = 0
+    jobs_per_hour: float = 0.0
+    early_stopped_epochs_saved: int = 0
+    early_stopped_wall_time_saved_seconds: float = 0.0
     cache_hit_rate: float = 0.0
     cache_hits: int = 0
     cache_misses: int = 0

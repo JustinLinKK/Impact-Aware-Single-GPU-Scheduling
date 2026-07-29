@@ -6,15 +6,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 import sys
+import warnings
 
 import yaml
-
 
 SCHEDULER_MODE_SERIAL_BASIC = "serial_basic"
 SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED = "serial_batch_optimized"
 SCHEDULER_MODE_PARALLEL_DEFAULT = "parallel_default"
 SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED = "parallel_batch_optimized"
 SCHEDULER_MODE_PARALLEL_AUTO_PACK = "parallel_auto_pack"
+SCHEDULER_MODE_PARALLEL_TIME_AWARE = "parallel_time_aware"
 PREDICTION_MODE_BRANCH_PROFILE = "branch_profile"
 PREDICTION_MODE_ML_PREDICTOR = "ml_predictor"
 
@@ -34,6 +35,7 @@ def normalize_scheduler_mode(value: str | None) -> str:
         SCHEDULER_MODE_PARALLEL_DEFAULT,
         SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
         SCHEDULER_MODE_PARALLEL_AUTO_PACK,
+        SCHEDULER_MODE_PARALLEL_TIME_AWARE,
     }
     if normalized not in allowed:
         raise ValueError(f"Unsupported scheduler mode: {value}")
@@ -62,17 +64,154 @@ class GpuProfilingSettings:
 
 @dataclass(slots=True)
 class GpuMemorySettings:
-    safe_vram_budget_gib: float = 28.0
-    hard_stop_memory_fraction: float = 0.90
+    # ``safe_vram_budget_gib`` is a legacy compatibility input. New
+    # time-aware configurations should use a detected/configured device size
+    # and ``predicted_budget_fraction``.
+    safe_vram_budget_gib: float | None = 28.0
+    gpu_vram_gib: float | None = None
+    predicted_budget_fraction: float = 0.85
+    live_admission_stop_fraction: float = 0.90
+    live_admission_resume_fraction: float = 0.85
+    admission_average_window_seconds: float = 10.0
+
+    def __post_init__(self) -> None:
+        if self.safe_vram_budget_gib is not None and self.safe_vram_budget_gib <= 0:
+            raise ValueError("safe_vram_budget_gib must be positive")
+        if self.gpu_vram_gib is not None and self.gpu_vram_gib <= 0:
+            raise ValueError("gpu_vram_gib must be positive")
+        if not 0 < self.predicted_budget_fraction <= 1:
+            raise ValueError("predicted_budget_fraction must be in (0, 1]")
+        if not 0 < self.live_admission_resume_fraction < self.live_admission_stop_fraction <= 1:
+            raise ValueError("live admission fractions must satisfy 0 < resume < stop <= 1")
+        if self.admission_average_window_seconds <= 0:
+            raise ValueError("admission_average_window_seconds must be positive")
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "GpuMemorySettings":
-        return cls(**(payload or {}))
+        return cls(**dict(payload or {}))
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "safe_vram_budget_gib": self.safe_vram_budget_gib,
-            "hard_stop_memory_fraction": self.hard_stop_memory_fraction,
+            "gpu_vram_gib": self.gpu_vram_gib,
+            "predicted_budget_fraction": self.predicted_budget_fraction,
+            "live_admission_stop_fraction": self.live_admission_stop_fraction,
+            "live_admission_resume_fraction": self.live_admission_resume_fraction,
+            "admission_average_window_seconds": self.admission_average_window_seconds,
+        }
+
+
+@dataclass(slots=True)
+class TimeObjectiveSettings:
+    priority_weight: float = 0.10
+    objective_version: str = "time_v3_flow_only"
+
+    def __post_init__(self) -> None:
+        if self.priority_weight < 0:
+            raise ValueError("priority_weight must be non-negative")
+        if not str(self.objective_version).strip():
+            raise ValueError("objective_version is required")
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "TimeObjectiveSettings":
+        raw = dict(payload or {})
+        removed = sorted({"makespan_weight", "flow_time_weight", "min_aggregate_gain"}.intersection(raw))
+        if removed:
+            raise ValueError(
+                "gpu_scheduler.objective no longer supports throughput scheduling controls: "
+                + ", ".join(removed)
+            )
+        return cls(**raw)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "priority_weight": self.priority_weight,
+            "objective_version": self.objective_version,
+        }
+
+
+@dataclass(slots=True)
+class BatchOptionSettings:
+    exponent_offsets: list[int] = field(default_factory=lambda: [-2, -1, 0, 1, 2])
+    require_power_of_two_original: bool = True
+
+    def __post_init__(self) -> None:
+        self.exponent_offsets = [int(value) for value in self.exponent_offsets]
+        if len(self.exponent_offsets) != 5 or len(set(self.exponent_offsets)) != 5:
+            raise ValueError("batch_options.exponent_offsets must contain five distinct offsets")
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "BatchOptionSettings":
+        return cls(**(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "exponent_offsets": list(self.exponent_offsets),
+            "require_power_of_two_original": self.require_power_of_two_original,
+        }
+
+
+@dataclass(slots=True)
+class ExclusiveProbeSettings:
+    enabled: bool = True
+    drain_without_preemption: bool = True
+
+    def __post_init__(self) -> None:
+        if self.enabled and not self.drain_without_preemption:
+            raise ValueError("exclusive probes only support non-preemptive drain semantics")
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "ExclusiveProbeSettings":
+        return cls(**(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "drain_without_preemption": self.drain_without_preemption,
+        }
+
+
+@dataclass(slots=True)
+class EarlyStoppingSettings:
+    enabled: bool = False
+    metric_name: str = "accuracy"
+    mode: str = "max"
+    patience_epochs: int = 5
+    min_delta: float = 0.0
+    min_epochs: int = 1
+    save_best_checkpoint: bool = True
+    restore_best_checkpoint: bool = False
+    missing_metric_policy: str = "ignore"
+
+    def __post_init__(self) -> None:
+        self.mode = str(self.mode).strip().lower()
+        if self.mode not in {"min", "max"}:
+            raise ValueError("early_stopping.mode must be 'min' or 'max'")
+        if self.patience_epochs < 1:
+            raise ValueError("early_stopping.patience_epochs must be at least 1")
+        if self.min_epochs < 0:
+            raise ValueError("early_stopping.min_epochs must be non-negative")
+        if self.min_delta < 0:
+            raise ValueError("early_stopping.min_delta must be non-negative")
+        self.missing_metric_policy = str(self.missing_metric_policy).strip().lower()
+        if self.missing_metric_policy not in {"ignore", "error"}:
+            raise ValueError("early_stopping.missing_metric_policy must be 'ignore' or 'error'")
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "EarlyStoppingSettings":
+        return cls(**(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "metric_name": self.metric_name,
+            "mode": self.mode,
+            "patience_epochs": self.patience_epochs,
+            "min_delta": self.min_delta,
+            "min_epochs": self.min_epochs,
+            "save_best_checkpoint": self.save_best_checkpoint,
+            "restore_best_checkpoint": self.restore_best_checkpoint,
+            "missing_metric_policy": self.missing_metric_policy,
         }
 
 
@@ -80,13 +219,19 @@ class GpuMemorySettings:
 class GpuThresholdSettings:
     pack_prefer_sm_active_lt: float = 0.50
     pack_reject_sm_active_ge: float = 0.80
+    # Reserved as passive evidence thresholds until a slowdown predictor is
+    # designed. Live placement does not consume either value.
     pack_reject_max_slowdown: float = 1.30
     latency_sensitive_max_slowdown: float = 1.15
-    min_aggregate_gain: float = 1.10
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "GpuThresholdSettings":
-        return cls(**(payload or {}))
+        raw = dict(payload or {})
+        if "min_aggregate_gain" in raw:
+            raise ValueError(
+                "gpu_scheduler.thresholds no longer supports throughput scheduling control: min_aggregate_gain"
+            )
+        return cls(**raw)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -94,7 +239,6 @@ class GpuThresholdSettings:
             "pack_reject_sm_active_ge": self.pack_reject_sm_active_ge,
             "pack_reject_max_slowdown": self.pack_reject_max_slowdown,
             "latency_sensitive_max_slowdown": self.latency_sensitive_max_slowdown,
-            "min_aggregate_gain": self.min_aggregate_gain,
         }
 
 
@@ -488,6 +632,12 @@ class GpuSchedulerSettings:
     mode: str = SCHEDULER_MODE_PARALLEL_DEFAULT
     backend_priority: list[str] = field(default_factory=lambda: ["mps", "stream", "cuda_process", "exclusive"])
     max_packed_jobs_per_gpu: int = 2
+    parallel_job_cap: int | None = None
+    priority_window_size: int = 8
+    oldest_window_size: int = 4
+    starvation_timeout_seconds: float = 1800.0
+    beam_width: int = 64
+    exact_search_max_jobs: int = 3
     allow_three_way_packing: bool = False
     candidate_window_size: int = 8
     device_index: int = 0
@@ -506,6 +656,9 @@ class GpuSchedulerSettings:
     telemetry: GpuTelemetrySettings = field(default_factory=GpuTelemetrySettings)
     auto_pack: AutoPackSettings = field(default_factory=AutoPackSettings)
     parallel_optimizer: ParallelOptimizerSettings = field(default_factory=ParallelOptimizerSettings)
+    objective: TimeObjectiveSettings = field(default_factory=TimeObjectiveSettings)
+    batch_options: BatchOptionSettings = field(default_factory=BatchOptionSettings)
+    exclusive_probe: ExclusiveProbeSettings = field(default_factory=ExclusiveProbeSettings)
     submission_defaults: SchedulerSubmissionDefaults = field(default_factory=SchedulerSubmissionDefaults)
     mps: MPSSettings = field(default_factory=MPSSettings)
     cuda_process: CudaProcessSettings = field(default_factory=CudaProcessSettings)
@@ -521,6 +674,13 @@ class GpuSchedulerSettings:
             self.concurrent_backend_allowlist = ["mps", "stream"]
         else:
             self.concurrent_backend_allowlist = [str(item) for item in self.concurrent_backend_allowlist]
+        if self.parallel_job_cap is not None:
+            self.parallel_job_cap = max(1, int(self.parallel_job_cap))
+        self.priority_window_size = max(1, int(self.priority_window_size))
+        self.oldest_window_size = max(1, int(self.oldest_window_size))
+        self.starvation_timeout_seconds = max(0.0, float(self.starvation_timeout_seconds))
+        self.beam_width = max(1, int(self.beam_width))
+        self.exact_search_max_jobs = max(1, int(self.exact_search_max_jobs))
         if self.profiling is None:
             self.profiling = GpuProfilingSettings()
         if isinstance(self.profiling, dict):
@@ -545,6 +705,24 @@ class GpuSchedulerSettings:
             self.parallel_optimizer = ParallelOptimizerSettings()
         if isinstance(self.parallel_optimizer, dict):
             self.parallel_optimizer = ParallelOptimizerSettings.from_dict(self.parallel_optimizer)
+        if self.objective is None:
+            self.objective = TimeObjectiveSettings()
+        if isinstance(self.objective, dict):
+            self.objective = TimeObjectiveSettings.from_dict(self.objective)
+        if self.batch_options is None:
+            self.batch_options = BatchOptionSettings()
+        if isinstance(self.batch_options, dict):
+            self.batch_options = BatchOptionSettings.from_dict(self.batch_options)
+        if self.exclusive_probe is None:
+            self.exclusive_probe = ExclusiveProbeSettings()
+        if isinstance(self.exclusive_probe, dict):
+            self.exclusive_probe = ExclusiveProbeSettings.from_dict(self.exclusive_probe)
+        if self.mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE and self.memory.predicted_budget_fraction > self.memory.live_admission_stop_fraction:
+            warnings.warn(
+                "predicted_budget_fraction exceeds live_admission_stop_fraction; a newly admitted pack may close admission immediately",
+                UserWarning,
+                stacklevel=2,
+            )
         if self.submission_defaults is None:
             self.submission_defaults = SchedulerSubmissionDefaults()
         if isinstance(self.submission_defaults, dict):
@@ -564,7 +742,10 @@ class GpuSchedulerSettings:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "GpuSchedulerSettings":
-        return cls(**(payload or {}))
+        raw = dict(payload or {})
+        if "parallel_job_cap" not in raw and "max_packed_jobs_per_gpu" in raw:
+            raw["parallel_job_cap"] = raw["max_packed_jobs_per_gpu"]
+        return cls(**raw)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -572,6 +753,12 @@ class GpuSchedulerSettings:
             "mode": self.mode,
             "backend_priority": list(self.backend_priority),
             "max_packed_jobs_per_gpu": self.max_packed_jobs_per_gpu,
+            "parallel_job_cap": self.parallel_job_cap,
+            "priority_window_size": self.priority_window_size,
+            "oldest_window_size": self.oldest_window_size,
+            "starvation_timeout_seconds": self.starvation_timeout_seconds,
+            "beam_width": self.beam_width,
+            "exact_search_max_jobs": self.exact_search_max_jobs,
             "allow_three_way_packing": self.allow_three_way_packing,
             "candidate_window_size": self.candidate_window_size,
             "device_index": self.device_index,
@@ -590,6 +777,9 @@ class GpuSchedulerSettings:
             "telemetry": self.telemetry.to_dict(),
             "auto_pack": self.auto_pack.to_dict(),
             "parallel_optimizer": self.parallel_optimizer.to_dict(),
+            "objective": self.objective.to_dict(),
+            "batch_options": self.batch_options.to_dict(),
+            "exclusive_probe": self.exclusive_probe.to_dict(),
             "submission_defaults": self.submission_defaults.to_dict(),
             "mps": self.mps.to_dict(),
             "cuda_process": self.cuda_process.to_dict(),
@@ -612,6 +802,7 @@ class SchedulerConfig:
     cache_socket_name: str = "cache_server.sock"
     auto_resume_recoverable: bool = False
     gpu_scheduler: GpuSchedulerSettings = field(default_factory=GpuSchedulerSettings)
+    early_stopping: EarlyStoppingSettings | dict[str, Any] = field(default_factory=EarlyStoppingSettings)
     prediction: PredictionSettings | dict[str, Any] = field(default_factory=PredictionSettings)
     graph_db: GraphDBSettings | dict[str, Any] = field(default_factory=GraphDBSettings)
     hardware_feature_db: HardwareFeatureDBSettings | dict[str, Any] = field(default_factory=HardwareFeatureDBSettings)
@@ -633,6 +824,10 @@ class SchedulerConfig:
     def __post_init__(self) -> None:
         if isinstance(self.gpu_scheduler, dict):
             self.gpu_scheduler = GpuSchedulerSettings.from_dict(self.gpu_scheduler)
+        if self.early_stopping is None:
+            self.early_stopping = EarlyStoppingSettings()
+        if isinstance(self.early_stopping, dict):
+            self.early_stopping = EarlyStoppingSettings.from_dict(self.early_stopping)
         if self.prediction is None:
             self.prediction = PredictionSettings()
         if isinstance(self.prediction, dict):
@@ -705,6 +900,12 @@ class SchedulerConfig:
         return (self.cache_server_host, self.cache_server_port)
 
     def to_dict(self) -> dict[str, Any]:
+        assert isinstance(self.baseline_cache, BaselineCacheSettings)
+        assert isinstance(self.early_stopping, EarlyStoppingSettings)
+        assert isinstance(self.prediction, PredictionSettings)
+        assert isinstance(self.graph_db, GraphDBSettings)
+        assert isinstance(self.hardware_feature_db, HardwareFeatureDBSettings)
+        assert isinstance(self.log_db, LogDBSettings)
         return {
             "runtime_root": str(self.runtime_root),
             "scheduler_poll_interval_seconds": self.scheduler_poll_interval_seconds,
@@ -719,6 +920,7 @@ class SchedulerConfig:
             "cache_socket_name": self.cache_socket_name,
             "auto_resume_recoverable": self.auto_resume_recoverable,
             "gpu_scheduler": self.gpu_scheduler.to_dict(),
+            "early_stopping": self.early_stopping.to_dict(),
             "prediction": self.prediction.to_dict(),
             "graph_db": self.graph_db.to_dict(),
             "hardware_feature_db": self.hardware_feature_db.to_dict(),

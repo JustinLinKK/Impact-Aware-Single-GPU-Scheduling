@@ -73,13 +73,14 @@ gpu_scheduler:
     reuse_profile_if_confidence_ge: 0.8
   memory:
     safe_vram_budget_gib: 28.0
-    hard_stop_memory_fraction: 0.90
+    live_admission_stop_fraction: 0.90
+    live_admission_resume_fraction: 0.85
+    admission_average_window_seconds: 10
   thresholds:
     pack_prefer_sm_active_lt: 0.50
     pack_reject_sm_active_ge: 0.80
-    pack_reject_max_slowdown: 1.30
-    latency_sensitive_max_slowdown: 1.15
-    min_aggregate_gain: 1.10
+    pack_reject_max_slowdown: 1.30  # reserved; ignored by live placement
+    latency_sensitive_max_slowdown: 1.15  # reserved; ignored by live placement
   telemetry:
     device_poll_ms: 500
     pair_recheck_every_steps: 20

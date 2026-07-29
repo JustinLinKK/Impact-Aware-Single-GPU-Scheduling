@@ -1,0 +1,554 @@
+"""Deterministic small-trace evaluator for scheduler policy validation.
+
+This deliberately models non-preemptive pack drain boundaries and is intended
+for fixtures/oracle comparisons, not as the production scheduling loop.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from itertools import combinations, product
+import math
+import statistics
+from typing import Callable, Iterable
+
+
+@dataclass(frozen=True, slots=True)
+class TraceBatchOption:
+    batch_size: int
+    memory_mb: float
+    solo_seconds: float
+    actual_memory_mb: float | None = None
+    actual_solo_seconds: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TraceJob:
+    job_id: str
+    release_seconds: float
+    priority: int
+    options: tuple[TraceBatchOption, ...]
+    backend_allowlist: tuple[str, ...] = ("cuda_process",)
+    validation_metrics: tuple[float | None, ...] = ()
+    planned_epochs: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TraceBackendChange:
+    at_seconds: float
+    backend_name: str
+    available: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TraceMemorySample:
+    at_seconds: float
+    used_fraction: float
+
+
+@dataclass(frozen=True, slots=True)
+class TracePack:
+    members: tuple[TraceJob, ...]
+    options: tuple[TraceBatchOption, ...]
+    completion_offsets: tuple[float, ...]
+    drain_seconds: float
+    backend_name: str = "exclusive"
+    predicted_completion_offsets: tuple[float, ...] = ()
+    predicted_drain_seconds: float = 0.0
+    member_slowdowns: tuple[float, ...] = ()
+
+    @property
+    def memory_mb(self) -> float:
+        return sum(option.memory_mb for option in self.options)
+
+    @property
+    def actual_memory_mb(self) -> float:
+        return sum(option.actual_memory_mb if option.actual_memory_mb is not None else option.memory_mb for option in self.options)
+
+@dataclass(frozen=True, slots=True)
+class TraceMetrics:
+    policy: str
+    makespan_seconds: float
+    total_flow_seconds: float
+    mean_flow_seconds: float
+    weighted_mean_flow_seconds: float
+    median_flow_seconds: float
+    p95_flow_seconds: float
+    max_wait_seconds: float
+    starvation_count: int
+    jobs_per_hour: float
+    average_slowdown: float = 1.0
+    predicted_avg_vram_mb: float = 0.0
+    actual_avg_vram_mb: float = 0.0
+    actual_memory_over_budget_count: int = 0
+    early_stopped_epochs_saved: int = 0
+    early_stopped_wall_time_saved_seconds: float = 0.0
+    hard_constraint_violations: int = 0
+
+    def to_dict(self) -> dict[str, float | int | str]:
+        return {
+            "policy": self.policy,
+            "makespan_seconds": self.makespan_seconds,
+            "total_flow_seconds": self.total_flow_seconds,
+            "mean_flow_seconds": self.mean_flow_seconds,
+            "weighted_mean_flow_seconds": self.weighted_mean_flow_seconds,
+            "median_flow_seconds": self.median_flow_seconds,
+            "p95_flow_seconds": self.p95_flow_seconds,
+            "max_wait_seconds": self.max_wait_seconds,
+            "starvation_count": self.starvation_count,
+            "jobs_per_hour": self.jobs_per_hour,
+            "average_slowdown": self.average_slowdown,
+            "predicted_avg_vram_mb": self.predicted_avg_vram_mb,
+            "actual_avg_vram_mb": self.actual_avg_vram_mb,
+            "actual_memory_over_budget_count": self.actual_memory_over_budget_count,
+            "early_stopped_epochs_saved": self.early_stopped_epochs_saved,
+            "early_stopped_wall_time_saved_seconds": self.early_stopped_wall_time_saved_seconds,
+            "hard_constraint_violations": self.hard_constraint_violations,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TraceProblem:
+    jobs: tuple[TraceJob, ...]
+    memory_budget_mb: float
+    parallel_cap: int | None = None
+    default_slowdown: float = 1.0
+    slowdown_by_pair: dict[tuple[str, str], float] | None = None
+    compatibility_by_pair: dict[tuple[str, str], bool] | None = None
+    initial_backend_availability: dict[str, bool] = field(
+        default_factory=lambda: {"exclusive": True, "cuda_process": True}
+    )
+    backend_changes: tuple[TraceBackendChange, ...] = ()
+    live_memory_samples: tuple[TraceMemorySample, ...] = ()
+    admission_stop_fraction: float = 0.90
+    admission_resume_fraction: float = 0.85
+    admission_window_seconds: float = 10.0
+    early_stopping_enabled: bool = False
+    early_stopping_mode: str = "max"
+    early_stopping_patience_epochs: int = 5
+    early_stopping_min_delta: float = 0.0
+    early_stopping_min_epochs: int = 1
+    priority_weight: float = 0.10
+    starvation_timeout_seconds: float = 1800.0
+
+    def pair_slowdown(self, left: TraceJob, right: TraceJob) -> float:
+        ordered = sorted((left.job_id, right.job_id))
+        key = (ordered[0], ordered[1])
+        return float((self.slowdown_by_pair or {}).get(key, self.default_slowdown))
+
+    def pair_compatible(self, left: TraceJob, right: TraceJob) -> bool:
+        ordered = sorted((left.job_id, right.job_id))
+        return bool((self.compatibility_by_pair or {}).get((ordered[0], ordered[1]), True))
+
+
+def _backend_availability(problem: TraceProblem, now: float) -> dict[str, bool]:
+    availability = dict(problem.initial_backend_availability)
+    for change in sorted(problem.backend_changes, key=lambda item: (item.at_seconds, item.backend_name)):
+        if change.at_seconds > now + 1e-9:
+            break
+        availability[change.backend_name] = change.available
+    return availability
+
+
+def _admission_open(problem: TraceProblem, now: float) -> bool:
+    is_open = True
+    below_resume_since: float | None = None
+    window: list[TraceMemorySample] = []
+    for sample in sorted(problem.live_memory_samples, key=lambda item: item.at_seconds):
+        if sample.at_seconds > now + 1e-9:
+            break
+        cutoff = sample.at_seconds - problem.admission_window_seconds
+        window.append(sample)
+        window = [item for item in window if item.at_seconds >= cutoff]
+        average = statistics.fmean(item.used_fraction for item in window)
+        complete_window = bool(window and sample.at_seconds - window[0].at_seconds >= problem.admission_window_seconds)
+        if is_open:
+            if complete_window and average >= problem.admission_stop_fraction:
+                is_open = False
+                below_resume_since = None
+        elif average <= problem.admission_resume_fraction:
+            below_resume_since = sample.at_seconds if below_resume_since is None else below_resume_since
+            if sample.at_seconds - below_resume_since >= problem.admission_window_seconds:
+                is_open = True
+                below_resume_since = None
+        else:
+            below_resume_since = None
+    return is_open
+
+
+def _early_stop_epoch(problem: TraceProblem, job: TraceJob) -> int:
+    planned_epochs = max(1, int(job.planned_epochs or len(job.validation_metrics) or 1))
+    if not problem.early_stopping_enabled or not job.validation_metrics:
+        return planned_epochs
+    best: float | None = None
+    bad_epochs = 0
+    for epoch, raw_metric in enumerate(job.validation_metrics[:planned_epochs], start=1):
+        if raw_metric is None or not math.isfinite(float(raw_metric)):
+            continue
+        metric = float(raw_metric)
+        improved = best is None
+        if best is not None:
+            improved = (
+                metric > best + problem.early_stopping_min_delta
+                if problem.early_stopping_mode == "max"
+                else metric < best - problem.early_stopping_min_delta
+            )
+        if improved:
+            best = metric
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+        if epoch >= problem.early_stopping_min_epochs and bad_epochs >= problem.early_stopping_patience_epochs:
+            return epoch
+    return planned_epochs
+
+
+def _actual_solo_seconds(problem: TraceProblem, job: TraceJob, option: TraceBatchOption) -> float:
+    full_seconds = option.actual_solo_seconds if option.actual_solo_seconds is not None else option.solo_seconds
+    planned_epochs = max(1, int(job.planned_epochs or len(job.validation_metrics) or 1))
+    return float(full_seconds) * _early_stop_epoch(problem, job) / planned_epochs
+
+
+def _backend_for_members(problem: TraceProblem, members: tuple[TraceJob, ...], now: float) -> str | None:
+    availability = _backend_availability(problem, now)
+    if len(members) == 1 and availability.get("exclusive", False):
+        return "exclusive"
+    common = set(members[0].backend_allowlist)
+    for member in members[1:]:
+        common.intersection_update(member.backend_allowlist)
+    for backend_name in sorted(common):
+        if backend_name != "exclusive" and availability.get(backend_name, False):
+            return backend_name
+    return None
+
+
+def feasible_packs(problem: TraceProblem, jobs: Iterable[TraceJob], *, now: float = 0.0) -> list[TracePack]:
+    ready = tuple(sorted(jobs, key=lambda job: job.job_id))
+    cap = min(len(ready), problem.parallel_cap or len(ready))
+    packs: list[TracePack] = []
+    for size in range(1, cap + 1):
+        for members in combinations(ready, size):
+            backend_name = _backend_for_members(problem, members, now)
+            if backend_name is None:
+                continue
+            if size > 1 and (not _admission_open(problem, now) or any(not problem.pair_compatible(left, right) for left, right in combinations(members, 2))):
+                continue
+            for option_vector in product(*(job.options for job in members)):
+                if sum(option.memory_mb for option in option_vector) > problem.memory_budget_mb + 1e-9:
+                    continue
+                slowdowns: list[float] = []
+                for member in members:
+                    slowdown = 1.0 + sum(max(0.0, problem.pair_slowdown(member, other) - 1.0) for other in members if other != member)
+                    slowdowns.append(slowdown)
+                predicted_offsets = tuple(option.solo_seconds for option in option_vector)
+                actual_offsets = tuple(
+                    _actual_solo_seconds(problem, member, option) * slowdown
+                    for member, option, slowdown in zip(members, option_vector, slowdowns, strict=True)
+                )
+                packs.append(
+                    TracePack(
+                        members=members,
+                        options=option_vector,
+                        completion_offsets=actual_offsets,
+                        drain_seconds=max(actual_offsets),
+                        backend_name=backend_name,
+                        predicted_completion_offsets=predicted_offsets,
+                        predicted_drain_seconds=max(predicted_offsets),
+                        member_slowdowns=tuple(slowdowns),
+                    )
+                )
+    return packs
+
+
+def _weights(problem: TraceProblem, jobs: Iterable[TraceJob]) -> dict[str, float]:
+    materialized = tuple(jobs)
+    minimum = min((job.priority for job in materialized), default=0)
+    return {job.job_id: 1.0 + problem.priority_weight * (job.priority - minimum) for job in materialized}
+
+
+def _time_aware_choice(problem: TraceProblem, ready: tuple[TraceJob, ...], now: float) -> TracePack:
+    weights = _weights(problem, ready)
+    starving = [job for job in ready if now - job.release_seconds >= problem.starvation_timeout_seconds]
+    anchor = (
+        min(starving, key=lambda job: (job.release_seconds, job.job_id))
+        if starving
+        else sorted(
+            ready,
+            key=lambda job: (-job.priority, job.release_seconds, job.job_id),
+        )[0]
+    )
+    exclusive_duration = min(option.solo_seconds for option in anchor.options if option.memory_mb <= problem.memory_budget_mb)
+    exclusive_flow = exclusive_duration * sum(weights.values())
+    scored: list[tuple[tuple[object, ...], TracePack]] = []
+    for pack in feasible_packs(problem, ready, now=now):
+        if starving and anchor not in pack.members:
+            continue
+        member_ids = {member.job_id for member in pack.members}
+        flow_cost = sum(
+            weights[member.job_id] * duration
+            for member, duration in zip(pack.members, pack.predicted_completion_offsets, strict=True)
+        ) + pack.predicted_drain_seconds * sum(weight for job_id, weight in weights.items() if job_id not in member_ids)
+        score = flow_cost / max(1e-9, exclusive_flow)
+        key = (
+            score,
+            min(member.release_seconds for member in pack.members),
+            -len(pack.members),
+            pack.memory_mb,
+            tuple(member.job_id for member in pack.members),
+            tuple(option.batch_size for option in pack.options),
+        )
+        scored.append((key, pack))
+    if not scored:
+        return next(pack for pack in feasible_packs(problem, (anchor,), now=now) if pack.options[0].solo_seconds == exclusive_duration)
+    return min(scored, key=lambda item: item[0])[1]
+
+
+def _serial_choice(problem: TraceProblem, ready: tuple[TraceJob, ...], now: float) -> TracePack:
+    anchor = sorted(ready, key=lambda job: (-job.priority, job.release_seconds, job.job_id))[0]
+    return min(
+        feasible_packs(problem, (anchor,), now=now),
+        key=lambda pack: (
+            pack.predicted_drain_seconds,
+            pack.memory_mb,
+            pack.options[0].batch_size,
+        ),
+    )
+
+
+def _fill_choice(problem: TraceProblem, ready: tuple[TraceJob, ...], now: float) -> TracePack:
+    return min(
+        feasible_packs(problem, ready, now=now),
+        key=lambda pack: (
+            -pack.memory_mb,
+            -len(pack.members),
+            tuple(member.job_id for member in pack.members),
+            tuple(-option.batch_size for option in pack.options),
+        ),
+    )
+
+
+def simulate_policy(
+    problem: TraceProblem,
+    policy: str,
+    chooser: Callable[[TraceProblem, tuple[TraceJob, ...], float], TracePack],
+) -> TraceMetrics:
+    remaining = {job.job_id: job for job in problem.jobs}
+    completion: dict[str, float] = {}
+    first_dispatch: dict[str, float] = {}
+    dispatches: list[tuple[float, TracePack]] = []
+    now = min((job.release_seconds for job in problem.jobs), default=0.0)
+    while remaining:
+        ready = tuple(job for job in remaining.values() if job.release_seconds <= now + 1e-9)
+        if not ready:
+            now = min(job.release_seconds for job in remaining.values())
+            continue
+        pack = chooser(problem, ready, now)
+        dispatches.append((now, pack))
+        for job, offset in zip(pack.members, pack.completion_offsets, strict=True):
+            first_dispatch[job.job_id] = now
+            completion[job.job_id] = now + offset
+            remaining.pop(job.job_id)
+        now += pack.drain_seconds
+    return trace_metrics(problem, policy, completion, first_dispatch, dispatches=dispatches)
+
+
+def trace_metrics(
+    problem: TraceProblem,
+    policy: str,
+    completion: dict[str, float],
+    first_dispatch: dict[str, float],
+    *,
+    dispatches: Iterable[tuple[float, TracePack]] = (),
+) -> TraceMetrics:
+    if not problem.jobs:
+        return TraceMetrics(policy, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0)
+    flows = [completion[job.job_id] - job.release_seconds for job in problem.jobs]
+    waits = [first_dispatch[job.job_id] - job.release_seconds for job in problem.jobs]
+    ordered_flow = sorted(flows)
+    p95_index = max(0, math.ceil(0.95 * len(ordered_flow)) - 1)
+    makespan = max(completion.values()) - min(job.release_seconds for job in problem.jobs)
+    weights = _weights(problem, problem.jobs)
+    weighted_flow = sum(weights[job.job_id] * (completion[job.job_id] - job.release_seconds) for job in problem.jobs) / max(1e-9, sum(weights.values()))
+    materialized_dispatches = list(dispatches)
+    packs = [pack for _, pack in materialized_dispatches]
+    slowdowns = [slowdown for pack in packs for slowdown in pack.member_slowdowns]
+    hard_violations = 0
+    for started_at, pack in materialized_dispatches:
+        availability = _backend_availability(problem, started_at)
+        if pack.memory_mb > problem.memory_budget_mb + 1e-9:
+            hard_violations += 1
+        if problem.parallel_cap is not None and len(pack.members) > problem.parallel_cap:
+            hard_violations += 1
+        if not availability.get(pack.backend_name, False):
+            hard_violations += 1
+        if any(member.release_seconds > started_at + 1e-9 for member in pack.members):
+            hard_violations += 1
+        if any(not problem.pair_compatible(left, right) for left, right in combinations(pack.members, 2)):
+            hard_violations += 1
+        if len(pack.members) > 1 and not _admission_open(problem, started_at):
+            hard_violations += 1
+    early_stopped_epochs_saved = 0
+    early_stopped_wall_time_saved_seconds = 0.0
+    for job in problem.jobs:
+        planned_epochs = max(1, int(job.planned_epochs or len(job.validation_metrics) or 1))
+        stop_epoch = _early_stop_epoch(problem, job)
+        early_stopped_epochs_saved += max(0, planned_epochs - stop_epoch)
+        if stop_epoch < planned_epochs:
+            selected_pack = next(pack for _, pack in materialized_dispatches if job in pack.members)
+            option = selected_pack.options[selected_pack.members.index(job)]
+            full_seconds = option.actual_solo_seconds if option.actual_solo_seconds is not None else option.solo_seconds
+            early_stopped_wall_time_saved_seconds += float(full_seconds) * (planned_epochs - stop_epoch) / planned_epochs
+    return TraceMetrics(
+        policy=policy,
+        makespan_seconds=makespan,
+        total_flow_seconds=sum(flows),
+        mean_flow_seconds=statistics.fmean(flows),
+        weighted_mean_flow_seconds=weighted_flow,
+        median_flow_seconds=statistics.median(flows),
+        p95_flow_seconds=ordered_flow[p95_index],
+        max_wait_seconds=max(waits),
+        starvation_count=sum(wait >= problem.starvation_timeout_seconds for wait in waits),
+        jobs_per_hour=(3600.0 * len(problem.jobs) / makespan) if makespan > 0 else 0.0,
+        average_slowdown=statistics.fmean(slowdowns) if slowdowns else 1.0,
+        predicted_avg_vram_mb=statistics.fmean(pack.memory_mb for pack in packs) if packs else 0.0,
+        actual_avg_vram_mb=statistics.fmean(pack.actual_memory_mb for pack in packs) if packs else 0.0,
+        actual_memory_over_budget_count=sum(pack.actual_memory_mb > problem.memory_budget_mb + 1e-9 for pack in packs),
+        early_stopped_epochs_saved=early_stopped_epochs_saved,
+        early_stopped_wall_time_saved_seconds=early_stopped_wall_time_saved_seconds,
+        hard_constraint_violations=hard_violations,
+    )
+
+
+def oracle(problem: TraceProblem, *, serial_baseline: TraceMetrics) -> TraceMetrics:
+    weights = _weights(problem, problem.jobs)
+    best_key: tuple[float, float, float] | None = None
+    best_result: tuple[dict[str, float], dict[str, float], tuple[tuple[float, TracePack], ...]] | None = None
+
+    def visit(
+        remaining: dict[str, TraceJob],
+        now: float,
+        completion: dict[str, float],
+        first_dispatch: dict[str, float],
+        dispatches: tuple[tuple[float, TracePack], ...],
+    ) -> None:
+        nonlocal best_key, best_result
+        if not remaining:
+            makespan = max(completion.values()) - min(job.release_seconds for job in problem.jobs)
+            weighted_flow = sum(weights[job.job_id] * (completion[job.job_id] - job.release_seconds) for job in problem.jobs) / max(1e-9, sum(weights.values()))
+            score = weighted_flow / max(1e-9, serial_baseline.weighted_mean_flow_seconds)
+            key = (score, makespan, weighted_flow)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_result = (dict(completion), dict(first_dispatch), dispatches)
+            return
+        ready = tuple(job for job in remaining.values() if job.release_seconds <= now + 1e-9)
+        if not ready:
+            visit(
+                remaining,
+                min(job.release_seconds for job in remaining.values()),
+                completion,
+                first_dispatch,
+                dispatches,
+            )
+            return
+        for pack in feasible_packs(problem, ready, now=now):
+            next_remaining = dict(remaining)
+            next_completion = dict(completion)
+            next_dispatch = dict(first_dispatch)
+            for job, offset in zip(pack.members, pack.completion_offsets, strict=True):
+                next_remaining.pop(job.job_id)
+                next_completion[job.job_id] = now + offset
+                next_dispatch[job.job_id] = now
+            visit(
+                next_remaining,
+                now + pack.drain_seconds,
+                next_completion,
+                next_dispatch,
+                (*dispatches, (now, pack)),
+            )
+
+    visit(
+        {job.job_id: job for job in problem.jobs},
+        min(job.release_seconds for job in problem.jobs),
+        {},
+        {},
+        (),
+    )
+    assert best_result is not None
+    completion, first_dispatch, dispatches = best_result
+    return trace_metrics(
+        problem,
+        "small_trace_oracle",
+        completion,
+        first_dispatch,
+        dispatches=dispatches,
+    )
+
+
+def compare_policies(problem: TraceProblem) -> list[TraceMetrics]:
+    serial = simulate_policy(problem, "serial_fifo", _serial_choice)
+    return [
+        serial,
+        simulate_policy(problem, "legacy_vram_fill", _fill_choice),
+        simulate_policy(problem, "parallel_time_aware", _time_aware_choice),
+        oracle(problem, serial_baseline=serial),
+    ]
+
+
+def benchmark_fixture() -> TraceProblem:
+    def job(job_id: str, release: float, priority: int = 0) -> TraceJob:
+        return TraceJob(
+            job_id,
+            release,
+            priority,
+            (
+                TraceBatchOption(1, 1_500, 13.0, actual_memory_mb=1_550),
+                TraceBatchOption(2, 1_800, 11.0, actual_memory_mb=1_850),
+                TraceBatchOption(4, 2_000, 10.0, actual_memory_mb=2_050),
+                TraceBatchOption(8, 3_500, 12.0, actual_memory_mb=3_600),
+                TraceBatchOption(16, 5_000, 15.0, actual_memory_mb=5_100),
+            ),
+            validation_metrics=((0.50, 0.60, 0.60, 0.59, 0.58, 0.57) if job_id == "d" else ()),
+            planned_epochs=(6 if job_id == "d" else None),
+        )
+
+    jobs = (job("a", 0), job("b", 0), job("c", 0), job("d", 5, 1))
+    slowdowns = {(left, right): 1.10 for left, right in combinations(sorted(member.job_id for member in jobs), 2)}
+    return TraceProblem(
+        jobs=jobs,
+        memory_budget_mb=10_000,
+        parallel_cap=2,
+        slowdown_by_pair=slowdowns,
+        starvation_timeout_seconds=60,
+        early_stopping_enabled=True,
+        early_stopping_patience_epochs=2,
+        early_stopping_min_epochs=2,
+    )
+
+
+def markdown_table(metrics: Iterable[TraceMetrics]) -> str:
+    rows = [
+        "| Policy | Makespan (s) | Total flow (s) | Mean flow (s) | Weighted flow (s) | Median flow (s) | p95 flow (s) | Max wait (s) | Starved | Jobs/hour | Slowdown | Pred/actual VRAM (MiB) | Actual over-budget packs | Early epochs/time saved | Violations |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for item in metrics:
+        rows.append(
+            f"| {item.policy} | {item.makespan_seconds:.2f} | {item.total_flow_seconds:.2f} | "
+            f"{item.mean_flow_seconds:.2f} | {item.weighted_mean_flow_seconds:.2f} | "
+            f"{item.median_flow_seconds:.2f} | {item.p95_flow_seconds:.2f} | {item.max_wait_seconds:.2f} | "
+            f"{item.starvation_count} | {item.jobs_per_hour:.2f} | {item.average_slowdown:.3f} | "
+            f"{item.predicted_avg_vram_mb:.1f}/{item.actual_avg_vram_mb:.1f} | "
+            f"{item.actual_memory_over_budget_count} | "
+            f"{item.early_stopped_epochs_saved}/{item.early_stopped_wall_time_saved_seconds:.1f}s | "
+            f"{item.hard_constraint_violations} |"
+        )
+    return "\n".join(rows)
+
+
+def main() -> int:
+    print(markdown_table(compare_policies(benchmark_fixture())))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

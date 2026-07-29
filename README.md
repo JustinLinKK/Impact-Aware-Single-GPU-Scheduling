@@ -4,7 +4,7 @@
 
 - a single-GPU scheduler with priority queueing, safe-point pause/resume, persistence, and restart recovery
 - a RAM-backed baseline-model cache with optional LRU entry-capacity and RAM-percent limits that keeps immutable CPU-side baselines warm and serves isolated copies to worker subprocesses
-- packed GPU scheduling for structured runner jobs, including fixed-width packed groups and `parallel_auto_pack` admission that targets VRAM or SM utilization
+- time-aware GPU packing that chooses ready jobs, batch sizes, and concurrent backends from predicted completion time, average VRAM, and compatibility evidence
 - optional Linux hybrid overlap across `mps` and `stream` backend groups on one GPU when concurrent groups are enabled
 - optional exclusive-path batch-size probing with SQLite-backed reuse for repeated model/device/shape combinations
 - one-epoch runtime profiling that makes new job families pack-eligible after the first exclusive calibration run
@@ -145,8 +145,84 @@ propagation run in a timed subprocess with GPU visibility disabled. An
 unsupported source, timeout, or invalid result falls back only that job.
 
 All placement modes use average used GPU VRAM in MiB (`avg_vram_mb`) for
-packing. Peak VRAM remains observable and the live memory hard-stop continues
-to protect active runs.
+packing. In `parallel_time_aware`, device-level memory is averaged over a time
+window: sustained use at the stop threshold closes only new packed admission,
+and active work continues normally. Admission reopens after a complete window
+below the resume threshold. GPU/SM utilization is not a placement input for
+this mode.
+
+## Time-aware scheduling
+
+`parallel_time_aware` requests the five exponent offsets `[-2,-1,0,1,2]`
+around each immutable originally requested power-of-two batch size. Exact
+batch observations are preferred, and a missing runtime estimate never becomes
+zero. Dominated memory/runtime choices are removed before bounded exact or beam
+search.
+
+For candidate pack `g`, member `j` has remaining time `p_j`, completion offset
+`d_j=p_j`, and drain time `D=max_j(d_j)`. The implemented score is minimized:
+
+```text
+L_F = sum(selected weight_j * d_j) + D * sum(unselected weight_j)
+score = L_F / max(epsilon, L_F(exclusive anchor))
+```
+
+Average VRAM, the parallel cap, backend availability, compatibility history,
+live admission state, and exclusive-probe drain state are hard constraints.
+There is no VRAM-fill reward. Slowdown prediction and throughput/makespan
+controls are intentionally deferred: stored slowdown evidence never affects
+placement, and throughput is reported only after execution. Jobs crossing the
+starvation timeout become mandatory anchors; if no pack is feasible, the oldest
+anchor runs exclusively at the next legal drain boundary.
+
+The former throughput controls `makespan_weight`, `flow_time_weight`, and
+`min_aggregate_gain` are no longer accepted. Remove them from existing
+configuration before starting the scheduler; `objective.priority_weight` and
+`objective.objective_version` remain supported.
+
+Jobs with `scheduling_class: exclusive_probe` reserve the next idle boundary.
+Existing packs drain without preemption and no normal work is admitted during
+the reservation. Early stopping is evaluated synchronously at epoch safe
+points and persists its patience state in job metadata across pause/restart.
+`save_best_checkpoint` protects the tagged best checkpoint from normal pruning.
+Reports include saved epochs and estimated wall time saved when the runner
+provides a remaining-runtime estimate (or epoch step timing).
+Generic runners still own model-state restoration; `restore_best_checkpoint`
+is reserved for a runner-level restore hook and is not applied implicitly.
+
+The deterministic validation fixture can be run with:
+
+```bash
+python -m localml_scheduler.scheduler.trace_simulator
+```
+
+It compares serial FIFO, legacy VRAM-fill packing, the time-aware policy, and
+an exhaustive small-trace oracle, reporting makespan, flow time, waiting,
+starvation, jobs/hour, predicted/actual VRAM, realized slowdown, and saved
+early-stop work. The simulator accepts live backend changes, rolling-memory
+samples, compatibility matrices, realized-slowdown matrices, and validation
+sequences. Slowdown changes simulated actual completion but is not visible to
+the placement policy. The exhaustive
+oracle remains intentionally limited to small, non-preemptive drain-boundary
+fixtures.
+
+The real-GPU benchmark performs a hardware-specific five-option calibration,
+then runs serial FIFO, the previous fill-based policy, and time-aware packing
+at least twice from isolated runtime directories. It records means, sample
+variance, standard deviation, raw runs, hardware identity, makespan, and flow
+metrics. A matched exclusive solo control replays each time-aware selected
+batch so measured slowdown is not confounded by batch-size changes:
+
+```bash
+python scheduler_benchmark_test/repeat_time_aware_benchmark.py \
+  --results-dir results/scheduler_benchmark_test/a10_time_aware \
+  --data-root /path/to/cassava/prepared/public \
+  --repetitions 3
+```
+
+The command requires an NVIDIA A10 by default and refuses to mislabel results
+from other GPUs. `--allow-hardware-mismatch` exists only for clearly labelled
+local harness validation.
 
 Jobs may optionally include a `preload_source` with `model_id`, `model_path`, and `loader_target`. When present, the scheduler warms that shared source in RAM instead of the job's normal baseline target. This is useful for raw MLEvolve runs where many sibling jobs share one immutable starting checkpoint but still execute different generated scripts.
 
@@ -162,6 +238,8 @@ The normal pause flow is:
 
 - `parallel_default` and `parallel_batch_optimized` keep the legacy fixed-width packed-group behavior and still fall back to exclusive execution when compatibility or memory evidence is missing
 - `parallel_auto_pack` ignores `max_packed_jobs_per_gpu` and keeps admitting work until the configured `auto_pack.target_metric` (`vram` or `sm`) is close to its target threshold
+- `parallel_time_aware` uses `parallel_job_cap` (`null` means unlimited); if absent, an explicitly supplied legacy `max_packed_jobs_per_gpu` is mapped to it
+- `safe_vram_budget_gib` remains a compatibility input for older modes; time-aware mode uses detected/configured total VRAM times `predicted_budget_fraction`
 - the packed path is opt-in per job via `packing.eligible: true` and a stable `packing.signature`
 - backend compatibility is tracked per backend, so an MPS failure does not automatically poison a stream pairing
 - Linux deployments can enable `concurrent_groups_enabled: true` with `concurrent_backend_allowlist: ["mps", "stream"]` to overlap an MPS group and a stream group on the same GPU
@@ -176,6 +254,6 @@ The normal pause flow is:
 ## Tests
 
 ```bash
-python -m unittest discover localml_scheduler/tests
-python -m unittest localml_scheduler.tests.test_ml_stress -v
+python -m pytest -q localml_scheduler/tests
+python -m pytest -q localml_scheduler/tests/test_ml_stress.py
 ```

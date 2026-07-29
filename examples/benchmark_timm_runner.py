@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 import json
+import math
 import random
 import time
 
@@ -53,6 +54,19 @@ def _build_dataloader(
 
     dataframe = pd.read_csv(f"{data_root}/train.csv").sample(n=subset_size, random_state=seed).reset_index(drop=True)
     image_dir = Path(data_root) / "train_images"
+    image_column = next(
+        (name for name in ("image_id", "id_code", "id") if name in dataframe.columns),
+        None,
+    )
+    label_column = next(
+        (name for name in ("label", "diagnosis", "target") if name in dataframe.columns),
+        None,
+    )
+    if image_column is None or label_column is None:
+        raise ValueError(
+            "benchmark train.csv must contain an image column (image_id/id_code/id) "
+            "and a label column (label/diagnosis/target)"
+        )
     transform = transforms.Compose(
         [
             transforms.Resize((224, 224)),
@@ -61,14 +75,20 @@ def _build_dataloader(
         ]
     )
 
-    class CassavaDataset(Dataset):
+    class CassavaDataset(Dataset):  # type: ignore[misc,valid-type]
         def __len__(self) -> int:
             return len(dataframe)
 
         def __getitem__(self, index: int):
             row = dataframe.iloc[index]
-            image = Image.open(image_dir / row["image_id"]).convert("RGB")
-            return transform(image), int(row["label"])
+            image_path = image_dir / str(row[image_column])
+            if not image_path.suffix:
+                image_path = next(
+                    (candidate for suffix in (".png", ".jpg", ".jpeg") if (candidate := image_path.with_suffix(suffix)).exists()),
+                    image_path,
+                )
+            image = Image.open(image_path).convert("RGB")
+            return transform(image), int(row[label_column])
 
     return DataLoader(
         CassavaDataset(),
@@ -99,10 +119,11 @@ def probe_timm_benchmark_batch_size(
     measure_steps: int,
 ):
     """Probe one candidate batch size using synthetic inputs for fast VRAM sizing."""
-    params = {
+    params: dict[str, Any] = {
         "model_name": None,
         "num_classes": 5,
         "batch_size": 16,
+        "subset_size": 4000,
         "learning_rate": 1e-3,
         "probe_max_batch_size": None,
     }
@@ -128,12 +149,15 @@ def probe_timm_benchmark_batch_size(
         synthetic_peak = None
         if estimated_vram is not None:
             synthetic_peak = int(float(estimated_vram) * (float(batch_size) / float(base_batch_size)))
+        steps_per_epoch = max(1, math.ceil(int(params["subset_size"]) / int(batch_size)))
         return {
             "fits": True,
             "peak_vram_mb": synthetic_peak,
             "avg_vram_mb": synthetic_peak,
             "memory_total_mb": None,
             "avg_step_time_ms": 1.0,
+            "steps_per_epoch": steps_per_epoch,
+            "seconds_per_epoch": steps_per_epoch / 1000.0,
             "message": "synthetic CPU probe result",
         }
 
@@ -183,6 +207,8 @@ def probe_timm_benchmark_batch_size(
                 )
         torch.cuda.synchronize(device)
         elapsed_ms = ((time.perf_counter() - start_time) * 1000.0) if start_time is not None else None
+        average_step_ms = (elapsed_ms / measured) if elapsed_ms is not None else None
+        steps_per_epoch = max(1, math.ceil(int(params["subset_size"]) / int(batch_size)))
         return {
             "fits": True,
             "peak_vram_mb": int(torch.cuda.max_memory_allocated(device) / (1024 * 1024)),
@@ -192,7 +218,13 @@ def probe_timm_benchmark_batch_size(
                 else None
             ),
             "memory_total_mb": int(torch.cuda.get_device_properties(device).total_memory / (1024 * 1024)),
-            "avg_step_time_ms": (elapsed_ms / measured) if elapsed_ms is not None else None,
+            "avg_step_time_ms": average_step_ms,
+            "steps_per_epoch": steps_per_epoch,
+            "seconds_per_epoch": (
+                average_step_ms * steps_per_epoch / 1000.0
+                if average_step_ms is not None
+                else None
+            ),
             "message": "cuda probe completed",
         }
     except RuntimeError as exc:
@@ -215,7 +247,7 @@ def probe_timm_benchmark_batch_size(
 
 def run_timm_benchmark_job(context: RunnerContext) -> dict[str, Any]:
     """Train one TIMM model on the cassava subset used by the benchmark harness."""
-    params = {
+    params: dict[str, Any] = {
         "data_root": "",
         "subset_size": 4000,
         "batch_size": 16,
@@ -227,6 +259,12 @@ def run_timm_benchmark_job(context: RunnerContext) -> dict[str, Any]:
         "num_classes": 5,
     }
     params.update(context.job.config.runner_kwargs)
+
+    if context.job.metadata.get("benchmark_probe_only"):
+        return {
+            "calibration_only": True,
+            "message": "five-option probe completed; training body intentionally skipped",
+        }
 
     seed = int(params.get("dataset_seed", 42))
     random.seed(seed)

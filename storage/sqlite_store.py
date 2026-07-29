@@ -6,7 +6,9 @@ from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 import json
+import math
 import sqlite3
+import statistics
 
 from ..domain import (
     BatchSizeObservation,
@@ -176,7 +178,14 @@ class SQLiteStateStore:
         self.save_job(job)
         return job
 
-    def set_job_status(self, job_id: str, status: JobStatus, *, reason: str | None = None, hold: bool | None = None) -> TrainingJob:
+    def set_job_status(
+        self,
+        job_id: str,
+        status: JobStatus,
+        *,
+        reason: str | None = None,
+        hold: bool | None = None,
+    ) -> TrainingJob:
         return self.update_job(job_id, status=status, reason=reason, hold=hold)
 
     def delete_job(self, job_id: str) -> None:
@@ -184,7 +193,13 @@ class SQLiteStateStore:
             connection.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
             connection.commit()
 
-    def enqueue_command(self, command_type: CommandType, *, job_id: str | None = None, payload: dict[str, Any] | None = None) -> int:
+    def enqueue_command(
+        self,
+        command_type: CommandType,
+        *,
+        job_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> int:
         payload_json = json.dumps(payload or {}, sort_keys=True)
         created_at = utc_now()
         with self._connect() as connection:
@@ -196,6 +211,7 @@ class SQLiteStateStore:
                 (job_id, command_type.value, payload_json, created_at),
             )
             connection.commit()
+            assert cursor.lastrowid is not None
             return int(cursor.lastrowid)
 
     def fetch_pending_commands(self, limit: int = 100) -> list[JobCommand]:
@@ -214,17 +230,31 @@ class SQLiteStateStore:
 
     def mark_command_processed(self, command_id: int) -> None:
         with self._connect() as connection:
-            connection.execute("UPDATE commands SET processed_at = ? WHERE command_id = ?", (utc_now(), command_id))
+            connection.execute(
+                "UPDATE commands SET processed_at = ? WHERE command_id = ?",
+                (utc_now(), command_id),
+            )
             connection.commit()
 
-    def log_event(self, event_type: str, *, job_id: str | None = None, payload: dict[str, Any] | None = None) -> None:
+    def log_event(
+        self,
+        event_type: str,
+        *,
+        job_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO events(job_id, event_type, payload_json, created_at)
                 VALUES(?, ?, ?, ?)
                 """,
-                (job_id, event_type, json.dumps(payload or {}, sort_keys=True), utc_now()),
+                (
+                    job_id,
+                    event_type,
+                    json.dumps(payload or {}, sort_keys=True),
+                    utc_now(),
+                ),
             )
             connection.commit()
 
@@ -245,7 +275,7 @@ class SQLiteStateStore:
                 "event_id": row["event_id"],
                 "job_id": row["job_id"],
                 "event_type": row["event_type"],
-                "payload": json.loads(row["payload_json"]) if row["payload_json"] else {},
+                "payload": (json.loads(row["payload_json"]) if row["payload_json"] else {}),
                 "created_at": row["created_at"],
             }
             for row in rows
@@ -259,7 +289,12 @@ class SQLiteStateStore:
                 INSERT INTO checkpoints(job_id, checkpoint_path, created_at, metadata_json, is_latest)
                 VALUES(?, ?, ?, ?, 1)
                 """,
-                (job_id, checkpoint_path, utc_now(), json.dumps(metadata or {}, sort_keys=True)),
+                (
+                    job_id,
+                    checkpoint_path,
+                    utc_now(),
+                    json.dumps(metadata or {}, sort_keys=True),
+                ),
             )
             connection.commit()
         self.update_job(job_id, latest_checkpoint_path=checkpoint_path)
@@ -325,8 +360,7 @@ class SQLiteStateStore:
 
     def cache_metadata_summary(self) -> dict[str, Any]:
         with self._connect() as connection:
-            row = connection.execute(
-                """
+            row = connection.execute("""
                 SELECT
                     COUNT(*) AS entries,
                     COALESCE(SUM(size_bytes), 0) AS used_bytes,
@@ -334,8 +368,7 @@ class SQLiteStateStore:
                     COALESCE(SUM(hits), 0) AS hits,
                     COALESCE(SUM(misses), 0) AS misses
                 FROM cache_entries
-                """
-            ).fetchone()
+                """).fetchone()
         return dict(row)
 
     def upsert_solo_profile(self, profile: SoloProfile) -> SoloProfile:
@@ -466,7 +499,13 @@ class SQLiteStateStore:
                     ORDER BY updated_at DESC
                     LIMIT 1
                     """,
-                    (hardware_key, left_signature, right_signature, right_signature, left_signature),
+                    (
+                        hardware_key,
+                        left_signature,
+                        right_signature,
+                        right_signature,
+                        left_signature,
+                    ),
                 ).fetchone()
             else:
                 pair_key = build_backend_scoped_pair_key(left_signature, right_signature, backend_name=backend_name)
@@ -752,7 +791,13 @@ class SQLiteStateStore:
                 ORDER BY updated_at DESC
                 LIMIT 1
                 """,
-                (model_key, shape_signature, hardware_key, backend_name, int(batch_size)),
+                (
+                    model_key,
+                    shape_signature,
+                    hardware_key,
+                    backend_name,
+                    int(batch_size),
+                ),
             ).fetchone()
         return BatchSizeObservation.from_row(dict(row)) if row else None
 
@@ -920,7 +965,12 @@ class SQLiteStateStore:
         metadata: dict[str, Any] | None = None,
     ) -> PairProfile:
         hardware_key = self.hardware_key()
-        existing = self.get_pair_profile(left_signature, right_signature, hardware_key=hardware_key, backend_name=backend_name)
+        existing = self.get_pair_profile(
+            left_signature,
+            right_signature,
+            hardware_key=hardware_key,
+            backend_name=backend_name,
+        )
         cooldown_until = None
         if cooldown_seconds > 0:
             cooldown_until = (parse_timestamp(utc_now()) + timedelta(seconds=cooldown_seconds)).isoformat()
@@ -931,10 +981,10 @@ class SQLiteStateStore:
             hardware_key=hardware_key,
             compatible=False,
             observations=(existing.observations + 1) if existing else 1,
-            peak_vram_mb=peak_vram_mb if peak_vram_mb is not None else (existing.peak_vram_mb if existing else None),
-            avg_vram_mb=avg_vram_mb if avg_vram_mb is not None else (existing.avg_vram_mb if existing else None),
-            avg_gpu_utilization=avg_gpu_utilization if avg_gpu_utilization is not None else (existing.avg_gpu_utilization if existing else None),
-            avg_memory_utilization=avg_memory_utilization if avg_memory_utilization is not None else (existing.avg_memory_utilization if existing else None),
+            peak_vram_mb=(peak_vram_mb if peak_vram_mb is not None else (existing.peak_vram_mb if existing else None)),
+            avg_vram_mb=(avg_vram_mb if avg_vram_mb is not None else (existing.avg_vram_mb if existing else None)),
+            avg_gpu_utilization=(avg_gpu_utilization if avg_gpu_utilization is not None else (existing.avg_gpu_utilization if existing else None)),
+            avg_memory_utilization=(avg_memory_utilization if avg_memory_utilization is not None else (existing.avg_memory_utilization if existing else None)),
             slowdown_ratio=existing.slowdown_ratio if existing else None,
             cooldown_until=cooldown_until,
             last_failure_reason=reason,
@@ -968,6 +1018,9 @@ class SQLiteStateStore:
         events = self.list_events(event_type=None)
         wait_times: list[float] = []
         runtimes: list[float] = []
+        flow_times: list[float] = []
+        release_times = []
+        finish_times = []
         for job in jobs:
             submitted = parse_timestamp(job.submitted_at)
             started = parse_timestamp(job.started_at)
@@ -976,6 +1029,18 @@ class SQLiteStateStore:
                 wait_times.append((started - submitted).total_seconds())
             if started and finished:
                 runtimes.append((finished - started).total_seconds())
+            if submitted and finished:
+                flow_times.append((finished - submitted).total_seconds())
+                release_times.append(submitted)
+                finish_times.append(finished)
+        sorted_flows = sorted(flow_times)
+        completed_jobs_with_flow = [job for job in jobs if parse_timestamp(job.submitted_at) and parse_timestamp(job.finished_at)]
+        minimum_priority = min((job.priority for job in completed_jobs_with_flow), default=0)
+        priority_weight = float(self.settings.gpu_scheduler.objective.priority_weight)
+        flow_weights = [1.0 + priority_weight * (job.priority - minimum_priority) for job in completed_jobs_with_flow]
+        weighted_flow = sum(weight * flow for weight, flow in zip(flow_weights, flow_times, strict=True)) / max(1e-9, sum(flow_weights)) if flow_times else 0.0
+        p95_index = max(0, math.ceil(0.95 * len(sorted_flows)) - 1) if sorted_flows else 0
+        makespan = (max(finish_times) - min(release_times)).total_seconds() if finish_times and release_times else 0.0
         cache_summary = self.cache_metadata_summary()
         total_cache = int(cache_summary["hits"]) + int(cache_summary["misses"])
         return SchedulerReport(
@@ -983,9 +1048,22 @@ class SQLiteStateStore:
             completed_jobs=sum(job.status == JobStatus.COMPLETED for job in jobs),
             failed_jobs=sum(job.status == JobStatus.FAILED for job in jobs),
             cancelled_jobs=sum(job.status == JobStatus.CANCELLED for job in jobs),
-            average_queue_wait_seconds=sum(wait_times) / len(wait_times) if wait_times else 0.0,
+            average_queue_wait_seconds=(sum(wait_times) / len(wait_times) if wait_times else 0.0),
             average_runtime_seconds=sum(runtimes) / len(runtimes) if runtimes else 0.0,
-            cache_hit_rate=(int(cache_summary["hits"]) / total_cache) if total_cache else 0.0,
+            trace_makespan_seconds=makespan,
+            total_flow_time_seconds=sum(flow_times),
+            mean_flow_time_seconds=statistics.fmean(flow_times) if flow_times else 0.0,
+            weighted_mean_flow_time_seconds=weighted_flow,
+            median_flow_time_seconds=(statistics.median(flow_times) if flow_times else 0.0),
+            p95_flow_time_seconds=sorted_flows[p95_index] if sorted_flows else 0.0,
+            max_wait_time_seconds=max(wait_times, default=0.0),
+            starvation_count=sum(wait >= self.settings.gpu_scheduler.starvation_timeout_seconds for wait in wait_times),
+            jobs_per_hour=((3600.0 * len(flow_times) / makespan) if makespan > 0 else 0.0),
+            early_stopped_epochs_saved=sum(int((job.metadata.get("early_stopping_result") or {}).get("epochs_saved", 0)) for job in jobs),
+            early_stopped_wall_time_saved_seconds=sum(
+                float((job.metadata.get("early_stopping_result") or {}).get("estimated_wall_time_saved_seconds", 0.0)) for job in jobs
+            ),
+            cache_hit_rate=((int(cache_summary["hits"]) / total_cache) if total_cache else 0.0),
             cache_hits=int(cache_summary["hits"]),
             cache_misses=int(cache_summary["misses"]),
             cache_evictions=sum(event["event_type"] == "cache_evicted" for event in events),

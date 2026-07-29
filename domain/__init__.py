@@ -1,7 +1,14 @@
 """Layered domain surface for the local scheduler."""
 
 from .batching import BatchResolution, build_batch_probe_shape_signature
-from .common import _to_primitive, import_string, parse_timestamp, stable_job_id, to_primitive, utc_now
+from .common import (
+    _to_primitive,
+    import_string,
+    parse_timestamp,
+    stable_job_id,
+    to_primitive,
+    utc_now,
+)
 from .identity import (
     build_backend_scoped_pair_key,
     build_batch_probe_key,
@@ -31,6 +38,7 @@ from .jobs import (
     ResourceRequirements,
     RuntimeProbeSpec,
     SafePointType,
+    SchedulingClass,
     TrainingJob,
     normalize_batch_probe_search_mode,
     normalize_runtime_probe_strategy,
@@ -85,6 +93,7 @@ __all__ = [
     "RuntimeProfile",
     "RuntimeProbeSpec",
     "SafePointType",
+    "SchedulingClass",
     "SchedulerReport",
     "SoloProfile",
     "TrainingJob",

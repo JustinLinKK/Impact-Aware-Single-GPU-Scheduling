@@ -11,7 +11,11 @@ from ..execution.backends import ExecutionBackend
 from ..execution.control import ControlPlane
 from ..execution.executor import SubprocessExecutor, WorkerProcessHandle
 from ..domain import JobStatus, PlacementDecision, TrainingJob
-from ..config import SchedulerSettings, SCHEDULER_MODE_PARALLEL_AUTO_PACK
+from ..config import (
+    SchedulerSettings,
+    SCHEDULER_MODE_PARALLEL_AUTO_PACK,
+    SCHEDULER_MODE_PARALLEL_TIME_AWARE,
+)
 from ..storage.state_store import StateStore
 
 
@@ -65,12 +69,13 @@ class WorkerSupervisor:
         self._groups: dict[str, PlacementGroupHandle] = {}
 
     def _concurrency_enabled(self) -> bool:
-        return (
-            self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK
-            and self.settings.gpu_scheduler.concurrent_groups_enabled
-        )
+        if self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE:
+            return True
+        return self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK and self.settings.gpu_scheduler.concurrent_groups_enabled
 
     def _overlap_allowed_for_backend(self, backend_name: str) -> bool:
+        if self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE:
+            return backend_name != "exclusive" and backend_name in self.settings.gpu_scheduler.backend_priority
         return backend_name in set(self.settings.gpu_scheduler.concurrent_backend_allowlist)
 
     def available_backends(self) -> dict[str, bool]:
@@ -280,7 +285,12 @@ class WorkerSupervisor:
             for job_id, worker in list(group.workers.items()):
                 if worker.handle.monitor_via_store:
                     job = self.store.get_job(job_id)
-                    if job is None or job.status not in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.PAUSED}:
+                    if job is None or job.status not in {
+                        JobStatus.COMPLETED,
+                        JobStatus.FAILED,
+                        JobStatus.CANCELLED,
+                        JobStatus.PAUSED,
+                    }:
                         continue
                     snapshots.append(
                         WorkerSnapshot(
@@ -321,14 +331,6 @@ class WorkerSupervisor:
         self.control_plane.request_cancel(job_id, reason=reason)
         return True
 
-    def request_fallback_pause(self, job_id: str, *, reason: str) -> bool:
-        for group in self._groups.values():
-            if job_id not in group.workers:
-                continue
-            self.control_plane.request_pause(job_id, reason=reason, hold=False)
-            return True
-        return False
-
     def shutdown(self) -> None:
         seen_processes: set[int] = set()
         for group in self._groups.values():
@@ -349,11 +351,7 @@ class WorkerSupervisor:
         group = self._groups.get(group_id)
         if group is None:
             return
-        alive_workers = {
-            job_id: worker
-            for job_id, worker in group.workers.items()
-            if self._worker_is_alive(worker)
-        }
+        alive_workers = {job_id: worker for job_id, worker in group.workers.items() if self._worker_is_alive(worker)}
         group.workers = alive_workers
         group.fallback_order = [job_id for job_id in group.fallback_order if job_id in alive_workers]
         if not alive_workers:

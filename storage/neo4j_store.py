@@ -7,8 +7,10 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Any, Iterable
 import json
+import math
 import os
 import sqlite3
+import statistics
 
 from ..config import SchedulerSettings
 from ..domain import (
@@ -266,8 +268,7 @@ class Neo4jStateStore:
         return self._build_hardware_record(rows[0])
 
     def list_hardware_records(self) -> list[dict[str, Any]]:
-        rows = self._run(
-            """
+        rows = self._run("""
             MATCH (h:Hardware)
             OPTIONAL MATCH (h)-[:HAS_ACCELERATOR]->(a:Accelerator)
             OPTIONAL MATCH (h)-[:RUNS_TOOLKIT]->(t:Toolkit)
@@ -294,8 +295,7 @@ class Neo4jStateStore:
                 t.toolkit_version AS toolkit_version_node,
                 t.torch_version AS toolkit_torch_version
             ORDER BY h.updated_at DESC, h.hardware_key ASC
-            """
-        )
+            """)
         return [self._build_hardware_record(row) for row in rows]
 
     def next_queue_sequence(self) -> int:
@@ -311,7 +311,7 @@ class Neo4jStateStore:
             "task_type": job.task_type,
             "runner_target": job.config.runner_target,
             "signature": job.packing.signature,
-            "signature_uid": f"signature::{job.packing.signature}" if job.packing.signature else None,
+            "signature_uid": (f"signature::{job.packing.signature}" if job.packing.signature else None),
             "family": job.packing.family,
             "default_batch_size": int(job.config.runner_kwargs.get(job.batch_probe.batch_param_name, 0) or 0) or None,
             "default_epochs": job.max_epochs or job.config.max_epochs,
@@ -396,7 +396,10 @@ class Neo4jStateStore:
             "updated_at": now,
             "summary_text": f"Job {job.job_id} for model {job.baseline_model_id} is {job.status.value}.",
         }
-        self._run_write("MERGE (j:Job {job_id: $job_id}) SET j += $props", {"job_id": job.job_id, "props": props})
+        self._run_write(
+            "MERGE (j:Job {job_id: $job_id}) SET j += $props",
+            {"job_id": job.job_id, "props": props},
+        )
         if job.workflow_id:
             self._run_write(
                 """
@@ -446,7 +449,10 @@ class Neo4jStateStore:
         return job
 
     def get_job(self, job_id: str) -> TrainingJob | None:
-        rows = self._run("MATCH (j:Job {job_id: $job_id}) RETURN j.payload_json AS payload_json", {"job_id": job_id})
+        rows = self._run(
+            "MATCH (j:Job {job_id: $job_id}) RETURN j.payload_json AS payload_json",
+            {"job_id": job_id},
+        )
         if not rows:
             return None
         return TrainingJob.from_dict(json.loads(rows[0]["payload_json"]))
@@ -476,7 +482,14 @@ class Neo4jStateStore:
         return [TrainingJob.from_dict(json.loads(row["payload_json"])) for row in rows]
 
     def runnable_jobs(self) -> list[TrainingJob]:
-        jobs = self.list_jobs(statuses=[JobStatus.PENDING, JobStatus.READY, JobStatus.PAUSED, JobStatus.RECOVERABLE])
+        jobs = self.list_jobs(
+            statuses=[
+                JobStatus.PENDING,
+                JobStatus.READY,
+                JobStatus.PAUSED,
+                JobStatus.RECOVERABLE,
+            ]
+        )
         return [job for job in jobs if job.is_runnable()]
 
     def update_job(
@@ -514,7 +527,14 @@ class Neo4jStateStore:
         self.save_job(job)
         return job
 
-    def set_job_status(self, job_id: str, status: JobStatus, *, reason: str | None = None, hold: bool | None = None) -> TrainingJob:
+    def set_job_status(
+        self,
+        job_id: str,
+        status: JobStatus,
+        *,
+        reason: str | None = None,
+        hold: bool | None = None,
+    ) -> TrainingJob:
         return self.update_job(job_id, status=status, reason=reason, hold=hold)
 
     def delete_job(self, job_id: str) -> None:
@@ -552,7 +572,10 @@ class Neo4jStateStore:
             "processed_at": processed_at,
             "updated_at": utc_now(),
         }
-        self._run_write("MERGE (c:Command {command_id: $command_id}) SET c += $props", {"command_id": command_id, "props": props})
+        self._run_write(
+            "MERGE (c:Command {command_id: $command_id}) SET c += $props",
+            {"command_id": command_id, "props": props},
+        )
         if job_id:
             self._run_write(
                 """
@@ -563,7 +586,13 @@ class Neo4jStateStore:
                 {"job_id": job_id, "command_id": command_id},
             )
 
-    def enqueue_command(self, command_type: CommandType, *, job_id: str | None = None, payload: dict[str, Any] | None = None) -> int:
+    def enqueue_command(
+        self,
+        command_type: CommandType,
+        *,
+        job_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> int:
         command_id = self._next_sequence("command_id")
         self._upsert_command(
             command_id=command_id,
@@ -614,7 +643,10 @@ class Neo4jStateStore:
             "updated_at": created_at,
             "summary_text": f"Event {event_type} for job {job_id or 'n/a'}",
         }
-        self._run_write("MERGE (e:Event {event_id: $event_id}) SET e += $props", {"event_id": event_id, "props": props})
+        self._run_write(
+            "MERGE (e:Event {event_id: $event_id}) SET e += $props",
+            {"event_id": event_id, "props": props},
+        )
         if job_id:
             self._run_write(
                 """
@@ -624,9 +656,21 @@ class Neo4jStateStore:
                 """,
                 {"job_id": job_id, "event_id": event_id},
             )
-        self._record_run_profile_from_event(event_id=event_id, event_type=event_type, job_id=job_id, payload=payload, created_at=created_at)
+        self._record_run_profile_from_event(
+            event_id=event_id,
+            event_type=event_type,
+            job_id=job_id,
+            payload=payload,
+            created_at=created_at,
+        )
 
-    def log_event(self, event_type: str, *, job_id: str | None = None, payload: dict[str, Any] | None = None) -> None:
+    def log_event(
+        self,
+        event_type: str,
+        *,
+        job_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
         event_id = self._next_sequence("event_id")
         self._upsert_event(
             event_id=event_id,
@@ -672,7 +716,10 @@ class Neo4jStateStore:
         is_latest: bool,
     ) -> None:
         if is_latest:
-            self._run_write("MATCH (c:Checkpoint {job_id: $job_id}) SET c.is_latest = false", {"job_id": job_id})
+            self._run_write(
+                "MATCH (c:Checkpoint {job_id: $job_id}) SET c.is_latest = false",
+                {"job_id": job_id},
+            )
         props = {
             "uid": f"checkpoint::{checkpoint_id}",
             "checkpoint_id": checkpoint_id,
@@ -683,7 +730,10 @@ class Neo4jStateStore:
             "is_latest": bool(is_latest),
             "updated_at": created_at,
         }
-        self._run_write("MERGE (c:Checkpoint {checkpoint_id: $checkpoint_id}) SET c += $props", {"checkpoint_id": checkpoint_id, "props": props})
+        self._run_write(
+            "MERGE (c:Checkpoint {checkpoint_id: $checkpoint_id}) SET c += $props",
+            {"checkpoint_id": checkpoint_id, "props": props},
+        )
         self._run_write(
             """
             MATCH (j:Job {job_id: $job_id})
@@ -748,7 +798,10 @@ class Neo4jStateStore:
             "metadata_json": _json_dumps(metadata),
             "updated_at": utc_now(),
         }
-        self._run_write("MERGE (c:CacheEntry {cache_key: $cache_key}) SET c += $props", {"cache_key": props["cache_key"], "props": props})
+        self._run_write(
+            "MERGE (c:CacheEntry {cache_key: $cache_key}) SET c += $props",
+            {"cache_key": props["cache_key"], "props": props},
+        )
         self._run_write(
             """
             MERGE (m:Model {model_key: $model_id})
@@ -757,21 +810,33 @@ class Neo4jStateStore:
             MATCH (c:CacheEntry {cache_key: $cache_key})
             MERGE (c)-[:CACHES_MODEL]->(m)
             """,
-            {"model_id": model_id, "model_uid": f"model::{model_id}", "cache_key": props["cache_key"]},
+            {
+                "model_id": model_id,
+                "model_uid": f"model::{model_id}",
+                "cache_key": props["cache_key"],
+            },
         )
 
     def cache_metadata_summary(self) -> dict[str, Any]:
-        rows = self._run(
-            """
+        rows = self._run("""
             MATCH (c:CacheEntry)
             RETURN count(c) AS entries,
                    coalesce(sum(c.size_bytes), 0) AS used_bytes,
                    coalesce(sum(CASE WHEN c.pinned THEN 1 ELSE 0 END), 0) AS pinned_entries,
                    coalesce(sum(c.hits), 0) AS hits,
                    coalesce(sum(c.misses), 0) AS misses
-            """
+            """)
+        return (
+            dict(rows[0])
+            if rows
+            else {
+                "entries": 0,
+                "used_bytes": 0,
+                "pinned_entries": 0,
+                "hits": 0,
+                "misses": 0,
+            }
         )
-        return dict(rows[0]) if rows else {"entries": 0, "used_bytes": 0, "pinned_entries": 0, "hits": 0, "misses": 0}
 
     def _status_to_evidence_status(self, status: str | None) -> str:
         normalized = str(status or "").strip().lower()
@@ -856,7 +921,7 @@ class Neo4jStateStore:
                 "total_vram_mb": profile.total_vram_mb,
                 "compute_capability": profile.compute_capability,
                 "toolkit_name": "cuda" if profile.cuda_runtime else "unknown",
-                "toolkit_version": str(profile.cuda_runtime) if profile.cuda_runtime else "unknown",
+                "toolkit_version": (str(profile.cuda_runtime) if profile.cuda_runtime else "unknown"),
                 "hardware_technology_keys": ["cuda"] if profile.cuda_runtime else [],
                 "updated_at": utc_now(),
             },
@@ -930,7 +995,7 @@ class Neo4jStateStore:
             "status": status,
             "hardware_set_key": hardware_key,
             "technology_keys": technology_keys,
-            "technology_set_key": self._canonical_json_key("tech", {"technology_keys": technology_keys}) if technology_keys else None,
+            "technology_set_key": (self._canonical_json_key("tech", {"technology_keys": technology_keys}) if technology_keys else None),
             "run_scope": config.get("run_scope") or "fixed_steps",
             "confidence": props.get("confidence") if props else None,
             "model_key": model_key,
@@ -987,7 +1052,7 @@ class Neo4jStateStore:
             "batch_size": resolved_batch_size or job.config.runner_kwargs.get(job.batch_probe.batch_param_name),
             "epochs": job.max_epochs or job.config.max_epochs,
             "max_steps": job.max_steps or job.config.max_steps,
-            "run_scope": "full_training" if job.status == JobStatus.COMPLETED else "fixed_steps",
+            "run_scope": ("full_training" if job.status == JobStatus.COMPLETED else "fixed_steps"),
             "model_family": job.packing.family,
             "task_type": job.task_type,
             "hyperparams": job.config.runner_kwargs,
@@ -1009,7 +1074,7 @@ class Neo4jStateStore:
                 "primary_metric_name": metrics.get("primary_metric_name"),
                 "primary_metric_value": metrics.get("primary_metric_value"),
                 "metrics_json": _json_dumps(metrics),
-                "error_message": job.status_reason if job.status != JobStatus.COMPLETED else None,
+                "error_message": (job.status_reason if job.status != JobStatus.COMPLETED else None),
                 "started_at": job.started_at,
                 "finished_at": job.finished_at,
             },
@@ -1022,7 +1087,7 @@ class Neo4jStateStore:
             status="succeeded",
             model_key=profile.model_key,
             hardware_key=self._hardware_key_for_device_type(profile.device_type),
-            technology_keys=["power_of_two_batch_optimizer"] if profile.metadata.get("search_mode") == "power_of_two" else [],
+            technology_keys=(["power_of_two_batch_optimizer"] if profile.metadata.get("search_mode") == "power_of_two" else []),
             config={
                 "input_signature": profile.shape_signature,
                 "batch_size": profile.resolved_batch_size,
@@ -1081,7 +1146,10 @@ class Neo4jStateStore:
                 "batch_size": profile.resolved_batch_size,
                 "steps_per_epoch": profile.steps_per_epoch,
                 "run_scope": "full_epoch" if profile.epoch_1_seconds else "fixed_steps",
-                "hyperparams": {"strategy": profile.strategy, "backend_name": profile.backend_name},
+                "hyperparams": {
+                    "strategy": profile.strategy,
+                    "backend_name": profile.backend_name,
+                },
             },
             props={
                 "resolved_batch_size": profile.resolved_batch_size,
@@ -1089,7 +1157,7 @@ class Neo4jStateStore:
                 "observed_avg_step_time_ms": profile.avg_step_time_ms,
                 "estimated_epoch_seconds": profile.epoch_1_seconds,
                 "estimated_total_training_seconds": profile.estimated_total_runtime_seconds,
-                "estimation_method": "step_time_extrapolation" if profile.avg_step_time_ms else "partial_epoch_extrapolation",
+                "estimation_method": ("step_time_extrapolation" if profile.avg_step_time_ms else "partial_epoch_extrapolation"),
                 "estimate_confidence": profile.confidence,
                 "confidence": profile.confidence,
                 "finished_at": profile.updated_at,
@@ -1135,18 +1203,29 @@ class Neo4jStateStore:
         technology_keys = [backend_name] if backend_name else []
         config_key = self._merge_evidence_dimensions(
             model_key=None,
-            config={"input_signature": packing_group_key, "run_scope": "fixed_steps", "hyperparams": {"backend_name": backend_name}},
+            config={
+                "input_signature": packing_group_key,
+                "run_scope": "fixed_steps",
+                "hyperparams": {"backend_name": backend_name},
+            },
             hardware_key=hardware_key,
             technology_keys=technology_keys,
         )
         packed_props = {
             "job_id": job_id,
-            "profile_key": self._canonical_json_key("packed_profile", {"packing_group_key": packing_group_key, "hardware_key": hardware_key, "backend_name": backend_name}),
+            "profile_key": self._canonical_json_key(
+                "packed_profile",
+                {
+                    "packing_group_key": packing_group_key,
+                    "hardware_key": hardware_key,
+                    "backend_name": backend_name,
+                },
+            ),
             "purpose": "packed_benchmark",
             "status": "succeeded" if compatible else "failed",
             "hardware_set_key": hardware_key,
             "technology_keys": technology_keys,
-            "technology_set_key": self._canonical_json_key("tech", {"technology_keys": technology_keys}) if technology_keys else None,
+            "technology_set_key": (self._canonical_json_key("tech", {"technology_keys": technology_keys}) if technology_keys else None),
             "run_scope": "fixed_steps",
             "packing_group_key": packing_group_key,
             "packing_strategy": backend_name or "scheduler_packing",
@@ -1287,7 +1366,11 @@ class Neo4jStateStore:
                 MATCH (r:RunProfile {run_profile_id: $run_profile_id})
                 MERGE (r)-[:FOR_MODEL]->(m)
                 """,
-                {"model_key": profile.model_key, "model_uid": f"model::{profile.model_key}", "run_profile_id": profile.run_profile_id},
+                {
+                    "model_key": profile.model_key,
+                    "model_uid": f"model::{profile.model_key}",
+                    "run_profile_id": profile.run_profile_id,
+                },
             )
         if profile.signature:
             self._run_write(
@@ -1298,7 +1381,11 @@ class Neo4jStateStore:
                 MATCH (r:RunProfile {run_profile_id: $run_profile_id})
                 MERGE (r)-[:FOR_SIGNATURE]->(s)
                 """,
-                {"signature": profile.signature, "signature_uid": f"signature::{profile.signature}", "run_profile_id": profile.run_profile_id},
+                {
+                    "signature": profile.signature,
+                    "signature_uid": f"signature::{profile.signature}",
+                    "run_profile_id": profile.run_profile_id,
+                },
             )
         return profile
 
@@ -1368,7 +1455,13 @@ class Neo4jStateStore:
         )
         self._upsert_run_profile(run_profile)
 
-    def list_run_profiles(self, *, job_id: str | None = None, model_key: str | None = None, signature: str | None = None) -> list[RunProfile]:
+    def list_run_profiles(
+        self,
+        *,
+        job_id: str | None = None,
+        model_key: str | None = None,
+        signature: str | None = None,
+    ) -> list[RunProfile]:
         clauses = ["MATCH (r:RunProfile) WHERE 1 = 1"]
         params: dict[str, Any] = {}
         if job_id is not None:
@@ -1410,7 +1503,10 @@ class Neo4jStateStore:
                 f"peak VRAM {profile.peak_vram_mb or 0} MB, avg SM {profile.avg_gpu_utilization or 0.0:.1%}."
             ),
         }
-        self._run_write("MERGE (s:SoloProfile {solo_profile_id: $solo_profile_id}) SET s += $props", {"solo_profile_id": solo_profile_id, "props": props})
+        self._run_write(
+            "MERGE (s:SoloProfile {solo_profile_id: $solo_profile_id}) SET s += $props",
+            {"solo_profile_id": solo_profile_id, "props": props},
+        )
         self._run_write(
             """
             MERGE (w:WorkloadSignature {signature: $signature})
@@ -1489,8 +1585,7 @@ class Neo4jStateStore:
 
     def list_solo_profiles(self, *, hardware_key: str | None = None) -> list[SoloProfile]:
         if hardware_key is None:
-            rows = self._run(
-                """
+            rows = self._run("""
                 MATCH (s:SoloProfile)
                 RETURN {
                     signature: s.signature,
@@ -1506,8 +1601,7 @@ class Neo4jStateStore:
                     metadata_json: s.metadata_json
                 } AS row
                 ORDER BY s.updated_at DESC
-                """
-            )
+                """)
         else:
             rows = self._run(
                 """
@@ -1562,8 +1656,16 @@ class Neo4jStateStore:
                 f"using {profile.backend_name}: compatible={profile.compatible}."
             ),
         }
-        self._run_write("MERGE (p:PacketProfile {packet_profile_id: $packet_profile_id}) SET p += $props", {"packet_profile_id": packet_profile_id, "props": props})
-        self._link_packet_profile(packet_profile_id, [profile.left_signature, profile.right_signature], profile.hardware_key, profile.backend_name)
+        self._run_write(
+            "MERGE (p:PacketProfile {packet_profile_id: $packet_profile_id}) SET p += $props",
+            {"packet_profile_id": packet_profile_id, "props": props},
+        )
+        self._link_packet_profile(
+            packet_profile_id,
+            [profile.left_signature, profile.right_signature],
+            profile.hardware_key,
+            profile.backend_name,
+        )
         self._upsert_run_profile(
             RunProfile(
                 run_profile_id=f"run::packet::{packet_profile_id}",
@@ -1584,7 +1686,13 @@ class Neo4jStateStore:
         )
         return profile
 
-    def _link_packet_profile(self, packet_profile_id: str, signatures: list[str], hardware_key: str, backend_name: str) -> None:
+    def _link_packet_profile(
+        self,
+        packet_profile_id: str,
+        signatures: list[str],
+        hardware_key: str,
+        backend_name: str,
+    ) -> None:
         for index, signature in enumerate(signatures):
             self._run_write(
                 """
@@ -1622,7 +1730,11 @@ class Neo4jStateStore:
                     MATCH (p:PacketProfile {packet_profile_id: $packet_profile_id})
                     MERGE (p)-[:INVOLVES_MODEL]->(m)
                     """,
-                    {"model_key": model_key, "model_uid": f"model::{model_key}", "packet_profile_id": packet_profile_id},
+                    {
+                        "model_key": model_key,
+                        "model_uid": f"model::{model_key}",
+                        "packet_profile_id": packet_profile_id,
+                    },
                 )
 
     def get_pair_profile(
@@ -1661,7 +1773,11 @@ class Neo4jStateStore:
                 ORDER BY p.updated_at DESC
                 LIMIT 1
                 """,
-                {"hardware_key": hardware_key, "left_signature": left_signature, "right_signature": right_signature},
+                {
+                    "hardware_key": hardware_key,
+                    "left_signature": left_signature,
+                    "right_signature": right_signature,
+                },
             )
         else:
             pair_key = build_backend_scoped_pair_key(left_signature, right_signature, backend_name=backend_name)
@@ -1701,8 +1817,7 @@ class Neo4jStateStore:
         if backend_name is not None:
             clauses.append("AND p.backend_name = $backend_name")
             params["backend_name"] = backend_name
-        clauses.append(
-            """
+        clauses.append("""
             RETURN {
                 pair_key: p.pair_key,
                 left_signature: p.left_signature,
@@ -1722,8 +1837,7 @@ class Neo4jStateStore:
                 metadata_json: p.metadata_json
             } AS row
             ORDER BY p.updated_at DESC
-            """
-        )
+            """)
         rows = self._run("\n".join(clauses), params)
         return [PairProfile.from_row(row["row"]) for row in rows]
 
@@ -1756,7 +1870,10 @@ class Neo4jStateStore:
                 f"epoch 1 {profile.epoch_1_seconds or 0.0}s, estimated total {profile.estimated_total_runtime_seconds or 0.0}s."
             ),
         }
-        self._run_write("MERGE (r:RuntimeProfile {profile_key: $profile_key}) SET r += $props", {"profile_key": profile.profile_key, "props": props})
+        self._run_write(
+            "MERGE (r:RuntimeProfile {profile_key: $profile_key}) SET r += $props",
+            {"profile_key": profile.profile_key, "props": props},
+        )
         self._run_write(
             """
             MERGE (s:WorkloadSignature {signature: $signature})
@@ -1829,7 +1946,13 @@ class Neo4jStateStore:
         )
         return RuntimeProfile.from_row(rows[0]["row"]) if rows else None
 
-    def list_runtime_profiles(self, *, signature: str | None = None, hardware_key: str | None = None, backend_name: str | None = None) -> list[RuntimeProfile]:
+    def list_runtime_profiles(
+        self,
+        *,
+        signature: str | None = None,
+        hardware_key: str | None = None,
+        backend_name: str | None = None,
+    ) -> list[RuntimeProfile]:
         clauses = ["MATCH (r:RuntimeProfile) WHERE 1 = 1"]
         params: dict[str, Any] = {}
         if signature is not None:
@@ -1868,7 +1991,10 @@ class Neo4jStateStore:
                 f"{profile.resolved_batch_size} under target budget {profile.target_budget_mb or 0} MB."
             ),
         }
-        self._run_write("MERGE (p:BatchProbeProfile {probe_key: $probe_key}) SET p += $props", {"probe_key": profile.probe_key, "props": props})
+        self._run_write(
+            "MERGE (p:BatchProbeProfile {probe_key: $probe_key}) SET p += $props",
+            {"probe_key": profile.probe_key, "props": props},
+        )
         self._run_write(
             """
             MERGE (m:Model {model_key: $model_key})
@@ -1917,7 +2043,10 @@ class Neo4jStateStore:
         return profile
 
     def get_batch_probe_profile(self, probe_key: str) -> BatchProbeProfile | None:
-        rows = self._run("MATCH (p:BatchProbeProfile {probe_key: $probe_key}) RETURN properties(p) AS row LIMIT 1", {"probe_key": probe_key})
+        rows = self._run(
+            "MATCH (p:BatchProbeProfile {probe_key: $probe_key}) RETURN properties(p) AS row LIMIT 1",
+            {"probe_key": probe_key},
+        )
         return BatchProbeProfile.from_row(rows[0]["row"]) if rows else None
 
     def list_batch_probe_profiles(self) -> list[BatchProbeProfile]:
@@ -1951,7 +2080,10 @@ class Neo4jStateStore:
                 f"{observation.hardware_key}: avg step {observation.avg_step_time_ms or 0.0} ms."
             ),
         }
-        self._run_write("MERGE (o:BatchSizeObservation {observation_key: $observation_key}) SET o += $props", {"observation_key": observation.observation_key, "props": props})
+        self._run_write(
+            "MERGE (o:BatchSizeObservation {observation_key: $observation_key}) SET o += $props",
+            {"observation_key": observation.observation_key, "props": props},
+        )
         self._run_write(
             """
             MERGE (m:Model {model_key: $model_key})
@@ -2071,7 +2203,10 @@ class Neo4jStateStore:
                 f"using {profile.backend_name}: compatible={profile.compatible}."
             ),
         }
-        self._run_write("MERGE (p:PacketProfile {packet_profile_id: $packet_profile_id}) SET p += $props", {"packet_profile_id": packet_profile_id, "props": props})
+        self._run_write(
+            "MERGE (p:PacketProfile {packet_profile_id: $packet_profile_id}) SET p += $props",
+            {"packet_profile_id": packet_profile_id, "props": props},
+        )
         signatures = [sig for sig in str(profile.group_signature).split("::") if sig]
         self._link_packet_profile(packet_profile_id, signatures, profile.hardware_key, profile.backend_name)
         return profile
@@ -2144,8 +2279,7 @@ class Neo4jStateStore:
         if scheduler_mode is not None:
             clauses.append("AND p.scheduler_mode = $scheduler_mode")
             params["scheduler_mode"] = scheduler_mode
-        clauses.append(
-            """
+        clauses.append("""
             RETURN {
                 combination_key: p.combination_key,
                 group_signature: p.group_signature,
@@ -2169,8 +2303,7 @@ class Neo4jStateStore:
                 metadata_json: p.metadata_json
             } AS row
             ORDER BY p.updated_at DESC
-            """
-        )
+            """)
         rows = self._run("\n".join(clauses), params)
         return [CombinationProfile.from_row(row["row"]) for row in rows]
 
@@ -2189,7 +2322,12 @@ class Neo4jStateStore:
         metadata: dict[str, Any] | None = None,
     ) -> PairProfile:
         hardware_key = self.hardware_key()
-        existing = self.get_pair_profile(left_signature, right_signature, hardware_key=hardware_key, backend_name=backend_name)
+        existing = self.get_pair_profile(
+            left_signature,
+            right_signature,
+            hardware_key=hardware_key,
+            backend_name=backend_name,
+        )
         cooldown_until = None
         if cooldown_seconds > 0:
             cooldown_until = (parse_timestamp(utc_now()) + timedelta(seconds=cooldown_seconds)).isoformat()
@@ -2200,10 +2338,10 @@ class Neo4jStateStore:
             hardware_key=hardware_key,
             compatible=False,
             observations=(existing.observations + 1) if existing else 1,
-            peak_vram_mb=peak_vram_mb if peak_vram_mb is not None else (existing.peak_vram_mb if existing else None),
-            avg_vram_mb=avg_vram_mb if avg_vram_mb is not None else (existing.avg_vram_mb if existing else None),
-            avg_gpu_utilization=avg_gpu_utilization if avg_gpu_utilization is not None else (existing.avg_gpu_utilization if existing else None),
-            avg_memory_utilization=avg_memory_utilization if avg_memory_utilization is not None else (existing.avg_memory_utilization if existing else None),
+            peak_vram_mb=(peak_vram_mb if peak_vram_mb is not None else (existing.peak_vram_mb if existing else None)),
+            avg_vram_mb=(avg_vram_mb if avg_vram_mb is not None else (existing.avg_vram_mb if existing else None)),
+            avg_gpu_utilization=(avg_gpu_utilization if avg_gpu_utilization is not None else (existing.avg_gpu_utilization if existing else None)),
+            avg_memory_utilization=(avg_memory_utilization if avg_memory_utilization is not None else (existing.avg_memory_utilization if existing else None)),
             slowdown_ratio=existing.slowdown_ratio if existing else None,
             cooldown_until=cooldown_until,
             last_failure_reason=reason,
@@ -2237,6 +2375,9 @@ class Neo4jStateStore:
         events = self.list_events(event_type=None)
         wait_times: list[float] = []
         runtimes: list[float] = []
+        flow_times: list[float] = []
+        release_times = []
+        finish_times = []
         for job in jobs:
             submitted = parse_timestamp(job.submitted_at)
             started = parse_timestamp(job.started_at)
@@ -2245,6 +2386,18 @@ class Neo4jStateStore:
                 wait_times.append((started - submitted).total_seconds())
             if started and finished:
                 runtimes.append((finished - started).total_seconds())
+            if submitted and finished:
+                flow_times.append((finished - submitted).total_seconds())
+                release_times.append(submitted)
+                finish_times.append(finished)
+        sorted_flows = sorted(flow_times)
+        completed_jobs_with_flow = [job for job in jobs if parse_timestamp(job.submitted_at) and parse_timestamp(job.finished_at)]
+        minimum_priority = min((job.priority for job in completed_jobs_with_flow), default=0)
+        priority_weight = float(self.settings.gpu_scheduler.objective.priority_weight)
+        flow_weights = [1.0 + priority_weight * (job.priority - minimum_priority) for job in completed_jobs_with_flow]
+        weighted_flow = sum(weight * flow for weight, flow in zip(flow_weights, flow_times, strict=True)) / max(1e-9, sum(flow_weights)) if flow_times else 0.0
+        p95_index = max(0, math.ceil(0.95 * len(sorted_flows)) - 1) if sorted_flows else 0
+        makespan = (max(finish_times) - min(release_times)).total_seconds() if finish_times and release_times else 0.0
         cache_summary = self.cache_metadata_summary()
         total_cache = int(cache_summary["hits"]) + int(cache_summary["misses"])
         return SchedulerReport(
@@ -2252,9 +2405,22 @@ class Neo4jStateStore:
             completed_jobs=sum(job.status == JobStatus.COMPLETED for job in jobs),
             failed_jobs=sum(job.status == JobStatus.FAILED for job in jobs),
             cancelled_jobs=sum(job.status == JobStatus.CANCELLED for job in jobs),
-            average_queue_wait_seconds=sum(wait_times) / len(wait_times) if wait_times else 0.0,
+            average_queue_wait_seconds=(sum(wait_times) / len(wait_times) if wait_times else 0.0),
             average_runtime_seconds=sum(runtimes) / len(runtimes) if runtimes else 0.0,
-            cache_hit_rate=(int(cache_summary["hits"]) / total_cache) if total_cache else 0.0,
+            trace_makespan_seconds=makespan,
+            total_flow_time_seconds=sum(flow_times),
+            mean_flow_time_seconds=statistics.fmean(flow_times) if flow_times else 0.0,
+            weighted_mean_flow_time_seconds=weighted_flow,
+            median_flow_time_seconds=(statistics.median(flow_times) if flow_times else 0.0),
+            p95_flow_time_seconds=sorted_flows[p95_index] if sorted_flows else 0.0,
+            max_wait_time_seconds=max(wait_times, default=0.0),
+            starvation_count=sum(wait >= self.settings.gpu_scheduler.starvation_timeout_seconds for wait in wait_times),
+            jobs_per_hour=((3600.0 * len(flow_times) / makespan) if makespan > 0 else 0.0),
+            early_stopped_epochs_saved=sum(int((job.metadata.get("early_stopping_result") or {}).get("epochs_saved", 0)) for job in jobs),
+            early_stopped_wall_time_saved_seconds=sum(
+                float((job.metadata.get("early_stopping_result") or {}).get("estimated_wall_time_saved_seconds", 0.0)) for job in jobs
+            ),
+            cache_hit_rate=((int(cache_summary["hits"]) / total_cache) if total_cache else 0.0),
             cache_hits=int(cache_summary["hits"]),
             cache_misses=int(cache_summary["misses"]),
             cache_evictions=sum(event["event_type"] == "cache_evicted" for event in events),

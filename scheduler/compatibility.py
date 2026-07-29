@@ -28,14 +28,14 @@ def compatibility_score(
     if pair_profile is not None:
         if pair_profile.on_cooldown() or not pair_profile.compatible:
             return float("-inf")
-        if pair_profile.slowdown_ratio is not None and pair_profile.slowdown_ratio > thresholds.pack_reject_max_slowdown:
-            return float("-inf")
     util_headroom = max(0.0, 1.0 - max(primary_util, partner_util))
     priority_bonus = 0.01 * max(0, partner_job.priority)
     memory_budget_mb = settings.gpu_scheduler.memory.safe_vram_budget_gib * 1024.0
     memory_penalty = (
-        _profile_avg_vram_mb(primary_job, primary_profile) + _profile_avg_vram_mb(partner_job, partner_profile)
-    ) / memory_budget_mb if memory_budget_mb > 0 else 0.0
+        (_profile_avg_vram_mb(primary_job, primary_profile) + _profile_avg_vram_mb(partner_job, partner_profile)) / memory_budget_mb
+        if memory_budget_mb > 0
+        else 0.0
+    )
     return 1.0 + util_headroom + priority_bonus - memory_penalty
 
 
@@ -48,7 +48,12 @@ def _profile_avg_vram_mb(job: TrainingJob, profile: SoloProfile | None) -> int:
 
 
 class CompatibilityEvaluator:
-    def __init__(self, settings: SchedulerSettings, repository: PlanningRepository, estimator: ResourceEstimator):
+    def __init__(
+        self,
+        settings: SchedulerSettings,
+        repository: PlanningRepository,
+        estimator: ResourceEstimator,
+    ):
         self.settings = settings
         self.repository = repository
         self.estimator = estimator
@@ -63,7 +68,6 @@ class CompatibilityEvaluator:
     def compatible_group(self, jobs: list[TrainingJob], *, backend_name: str) -> bool:
         if len(jobs) <= 1:
             return True
-        thresholds = self.settings.gpu_scheduler.thresholds
         for left_job, right_job in combinations(jobs, 2):
             left_profile = self.estimator.solo_profile(left_job)
             right_profile = self.estimator.solo_profile(right_job)
@@ -76,9 +80,33 @@ class CompatibilityEvaluator:
                 if pair_profile is not None and (pair_profile.on_cooldown() or not pair_profile.compatible):
                     return False
                 continue
-            score = compatibility_score(left_job, right_job, left_profile, right_profile, pair_profile, self.settings)
+            score = compatibility_score(
+                left_job,
+                right_job,
+                left_profile,
+                right_profile,
+                pair_profile,
+                self.settings,
+            )
             if score == float("-inf"):
                 return False
-            if pair_profile and pair_profile.slowdown_ratio is not None and pair_profile.slowdown_ratio > thresholds.pack_reject_max_slowdown:
+        return True
+
+    def compatible_time_aware_group(self, jobs: list[TrainingJob], *, backend_name: str) -> bool:
+        """Compatibility for time-aware placement, intentionally independent of SM utilization."""
+        if len(jobs) <= 1:
+            return True
+        for left_job, right_job in combinations(jobs, 2):
+            if not self.pack_eligible(left_job, backend_name=backend_name):
                 return False
+            if not self.pack_eligible(right_job, backend_name=backend_name):
+                return False
+            pair_profile = self.repository.get_pair_profile(
+                left_job.packing.signature or "",
+                right_job.packing.signature or "",
+                backend_name=backend_name,
+            )
+            if pair_profile is not None:
+                if pair_profile.on_cooldown() or not pair_profile.compatible:
+                    return False
         return True

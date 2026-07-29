@@ -624,7 +624,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
 
             self.assertEqual(planner._candidate_batch_sizes(job), [4, 8, 16])
 
-    def test_parallel_batch_optimizer_uses_cached_optimal_profile(self) -> None:
+    def test_parallel_batch_optimizer_ignores_legacy_cached_objective(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerSettings(
                 runtime_root=tmpdir,
@@ -671,10 +671,11 @@ class GpuSchedulerUnitTest(unittest.TestCase):
 
             plan = planner.choose_plan(jobs, backend_available={"exclusive": True, "cuda_process": True})
             self.assertEqual(plan.mode, "packed_pair")
-            self.assertEqual(plan.reason, "cached optimal packed group selected")
-            self.assertEqual(plan.batch_overrides[jobs[0].job_id], 4)
-            self.assertEqual(plan.batch_overrides[jobs[1].job_id], 8)
-            self.assertEqual(plan.fallback_order, [jobs[1].job_id, jobs[0].job_id])
+            self.assertEqual(plan.reason, "optimized packed group selected")
+            self.assertNotEqual(
+                plan.batch_overrides,
+                {jobs[0].job_id: 4, jobs[1].job_id: 8},
+            )
 
     def test_batch_size_and_combination_profiles_are_hardware_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -976,7 +977,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                 fallback_order=[jobs[1].job_id],
             )
 
-            service._dispatch_if_idle()
+            service._dispatch_pending_work()
 
             entries = service.cache.snapshot_entries()
             self.assertEqual(len(entries), 1)

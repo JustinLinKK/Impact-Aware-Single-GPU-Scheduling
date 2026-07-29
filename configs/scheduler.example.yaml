@@ -58,50 +58,47 @@ log_db:
   enabled: false
 gpu_scheduler:
   enabled: true
-  mode: "parallel_default"
+  mode: "parallel_time_aware"
   backend_priority: ["mps", "stream", "cuda_process", "exclusive"]
-  max_packed_jobs_per_gpu: 2
-  allow_three_way_packing: false
-  candidate_window_size: 8
+  # null is unlimited. Legacy max_packed_jobs_per_gpu is still accepted when this is absent.
+  parallel_job_cap: null
+  priority_window_size: 8
+  oldest_window_size: 4
+  starvation_timeout_seconds: 1800
+  beam_width: 64
+  exact_search_max_jobs: 3
   fallback_cooldown_seconds: 900
-  concurrent_groups_enabled: false
-  concurrent_backend_allowlist: ["mps", "stream"]
   batch_probe_enabled: true
   batch_probe_target_memory_fraction: 0.97
   batch_probe_min_batch_size: 1
   batch_probe_max_search_rounds: 12
   batch_probe_max_batch_size: null
   batch_probe_search_mode: "binary"
-  auto_pack:
-    target_metric: "vram"
-    target_vram_fraction: 0.97
-    target_sm_fraction: 0.90
-    runtime_skew_guardrail_ratio: 2.0
   profiling:
     warmup_steps: 30
     solo_probe_steps: 80
     pair_probe_steps: 60
     reuse_profile_if_confidence_ge: 0.8
   memory:
-    safe_vram_budget_gib: 28.0
-    hard_stop_memory_fraction: 0.90
+    gpu_vram_gib: null
+    predicted_budget_fraction: 0.85
+    live_admission_stop_fraction: 0.90
+    live_admission_resume_fraction: 0.85
+    admission_average_window_seconds: 10
+  objective:
+    priority_weight: 0.10
+    objective_version: "time_v3_flow_only"
+  batch_options:
+    exponent_offsets: [-2, -1, 0, 1, 2]
+    require_power_of_two_original: true
+  exclusive_probe:
+    enabled: true
+    drain_without_preemption: true
   thresholds:
-    pack_prefer_sm_active_lt: 0.50
-    pack_reject_sm_active_ge: 0.80
-    pack_reject_max_slowdown: 1.30
-    latency_sensitive_max_slowdown: 1.15
-    min_aggregate_gain: 1.10
+    pack_reject_max_slowdown: 1.30  # reserved; ignored by live placement
   telemetry:
     device_poll_ms: 500
     pair_recheck_every_steps: 20
-  parallel_optimizer:
-    batch_search_mode: "binary"
-    target_vram_fraction: 0.97
-    max_probe_jobs: 3
-    binary_range_up: 32
-    binary_range_down: 1
-    power_of_two_range_up: 5
-    power_of_two_range_down: 1
   submission_defaults:
     requires_gpu: true
     estimated_vram_mb: null
@@ -138,3 +135,13 @@ gpu_scheduler:
     enabled: false
     host_poll_interval_seconds: 0.1
     host_join_timeout_seconds: 3.0
+early_stopping:
+  enabled: false
+  metric_name: "accuracy"
+  mode: "max"
+  patience_epochs: 5
+  min_delta: 0.0
+  min_epochs: 1
+  save_best_checkpoint: true
+  restore_best_checkpoint: false
+  missing_metric_policy: "ignore"

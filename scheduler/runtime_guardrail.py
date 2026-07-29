@@ -21,7 +21,12 @@ class RuntimeGuardrail:
             if profile is None or profile.estimated_total_runtime_seconds is None:
                 missing += 1
                 continue
-            estimates.append((float(profile.estimated_total_runtime_seconds), str(profile.source or "history")))
+            estimates.append(
+                (
+                    float(profile.estimated_total_runtime_seconds),
+                    str(profile.source or "history"),
+                )
+            )
         if len(jobs) <= 1:
             return (0.0 if missing == 0 else 0.05 * missing, False)
         if len(estimates) < len(jobs):
@@ -34,4 +39,3 @@ class RuntimeGuardrail:
         if all_probe and ratio > float(self.settings.gpu_scheduler.auto_pack.runtime_skew_guardrail_ratio):
             return (0.0, True)
         return max(0.0, ratio - 1.0) * (0.20 if all_probe else 0.10), False
-
