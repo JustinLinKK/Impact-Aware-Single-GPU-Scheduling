@@ -90,11 +90,18 @@ class ResourceEstimator:
             return []
         remaining_epochs = max(0, total_epochs - completed_epochs)
         ml_predictions: dict[int, float] | None = None
+        ml_epoch_predictions: dict[int, float] = {}
         if self.ml_predictor is not None:
             try:
                 ml_predictions = self.ml_predictor.predict_avg_vram_options(job, batch_sizes)
             except JobPredictionError:
                 ml_predictions = {}
+            epoch_predictor = getattr(self.ml_predictor, "predict_seconds_per_epoch_options", None)
+            if callable(epoch_predictor):
+                try:
+                    ml_epoch_predictions = epoch_predictor(job, batch_sizes)
+                except JobPredictionError:
+                    ml_epoch_predictions = {}
         estimates: list[BatchOptionEstimate] = []
         for batch_size in batch_sizes:
             memory_mb, memory_source = self._time_aware_memory_estimate(
@@ -105,7 +112,14 @@ class ResourceEstimator:
             )
             if memory_mb <= 0:
                 continue
-            seconds_per_epoch, runtime_source, confidence = self._seconds_per_epoch(job, batch_size, backend_name)
+            if int(batch_size) in ml_epoch_predictions:
+                seconds_per_epoch, runtime_source, confidence = (
+                    float(ml_epoch_predictions[int(batch_size)]),
+                    "ml_predictor",
+                    None,
+                )
+            else:
+                seconds_per_epoch, runtime_source, confidence = self._seconds_per_epoch(job, batch_size, backend_name)
             if seconds_per_epoch is None or seconds_per_epoch <= 0:
                 continue
             source = runtime_source if runtime_source == memory_source else f"{memory_source}+{runtime_source}"
@@ -399,37 +413,8 @@ class ResourceEstimator:
             return float(job.resource_requirements.estimated_vram_mb) * (float(batch_size) / float(base_batch))
         return 0.0
 
-    def estimate_sm_utilization(self, job: TrainingJob, batch_size: int, backend_name: str) -> float:
-        hardware_key = self.repository.hardware_key()
-        observation = self.repository.get_batch_size_observation(
-            model_key=self.model_key(job),
-            shape_signature=self.shape_signature(job),
-            hardware_key=hardware_key,
-            backend_name=backend_name,
-            batch_size=batch_size,
-        )
-        if observation and observation.avg_gpu_utilization is not None:
-            return max(0.0, float(observation.avg_gpu_utilization))
-        related = self.repository.list_batch_size_observations(
-            model_key=self.model_key(job),
-            shape_signature=self.shape_signature(job),
-            hardware_key=hardware_key,
-            backend_name=backend_name,
-        )
-        util_candidates = [item for item in related if item.avg_gpu_utilization is not None]
-        if util_candidates:
-            nearest = min(util_candidates, key=lambda item: abs(item.batch_size - batch_size))
-            return max(0.0, float(nearest.avg_gpu_utilization))
-        solo_profile = self.solo_profile(job)
-        if solo_profile and solo_profile.avg_gpu_utilization is not None:
-            return max(0.0, float(solo_profile.avg_gpu_utilization))
-        return 0.0
-
     def predicted_group_vram_mb(self, jobs: list[TrainingJob], *, backend_name: str) -> float:
         return sum(self.estimate_avg_vram_mb(job, self.resolved_batch_size(job), backend_name) for job in jobs)
-
-    def predicted_group_sm_utilization(self, jobs: list[TrainingJob], *, backend_name: str) -> float:
-        return sum(self.estimate_sm_utilization(job, self.resolved_batch_size(job), backend_name) for job in jobs)
 
     def prediction_metadata(self, job_id: str) -> dict[str, str | None]:
         if self.ml_predictor is None:

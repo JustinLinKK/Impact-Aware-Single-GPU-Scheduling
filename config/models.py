@@ -104,13 +104,20 @@ class GpuMemorySettings:
 @dataclass(slots=True)
 class TimeObjectiveSettings:
     priority_weight: float = 0.10
-    objective_version: str = "time_v3_flow_only"
+    objective_version: str = "time_v4_colocation_gain"
 
     def __post_init__(self) -> None:
         if self.priority_weight < 0:
             raise ValueError("priority_weight must be non-negative")
         if not str(self.objective_version).strip():
             raise ValueError("objective_version is required")
+        if self.objective_version == "time_v3_flow_only":
+            warnings.warn(
+                "time_v3_flow_only is migrated to time_v4_colocation_gain",
+                UserWarning,
+                stacklevel=2,
+            )
+            self.objective_version = "time_v4_colocation_gain"
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "TimeObjectiveSettings":
@@ -148,6 +155,37 @@ class BatchOptionSettings:
         return {
             "exponent_offsets": list(self.exponent_offsets),
             "require_power_of_two_original": self.require_power_of_two_original,
+        }
+
+
+@dataclass(slots=True)
+class ColocationSettings:
+    min_gain: float = 1.0
+    trial_epochs: int = 2
+    trial_decision_timeout_seconds: float = 30.0
+    live_trial_enabled: bool = True
+
+    def __post_init__(self) -> None:
+        self.min_gain = float(self.min_gain)
+        self.trial_epochs = int(self.trial_epochs)
+        self.trial_decision_timeout_seconds = float(self.trial_decision_timeout_seconds)
+        if self.min_gain <= 0:
+            raise ValueError("colocation.min_gain must be positive")
+        if self.trial_epochs < 1:
+            raise ValueError("colocation.trial_epochs must be at least 1")
+        if self.trial_decision_timeout_seconds <= 0:
+            raise ValueError("colocation.trial_decision_timeout_seconds must be positive")
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "ColocationSettings":
+        return cls(**(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "min_gain": self.min_gain,
+            "trial_epochs": self.trial_epochs,
+            "trial_decision_timeout_seconds": self.trial_decision_timeout_seconds,
+            "live_trial_enabled": self.live_trial_enabled,
         }
 
 
@@ -217,16 +255,21 @@ class EarlyStoppingSettings:
 
 @dataclass(slots=True)
 class GpuThresholdSettings:
-    pack_prefer_sm_active_lt: float = 0.50
-    pack_reject_sm_active_ge: float = 0.80
-    # Reserved as passive evidence thresholds until a slowdown predictor is
-    # designed. Live placement does not consume either value.
+    # Retained for legacy reports. Colocation admission uses colocation.min_gain.
     pack_reject_max_slowdown: float = 1.30
     latency_sensitive_max_slowdown: float = 1.15
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "GpuThresholdSettings":
         raw = dict(payload or {})
+        removed_sm_controls = sorted(
+            {"pack_prefer_sm_active_lt", "pack_reject_sm_active_ge"}.intersection(raw)
+        )
+        if removed_sm_controls:
+            raise ValueError(
+                "gpu_scheduler.thresholds no longer supports SM scheduling controls: "
+                + ", ".join(removed_sm_controls)
+            )
         if "min_aggregate_gain" in raw:
             raise ValueError(
                 "gpu_scheduler.thresholds no longer supports throughput scheduling control: min_aggregate_gain"
@@ -235,8 +278,6 @@ class GpuThresholdSettings:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "pack_prefer_sm_active_lt": self.pack_prefer_sm_active_lt,
-            "pack_reject_sm_active_ge": self.pack_reject_sm_active_ge,
             "pack_reject_max_slowdown": self.pack_reject_max_slowdown,
             "latency_sensitive_max_slowdown": self.latency_sensitive_max_slowdown,
         }
@@ -324,26 +365,23 @@ class StreamSettings:
 
 @dataclass(slots=True)
 class AutoPackSettings:
-    target_metric: str = "vram"
     target_vram_fraction: float = 0.97
-    target_sm_fraction: float = 0.90
     runtime_skew_guardrail_ratio: float = 2.0
-
-    def __post_init__(self) -> None:
-        normalized = str(self.target_metric or "vram").strip().lower().replace("-", "_")
-        if normalized not in {"vram", "sm"}:
-            normalized = "vram"
-        self.target_metric = normalized
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "AutoPackSettings":
-        return cls(**(payload or {}))
+        raw = dict(payload or {})
+        removed_sm_controls = sorted({"target_metric", "target_sm_fraction"}.intersection(raw))
+        if removed_sm_controls:
+            raise ValueError(
+                "gpu_scheduler.auto_pack is always VRAM-only and no longer supports target selection controls: "
+                + ", ".join(removed_sm_controls)
+            )
+        return cls(**raw)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "target_metric": self.target_metric,
             "target_vram_fraction": self.target_vram_fraction,
-            "target_sm_fraction": self.target_sm_fraction,
             "runtime_skew_guardrail_ratio": self.runtime_skew_guardrail_ratio,
         }
 
@@ -658,6 +696,7 @@ class GpuSchedulerSettings:
     parallel_optimizer: ParallelOptimizerSettings = field(default_factory=ParallelOptimizerSettings)
     objective: TimeObjectiveSettings = field(default_factory=TimeObjectiveSettings)
     batch_options: BatchOptionSettings = field(default_factory=BatchOptionSettings)
+    colocation: ColocationSettings = field(default_factory=ColocationSettings)
     exclusive_probe: ExclusiveProbeSettings = field(default_factory=ExclusiveProbeSettings)
     submission_defaults: SchedulerSubmissionDefaults = field(default_factory=SchedulerSubmissionDefaults)
     mps: MPSSettings = field(default_factory=MPSSettings)
@@ -713,6 +752,10 @@ class GpuSchedulerSettings:
             self.batch_options = BatchOptionSettings()
         if isinstance(self.batch_options, dict):
             self.batch_options = BatchOptionSettings.from_dict(self.batch_options)
+        if self.colocation is None:
+            self.colocation = ColocationSettings()
+        if isinstance(self.colocation, dict):
+            self.colocation = ColocationSettings.from_dict(self.colocation)
         if self.exclusive_probe is None:
             self.exclusive_probe = ExclusiveProbeSettings()
         if isinstance(self.exclusive_probe, dict):
@@ -779,6 +822,7 @@ class GpuSchedulerSettings:
             "parallel_optimizer": self.parallel_optimizer.to_dict(),
             "objective": self.objective.to_dict(),
             "batch_options": self.batch_options.to_dict(),
+            "colocation": self.colocation.to_dict(),
             "exclusive_probe": self.exclusive_probe.to_dict(),
             "submission_defaults": self.submission_defaults.to_dict(),
             "mps": self.mps.to_dict(),

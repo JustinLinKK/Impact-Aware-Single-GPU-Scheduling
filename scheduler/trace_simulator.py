@@ -84,6 +84,10 @@ class TraceMetrics:
     early_stopped_epochs_saved: int = 0
     early_stopped_wall_time_saved_seconds: float = 0.0
     hard_constraint_violations: int = 0
+    colocation_trial_epochs: float = 0.0
+    rejected_trial_epochs_preserved: float = 0.0
+    slowdown_rejections: int = 0
+    admission_stalls: int = 0
 
     def to_dict(self) -> dict[str, float | int | str]:
         return {
@@ -104,6 +108,10 @@ class TraceMetrics:
             "early_stopped_epochs_saved": self.early_stopped_epochs_saved,
             "early_stopped_wall_time_saved_seconds": self.early_stopped_wall_time_saved_seconds,
             "hard_constraint_violations": self.hard_constraint_violations,
+            "colocation_trial_epochs": self.colocation_trial_epochs,
+            "rejected_trial_epochs_preserved": self.rejected_trial_epochs_preserved,
+            "slowdown_rejections": self.slowdown_rejections,
+            "admission_stalls": self.admission_stalls,
         }
 
 
@@ -130,6 +138,8 @@ class TraceProblem:
     early_stopping_min_epochs: int = 1
     priority_weight: float = 0.10
     starvation_timeout_seconds: float = 1800.0
+    colocation_trial_epochs: int = 2
+    colocation_min_gain: float = 1.0
 
     def pair_slowdown(self, left: TraceJob, right: TraceJob) -> float:
         ordered = sorted((left.job_id, right.job_id))
@@ -267,40 +277,24 @@ def _weights(problem: TraceProblem, jobs: Iterable[TraceJob]) -> dict[str, float
 
 
 def _time_aware_choice(problem: TraceProblem, ready: tuple[TraceJob, ...], now: float) -> TracePack:
-    weights = _weights(problem, ready)
     starving = [job for job in ready if now - job.release_seconds >= problem.starvation_timeout_seconds]
     anchor = (
         min(starving, key=lambda job: (job.release_seconds, job.job_id))
         if starving
-        else sorted(
+        else min(
             ready,
-            key=lambda job: (-job.priority, job.release_seconds, job.job_id),
-        )[0]
-    )
-    exclusive_duration = min(option.solo_seconds for option in anchor.options if option.memory_mb <= problem.memory_budget_mb)
-    exclusive_flow = exclusive_duration * sum(weights.values())
-    scored: list[tuple[tuple[object, ...], TracePack]] = []
-    for pack in feasible_packs(problem, ready, now=now):
-        if starving and anchor not in pack.members:
-            continue
-        member_ids = {member.job_id for member in pack.members}
-        flow_cost = sum(
-            weights[member.job_id] * duration
-            for member, duration in zip(pack.members, pack.predicted_completion_offsets, strict=True)
-        ) + pack.predicted_drain_seconds * sum(weight for job_id, weight in weights.items() if job_id not in member_ids)
-        score = flow_cost / max(1e-9, exclusive_flow)
-        key = (
-            score,
-            min(member.release_seconds for member in pack.members),
-            -len(pack.members),
-            pack.memory_mb,
-            tuple(member.job_id for member in pack.members),
-            tuple(option.batch_size for option in pack.options),
+            key=lambda job: (
+                min(option.solo_seconds for option in job.options if option.memory_mb <= problem.memory_budget_mb),
+                -job.priority,
+                job.release_seconds,
+                job.job_id,
+            ),
         )
-        scored.append((key, pack))
-    if not scored:
-        return next(pack for pack in feasible_packs(problem, (anchor,), now=now) if pack.options[0].solo_seconds == exclusive_duration)
-    return min(scored, key=lambda item: item[0])[1]
+    )
+    return min(
+        feasible_packs(problem, (anchor,), now=now),
+        key=lambda pack: (pack.predicted_drain_seconds, pack.memory_mb, pack.options[0].batch_size),
+    )
 
 
 def _serial_choice(problem: TraceProblem, ready: tuple[TraceJob, ...], now: float) -> TracePack:
@@ -352,6 +346,284 @@ def simulate_policy(
     return trace_metrics(problem, policy, completion, first_dispatch, dispatches=dispatches)
 
 
+def simulate_recursive_time_aware(problem: TraceProblem) -> TraceMetrics:
+    """Simulate incremental packing with useful two-epoch admission trials."""
+
+    jobs = {job.job_id: job for job in problem.jobs}
+    planned_epochs = {
+        job.job_id: max(1, int(job.planned_epochs or len(job.validation_metrics) or 1))
+        for job in problem.jobs
+    }
+    remaining_epochs = {
+        job.job_id: float(_early_stop_epoch(problem, job))
+        for job in problem.jobs
+    }
+    selected_options: dict[str, TraceBatchOption] = {}
+    active: list[str] = []
+    completion: dict[str, float] = {}
+    first_dispatch: dict[str, float] = {}
+    dispatches: list[tuple[float, TracePack]] = []
+    lifecycle: dict[str, float | int] = {
+        "trial_epochs": 0.0,
+        "rejected_trial_epochs_preserved": 0.0,
+        "slowdown_rejections": 0,
+        "admission_stalls": 0,
+    }
+    stalled_members: set[str] | None = None
+    active_backend = "exclusive"
+    now = min((job.release_seconds for job in problem.jobs), default=0.0)
+    epsilon = 1e-9
+
+    def solo_epoch_seconds(job_id: str, *, predicted: bool) -> float:
+        option = selected_options[job_id]
+        total = option.solo_seconds if predicted or option.actual_solo_seconds is None else option.actual_solo_seconds
+        return float(total) / planned_epochs[job_id]
+
+    def slowdown(job_id: str, member_ids: list[str]) -> float:
+        member = jobs[job_id]
+        return 1.0 + sum(
+            max(0.0, problem.pair_slowdown(member, jobs[other_id]) - 1.0)
+            for other_id in member_ids
+            if other_id != job_id
+        )
+
+    def packed_epoch_seconds(job_id: str, member_ids: list[str]) -> float:
+        return solo_epoch_seconds(job_id, predicted=False) * slowdown(job_id, member_ids)
+
+    def fastest_option(job_id: str, *, available_memory_mb: float = 0.0) -> TraceBatchOption | None:
+        return min(
+            (
+                option
+                for option in jobs[job_id].options
+                if available_memory_mb + option.memory_mb <= problem.memory_budget_mb + epsilon
+            ),
+            key=lambda option: (option.solo_seconds, option.memory_mb, option.batch_size),
+            default=None,
+        )
+
+    def overlap_backend(member_ids: list[str]) -> str | None:
+        availability = _backend_availability(problem, now)
+        common: set[str] | None = None
+        for job_id in member_ids:
+            allowed = set(jobs[job_id].backend_allowlist)
+            common = allowed if common is None else common.intersection(allowed)
+        for backend_name in sorted(common or ()):
+            if backend_name != "exclusive" and availability.get(backend_name, False):
+                return backend_name
+        return None
+
+    def record_segment(member_ids: list[str], duration: float, rates: dict[str, float]) -> None:
+        if duration <= epsilon or not member_ids:
+            return
+        members = tuple(jobs[job_id] for job_id in member_ids)
+        options = tuple(selected_options[job_id] for job_id in member_ids)
+        slowdowns = tuple(rates[job_id] / solo_epoch_seconds(job_id, predicted=False) for job_id in member_ids)
+        predicted = tuple(solo_epoch_seconds(job_id, predicted=True) * remaining_epochs[job_id] for job_id in member_ids)
+        dispatches.append(
+            (
+                now,
+                TracePack(
+                    members=members,
+                    options=options,
+                    completion_offsets=tuple(duration for _ in member_ids),
+                    drain_seconds=duration,
+                    backend_name=active_backend,
+                    predicted_completion_offsets=predicted,
+                    predicted_drain_seconds=max(predicted, default=0.0),
+                    member_slowdowns=slowdowns,
+                ),
+            )
+        )
+
+    def advance(max_duration: float) -> tuple[float, set[str], dict[str, float]]:
+        nonlocal now, active, stalled_members
+        if not active or max_duration <= epsilon:
+            return 0.0, set(), {}
+        member_ids = list(active)
+        rates = {job_id: packed_epoch_seconds(job_id, member_ids) for job_id in member_ids}
+        duration = min(
+            max_duration,
+            min(remaining_epochs[job_id] * rates[job_id] for job_id in member_ids),
+        )
+        record_segment(member_ids, duration, rates)
+        for job_id in member_ids:
+            remaining_epochs[job_id] = max(0.0, remaining_epochs[job_id] - duration / rates[job_id])
+        now += duration
+        finished = {job_id for job_id in member_ids if remaining_epochs[job_id] <= epsilon}
+        for job_id in finished:
+            completion[job_id] = now
+        active = [job_id for job_id in active if job_id not in finished]
+        if stalled_members is not None and finished.intersection(stalled_members):
+            stalled_members = None
+        return duration, finished, rates
+
+    def start_anchor() -> bool:
+        nonlocal active, active_backend
+        ready = [
+            job_id
+            for job_id, job in jobs.items()
+            if job_id not in completion
+            and job_id not in active
+            and remaining_epochs[job_id] > epsilon
+            and job.release_seconds <= now + epsilon
+        ]
+        if not ready:
+            return False
+        starving = [job_id for job_id in ready if now - jobs[job_id].release_seconds >= problem.starvation_timeout_seconds]
+        eligible = starving or ready
+        for job_id in eligible:
+            selected_options[job_id] = fastest_option(job_id) or jobs[job_id].options[0]
+        anchor = min(
+            eligible,
+            key=lambda job_id: (
+                jobs[job_id].release_seconds if starving else remaining_epochs[job_id] * solo_epoch_seconds(job_id, predicted=True),
+                -jobs[job_id].priority,
+                jobs[job_id].release_seconds,
+                job_id,
+            ),
+        )
+        active = [anchor]
+        first_dispatch.setdefault(anchor, now)
+        active_backend = overlap_backend(active) or "exclusive"
+        return True
+
+    def candidate_order() -> list[str]:
+        if stalled_members is not None or active_backend == "exclusive":
+            return []
+        ready = [
+            job_id
+            for job_id, job in jobs.items()
+            if job_id not in completion
+            and job_id not in active
+            and remaining_epochs[job_id] > epsilon
+            and job.release_seconds <= now + epsilon
+        ]
+        starving = [job_id for job_id in ready if now - jobs[job_id].release_seconds >= problem.starvation_timeout_seconds]
+        if starving:
+            return [min(starving, key=lambda job_id: (jobs[job_id].release_seconds, job_id))]
+        for job_id in ready:
+            if job_id not in selected_options:
+                option = fastest_option(job_id)
+                if option is not None:
+                    selected_options[job_id] = option
+        return sorted(
+            (job_id for job_id in ready if job_id in selected_options),
+            key=lambda job_id: (
+                remaining_epochs[job_id] * solo_epoch_seconds(job_id, predicted=True),
+                -jobs[job_id].priority,
+                jobs[job_id].release_seconds,
+                job_id,
+            ),
+        )
+
+    def feasible_candidate(candidate_id: str) -> bool:
+        cap = problem.parallel_cap
+        if cap is not None and len(active) >= cap:
+            return False
+        if not _admission_open(problem, now) or not _backend_availability(problem, now).get(active_backend, False):
+            return False
+        if active_backend not in jobs[candidate_id].backend_allowlist:
+            return False
+        if any(not problem.pair_compatible(jobs[candidate_id], jobs[job_id]) for job_id in active):
+            return False
+        active_memory = sum(selected_options[job_id].memory_mb for job_id in active)
+        option = fastest_option(candidate_id, available_memory_mb=active_memory)
+        if option is None:
+            return False
+        selected_options[candidate_id] = option
+        return overlap_backend([*active, candidate_id]) == active_backend
+
+    def run_trial(candidate_id: str) -> str:
+        nonlocal active, stalled_members
+        preexisting = list(active)
+        pretrial_rates = {job_id: packed_epoch_seconds(job_id, preexisting) for job_id in preexisting}
+        active.append(candidate_id)
+        first_dispatch.setdefault(candidate_id, now)
+        measured_candidate_epochs = 0.0
+        trial_target = min(float(problem.colocation_trial_epochs), remaining_epochs[candidate_id])
+        while measured_candidate_epochs + epsilon < trial_target:
+            rate = packed_epoch_seconds(candidate_id, active)
+            wanted = (trial_target - measured_candidate_epochs) * rate
+            elapsed, finished, rates = advance(wanted)
+            candidate_progress = elapsed / rates[candidate_id] if candidate_id in rates else 0.0
+            measured_candidate_epochs += candidate_progress
+            lifecycle["trial_epochs"] = float(lifecycle["trial_epochs"]) + candidate_progress
+            if candidate_id in finished:
+                return "completed"
+            if finished.intersection(preexisting):
+                preexisting = list(active)
+                if preexisting == [candidate_id] or not [job_id for job_id in preexisting if job_id != candidate_id]:
+                    return "accepted"
+                preexisting = [job_id for job_id in active if job_id != candidate_id]
+                pretrial_rates = {job_id: packed_epoch_seconds(job_id, preexisting) for job_id in preexisting}
+                measured_candidate_epochs = 0.0
+                trial_target = min(float(problem.colocation_trial_epochs), remaining_epochs[candidate_id])
+
+        packed_rates = {job_id: packed_epoch_seconds(job_id, active) for job_id in active}
+        active_drain = max(
+            (remaining_epochs[job_id] * pretrial_rates[job_id] for job_id in preexisting),
+            default=0.0,
+        )
+        sequential = active_drain + remaining_epochs[candidate_id] * solo_epoch_seconds(candidate_id, predicted=True)
+        packed_drain = max(
+            (remaining_epochs[job_id] * packed_rates[job_id] for job_id in active),
+            default=0.0,
+        )
+        gain = sequential / packed_drain if packed_drain > epsilon else float("inf")
+        if gain + epsilon >= problem.colocation_min_gain:
+            return "accepted"
+        active = [job_id for job_id in active if job_id != candidate_id]
+        stalled_members = set(preexisting)
+        lifecycle["rejected_trial_epochs_preserved"] = (
+            float(lifecycle["rejected_trial_epochs_preserved"]) + measured_candidate_epochs
+        )
+        lifecycle["slowdown_rejections"] = int(lifecycle["slowdown_rejections"]) + 1
+        lifecycle["admission_stalls"] = int(lifecycle["admission_stalls"]) + 1
+        return "rejected"
+
+    while len(completion) < len(jobs):
+        if not active:
+            if not start_anchor():
+                future = [
+                    job.release_seconds
+                    for job in problem.jobs
+                    if job.job_id not in completion and job.release_seconds > now + epsilon
+                ]
+                if not future:
+                    break
+                now = min(future)
+                continue
+
+        candidates = candidate_order()
+        selected_candidate = next((job_id for job_id in candidates if feasible_candidate(job_id)), None)
+        if selected_candidate is not None:
+            run_trial(selected_candidate)
+            continue
+
+        rates = {job_id: packed_epoch_seconds(job_id, active) for job_id in active}
+        next_completion = min(remaining_epochs[job_id] * rates[job_id] for job_id in active)
+        future_releases = [
+            job.release_seconds - now
+            for job in problem.jobs
+            if job.job_id not in completion
+            and job.job_id not in active
+            and job.release_seconds > now + epsilon
+        ]
+        duration = next_completion
+        if stalled_members is None and active_backend != "exclusive" and future_releases:
+            duration = min(duration, min(future_releases))
+        advance(duration)
+
+    return trace_metrics(
+        problem,
+        "parallel_time_aware",
+        completion,
+        first_dispatch,
+        dispatches=dispatches,
+        colocation_lifecycle=lifecycle,
+    )
+
+
 def trace_metrics(
     problem: TraceProblem,
     policy: str,
@@ -359,6 +631,7 @@ def trace_metrics(
     first_dispatch: dict[str, float],
     *,
     dispatches: Iterable[tuple[float, TracePack]] = (),
+    colocation_lifecycle: dict[str, float | int] | None = None,
 ) -> TraceMetrics:
     if not problem.jobs:
         return TraceMetrics(policy, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0)
@@ -398,6 +671,7 @@ def trace_metrics(
             option = selected_pack.options[selected_pack.members.index(job)]
             full_seconds = option.actual_solo_seconds if option.actual_solo_seconds is not None else option.solo_seconds
             early_stopped_wall_time_saved_seconds += float(full_seconds) * (planned_epochs - stop_epoch) / planned_epochs
+    lifecycle = colocation_lifecycle or {}
     return TraceMetrics(
         policy=policy,
         makespan_seconds=makespan,
@@ -416,6 +690,10 @@ def trace_metrics(
         early_stopped_epochs_saved=early_stopped_epochs_saved,
         early_stopped_wall_time_saved_seconds=early_stopped_wall_time_saved_seconds,
         hard_constraint_violations=hard_violations,
+        colocation_trial_epochs=float(lifecycle.get("trial_epochs", 0.0)),
+        rejected_trial_epochs_preserved=float(lifecycle.get("rejected_trial_epochs_preserved", 0.0)),
+        slowdown_rejections=int(lifecycle.get("slowdown_rejections", 0)),
+        admission_stalls=int(lifecycle.get("admission_stalls", 0)),
     )
 
 
@@ -490,7 +768,7 @@ def compare_policies(problem: TraceProblem) -> list[TraceMetrics]:
     return [
         serial,
         simulate_policy(problem, "legacy_vram_fill", _fill_choice),
-        simulate_policy(problem, "parallel_time_aware", _time_aware_choice),
+        simulate_recursive_time_aware(problem),
         oracle(problem, serial_baseline=serial),
     ]
 
@@ -509,7 +787,7 @@ def benchmark_fixture() -> TraceProblem:
                 TraceBatchOption(16, 5_000, 15.0, actual_memory_mb=5_100),
             ),
             validation_metrics=((0.50, 0.60, 0.60, 0.59, 0.58, 0.57) if job_id == "d" else ()),
-            planned_epochs=(6 if job_id == "d" else None),
+            planned_epochs=6,
         )
 
     jobs = (job("a", 0), job("b", 0), job("c", 0), job("d", 5, 1))
@@ -528,8 +806,8 @@ def benchmark_fixture() -> TraceProblem:
 
 def markdown_table(metrics: Iterable[TraceMetrics]) -> str:
     rows = [
-        "| Policy | Makespan (s) | Total flow (s) | Mean flow (s) | Weighted flow (s) | Median flow (s) | p95 flow (s) | Max wait (s) | Starved | Jobs/hour | Slowdown | Pred/actual VRAM (MiB) | Actual over-budget packs | Early epochs/time saved | Violations |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Policy | Makespan (s) | Total flow (s) | Mean flow (s) | Weighted flow (s) | Median flow (s) | p95 flow (s) | Max wait (s) | Starved | Jobs/hour | Slowdown | Pred/actual VRAM (MiB) | Actual over-budget packs | Trial/rejected epochs | Rejections/stalls | Early epochs/time saved | Violations |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for item in metrics:
         rows.append(
@@ -539,6 +817,8 @@ def markdown_table(metrics: Iterable[TraceMetrics]) -> str:
             f"{item.starvation_count} | {item.jobs_per_hour:.2f} | {item.average_slowdown:.3f} | "
             f"{item.predicted_avg_vram_mb:.1f}/{item.actual_avg_vram_mb:.1f} | "
             f"{item.actual_memory_over_budget_count} | "
+            f"{item.colocation_trial_epochs:.1f}/{item.rejected_trial_epochs_preserved:.1f} | "
+            f"{item.slowdown_rejections}/{item.admission_stalls} | "
             f"{item.early_stopped_epochs_saved}/{item.early_stopped_wall_time_saved_seconds:.1f}s | "
             f"{item.hard_constraint_violations} |"
         )

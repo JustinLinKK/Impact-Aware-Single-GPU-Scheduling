@@ -149,36 +149,52 @@ packing. In `parallel_time_aware`, device-level memory is averaged over a time
 window: sustained use at the stop threshold closes only new packed admission,
 and active work continues normally. Admission reopens after a complete window
 below the resume threshold. GPU/SM utilization is not a placement input for
-this mode.
+any scheduler mode; it is retained only as telemetry and profile evidence.
 
 ## Time-aware scheduling
 
-`parallel_time_aware` requests the five exponent offsets `[-2,-1,0,1,2]`
-around each immutable originally requested power-of-two batch size. Exact
-batch observations are preferred, and a missing runtime estimate never becomes
-zero. Dominated memory/runtime choices are removed before bounded exact or beam
-search.
+`parallel_time_aware` starts the shortest predicted solo job as an anchor and
+then admits one candidate at a time, shortest remaining runtime first. A
+starving job overrides that ordering. Each addition must pass scheduling class,
+parallel cap, backend and pair compatibility, live-admission, fixed-batch, and
+predicted average-VRAM checks before any concurrent work begins.
 
-For candidate pack `g`, member `j` has remaining time `p_j`, completion offset
-`d_j=p_j`, and drain time `D=max_j(d_j)`. The implemented score is minimized:
+The final admission check is a two-epoch live trial. These are ordinary training
+epochs: progress and checkpoints are retained whether the candidate is accepted
+or paused. After epoch two the newcomer waits at its epoch safe point while the
+scheduler compares sequential drain time with the measured packed drain time:
 
 ```text
-L_F = sum(selected weight_j * d_j) + D * sum(unselected weight_j)
-score = L_F / max(epsilon, L_F(exclusive anchor))
+D_active = max(active remaining_epochs * active pre-trial epoch_seconds)
+T_seq    = D_active + candidate remaining_epochs * candidate solo epoch_seconds
+T_pack   = max(all remaining_epochs * measured packed epoch_seconds)
+gain     = T_seq / T_pack
 ```
 
-Average VRAM, the parallel cap, backend availability, compatibility history,
-live admission state, and exclusive-probe drain state are hard constraints.
-There is no VRAM-fill reward. Slowdown prediction and throughput/makespan
-controls are intentionally deferred: stored slowdown evidence never affects
-placement, and throughput is reported only after execution. Jobs crossing the
-starvation timeout become mandatory anchors; if no pack is feasible, the oldest
-anchor runs exclusively at the next legal drain boundary.
+Admission requires `gain >= gpu_scheduler.colocation.min_gain` (1.0 by
+default). A slowdown rejection pauses only the newcomer with `hold: false` and
+stalls every further packing attempt until one member of the pre-trial pack
+leaves execution. Memory or compatibility failures do not create that stall.
+Trial and stall state survive scheduler restart, and stale state is discarded
+when active membership no longer matches.
+
+Exact colocation timing profiles are isolated by hardware and the multiset of
+packing signature, resolved batch, and backend. Only clean epoch intervals are
+used; an interval crossing a membership change is ignored. Runner step timing
+is a fallback when `steps_per_epoch` is known. Whole-run elapsed time is never
+used as a slowdown estimate. Jobs without finite epoch progress, an epoch safe
+point, checkpoint support, safe memory evidence, or an overlap-capable backend
+run exclusively.
+
+The local ML adapter consumes an epoch-time prediction only when the selected
+artifact explicitly declares the canonical `train_epoch_ms` target. Legacy
+PerfSeer `train_time` output is not treated as a full-epoch estimate.
 
 The former throughput controls `makespan_weight`, `flow_time_weight`, and
-`min_aggregate_gain` are no longer accepted. Remove them from existing
-configuration before starting the scheduler; `objective.priority_weight` and
-`objective.objective_version` remain supported.
+`min_aggregate_gain` are no longer accepted. `time_v3_flow_only` is migrated to
+`time_v4_colocation_gain` with a warning. The `colocation` defaults are
+`min_gain: 1.0`, `trial_epochs: 2`, `trial_decision_timeout_seconds: 30`, and
+`live_trial_enabled: true`.
 
 Jobs with `scheduling_class: exclusive_probe` reserve the next idle boundary.
 Existing packs drain without preemption and no normal work is admitted during
@@ -196,13 +212,13 @@ The deterministic validation fixture can be run with:
 python -m localml_scheduler.scheduler.trace_simulator
 ```
 
-It compares serial FIFO, legacy VRAM-fill packing, the time-aware policy, and
-an exhaustive small-trace oracle, reporting makespan, flow time, waiting,
-starvation, jobs/hour, predicted/actual VRAM, realized slowdown, and saved
-early-stop work. The simulator accepts live backend changes, rolling-memory
-samples, compatibility matrices, realized-slowdown matrices, and validation
-sequences. Slowdown changes simulated actual completion but is not visible to
-the placement policy. The exhaustive
+It compares serial FIFO, legacy VRAM-fill packing, the recursive time-aware
+policy, and an exhaustive small-trace oracle, reporting makespan, flow time,
+waiting, starvation, jobs/hour, predicted/actual VRAM, realized slowdown, trial
+epochs, preserved rejected progress, admission stalls, and saved early-stop
+work. The simulator accepts live backend changes, rolling-memory samples,
+compatibility matrices, harmful or beneficial slowdown matrices, and validation
+sequences. The exhaustive
 oracle remains intentionally limited to small, non-preemptive drain-boundary
 fixtures.
 
@@ -237,7 +253,7 @@ The normal pause flow is:
 ## Packed Execution Notes
 
 - `parallel_default` and `parallel_batch_optimized` keep the legacy fixed-width packed-group behavior and still fall back to exclusive execution when compatibility or memory evidence is missing
-- `parallel_auto_pack` ignores `max_packed_jobs_per_gpu` and keeps admitting work until the configured `auto_pack.target_metric` (`vram` or `sm`) is close to its target threshold
+- `parallel_auto_pack` ignores `max_packed_jobs_per_gpu` and keeps admitting work until predicted VRAM is close to `auto_pack.target_vram_fraction`
 - `parallel_time_aware` uses `parallel_job_cap` (`null` means unlimited); if absent, an explicitly supplied legacy `max_packed_jobs_per_gpu` is mapped to it
 - `safe_vram_budget_gib` remains a compatibility input for older modes; time-aware mode uses detected/configured total VRAM times `predicted_budget_fraction`
 - the packed path is opt-in per job via `packing.eligible: true` and a stable `packing.signature`

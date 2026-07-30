@@ -15,12 +15,10 @@ from localml_scheduler.domain import (
     PlacementDecision,
     PreloadSource,
     ResourceRequirements,
-    SoloProfile,
     TrainingJob,
     build_batch_size_observation_key,
     build_group_signature,
 )
-from localml_scheduler.scheduler.compatibility import compatibility_score
 from localml_scheduler.scheduler.placement_planner import PlacementPlanner
 from localml_scheduler.scheduler.policies import PriorityFifoPolicy
 from localml_scheduler.scheduler.planner_types import DispatchPlan
@@ -319,17 +317,6 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             plan = planner.choose_plan([primary, secondary], backend_available={"exclusive": True, "mps": True})
             self.assertEqual(plan.mode, "exclusive")
             self.assertIn("solo profile", plan.reason)
-
-    def test_compatibility_score_prefers_lower_utilization_partner(self) -> None:
-        settings = SchedulerSettings(runtime_root=Path(tempfile.mkdtemp()))
-        primary = TrainingJob.create("pkg.runner:train", "baseline-a", "/tmp/a.pt", priority=9)
-        partner = TrainingJob.create("pkg.runner:train", "baseline-b", "/tmp/b.pt", priority=3)
-        primary_profile = SoloProfile(signature="a", peak_vram_mb=2048, avg_vram_mb=1800, avg_gpu_utilization=0.25)
-        low_util = SoloProfile(signature="b", peak_vram_mb=2048, avg_vram_mb=1800, avg_gpu_utilization=0.20)
-        high_util = SoloProfile(signature="c", peak_vram_mb=2048, avg_vram_mb=1800, avg_gpu_utilization=0.78)
-        low_score = compatibility_score(primary, partner, primary_profile, low_util, None, settings)
-        high_score = compatibility_score(primary, partner, primary_profile, high_util, None, settings)
-        self.assertGreater(low_score, high_score)
 
     def test_planner_prefers_stream_for_structured_jobs_and_reroutes_raw_jobs_to_cuda_process(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

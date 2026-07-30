@@ -107,6 +107,11 @@ class _MirrorStateStore:
         self._mirror_call("record_combination_profile_evidence", result)
         return result
 
+    def upsert_colocation_timing_profile(self, profile):
+        result = self._primary.upsert_colocation_timing_profile(profile)
+        self._mirror_call("record_colocation_timing_evidence", result)
+        return result
+
     def mark_pair_incompatible(self, *args: Any, **kwargs: Any):
         result = self._primary.mark_pair_incompatible(*args, **kwargs)
         self._mirror_call("mark_pair_incompatible", *args, **kwargs)

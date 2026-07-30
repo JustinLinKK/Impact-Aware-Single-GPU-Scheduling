@@ -23,6 +23,9 @@ class JobProgress:
     avg_step_time_ms: float | None = None
     estimated_total_runtime_seconds: float | None = None
     remaining_runtime_seconds: float | None = None
+    observed_epoch_seconds: float | None = None
+    epoch_interval_started_at: str | None = None
+    epoch_interval_finished_at: str | None = None
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "JobProgress | None":
@@ -47,4 +50,3 @@ class PlacementAssignment:
 
 
 ProgressSnapshot = JobProgress
-

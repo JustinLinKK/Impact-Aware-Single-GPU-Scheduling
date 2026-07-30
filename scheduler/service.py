@@ -18,6 +18,7 @@ from ..observability.logging_utils import setup_scheduler_logger
 from ..observability.metrics import MetricsCollector
 from ..domain import (
     BatchResolution,
+    ColocationTimingProfile,
     CombinationProfile,
     JobStatus,
     PairProfile,
@@ -26,6 +27,7 @@ from ..domain import (
     SoloProfile,
     TrainingJob,
     build_group_signature,
+    build_colocation_profile_key,
     parse_timestamp,
     utc_now,
 )
@@ -69,6 +71,77 @@ class ActiveRun:
     objective_breakdown: dict[str, object] = field(default_factory=dict)
     objective_version: str | None = None
     mandatory_anchor_job_id: str | None = None
+
+
+@dataclass(slots=True)
+class ColocationTrialState:
+    trial_id: str
+    candidate_job_id: str
+    preexisting_job_ids: tuple[str, ...]
+    started_at: str
+    start_epoch: int
+    target_epoch: int
+    backend_name: str
+    profile_key: str
+    candidate_solo_epoch_seconds: float
+    pretrial_epoch_seconds: dict[str, float] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "trial_id": self.trial_id,
+            "candidate_job_id": self.candidate_job_id,
+            "preexisting_job_ids": list(self.preexisting_job_ids),
+            "started_at": self.started_at,
+            "start_epoch": self.start_epoch,
+            "target_epoch": self.target_epoch,
+            "backend_name": self.backend_name,
+            "profile_key": self.profile_key,
+            "candidate_solo_epoch_seconds": self.candidate_solo_epoch_seconds,
+            "pretrial_epoch_seconds": dict(self.pretrial_epoch_seconds),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> "ColocationTrialState":
+        return cls(
+            trial_id=str(payload["trial_id"]),
+            candidate_job_id=str(payload["candidate_job_id"]),
+            preexisting_job_ids=tuple(str(value) for value in payload.get("preexisting_job_ids", [])),
+            started_at=str(payload["started_at"]),
+            start_epoch=int(payload["start_epoch"]),
+            target_epoch=int(payload["target_epoch"]),
+            backend_name=str(payload["backend_name"]),
+            profile_key=str(payload["profile_key"]),
+            candidate_solo_epoch_seconds=float(payload["candidate_solo_epoch_seconds"]),
+            pretrial_epoch_seconds={str(key): float(value) for key, value in dict(payload.get("pretrial_epoch_seconds", {})).items()},
+        )
+
+
+@dataclass(slots=True)
+class ColocationStallState:
+    preexisting_job_ids: tuple[str, ...]
+    candidate_job_id: str
+    profile_key: str
+    reason: str
+    started_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "preexisting_job_ids": list(self.preexisting_job_ids),
+            "candidate_job_id": self.candidate_job_id,
+            "profile_key": self.profile_key,
+            "reason": self.reason,
+            "started_at": self.started_at,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> "ColocationStallState":
+        return cls(
+            preexisting_job_ids=tuple(str(value) for value in payload.get("preexisting_job_ids", [])),
+            candidate_job_id=str(payload["candidate_job_id"]),
+            profile_key=str(payload["profile_key"]),
+            reason=str(payload["reason"]),
+            started_at=str(payload.get("started_at") or utc_now()),
+        )
 
 
 class SchedulerService:
@@ -117,6 +190,8 @@ class SchedulerService:
             window_seconds=memory.admission_average_window_seconds,
         )
         self._exclusive_probe_job_id: str | None = None
+        self._colocation_trial: ColocationTrialState | None = None
+        self._colocation_stall: ColocationStallState | None = None
         self._restore_scheduler_decision_state()
 
     @property
@@ -141,6 +216,8 @@ class SchedulerService:
                 for sample in self._admission_gate.samples
             ],
             "exclusive_probe_job_id": self._exclusive_probe_job_id,
+            "colocation_trial": self._colocation_trial.to_dict() if self._colocation_trial else None,
+            "colocation_stall": self._colocation_stall.to_dict() if self._colocation_stall else None,
             "updated_at": utc_now(),
         }
         tmp_path = self._decision_state_path.with_suffix(".json.tmp")
@@ -167,6 +244,10 @@ class SchedulerService:
                 # draining is enabled.  Do not let stale restart state close
                 # normal admission after the feature has been turned off.
                 self._exclusive_probe_job_id = None
+            trial = payload.get("colocation_trial")
+            self._colocation_trial = ColocationTrialState.from_dict(trial) if isinstance(trial, dict) else None
+            stall = payload.get("colocation_stall")
+            self._colocation_stall = ColocationStallState.from_dict(stall) if isinstance(stall, dict) else None
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self.logger.warning("Ignoring invalid scheduler decision state: %s", exc)
 
@@ -250,6 +331,7 @@ class SchedulerService:
         while not self._stop_event.is_set():
             self._write_service_heartbeat("running")
             self._poll_active_workers()
+            self._evaluate_colocation_trial()
             self._process_commands()
             self._warm_cache()
             self._poll_telemetry()
@@ -671,93 +753,20 @@ class SchedulerService:
             right_job.packing.signature,
             backend_name=run.backend_name,
         )
-        opened_at = parse_timestamp(run.opened_at)
-        elapsed_seconds = max(0.0, (parse_timestamp(utc_now()) - opened_at).total_seconds()) if opened_at else 0.0
-        per_member_slowdown: dict[str, float] = {}
-        slowdown_sources: dict[str, str] = {}
-        for member in materialized_jobs:
-            batch_size = run.batch_overrides.get(
-                member.job_id,
-                BatchResolution.resolved_batch_size(member),
-            )
-            # A concurrent runtime profile is not a solo baseline. Only an
-            # exclusive profile at the same selected batch can support a
-            # measured slowdown ratio. The scheduler intentionally does not
-            # invent a slowdown value when that evidence is unavailable.
-            solo_profile = self.store.get_runtime_profile(
-                member.packing.signature or member.job_id,
-                resolved_batch_size=batch_size,
-                backend_name="exclusive",
-            )
-            solo_seconds = (
-                float(solo_profile.estimated_total_runtime_seconds)
-                if solo_profile is not None
-                and solo_profile.estimated_total_runtime_seconds is not None
-                and solo_profile.estimated_total_runtime_seconds > 0
-                else 0.0
-            )
-            if member.status.is_terminal and solo_seconds > 0 and elapsed_seconds > 0:
-                per_member_slowdown[member.job_id] = max(1.0, elapsed_seconds / solo_seconds)
-                slowdown_sources[member.job_id] = "measured_against_exclusive_profile"
-
-        if per_member_slowdown:
-            recorded_slowdown = max(per_member_slowdown.values())
-            per_signature_slowdown = {
-                member.packing.signature: per_member_slowdown[member.job_id]
-                for member in materialized_jobs
-                if member.packing.signature and member.job_id in per_member_slowdown
-            }
-            slowdown_batch_vector = dict(run.batch_overrides)
-        else:
-            existing_metadata = dict(existing_pair.metadata or {}) if existing_pair else {}
-            existing_sources = existing_metadata.get("slowdown_sources")
-            measured_sources = (
-                {
-                    str(job_id): str(source)
-                    for job_id, source in existing_sources.items()
-                    if source == "measured_against_exclusive_profile"
-                }
-                if isinstance(existing_sources, dict)
-                else {}
-            )
-            has_measured_evidence = bool(measured_sources)
-            if existing_pair is not None and has_measured_evidence:
-                recorded_slowdown = existing_pair.slowdown_ratio
-                raw_per_member = existing_metadata.get("per_member_slowdown")
-                raw_per_signature = existing_metadata.get("per_signature_slowdown")
-                per_member_slowdown = (
-                    {
-                        str(job_id): float(value)
-                        for job_id, value in raw_per_member.items()
-                        if isinstance(value, (int, float))
-                    }
-                    if isinstance(raw_per_member, dict)
-                    else {}
-                )
-                per_signature_slowdown = (
-                    {
-                        str(signature): float(value)
-                        for signature, value in raw_per_signature.items()
-                        if isinstance(value, (int, float))
-                    }
-                    if isinstance(raw_per_signature, dict)
-                    else {}
-                )
-                slowdown_sources = measured_sources
-                raw_batch_vector = existing_metadata.get("batch_vector")
-                slowdown_batch_vector = (
-                    {
-                        str(job_id): int(batch_size)
-                        for job_id, batch_size in raw_batch_vector.items()
-                        if isinstance(batch_size, int)
-                    }
-                    if isinstance(raw_batch_vector, dict)
-                    else {}
-                )
-            else:
-                recorded_slowdown = None
-                per_signature_slowdown = {}
-                slowdown_batch_vector = {}
+        existing_metadata = dict(existing_pair.metadata or {}) if existing_pair else {}
+        existing_sources = existing_metadata.get("slowdown_sources")
+        has_epoch_evidence = isinstance(existing_sources, dict) and any(
+            source == "measured_epoch_against_exclusive_profile"
+            for source in existing_sources.values()
+        )
+        # Combination completion still records compatibility and telemetry,
+        # but it must never infer slowdown from whole-run elapsed time. Preserve
+        # only slowdown evidence produced from clean epoch intervals.
+        recorded_slowdown = existing_pair.slowdown_ratio if existing_pair and has_epoch_evidence else None
+        per_member_slowdown = existing_metadata.get("per_member_slowdown", {}) if has_epoch_evidence else {}
+        per_signature_slowdown = existing_metadata.get("per_signature_slowdown", {}) if has_epoch_evidence else {}
+        slowdown_sources = existing_sources if has_epoch_evidence else {}
+        slowdown_batch_vector = existing_metadata.get("batch_vector", {}) if has_epoch_evidence else {}
         self.store.upsert_pair_profile(
             PairProfile.create(
                 left_job.packing.signature,
@@ -874,18 +883,6 @@ class SchedulerService:
                 exc,
             )
 
-    def _active_occupancy(self) -> tuple[float, float]:
-        active_vram_mb = 0.0
-        active_sm_utilization = 0.0
-        for group_id, run in self._active_runs.items():
-            jobs = [self.store.get_job(job_id) for job_id in self._supervisor_active_job_ids_by_group().get(group_id, [])]
-            materialized = [job for job in jobs if job is not None]
-            if not materialized:
-                continue
-            active_vram_mb += self.planner.predicted_group_vram_mb(materialized, backend_name=run.backend_name)
-            active_sm_utilization += self.planner.predicted_group_sm_utilization(materialized, backend_name=run.backend_name)
-        return active_vram_mb, active_sm_utilization
-
     def _active_vram_occupancy(self) -> float:
         active_vram_mb = 0.0
         for group_id, run in self._active_runs.items():
@@ -900,6 +897,390 @@ class SchedulerService:
         jobs = [self.store.get_job(job_id) for job_id in active_ids]
         return [job for job in jobs if job is not None]
 
+    @staticmethod
+    def _remaining_epochs(job: TrainingJob) -> int | None:
+        total = job.max_epochs or job.config.max_epochs
+        if total is None:
+            return None
+        try:
+            return max(0, int(total) - int(job.metadata.get("last_completed_epoch", 0)))
+        except (TypeError, ValueError):
+            return None
+
+    def _observed_epoch_rate(self, job: TrainingJob, trial: ColocationTrialState) -> float | None:
+        started_at = parse_timestamp(trial.started_at)
+        values: list[float] = []
+        for sample in list(job.metadata.get("runtime_epoch_timing_history") or []):
+            try:
+                if int(sample.get("epoch", 0)) <= trial.start_epoch and job.job_id == trial.candidate_job_id:
+                    continue
+                finished_at = parse_timestamp(sample.get("finished_at"))
+                interval_started = parse_timestamp(sample.get("started_at"))
+                if started_at is not None and finished_at is not None and finished_at < started_at:
+                    continue
+                if started_at is not None and interval_started is not None and interval_started < started_at:
+                    continue
+                seconds = float(sample.get("seconds", 0.0))
+                if seconds > 0:
+                    values.append(seconds)
+            except (TypeError, ValueError):
+                continue
+        if values:
+            return sum(values) / len(values)
+        try:
+            step_ms = float(job.metadata.get("runtime_avg_step_time_ms") or 0.0)
+            steps = int(job.metadata.get("runtime_steps_per_epoch") or 0)
+            if step_ms > 0 and steps > 0:
+                return step_ms * steps / 1000.0
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    @staticmethod
+    def _member_descriptor(job: TrainingJob, fallback_backend: str) -> dict[str, object]:
+        return {
+            "signature": job.packing.signature or job.job_id,
+            "batch_size": BatchResolution.resolved_batch_size(job),
+            "backend_name": str(job.metadata.get("placement_backend") or fallback_backend),
+        }
+
+    @staticmethod
+    def _profile_rate(profile: ColocationTimingProfile | None, descriptor: dict[str, object]) -> float | None:
+        if profile is None:
+            return None
+        values = [
+            float(item["seconds_per_epoch"])
+            for item in profile.member_timings
+            if str(item.get("signature")) == str(descriptor["signature"])
+            and int(item.get("batch_size", 0)) == int(descriptor["batch_size"])
+            and str(item.get("backend_name")) == str(descriptor["backend_name"])
+            and float(item.get("seconds_per_epoch", 0.0)) > 0
+        ]
+        return (sum(values) / len(values)) if values else None
+
+    def _activate_colocation_stall(
+        self,
+        *,
+        preexisting_job_ids: tuple[str, ...],
+        candidate_job_id: str,
+        profile_key: str,
+        reason: str,
+    ) -> None:
+        self._colocation_stall = ColocationStallState(
+            preexisting_job_ids=preexisting_job_ids,
+            candidate_job_id=candidate_job_id,
+            profile_key=profile_key,
+            reason=reason,
+        )
+        self._persist_scheduler_decision_state()
+        self.event_logger.emit(
+            "colocation_admission_stalled",
+            job_id=candidate_job_id,
+            payload={
+                "preexisting_job_ids": list(preexisting_job_ids),
+                "profile_key": profile_key,
+                "reason": reason,
+            },
+        )
+
+    def _refresh_colocation_stall(self) -> None:
+        if self._colocation_stall is None:
+            return
+        active_ids = set(self._supervisor_active_job_ids())
+        if all(job_id in active_ids for job_id in self._colocation_stall.preexisting_job_ids):
+            return
+        previous = self._colocation_stall
+        self._colocation_stall = None
+        self._persist_scheduler_decision_state()
+        self.event_logger.emit(
+            "colocation_admission_resumed",
+            payload={
+                "previous_preexisting_job_ids": list(previous.preexisting_job_ids),
+                "candidate_job_id": previous.candidate_job_id,
+                "reason": "pre-trial pack membership changed",
+            },
+        )
+
+    def _restart_colocation_trial(self, trial: ColocationTrialState, preexisting_jobs: list[TrainingJob]) -> None:
+        candidate = self.store.get_job(trial.candidate_job_id)
+        if candidate is None:
+            self._colocation_trial = None
+            self._persist_scheduler_decision_state()
+            return
+        start_epoch = int(candidate.metadata.get("last_completed_epoch", 0))
+        total_epochs = candidate.max_epochs or candidate.config.max_epochs or start_epoch
+        target_epoch = min(int(total_epochs), start_epoch + self.settings.gpu_scheduler.colocation.trial_epochs)
+        pretrial: dict[str, float] = {}
+        for job in preexisting_jobs:
+            rate = trial.pretrial_epoch_seconds.get(job.job_id)
+            if rate is None:
+                rate, _ = self.planner.time_objective.current_epoch_seconds(job)
+            if rate is not None:
+                pretrial[job.job_id] = rate
+        descriptors = [self._member_descriptor(job, trial.backend_name) for job in [*preexisting_jobs, candidate]]
+        restarted = ColocationTrialState(
+            trial_id=f"trial-{candidate.job_id}-{time.monotonic_ns()}",
+            candidate_job_id=candidate.job_id,
+            preexisting_job_ids=tuple(job.job_id for job in preexisting_jobs),
+            started_at=utc_now(),
+            start_epoch=start_epoch,
+            target_epoch=target_epoch,
+            backend_name=trial.backend_name,
+            profile_key=build_colocation_profile_key(self.store.hardware_key(), descriptors),
+            candidate_solo_epoch_seconds=trial.candidate_solo_epoch_seconds,
+            pretrial_epoch_seconds=pretrial,
+        )
+        self._colocation_trial = restarted
+        self.store.update_job(
+            candidate.job_id,
+            metadata_updates={"colocation_trial": {**restarted.to_dict(), "decision": "pending"}},
+        )
+        self._persist_scheduler_decision_state()
+        self.event_logger.emit(
+            "colocation_trial_started",
+            job_id=candidate.job_id,
+            payload={**restarted.to_dict(), "reason": "pack membership changed; trial restarted"},
+        )
+
+    def _persist_colocation_timing_profile(
+        self,
+        jobs: list[TrainingJob],
+        rates: dict[str, float],
+        trial: ColocationTrialState,
+        *,
+        sources: dict[str, str] | None = None,
+    ) -> None:
+        descriptors = [self._member_descriptor(job, trial.backend_name) for job in jobs]
+        profile_key = build_colocation_profile_key(self.store.hardware_key(), descriptors)
+        existing = self.store.get_colocation_timing_profile(profile_key)
+        if sources is not None and not any(
+            source != "exact_colocation_profile" for source in sources.values()
+        ):
+            return
+        old_by_key: dict[tuple[str, int, str], dict[str, object]] = {}
+        if existing is not None:
+            for item in existing.member_timings:
+                old_by_key[(str(item["signature"]), int(item["batch_size"]), str(item["backend_name"]))] = item
+        timings: list[dict[str, object]] = []
+        for job, descriptor in zip(jobs, descriptors, strict=True):
+            rate = rates.get(job.job_id)
+            if rate is None:
+                continue
+            key = (str(descriptor["signature"]), int(descriptor["batch_size"]), str(descriptor["backend_name"]))
+            old = old_by_key.get(key)
+            source = (sources or {}).get(job.job_id, "live_training")
+            if source == "exact_colocation_profile" and old is not None:
+                timings.append(dict(old))
+                continue
+            old_count = int(old.get("observations", 0)) if old else 0
+            old_rate = float(old.get("seconds_per_epoch", 0.0)) if old else 0.0
+            timings.append(
+                {
+                    **descriptor,
+                    "seconds_per_epoch": ((old_rate * old_count) + rate) / (old_count + 1),
+                    "observations": old_count + 1,
+                    "source": source,
+                }
+            )
+        if len(timings) != len(jobs):
+            return
+        profile = ColocationTimingProfile.create(
+            self.store.hardware_key(),
+            descriptors,
+            timings,
+            observations=(existing.observations + 1) if existing else 1,
+            metadata={"last_trial_id": trial.trial_id, "job_ids": [job.job_id for job in jobs]},
+        )
+        self.store.upsert_colocation_timing_profile(profile)
+        if sources is not None and any(
+            source == "exact_colocation_profile" for source in sources.values()
+        ):
+            return
+        if len(jobs) != 2 or any(not job.packing.signature for job in jobs):
+            return
+        per_member_slowdown: dict[str, float] = {}
+        per_signature_slowdown: dict[str, float] = {}
+        slowdown_sources: dict[str, str] = {}
+        batch_vector: dict[str, int] = {}
+        for job in jobs:
+            packed_rate = rates.get(job.job_id)
+            batch_size = BatchResolution.resolved_batch_size(job)
+            solo_profile = self.store.get_runtime_profile(
+                job.packing.signature or job.job_id,
+                resolved_batch_size=batch_size,
+                backend_name="exclusive",
+            )
+            solo_rate: float | None = None
+            if solo_profile is not None:
+                if solo_profile.epoch_1_seconds is not None and solo_profile.epoch_1_seconds > 0:
+                    solo_rate = float(solo_profile.epoch_1_seconds)
+                elif (
+                    solo_profile.avg_step_time_ms is not None
+                    and solo_profile.avg_step_time_ms > 0
+                    and solo_profile.steps_per_epoch is not None
+                    and solo_profile.steps_per_epoch > 0
+                ):
+                    solo_rate = float(solo_profile.avg_step_time_ms) * int(solo_profile.steps_per_epoch) / 1000.0
+            if packed_rate is None or packed_rate <= 0 or solo_rate is None:
+                continue
+            ratio = float(packed_rate) / solo_rate
+            per_member_slowdown[job.job_id] = ratio
+            per_signature_slowdown[job.packing.signature or job.job_id] = ratio
+            slowdown_sources[job.job_id] = "measured_epoch_against_exclusive_profile"
+            batch_vector[job.job_id] = batch_size
+        if len(per_member_slowdown) != 2:
+            return
+        left_job, right_job = jobs
+        existing_pair = self.store.get_pair_profile(
+            left_job.packing.signature or left_job.job_id,
+            right_job.packing.signature or right_job.job_id,
+            backend_name=trial.backend_name,
+        )
+        self.store.upsert_pair_profile(
+            PairProfile.create(
+                left_job.packing.signature or left_job.job_id,
+                right_job.packing.signature or right_job.job_id,
+                backend_name=trial.backend_name,
+                hardware_key=self.store.hardware_key(),
+                compatible=True,
+                observations=(existing_pair.observations + 1) if existing_pair else 1,
+                slowdown_ratio=max(per_member_slowdown.values()),
+                metadata={
+                    "backend_name": trial.backend_name,
+                    "batch_vector": batch_vector,
+                    "per_member_slowdown": per_member_slowdown,
+                    "per_signature_slowdown": per_signature_slowdown,
+                    "slowdown_sources": slowdown_sources,
+                    "colocation_profile_key": profile.profile_key,
+                    "trial_id": trial.trial_id,
+                },
+            )
+        )
+
+    def _evaluate_colocation_trial(self) -> None:
+        self._refresh_colocation_stall()
+        trial = self._colocation_trial
+        if trial is None:
+            return
+        candidate = self.store.get_job(trial.candidate_job_id)
+        active_ids = set(self._supervisor_active_job_ids())
+        if candidate is None:
+            self._colocation_trial = None
+            self._persist_scheduler_decision_state()
+            return
+        trial_metadata = dict(candidate.metadata.get("colocation_trial") or {})
+        if str(trial_metadata.get("decision")) == "timeout":
+            self.store.update_job(
+                candidate.job_id,
+                metadata_updates={"colocation_unverified_profile_key": trial.profile_key},
+            )
+            self._colocation_trial = None
+            self._persist_scheduler_decision_state()
+            return
+        if candidate.job_id not in active_ids:
+            self._colocation_trial = None
+            self._persist_scheduler_decision_state()
+            return
+
+        current_preexisting = [
+            job for job in self._active_jobs() if job.job_id != candidate.job_id
+        ]
+        if set(job.job_id for job in current_preexisting) != set(trial.preexisting_job_ids):
+            if not current_preexisting:
+                accepted = {**dict(candidate.metadata.get("colocation_trial") or {}), "decision": "accepted", "reason": "newcomer became stack anchor"}
+                self.store.update_job(candidate.job_id, metadata_updates={"colocation_trial": accepted})
+                self._colocation_trial = None
+                self._persist_scheduler_decision_state()
+                return
+            self._restart_colocation_trial(trial, current_preexisting)
+            return
+
+        completed_epoch = int(candidate.metadata.get("last_completed_epoch", 0))
+        if completed_epoch < trial.target_epoch:
+            return
+
+        all_jobs = [*current_preexisting, candidate]
+        profile = self.store.get_colocation_timing_profile(trial.profile_key)
+        packed_rates: dict[str, float] = {}
+        packed_sources: dict[str, str] = {}
+        for job in all_jobs:
+            descriptor = self._member_descriptor(job, trial.backend_name)
+            rate = self._observed_epoch_rate(job, trial)
+            if rate is not None:
+                packed_sources[job.job_id] = "complete_epoch_interval_or_step_timing"
+            else:
+                rate = self._profile_rate(profile, descriptor)
+                if rate is not None:
+                    packed_sources[job.job_id] = "exact_colocation_profile"
+            if rate is not None and rate > 0:
+                packed_rates[job.job_id] = rate
+        result = self.planner.time_objective.gain(
+            current_preexisting,
+            candidate,
+            active_epoch_seconds=trial.pretrial_epoch_seconds,
+            candidate_solo_epoch_seconds=trial.candidate_solo_epoch_seconds,
+            packed_epoch_seconds=packed_rates,
+        )
+        if result is None:
+            gain = 0.0
+            sequential = None
+            packed = None
+            reason = "colocation trial lacked complete timing evidence"
+        else:
+            gain, sequential, packed = result
+            reason = "colocation gain accepted" if gain + 1e-9 >= self.settings.gpu_scheduler.colocation.min_gain else "colocation gain below threshold"
+        payload = {
+            "trial_id": trial.trial_id,
+            "gain": gain,
+            "gain_threshold": self.settings.gpu_scheduler.colocation.min_gain,
+            "sequential_drain_seconds": sequential,
+            "packed_drain_seconds": packed,
+            "packed_epoch_seconds": packed_rates,
+            "pretrial_epoch_seconds": trial.pretrial_epoch_seconds,
+            "candidate_solo_epoch_seconds": trial.candidate_solo_epoch_seconds,
+            "profile_key": trial.profile_key,
+        }
+        self.event_logger.emit("colocation_gain_evaluated", job_id=candidate.job_id, payload=payload)
+        self._persist_colocation_timing_profile(
+            all_jobs,
+            packed_rates,
+            trial,
+            sources=packed_sources,
+        )
+        newcomer_finished = self._remaining_epochs(candidate) == 0
+        if newcomer_finished or gain + 1e-9 >= self.settings.gpu_scheduler.colocation.min_gain:
+            if newcomer_finished:
+                reason = "newcomer completed during colocation trial"
+            decision = {**trial.to_dict(), "decision": "accepted", "reason": reason, "result": payload}
+            self.store.update_job(candidate.job_id, metadata_updates={"colocation_trial": decision})
+            self.event_logger.emit("colocation_trial_accepted", job_id=candidate.job_id, payload=payload)
+            self._colocation_trial = None
+            self._persist_scheduler_decision_state()
+            return
+
+        pause_requested = self.supervisor.request_pause(candidate.job_id, reason=reason, hold=False)
+        decision = {**trial.to_dict(), "decision": "rejected", "reason": reason, "result": payload}
+        self.store.update_job(
+            candidate.job_id,
+            status=JobStatus.PAUSING if pause_requested else candidate.status,
+            reason=reason,
+            hold=False,
+            metadata_updates={
+                "colocation_trial": decision,
+                "colocation_unverified_profile_key": trial.profile_key if result is None else None,
+            },
+        )
+        self.event_logger.emit("colocation_trial_rejected", job_id=candidate.job_id, payload=payload)
+        if result is not None:
+            self._activate_colocation_stall(
+                preexisting_job_ids=trial.preexisting_job_ids,
+                candidate_job_id=candidate.job_id,
+                profile_key=trial.profile_key,
+                reason=reason,
+            )
+        self._colocation_trial = None
+        self._persist_scheduler_decision_state()
+
     def _prediction_metadata(self, job_id: str) -> dict[str, str | None]:
         estimator = getattr(self.planner, "estimator", None)
         method = getattr(estimator, "prediction_metadata", None)
@@ -912,7 +1293,103 @@ class SchedulerService:
             "vram_prediction_error": None,
         }
 
+    def _known_colocation_rejection(self, plan: DispatchPlan) -> bool:
+        if not bool(plan.objective_breakdown.get("colocation_rejected")) or not plan.job_ids:
+            return False
+        candidate_job_id = plan.job_ids[0]
+        preexisting_job_ids = tuple(
+            str(job_id) for job_id in plan.objective_breakdown.get("preexisting_job_ids", [])
+        )
+        profile_key = str(plan.objective_breakdown.get("colocation_profile_key") or "")
+        payload = {
+            "gain": plan.objective_breakdown.get("gain"),
+            "gain_threshold": plan.objective_breakdown.get("gain_threshold"),
+            "sequential_drain_seconds": plan.objective_breakdown.get("sequential_drain_seconds"),
+            "packed_drain_seconds": plan.objective_breakdown.get("packed_drain_seconds"),
+            "profile_key": profile_key,
+            "preexisting_job_ids": list(preexisting_job_ids),
+            "source": "exact_colocation_profile",
+        }
+        self.store.update_job(
+            candidate_job_id,
+            status=JobStatus.PAUSED,
+            reason="known colocation gain is below threshold",
+            hold=False,
+            metadata_updates={
+                "colocation_trial": {
+                    "decision": "rejected",
+                    "reason": "known colocation gain is below threshold",
+                    "result": payload,
+                }
+            },
+        )
+        self.event_logger.emit("colocation_gain_evaluated", job_id=candidate_job_id, payload=payload)
+        self.event_logger.emit("colocation_trial_rejected", job_id=candidate_job_id, payload=payload)
+        self._activate_colocation_stall(
+            preexisting_job_ids=preexisting_job_ids,
+            candidate_job_id=candidate_job_id,
+            profile_key=profile_key,
+            reason="known colocation gain is below threshold",
+        )
+        return True
+
+    def _prepare_colocation_trial(self, plan: DispatchPlan, candidate: TrainingJob) -> ColocationTrialState | None:
+        metadata = plan.trial_metadata or plan.objective_breakdown
+        if not bool(metadata.get("requires_live_trial")):
+            return None
+        start_epoch = int(candidate.metadata.get("last_completed_epoch", 0))
+        total_epochs = candidate.max_epochs or candidate.config.max_epochs
+        if total_epochs is None:
+            return None
+        target_epoch = min(
+            int(total_epochs),
+            start_epoch + self.settings.gpu_scheduler.colocation.trial_epochs,
+        )
+        trial = ColocationTrialState(
+            trial_id=f"trial-{candidate.job_id}-{time.monotonic_ns()}",
+            candidate_job_id=candidate.job_id,
+            preexisting_job_ids=tuple(str(job_id) for job_id in metadata.get("preexisting_job_ids", [])),
+            started_at=utc_now(),
+            start_epoch=start_epoch,
+            target_epoch=target_epoch,
+            backend_name=plan.backend_name,
+            profile_key=str(metadata.get("profile_key") or metadata.get("colocation_profile_key") or ""),
+            candidate_solo_epoch_seconds=float(metadata.get("candidate_solo_epoch_seconds") or 0.0),
+            pretrial_epoch_seconds={
+                str(job_id): float(seconds)
+                for job_id, seconds in dict(
+                    metadata.get("pretrial_epoch_seconds")
+                    or metadata.get("active_pretrial_epoch_seconds")
+                    or {}
+                ).items()
+            },
+        )
+        self._colocation_trial = trial
+        self.store.update_job(
+            candidate.job_id,
+            metadata_updates={"colocation_trial": {**trial.to_dict(), "decision": "pending"}},
+        )
+        self._persist_scheduler_decision_state()
+        return trial
+
+    def _cancel_prepared_colocation_trial(self, trial: ColocationTrialState | None, *, reason: str) -> None:
+        if trial is None:
+            return
+        current = self.store.get_job(trial.candidate_job_id)
+        if current is not None:
+            self.store.update_job(
+                current.job_id,
+                metadata_updates={
+                    "colocation_trial": {**trial.to_dict(), "decision": "cancelled", "reason": reason}
+                },
+            )
+        if self._colocation_trial is not None and self._colocation_trial.trial_id == trial.trial_id:
+            self._colocation_trial = None
+            self._persist_scheduler_decision_state()
+
     def _dispatch_plan(self, plan: DispatchPlan) -> bool:
+        if self._known_colocation_rejection(plan):
+            return False
         selected_jobs = []
         for job_id in plan.job_ids:
             job = self.store.get_job(job_id)
@@ -930,6 +1407,8 @@ class SchedulerService:
         for job in selected_jobs:
             self._preload_job_baseline(job)
 
+        prepared_trial = self._prepare_colocation_trial(plan, selected_jobs[0]) if selected_jobs else None
+
         try:
             dispatched = self.supervisor.dispatch(
                 selected_jobs,
@@ -939,6 +1418,7 @@ class SchedulerService:
                 fallback_order=plan.fallback_order,
             )
         except Exception as exc:
+            self._cancel_prepared_colocation_trial(prepared_trial, reason="trial dispatch failed")
             self.logger.warning("Dispatch failed for jobs %s: %s", ",".join(plan.job_ids), exc)
             if plan.backend_name != "exclusive" and selected_jobs and not self._active_runs:
                 fallback_job = selected_jobs[0]
@@ -987,6 +1467,7 @@ class SchedulerService:
                     )
             return False
         if not dispatched.can_run:
+            self._cancel_prepared_colocation_trial(prepared_trial, reason=dispatched.reason)
             self.logger.info(
                 "Skipping dispatch for %s: %s",
                 ",".join(plan.job_ids),
@@ -1015,8 +1496,17 @@ class SchedulerService:
                 run.overlapped = True
         self._last_telemetry_poll_at = 0.0
 
+        if prepared_trial is not None:
+            self.event_logger.emit(
+                "colocation_trial_started",
+                job_id=prepared_trial.candidate_job_id,
+                payload=prepared_trial.to_dict(),
+            )
+
         for index, job in enumerate(selected_jobs):
-            if len(plan.job_ids) == 1:
+            if prepared_trial is not None and job.job_id == prepared_trial.candidate_job_id:
+                role = "trial_newcomer"
+            elif len(plan.job_ids) == 1:
                 role = "solo"
             elif len(plan.job_ids) == 2:
                 role = "primary" if index == 0 else "secondary"
@@ -1035,6 +1525,7 @@ class SchedulerService:
                     "placement_group_id": group_id,
                     "placement_objective_version": plan.objective_version,
                     "placement_objective_breakdown": plan.objective_breakdown,
+                    "placement_trial_metadata": plan.trial_metadata,
                     "placement_mandatory_anchor_job_id": plan.mandatory_anchor_job_id,
                     **self._prediction_metadata(job.job_id),
                 },
@@ -1052,6 +1543,7 @@ class SchedulerService:
                     "reason": plan.reason,
                     "objective_version": plan.objective_version,
                     "objective_breakdown": plan.objective_breakdown,
+                    "trial_metadata": plan.trial_metadata,
                     "mandatory_anchor_job_id": plan.mandatory_anchor_job_id,
                 },
             )
@@ -1149,20 +1641,17 @@ class SchedulerService:
                         self._persist_scheduler_decision_state()
                         continue
                     runnable = [reserved]
-            if scheduler_mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE:
-                active_vram_mb = self._active_vram_occupancy()
-                active_sm_utilization = 0.0
-            else:
-                active_vram_mb, active_sm_utilization = self._active_occupancy()
+            active_vram_mb = self._active_vram_occupancy()
             active_jobs = self._active_jobs()
             plan = self.planner.choose_plan(
                 runnable,
                 backend_available=self.supervisor.available_backends(),
                 active_vram_mb=active_vram_mb,
-                active_sm_utilization=active_sm_utilization,
                 active_jobs=active_jobs,
                 admission_open=self._admission_gate.is_open,
                 exclusive_drain_requested=bool(self._exclusive_probe_job_id and active_jobs),
+                packing_admission_stalled=self._colocation_stall is not None,
+                trial_pending=self._colocation_trial is not None,
             )
             if plan is None:
                 return
@@ -1179,6 +1668,9 @@ class SchedulerService:
             "average_memory_fraction": self._admission_gate.average_fraction,
             "exclusive_drain_requested": self._exclusive_probe_job_id is not None,
             "reserved_exclusive_probe_job_id": self._exclusive_probe_job_id,
+            "packing_admission_stalled": self._colocation_stall is not None,
+            "colocation_stall": self._colocation_stall.to_dict() if self._colocation_stall else None,
+            "colocation_trial": self._colocation_trial.to_dict() if self._colocation_trial else None,
         }
 
     def cache_stats(self) -> dict[str, Any]:

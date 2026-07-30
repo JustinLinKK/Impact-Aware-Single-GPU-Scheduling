@@ -142,7 +142,9 @@ class MLVramPredictor:
         self._encoded_type: Any | None = None
         self._cache: OrderedDict[str, Any] = OrderedDict()
         self._job_values: dict[str, float] = {}
+        self._job_epoch_seconds: dict[str, float] = {}
         self._job_failures: dict[str, str] = {}
+        self._target_names: tuple[str, ...] = ()
         self.last_sources: dict[str, str] = {}
         self.last_errors: dict[str, str] = {}
         self._initialize()
@@ -178,6 +180,7 @@ class MLVramPredictor:
                 artifact_path = record.artifact_path
                 train_mem_index = record.train_mem_index
                 self.model_id = record.model_id
+                self._target_names = tuple(record.targets)
             if not artifact_path.is_file():
                 raise RuntimeError(f"predictor artifact is missing: {artifact_path}")
             self.artifact_hash = sha256(artifact_path.read_bytes()).hexdigest()
@@ -387,3 +390,33 @@ class MLVramPredictor:
 
     def predict_avg_vram_mb(self, job: TrainingJob, batch_size: int) -> float:
         return self.predict_avg_vram_options(job, [batch_size])[int(batch_size)]
+
+    def predict_seconds_per_epoch_options(self, job: TrainingJob, batch_sizes: Sequence[int]) -> dict[int, float]:
+        """Return scheduler-grade epoch predictions when the artifact explicitly declares them.
+
+        The legacy ``train_time`` target is deliberately not accepted because
+        it is not a measured full-epoch label.
+        """
+        if "train_epoch_ms" not in self._target_names:
+            raise JobPredictionError("predictor artifact does not expose train_epoch_ms")
+        if not self.available:
+            raise JobPredictionError(self.unavailable_reason or "ML predictor unavailable")
+        epoch_index = self._target_names.index("train_epoch_ms")
+        ordered_sizes = [int(value) for value in dict.fromkeys(batch_sizes)]
+        specifications = [model_specification_for_job(job, batch_size) for batch_size in ordered_sizes]
+        keys = [self._prediction_key(job, batch_size, spec) for batch_size, spec in zip(ordered_sizes, specifications, strict=True)]
+        missing = [index for index, key in enumerate(keys) if key not in self._job_epoch_seconds]
+        try:
+            encoded_options = self._convert_many([specifications[index] for index in missing]) if missing else []
+            assert self._runtime is not None
+            for index, encoded in zip(missing, encoded_options, strict=True):
+                milliseconds = float(self._runtime.predict(encoded)[epoch_index].item())
+                seconds = milliseconds / 1000.0
+                if not (0.0 < seconds < float("inf")):
+                    raise JobPredictionError(f"invalid train_epoch_ms prediction {milliseconds}")
+                self._job_epoch_seconds[keys[index]] = seconds
+        except Exception as exc:
+            if isinstance(exc, JobPredictionError):
+                raise
+            raise JobPredictionError(f"{type(exc).__name__}: {exc}") from exc
+        return {batch_size: self._job_epoch_seconds[key] for batch_size, key in zip(ordered_sizes, keys, strict=True)}

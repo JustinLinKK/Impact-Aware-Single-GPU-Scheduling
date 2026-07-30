@@ -179,6 +179,18 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS colocation_timing_profiles (
+        profile_key TEXT PRIMARY KEY,
+        hardware_key TEXT NOT NULL,
+        members_json TEXT NOT NULL,
+        member_timings_json TEXT NOT NULL,
+        observations INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'live_training',
+        metadata_json TEXT
+    )
+    """,
+    """
     CREATE INDEX IF NOT EXISTS idx_jobs_status_priority
     ON jobs(status, priority DESC, queue_sequence ASC)
     """,
@@ -221,6 +233,10 @@ SCHEMA_STATEMENTS = [
     """
     CREATE INDEX IF NOT EXISTS idx_runtime_profiles_lookup
     ON runtime_profiles(signature, hardware_key, backend_name, resolved_batch_size, updated_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_colocation_timing_profiles_hardware
+    ON colocation_timing_profiles(hardware_key, updated_at DESC)
     """,
 ]
 

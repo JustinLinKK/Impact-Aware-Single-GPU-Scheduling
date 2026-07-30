@@ -37,14 +37,13 @@ class ObjectiveScorer:
         safe_budget_mb = self.estimator.safe_budget_mb()
         if estimated_vram_mb > safe_budget_mb:
             return None
-        utilization = estimated_vram_mb / safe_budget_mb if safe_budget_mb > 0 else 0.0
+        vram_fill_fraction = estimated_vram_mb / safe_budget_mb if safe_budget_mb > 0 else 0.0
         age_bonus = sum(max(1, job.queue_sequence) for job in jobs) / max(1, len(jobs))
-        objective = utilization + (0.001 * len(jobs)) - (0.0001 * age_bonus)
+        objective = vram_fill_fraction + (0.001 * len(jobs)) - (0.0001 * age_bonus)
         return EvaluatedGroup(
             jobs=jobs,
             backend_name=backend_name,
             estimated_vram_mb=estimated_vram_mb,
-            estimated_sm_utilization=self.estimator.predicted_group_sm_utilization(jobs, backend_name=backend_name),
             objective_score=objective,
             batch_overrides=batch_overrides,
             fallback_order=self.candidate_generator.fallback_order(jobs, batch_overrides, backend_name),
@@ -76,13 +75,12 @@ class ObjectiveScorer:
             estimated_vram_mb = sum(self.estimator.estimate_avg_vram_mb(job, overrides[job.job_id], backend_name) for job in jobs)
             if estimated_vram_mb > safe_budget_mb:
                 continue
-            utilization = estimated_vram_mb / safe_budget_mb if safe_budget_mb > 0 else 0.0
+            vram_fill_fraction = estimated_vram_mb / safe_budget_mb if safe_budget_mb > 0 else 0.0
             candidate = EvaluatedGroup(
                 jobs=jobs,
                 backend_name=backend_name,
                 estimated_vram_mb=estimated_vram_mb,
-                estimated_sm_utilization=self.estimator.predicted_group_sm_utilization(jobs, backend_name=backend_name),
-                objective_score=utilization,
+                objective_score=vram_fill_fraction,
                 batch_overrides=overrides,
                 fallback_order=self.candidate_generator.fallback_order(jobs, overrides, backend_name),
                 reason="optimized packed group selected",
@@ -97,7 +95,6 @@ class ObjectiveScorer:
         backend_name: str,
         *,
         active_vram_mb: float,
-        active_sm_utilization: float,
     ) -> EvaluatedGroup | None:
         if not self.compatibility.compatible_group(jobs, backend_name=backend_name):
             return None
@@ -110,32 +107,22 @@ class ObjectiveScorer:
         estimated_vram_mb = sum(self.estimator.estimate_avg_vram_mb(job, batch_overrides[job.job_id], backend_name) for job in jobs)
         if (active_vram_mb + estimated_vram_mb) > self.estimator.safe_budget_mb():
             return None
-        estimated_sm_utilization = sum(self.estimator.estimate_sm_utilization(job, batch_overrides[job.job_id], backend_name) for job in jobs)
         runtime_penalty, hard_reject = self.runtime_guardrail.runtime_penalty(jobs, backend_name=backend_name)
         if hard_reject:
             return None
 
-        target_metric = self.settings.gpu_scheduler.auto_pack.target_metric
         target_vram_mb = self.estimator.safe_budget_mb() * float(self.settings.gpu_scheduler.auto_pack.target_vram_fraction)
-        target_sm = float(self.settings.gpu_scheduler.auto_pack.target_sm_fraction)
-        if target_metric == "sm":
-            projected = active_sm_utilization + estimated_sm_utilization
-            if projected > target_sm:
-                return None
-            gap = abs(target_sm - projected)
-        else:
-            projected = active_vram_mb + estimated_vram_mb
-            if projected > target_vram_mb:
-                return None
-            gap = abs(target_vram_mb - projected) / max(1.0, target_vram_mb)
-        objective = (1.0 - gap) + (0.01 * len(jobs)) - runtime_penalty
+        projected_vram_mb = active_vram_mb + estimated_vram_mb
+        if projected_vram_mb > target_vram_mb:
+            return None
+        vram_gap_fraction = abs(target_vram_mb - projected_vram_mb) / max(1.0, target_vram_mb)
+        objective = (1.0 - vram_gap_fraction) + (0.01 * len(jobs)) - runtime_penalty
         if backend_name != "exclusive":
             objective += 0.02
         return EvaluatedGroup(
             jobs=jobs,
             backend_name=backend_name,
             estimated_vram_mb=estimated_vram_mb,
-            estimated_sm_utilization=estimated_sm_utilization,
             objective_score=objective,
             batch_overrides=batch_overrides,
             fallback_order=self.candidate_generator.fallback_order(jobs, batch_overrides, backend_name),

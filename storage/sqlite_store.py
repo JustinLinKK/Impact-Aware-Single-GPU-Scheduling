@@ -14,6 +14,7 @@ from ..domain import (
     BatchSizeObservation,
     BatchProbeProfile,
     CombinationProfile,
+    ColocationTimingProfile,
     CommandType,
     JobCommand,
     JobStatus,
@@ -922,6 +923,46 @@ class SQLiteStateStore:
                 (group_signature, hardware_key, backend_name, scheduler_mode),
             ).fetchone()
         return CombinationProfile.from_row(dict(row)) if row else None
+
+    def upsert_colocation_timing_profile(self, profile: ColocationTimingProfile) -> ColocationTimingProfile:
+        profile.updated_at = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO colocation_timing_profiles(
+                    profile_key, hardware_key, members_json, member_timings_json,
+                    observations, updated_at, source, metadata_json
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile_key) DO UPDATE SET
+                    hardware_key=excluded.hardware_key,
+                    members_json=excluded.members_json,
+                    member_timings_json=excluded.member_timings_json,
+                    observations=excluded.observations,
+                    updated_at=excluded.updated_at,
+                    source=excluded.source,
+                    metadata_json=excluded.metadata_json
+                """,
+                (
+                    profile.profile_key,
+                    profile.hardware_key,
+                    json.dumps(profile.members, sort_keys=True),
+                    json.dumps(profile.member_timings, sort_keys=True),
+                    profile.observations,
+                    profile.updated_at,
+                    profile.source,
+                    json.dumps(profile.metadata or {}, sort_keys=True),
+                ),
+            )
+            connection.commit()
+        return profile
+
+    def get_colocation_timing_profile(self, profile_key: str) -> ColocationTimingProfile | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM colocation_timing_profiles WHERE profile_key = ?",
+                (profile_key,),
+            ).fetchone()
+        return ColocationTimingProfile.from_row(dict(row)) if row else None
 
     def list_combination_profiles(
         self,

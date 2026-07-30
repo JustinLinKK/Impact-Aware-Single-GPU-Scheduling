@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 import json
+import time
 
 from ..checkpointing.manager import CheckpointManager
 from ..observability.events import EventLogger
@@ -121,6 +122,58 @@ class TrainingControlHook:
         self.store = store
         self.event_logger = event_logger
         self.early_stopping = EarlyStoppingWatchdog(self.control_plane.settings.early_stopping)
+        self._last_epoch_safe_point_monotonic: float | None = None
+        self._last_epoch_safe_point_at: str | None = None
+
+    def _trial_command_at_epoch(self, epoch: int) -> ControlCommand | None:
+        current = self.store.get_job(self.job.job_id)
+        trial = dict((current.metadata if current is not None else {}).get("colocation_trial") or {})
+        if not trial or int(epoch) < int(trial.get("target_epoch") or 0):
+            return None
+        decision = str(trial.get("decision") or "pending")
+        if decision == "accepted":
+            return ControlCommand()
+        if decision in {"rejected", "timeout"}:
+            return ControlCommand(
+                action="pause",
+                requested_at=utc_now(),
+                reason=str(trial.get("reason") or "colocation trial rejected"),
+                hold=False,
+            )
+
+        timeout = self.control_plane.settings.gpu_scheduler.colocation.trial_decision_timeout_seconds
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            command = self.control_plane.read_command(self.job.job_id)
+            if command.action in {"pause", "cancel"}:
+                return command
+            current = self.store.get_job(self.job.job_id)
+            trial = dict((current.metadata if current is not None else {}).get("colocation_trial") or {})
+            decision = str(trial.get("decision") or "pending")
+            if decision == "accepted":
+                return ControlCommand()
+            if decision in {"rejected", "timeout"}:
+                return ControlCommand(
+                    action="pause",
+                    requested_at=utc_now(),
+                    reason=str(trial.get("reason") or "colocation trial rejected"),
+                    hold=False,
+                )
+            time.sleep(0.05)
+
+        timeout_trial = {**trial, "decision": "timeout", "reason": "colocation trial decision timed out"}
+        self.store.update_job(self.job.job_id, metadata_updates={"colocation_trial": timeout_trial})
+        self.event_logger.emit(
+            "colocation_trial_rejected",
+            job_id=self.job.job_id,
+            payload={"trial_id": timeout_trial.get("trial_id"), "reason": timeout_trial["reason"]},
+        )
+        return ControlCommand(
+            action="pause",
+            requested_at=utc_now(),
+            reason=timeout_trial["reason"],
+            hold=False,
+        )
 
     def _should_checkpoint(self, safe_point_type: SafePointType, *, epoch: int, global_step: int) -> bool:
         policy = self.job.checkpoint_policy
@@ -147,6 +200,20 @@ class TrainingControlHook:
         remaining_runtime_seconds: float | None = None,
     ) -> None:
         command = self.control_plane.read_command(self.job.job_id)
+        observed_epoch_seconds: float | None = None
+        epoch_interval_started_at: str | None = None
+        epoch_interval_finished_at: str | None = None
+        heartbeat_at = utc_now()
+        if safe_point_type == SafePointType.EPOCH:
+            now_monotonic = time.monotonic()
+            epoch_interval_finished_at = heartbeat_at
+            if self._last_epoch_safe_point_monotonic is not None:
+                observed_epoch_seconds = max(0.0, now_monotonic - self._last_epoch_safe_point_monotonic)
+                epoch_interval_started_at = self._last_epoch_safe_point_at
+            elif avg_step_time_ms is not None and steps_per_epoch is not None:
+                observed_epoch_seconds = max(0.0, float(avg_step_time_ms) * int(steps_per_epoch) / 1000.0)
+            self._last_epoch_safe_point_monotonic = now_monotonic
+            self._last_epoch_safe_point_at = heartbeat_at
         snapshot = ProgressSnapshot(
             job_id=self.job.job_id,
             epoch=epoch,
@@ -159,10 +226,22 @@ class TrainingControlHook:
             avg_step_time_ms=avg_step_time_ms,
             estimated_total_runtime_seconds=estimated_total_runtime_seconds,
             remaining_runtime_seconds=remaining_runtime_seconds,
+            observed_epoch_seconds=observed_epoch_seconds,
+            epoch_interval_started_at=epoch_interval_started_at,
+            epoch_interval_finished_at=epoch_interval_finished_at,
+            heartbeat_at=heartbeat_at,
         )
         self.control_plane.write_heartbeat(snapshot)
         metadata_updates: dict[str, Any] | None = None
-        if estimated_total_runtime_seconds is not None or remaining_runtime_seconds is not None:
+        if any(
+            value is not None
+            for value in (
+                estimated_total_runtime_seconds,
+                remaining_runtime_seconds,
+                steps_per_epoch,
+                avg_step_time_ms,
+            )
+        ):
             metadata_updates = {}
             if estimated_total_runtime_seconds is not None:
                 metadata_updates["runtime_estimated_total_runtime_seconds"] = float(estimated_total_runtime_seconds)
@@ -175,6 +254,26 @@ class TrainingControlHook:
         if safe_point_type == SafePointType.EPOCH:
             metadata_updates = metadata_updates or {}
             metadata_updates["last_completed_epoch"] = int(epoch)
+            if observed_epoch_seconds is not None and observed_epoch_seconds > 0:
+                current = self.store.get_job(self.job.job_id)
+                history = list((current.metadata if current is not None else {}).get("runtime_epoch_timing_history") or [])
+                history.append(
+                    {
+                        "epoch": int(epoch),
+                        "seconds": float(observed_epoch_seconds),
+                        "started_at": epoch_interval_started_at,
+                        "finished_at": epoch_interval_finished_at,
+                        "source": "safe_point_interval" if epoch_interval_started_at else "runner_step_time",
+                    }
+                )
+                metadata_updates.update(
+                    {
+                        "runtime_observed_epoch_seconds": float(observed_epoch_seconds),
+                        "runtime_epoch_interval_started_at": epoch_interval_started_at,
+                        "runtime_epoch_interval_finished_at": epoch_interval_finished_at,
+                        "runtime_epoch_timing_history": history[-16:],
+                    }
+                )
         self.store.update_job(
             self.job.job_id,
             last_heartbeat_at=snapshot.heartbeat_at,
@@ -209,6 +308,11 @@ class TrainingControlHook:
                     job_id=self.job.job_id,
                     payload={"epoch": epoch, "warning": early_decision.warning},
                 )
+
+        if safe_point_type == SafePointType.EPOCH:
+            trial_command = self._trial_command_at_epoch(epoch)
+            if trial_command is not None:
+                command = trial_command
 
         pause_requested = command.action == "pause"
         cancel_requested = command.action == "cancel"

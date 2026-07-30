@@ -99,3 +99,24 @@ def build_runtime_profile_key(
     }
     return sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
+
+def normalize_colocation_members(members: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        (
+            {
+                "signature": str(member["signature"]),
+                "batch_size": int(member["batch_size"]),
+                "backend_name": str(member["backend_name"]),
+            }
+            for member in members
+        ),
+        key=lambda member: (member["signature"], member["batch_size"], member["backend_name"]),
+    )
+
+
+def build_colocation_profile_key(hardware_key: str, members: list[dict[str, Any]]) -> str:
+    payload = {
+        "hardware_key": str(hardware_key),
+        "members": normalize_colocation_members(members),
+    }
+    return sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()

@@ -9,6 +9,7 @@ from ..domain import (
     BatchProbeProfile,
     BatchSizeObservation,
     CombinationProfile,
+    ColocationTimingProfile,
     PairProfile,
     RuntimeProfile,
     SoloProfile,
@@ -69,3 +70,5 @@ class PlanningRepository(Protocol):
         backend_name: str | None = None,
         hardware_key: str | None = None,
     ) -> RuntimeProfile | None: ...
+
+    def get_colocation_timing_profile(self, profile_key: str) -> ColocationTimingProfile | None: ...

@@ -18,7 +18,7 @@ from ..profiling.runtime_probe import (
     estimate_total_runtime_from_step_window,
     planned_total_steps,
 )
-from ..domain import ProgressSnapshot
+from ..domain import SafePointType
 
 
 def _load_benchmark_modules():
@@ -298,6 +298,29 @@ def run_timm_benchmark_job(context: RunnerContext) -> dict[str, Any]:
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(params["learning_rate"]))
     criterion = nn.CrossEntropyLoss()
+    start_epoch = 0
+    global_step = 0
+    resume_state = context.load_resume_checkpoint()
+    if resume_state is not None:
+        if resume_state.get("model_state") is not None:
+            model.load_state_dict(resume_state["model_state"])
+        if resume_state.get("optimizer_state") is not None:
+            optimizer.load_state_dict(resume_state["optimizer_state"])
+            for optimizer_state in optimizer.state.values():
+                for key, value in optimizer_state.items():
+                    if torch.is_tensor(value):
+                        optimizer_state[key] = value.to(device)
+        start_epoch = max(0, int(resume_state.get("epoch", 0)))
+        global_step = max(0, int(resume_state.get("global_step", 0)))
+
+    def checkpoint_state(epoch: int) -> dict[str, Any]:
+        return {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "epoch": int(epoch),
+            "global_step": int(global_step),
+            "job_config": context.job.to_dict(),
+        }
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -307,7 +330,6 @@ def run_timm_benchmark_job(context: RunnerContext) -> dict[str, Any]:
     runtime_started_at = time.perf_counter()
     last_loss = 0.0
     n_samples = 0
-    global_step = 0
     first_epoch_step_durations_ms: list[float] = []
     runtime_profile = context.get_runtime_profile(backend_name=backend_name)
     estimated_total_runtime_seconds = (
@@ -317,7 +339,7 @@ def run_timm_benchmark_job(context: RunnerContext) -> dict[str, Any]:
     )
     profile_ready = runtime_profile is not None
     steps_per_epoch = len(dataloader)
-    for epoch_index in range(epochs):
+    for epoch_index in range(start_epoch, epochs):
         epoch_started_at = time.perf_counter()
         for features, labels in dataloader:
             if max_steps is not None and global_step >= int(max_steps):
@@ -378,30 +400,26 @@ def run_timm_benchmark_job(context: RunnerContext) -> dict[str, Any]:
                 },
             )
             profile_ready = True
-        heartbeat = ProgressSnapshot(
-            job_id=context.job.job_id,
+        avg_step_time_ms = (
+            sum(first_epoch_step_durations_ms) / max(1, len(first_epoch_step_durations_ms))
+            if first_epoch_step_durations_ms
+            else None
+        )
+        remaining_runtime_seconds = (
+            max(0.0, estimated_total_runtime_seconds - (time.perf_counter() - runtime_started_at))
+            if estimated_total_runtime_seconds is not None
+            else None
+        )
+        context.control_hook.safe_point(
+            SafePointType.EPOCH,
             epoch=epoch_index + 1,
             global_step=global_step,
-            phase="train",
             metrics={"loss": last_loss},
-            last_safe_point="epoch",
+            state_factory=lambda epoch=epoch_index + 1: checkpoint_state(epoch),
             steps_per_epoch=steps_per_epoch,
-            avg_step_time_ms=(sum(first_epoch_step_durations_ms) / max(1, len(first_epoch_step_durations_ms))) if first_epoch_step_durations_ms else None,
+            avg_step_time_ms=avg_step_time_ms,
             estimated_total_runtime_seconds=estimated_total_runtime_seconds,
-            remaining_runtime_seconds=max(0.0, estimated_total_runtime_seconds - (time.perf_counter() - runtime_started_at))
-            if estimated_total_runtime_seconds is not None
-            else None,
-        )
-        context.control_hook.control_plane.write_heartbeat(heartbeat)
-        context.store.update_job(
-            context.job.job_id,
-            last_heartbeat_at=heartbeat.heartbeat_at,
-            metadata_updates={
-                "runtime_estimated_total_runtime_seconds": estimated_total_runtime_seconds,
-                "runtime_remaining_runtime_seconds": heartbeat.remaining_runtime_seconds,
-                "runtime_steps_per_epoch": steps_per_epoch,
-                "runtime_avg_step_time_ms": heartbeat.avg_step_time_ms,
-            },
+            remaining_runtime_seconds=remaining_runtime_seconds,
         )
         if max_steps is not None and global_step >= int(max_steps):
             break

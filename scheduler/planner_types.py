@@ -17,6 +17,7 @@ class DispatchPlan:
     batch_overrides: dict[str, int] = field(default_factory=dict)
     fallback_order: list[str] = field(default_factory=list)
     objective_breakdown: dict[str, object] = field(default_factory=dict)
+    trial_metadata: dict[str, object] = field(default_factory=dict)
     mandatory_anchor_job_id: str | None = None
     objective_version: str | None = None
 
@@ -31,7 +32,6 @@ class EvaluatedGroup:
     jobs: list[TrainingJob]
     backend_name: str
     estimated_vram_mb: float
-    estimated_sm_utilization: float
     objective_score: float
     batch_overrides: dict[str, int]
     fallback_order: list[str]

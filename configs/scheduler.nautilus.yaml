@@ -62,9 +62,7 @@ gpu_scheduler:
   batch_probe_max_batch_size: null
   batch_probe_search_mode: "binary"
   auto_pack:
-    target_metric: "vram"
     target_vram_fraction: 0.97
-    target_sm_fraction: 0.90
     runtime_skew_guardrail_ratio: 2.0
   profiling:
     warmup_steps: 30
@@ -76,11 +74,14 @@ gpu_scheduler:
     live_admission_stop_fraction: 0.90
     live_admission_resume_fraction: 0.85
     admission_average_window_seconds: 10
+  colocation:
+    min_gain: 1.0
+    trial_epochs: 2
+    trial_decision_timeout_seconds: 30
+    live_trial_enabled: true
   thresholds:
-    pack_prefer_sm_active_lt: 0.50
-    pack_reject_sm_active_ge: 0.80
-    pack_reject_max_slowdown: 1.30  # reserved; ignored by live placement
-    latency_sensitive_max_slowdown: 1.15  # reserved; ignored by live placement
+    pack_reject_max_slowdown: 1.30  # legacy reporting threshold
+    latency_sensitive_max_slowdown: 1.15  # legacy reporting threshold
   telemetry:
     device_poll_ms: 500
     pair_recheck_every_steps: 20

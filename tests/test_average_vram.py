@@ -25,12 +25,13 @@ class AverageVramTest(unittest.TestCase):
     def test_telemetry_separates_average_used_vram_from_controller_utilization(self) -> None:
         summary = GpuTelemetrySummary.from_samples(
             [
-                GpuTelemetrySample(memory_used_mb=100, memory_utilization=0.9),
-                GpuTelemetrySample(memory_used_mb=300, memory_utilization=0.1),
+                GpuTelemetrySample(memory_used_mb=100, gpu_utilization=0.25, memory_utilization=0.9),
+                GpuTelemetrySample(memory_used_mb=300, gpu_utilization=0.75, memory_utilization=0.1),
             ]
         )
         self.assertEqual(summary.peak_vram_mb, 300)
         self.assertEqual(summary.avg_vram_mb, 200)
+        self.assertEqual(summary.avg_gpu_utilization, 0.5)
         self.assertEqual(summary.avg_memory_utilization, 0.5)
 
     def test_sqlite_round_trips_average_vram_for_all_packing_profiles(self) -> None:

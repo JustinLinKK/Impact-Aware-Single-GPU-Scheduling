@@ -87,15 +87,20 @@ gpu_scheduler:
     admission_average_window_seconds: 10
   objective:
     priority_weight: 0.10
-    objective_version: "time_v3_flow_only"
+    objective_version: "time_v4_colocation_gain"
   batch_options:
     exponent_offsets: [-2, -1, 0, 1, 2]
     require_power_of_two_original: true
+  colocation:
+    min_gain: 1.0
+    trial_epochs: 2
+    trial_decision_timeout_seconds: 30
+    live_trial_enabled: true
   exclusive_probe:
     enabled: true
     drain_without_preemption: true
   thresholds:
-    pack_reject_max_slowdown: 1.30  # reserved; ignored by live placement
+    pack_reject_max_slowdown: 1.30  # legacy reporting threshold; admission uses colocation.min_gain
   telemetry:
     device_poll_ms: 500
     pair_recheck_every_steps: 20

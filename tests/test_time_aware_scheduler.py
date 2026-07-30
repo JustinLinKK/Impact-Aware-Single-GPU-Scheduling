@@ -15,6 +15,7 @@ from localml_scheduler.config import SchedulerSettings
 from localml_scheduler.domain import (
     BatchSizeObservation,
     BatchResolution,
+    ColocationTimingProfile,
     CombinationProfile,
     JobStatus,
     PackingSpec,
@@ -24,8 +25,10 @@ from localml_scheduler.domain import (
     RuntimeProfile,
     SafePointType,
     SchedulingClass,
+    SoloProfile,
     TrainingJob,
     build_batch_size_observation_key,
+    build_colocation_profile_key,
     build_group_signature,
 )
 from localml_scheduler.scheduler.early_stopping import (
@@ -35,6 +38,7 @@ from localml_scheduler.scheduler.early_stopping import (
 from localml_scheduler.execution.control import (
     ControlPlane,
     EarlyStopRequested,
+    PauseRequested,
     TrainingControlHook,
 )
 from localml_scheduler.execution.worker_runtime import mark_job_completed
@@ -43,12 +47,13 @@ from localml_scheduler.observability.outcomes import classify_job_outcome
 from localml_scheduler.scheduler.placement_planner import PlacementPlanner
 from localml_scheduler.scheduler.policies import PriorityFifoPolicy
 from localml_scheduler.scheduler.resource_estimator import BatchOptionEstimate
-from localml_scheduler.prediction import JobPredictionError
+from localml_scheduler.prediction import JobPredictionError, MLVramPredictor
 from localml_scheduler.scheduler.telemetry import (
     GpuTelemetrySample,
     MemoryAdmissionGate,
 )
-from localml_scheduler.scheduler.service import ActiveRun, SchedulerService
+from localml_scheduler.scheduler.time_objective import TimeAwareObjectiveScorer
+from localml_scheduler.scheduler.service import ActiveRun, ColocationTrialState, SchedulerService
 from localml_scheduler.scheduler.supervisor import WorkerSnapshot
 from localml_scheduler.scheduler.trace_simulator import (
     TraceBackendChange,
@@ -61,6 +66,7 @@ from localml_scheduler.scheduler.trace_simulator import (
     compare_policies,
     feasible_packs,
     markdown_table,
+    simulate_recursive_time_aware,
     simulate_policy,
 )
 from localml_scheduler.storage.sqlite_store import SQLiteStateStore
@@ -173,8 +179,37 @@ def test_time_aware_configuration_validates_and_migrates_legacy_cap() -> None:
             gpu_scheduler=migrated.gpu_scheduler.to_dict(),
             early_stopping={"mode": "min", "patience_epochs": 2},
         )
-        assert restored.gpu_scheduler.objective.objective_version == "time_v3_flow_only"
+        assert restored.gpu_scheduler.objective.objective_version == "time_v4_colocation_gain"
+        assert restored.gpu_scheduler.colocation.min_gain == 1.0
+        assert restored.gpu_scheduler.colocation.trial_epochs == 2
+        assert restored.gpu_scheduler.colocation.trial_decision_timeout_seconds == 30
+        assert restored.gpu_scheduler.colocation.live_trial_enabled
+        legacy_objective = SchedulerSettings(
+            runtime_root=tmpdir,
+            gpu_scheduler={
+                "mode": "parallel_time_aware",
+                "objective": {"objective_version": "time_v3_flow_only"},
+            },
+        )
+        assert legacy_objective.gpu_scheduler.objective.objective_version == "time_v4_colocation_gain"
         assert restored.early_stopping.mode == "min"
+        serialized_gpu = restored.gpu_scheduler.to_dict()
+        assert "pack_prefer_sm_active_lt" not in serialized_gpu["thresholds"]
+        assert "pack_reject_sm_active_ge" not in serialized_gpu["thresholds"]
+        assert "target_metric" not in serialized_gpu["auto_pack"]
+        assert "target_sm_fraction" not in serialized_gpu["auto_pack"]
+        for removed_key in ("pack_prefer_sm_active_lt", "pack_reject_sm_active_ge"):
+            with pytest.raises(ValueError, match="no longer supports SM scheduling controls"):
+                SchedulerSettings(
+                    runtime_root=tmpdir,
+                    gpu_scheduler={"thresholds": {removed_key: 0.9}},
+                )
+        for removed_key, value in (("target_metric", "vram"), ("target_sm_fraction", 0.9)):
+            with pytest.raises(ValueError, match="always VRAM-only"):
+                SchedulerSettings(
+                    runtime_root=tmpdir,
+                    gpu_scheduler={"auto_pack": {removed_key: value}},
+                )
         with pytest.raises(ValueError, match="no longer supports throughput scheduling controls"):
             SchedulerSettings(
                 runtime_root=tmpdir,
@@ -193,7 +228,100 @@ def test_time_aware_configuration_validates_and_migrates_legacy_cap() -> None:
             )
 
 
-def test_time_score_prefers_faster_pack_and_ignores_sm_utilization() -> None:
+@pytest.mark.parametrize(
+    "scheduler_mode",
+    [
+        "parallel_default",
+        "parallel_batch_optimized",
+        "parallel_auto_pack",
+        "parallel_time_aware",
+    ],
+)
+def test_parallel_placement_is_invariant_to_sm_utilization(scheduler_mode: str) -> None:
+    def plan_for_utilization(avg_gpu_utilization: float) -> tuple[object, ...]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = _settings(
+                tmpdir,
+                mode=scheduler_mode,
+                max_packed_jobs_per_gpu=2,
+                parallel_job_cap=2,
+                auto_pack={"target_vram_fraction": 0.97},
+            )
+            store = SQLiteStateStore(settings)
+            planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
+            jobs = [_job("sm-left", "sm-left-sig"), _job("sm-right", "sm-right-sig")]
+            for index, job in enumerate(jobs, start=1):
+                job.queue_sequence = index
+                job.runtime_probe.enabled = True
+                _seed_options(store, planner, job)
+                store.upsert_solo_profile(
+                    SoloProfile(
+                        signature=job.packing.signature or job.job_id,
+                        family=job.packing.family,
+                        peak_vram_mb=512,
+                        avg_vram_mb=404.0,
+                        avg_gpu_utilization=avg_gpu_utilization,
+                        sample_count=1,
+                        last_job_id=job.job_id,
+                    )
+                )
+            plan = planner.choose_plan(
+                jobs,
+                backend_available={"cuda_process": True, "exclusive": True},
+            )
+            assert plan is not None
+            assert plan.mode == ("stack_anchor" if scheduler_mode == "parallel_time_aware" else "packed_pair")
+            return plan.mode, plan.backend_name, plan.job_ids, plan.batch_overrides
+
+    baseline = plan_for_utilization(0.0)
+    assert plan_for_utilization(0.9) == baseline
+    assert plan_for_utilization(1.0) == baseline
+
+
+def test_auto_pack_uses_active_and_candidate_vram_only() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(
+            tmpdir,
+            mode="parallel_auto_pack",
+            auto_pack={"target_vram_fraction": 0.10},
+        )
+        store = SQLiteStateStore(settings)
+        planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
+        jobs = [_job("auto-left", "auto-left-sig"), _job("auto-right", "auto-right-sig")]
+        for job in jobs:
+            job.runtime_probe.enabled = True
+            _seed_options(store, planner, job)
+            store.upsert_solo_profile(
+                SoloProfile(
+                    signature=job.packing.signature or job.job_id,
+                    family=job.packing.family,
+                    avg_vram_mb=404.0,
+                    avg_gpu_utilization=1.0,
+                    sample_count=1,
+                )
+            )
+        target_vram_mb = planner.estimator.safe_budget_mb() * settings.gpu_scheduler.auto_pack.target_vram_fraction
+        candidate_vram_mb = sum(
+            planner.estimator.estimate_avg_vram_mb(job, 4, "cuda_process") for job in jobs
+        )
+        exact_active_vram_mb = target_vram_mb - candidate_vram_mb
+
+        accepted = planner.objective.evaluate_auto_pack_group(
+            jobs,
+            "cuda_process",
+            active_vram_mb=exact_active_vram_mb,
+        )
+        rejected = planner.objective.evaluate_auto_pack_group(
+            jobs,
+            "cuda_process",
+            active_vram_mb=exact_active_vram_mb + 1e-6,
+        )
+
+        assert accepted is not None
+        assert rejected is None
+
+
+def test_time_score_starts_one_anchor_and_ignores_legacy_pair_slowdown() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         settings = _settings(tmpdir)
         store = SQLiteStateStore(settings)
@@ -221,16 +349,10 @@ def test_time_score_prefers_faster_pack_and_ignores_sm_utilization() -> None:
             backend_available={"cuda_process": True, "exclusive": True},
         )
         assert plan is not None
-        assert plan.mode == "packed_pair"
-        assert plan.objective_version == "time_v3_flow_only"
-        assert plan.objective_breakdown["score"] == pytest.approx(
-            plan.objective_breakdown["normalized_flow_cost"]
-        )
-        assert plan.objective_breakdown["slowdown_prediction"] == "disabled"
-        assert "member_slowdowns" not in plan.objective_breakdown
-        assert "aggregate_gain" not in plan.objective_breakdown
-        assert "makespan_proxy" not in plan.objective_breakdown
-        assert "candidate_estimates" in plan.objective_breakdown
+        assert plan.mode == "stack_anchor"
+        assert plan.job_ids == ("left",)
+        assert plan.objective_version == "time_v4_colocation_gain"
+        assert plan.objective_breakdown["requires_live_trial"] is False
 
 
 def test_starved_oldest_job_is_mandatory_exclusive_fallback() -> None:
@@ -357,8 +479,9 @@ def test_active_plus_new_jobs_respect_cap_memory_and_determinism() -> None:
         assert first is not None
         assert first.mode == "concurrent_group"
         assert len(first.job_ids) + 1 == 2
-        assert set(first.objective_breakdown["completion_offsets_seconds"]) == {"active", "waiting"}
-        assert "active" in first.objective_breakdown["active_fixed_estimates"]
+        assert first.objective_breakdown["preexisting_job_ids"] == ["active"]
+        assert first.objective_breakdown["requires_live_trial"]
+        assert first.trial_metadata["preexisting_job_ids"] == ["active"]
         assert planner.choose_plan([waiting], **{**kwargs, "active_vram_mb": 8_500.0}) is None
 
 
@@ -398,8 +521,9 @@ def test_stale_cached_fill_objective_cannot_influence_time_score() -> None:
             backend_available={"cuda_process": True, "exclusive": True},
         )
         assert plan is not None
-        assert plan.objective_version == "time_v3_flow_only"
-        assert plan.batch_overrides == {"left": 1, "right": 1}
+        assert plan.objective_version == "time_v4_colocation_gain"
+        assert plan.mode == "stack_anchor"
+        assert plan.batch_overrides == {"left": 1}
 
 
 def test_batch_optimized_ignores_slowdown_and_legacy_cached_objective() -> None:
@@ -531,6 +655,7 @@ class _DrainSupervisor:
     def __init__(self, active_ids: list[str]) -> None:
         self.active_ids = active_ids
         self.dispatched: list[str] = []
+        self.paused: list[str] = []
 
     def active_job_ids(self) -> list[str]:
         return list(self.active_ids)
@@ -551,6 +676,10 @@ class _DrainSupervisor:
             job_ids=[job.job_id for job in jobs],
             group_id="probe-group",
         )
+
+    def request_pause(self, job_id: str, *, reason: str, hold: bool) -> bool:
+        self.paused.append(job_id)
+        return job_id in self.active_ids
 
 
 def test_service_probe_reservation_blocks_normal_admission_until_drain() -> None:
@@ -686,8 +815,8 @@ def test_existing_measured_slowdown_survives_run_without_solo_baseline() -> None
                     "per_member_slowdown": {left.job_id: 1.25, right.job_id: 1.2},
                     "per_signature_slowdown": {"preserve-left-sig": 1.25, "preserve-right-sig": 1.2},
                     "slowdown_sources": {
-                        left.job_id: "measured_against_exclusive_profile",
-                        right.job_id: "measured_against_exclusive_profile",
+                        left.job_id: "measured_epoch_against_exclusive_profile",
+                        right.job_id: "measured_epoch_against_exclusive_profile",
                     },
                 },
             )
@@ -705,10 +834,10 @@ def test_existing_measured_slowdown_survives_run_without_solo_baseline() -> None
         assert profile is not None
         assert profile.slowdown_ratio == pytest.approx(1.25)
         assert profile.metadata["batch_vector"] == {left.job_id: 4, right.job_id: 4}
-        assert set(profile.metadata["slowdown_sources"].values()) == {"measured_against_exclusive_profile"}
+        assert set(profile.metadata["slowdown_sources"].values()) == {"measured_epoch_against_exclusive_profile"}
 
 
-def test_same_batch_exclusive_profiles_support_passive_slowdown_measurement() -> None:
+def test_whole_run_elapsed_time_is_not_used_for_slowdown_measurement() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         settings = _settings(tmpdir)
         store = SQLiteStateStore(settings)
@@ -740,8 +869,8 @@ def test_same_batch_exclusive_profiles_support_passive_slowdown_measurement() ->
         SchedulerService(settings, store=store, supervisor=_DrainSupervisor([]))._record_combination_profiles(run)
         profile = store.get_pair_profile("measured-left-sig", "measured-right-sig", backend_name="cuda_process")
         assert profile is not None
-        assert profile.slowdown_ratio == pytest.approx(2.0, rel=0.05)
-        assert set(profile.metadata["slowdown_sources"].values()) == {"measured_against_exclusive_profile"}
+        assert profile.slowdown_ratio is None
+        assert profile.metadata["slowdown_sources"] == {}
 
 
 def test_batch_resolution_remains_immutable_across_dispatch_and_resume_round_trip() -> None:
@@ -894,16 +1023,25 @@ def test_time_aware_pair_rejects_incompatibility_and_cooldown_but_ignores_slowdo
                 observations=1,
             )
         )
-        plan = planner.choose_plan(
-            [left, right],
-            backend_available={"cuda_process": True, "exclusive": True},
+        left.metadata.update(
+            {
+                "placement_backend": "cuda_process",
+                "runtime_observed_epoch_seconds": 10.0,
+            }
         )
-        assert plan is not None
-        assert (plan.mode == "packed_pair") is expect_pair
+        plan = planner.choose_plan(
+            [right],
+            backend_available={"cuda_process": True, "exclusive": True},
+            active_jobs=[left],
+            active_vram_mb=404.0,
+        )
+        assert (plan is not None) is expect_pair
+        if plan is not None:
+            assert plan.mode == "concurrent_group"
 
 
-@pytest.mark.parametrize(("cap", "expected_size"), [(1, 1), (2, 2), (3, 3), (None, 3)])
-def test_parallel_cap_values_one_two_three_and_unlimited(cap: int | None, expected_size: int) -> None:
+@pytest.mark.parametrize("cap", [1, 2, 3, None])
+def test_parallel_cap_values_start_one_anchor(cap: int | None) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         settings = _settings(tmpdir, parallel_job_cap=cap)
         store = SQLiteStateStore(settings)
@@ -925,7 +1063,497 @@ def test_parallel_cap_values_one_two_three_and_unlimited(cap: int | None, expect
             )
         plan = planner.choose_plan(jobs, backend_available={"cuda_process": True, "exclusive": True})
         assert plan is not None
-        assert len(plan.job_ids) == expected_size
+        assert len(plan.job_ids) == 1
+        assert plan.mode == ("exclusive" if cap == 1 else "stack_anchor")
+
+
+@pytest.mark.parametrize(
+    ("packed_rate", "expected_gain"),
+    [(1.0, 2.0), (2.0, 1.0), (3.0, 2.0 / 3.0)],
+)
+def test_colocation_gain_above_equal_and_below_one(packed_rate: float, expected_gain: float) -> None:
+    active = _job("gain-active", "gain-active-sig")
+    candidate = _job("gain-candidate", "gain-candidate-sig")
+    for job in (active, candidate):
+        job.max_epochs = 10
+        job.config.max_epochs = 10
+    gain = TimeAwareObjectiveScorer.gain(
+        [active],
+        candidate,
+        active_epoch_seconds={active.job_id: 1.0},
+        candidate_solo_epoch_seconds=1.0,
+        packed_epoch_seconds={active.job_id: packed_rate, candidate.job_id: packed_rate},
+    )
+    assert gain is not None
+    assert gain[0] == pytest.approx(expected_gain)
+
+
+def test_colocation_profile_key_isolated_by_hardware_backend_batch_duplicates_and_size() -> None:
+    base = [
+        {"signature": "same", "batch_size": 4, "backend_name": "cuda_process"},
+        {"signature": "same", "batch_size": 4, "backend_name": "cuda_process"},
+    ]
+    key = build_colocation_profile_key("gpu-a", base)
+    assert key == build_colocation_profile_key("gpu-a", list(reversed(base)))
+    assert key != build_colocation_profile_key("gpu-b", base)
+    assert key != build_colocation_profile_key(
+        "gpu-a",
+        [{**base[0], "batch_size": 8}, base[1]],
+    )
+    assert key != build_colocation_profile_key(
+        "gpu-a",
+        [{**base[0], "backend_name": "stream"}, base[1]],
+    )
+    assert key != build_colocation_profile_key("gpu-a", base[:1])
+    assert key != build_colocation_profile_key(
+        "gpu-a",
+        [*base, {"signature": "same", "batch_size": 4, "backend_name": "cuda_process"}],
+    )
+
+
+def test_exact_colocation_profile_below_gain_is_rejected_before_dispatch_and_stalls() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir, parallel_job_cap=2)
+        store = SQLiteStateStore(settings)
+        planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
+        active = _job("known-active", "known-active-sig")
+        candidate = _job("known-candidate", "known-candidate-sig")
+        for job in (active, candidate):
+            job.max_epochs = 10
+            job.config.max_epochs = 10
+            _seed_options(store, planner, job)
+        active.metadata.update(
+            {
+                "placement_backend": "cuda_process",
+                "runtime_observed_epoch_seconds": 1.0,
+                "resolved_batch_size": 4,
+            }
+        )
+        active = store.submit_job(active)
+        candidate = store.submit_job(candidate)
+        store.set_job_status(active.job_id, JobStatus.RUNNING, reason="test", hold=False)
+        store.set_job_status(candidate.job_id, JobStatus.READY, reason="test", hold=False)
+        members = [
+            {"signature": "known-active-sig", "batch_size": 4, "backend_name": "cuda_process"},
+            {"signature": "known-candidate-sig", "batch_size": 1, "backend_name": "cuda_process"},
+        ]
+        store.upsert_colocation_timing_profile(
+            ColocationTimingProfile.create(
+                store.hardware_key(),
+                members,
+                [{**member, "seconds_per_epoch": 20.0, "observations": 1} for member in members],
+                observations=1,
+            )
+        )
+        plan = planner.choose_plan(
+            [store.get_job(candidate.job_id)],
+            backend_available={"cuda_process": True, "exclusive": True},
+            active_jobs=[store.get_job(active.job_id)],
+            active_vram_mb=404.0,
+        )
+        assert plan is not None
+        assert plan.objective_breakdown["gain"] < 1.0
+        assert plan.objective_breakdown["colocation_rejected"]
+        supervisor = _DrainSupervisor([active.job_id])
+        service = SchedulerService(settings, store=store, supervisor=supervisor)
+        assert not service._dispatch_plan(plan)
+        assert supervisor.dispatched == []
+        assert service._colocation_stall is not None
+        rejected = store.get_job(candidate.job_id)
+        assert rejected is not None and rejected.status == JobStatus.PAUSED and not rejected.hold
+
+
+def test_two_real_trial_epochs_hit_decision_barrier_and_rejection_preserves_checkpoint() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir)
+        settings.ensure_runtime_layout()
+        store = SQLiteStateStore(settings)
+        job = _job("trial-barrier", "trial-barrier-sig")
+        job.max_epochs = 10
+        job.config.max_epochs = 10
+        job.metadata["colocation_trial"] = {
+            "trial_id": "trial-barrier",
+            "start_epoch": 0,
+            "target_epoch": 2,
+            "decision": "pending",
+        }
+        job = store.submit_job(job)
+        store.set_job_status(job.job_id, JobStatus.RUNNING, reason="test", hold=False)
+        events = EventLogger(store, settings.events_jsonl_path)
+        control = ControlPlane(settings)
+        control.initialize_job(job.job_id)
+        hook = TrainingControlHook(job, control, CheckpointManager(settings, store, events), store, events)
+        hook.safe_point(
+            SafePointType.EPOCH,
+            epoch=1,
+            global_step=1,
+            state_factory=lambda: {"epoch": 1},
+            steps_per_epoch=2,
+            avg_step_time_ms=500.0,
+        )
+        store.update_job(
+            job.job_id,
+            metadata_updates={
+                "colocation_trial": {
+                    **store.get_job(job.job_id).metadata["colocation_trial"],
+                    "decision": "rejected",
+                    "reason": "gain below one",
+                }
+            },
+        )
+        with pytest.raises(PauseRequested):
+            hook.safe_point(
+                SafePointType.EPOCH,
+                epoch=2,
+                global_step=2,
+                state_factory=lambda: {"epoch": 2},
+                steps_per_epoch=2,
+                avg_step_time_ms=500.0,
+            )
+        paused = store.get_job(job.job_id)
+        assert paused is not None
+        assert paused.metadata["last_completed_epoch"] == 2
+        assert paused.status == JobStatus.PAUSED and not paused.hold
+        assert paused.latest_checkpoint_path
+
+
+def test_accepted_trial_retains_two_epochs_and_releases_third_epoch() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir)
+        settings.ensure_runtime_layout()
+        store = SQLiteStateStore(settings)
+        job = _job("accepted-barrier", "accepted-barrier-sig")
+        job.max_epochs = 10
+        job.config.max_epochs = 10
+        job.metadata["colocation_trial"] = {
+            "trial_id": "accepted-barrier",
+            "start_epoch": 0,
+            "target_epoch": 2,
+            "decision": "pending",
+        }
+        job = store.submit_job(job)
+        store.set_job_status(job.job_id, JobStatus.RUNNING, reason="test", hold=False)
+        events = EventLogger(store, settings.events_jsonl_path)
+        control = ControlPlane(settings)
+        control.initialize_job(job.job_id)
+        hook = TrainingControlHook(job, control, CheckpointManager(settings, store, events), store, events)
+        hook.safe_point(SafePointType.EPOCH, epoch=1, global_step=1, state_factory=lambda: {"epoch": 1})
+        store.update_job(
+            job.job_id,
+            metadata_updates={
+                "colocation_trial": {
+                    **store.get_job(job.job_id).metadata["colocation_trial"],
+                    "decision": "accepted",
+                }
+            },
+        )
+        hook.safe_point(SafePointType.EPOCH, epoch=2, global_step=2, state_factory=lambda: {"epoch": 2})
+        hook.safe_point(SafePointType.EPOCH, epoch=3, global_step=3, state_factory=lambda: {"epoch": 3})
+        running = store.get_job(job.job_id)
+        assert running is not None and running.status == JobStatus.RUNNING
+        assert running.metadata["last_completed_epoch"] == 3
+
+
+def test_trial_decision_timeout_checkpoints_and_pauses_as_unverified() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(
+            tmpdir,
+            colocation={
+                "min_gain": 1.0,
+                "trial_epochs": 2,
+                "trial_decision_timeout_seconds": 0.05,
+                "live_trial_enabled": True,
+            },
+        )
+        settings.ensure_runtime_layout()
+        store = SQLiteStateStore(settings)
+        job = _job("timeout-barrier", "timeout-barrier-sig")
+        job.max_epochs = 10
+        job.config.max_epochs = 10
+        job.metadata["colocation_trial"] = {
+            "trial_id": "timeout-barrier",
+            "start_epoch": 0,
+            "target_epoch": 1,
+            "decision": "pending",
+        }
+        job = store.submit_job(job)
+        store.set_job_status(job.job_id, JobStatus.RUNNING, reason="test", hold=False)
+        events = EventLogger(store, settings.events_jsonl_path)
+        control = ControlPlane(settings)
+        control.initialize_job(job.job_id)
+        hook = TrainingControlHook(job, control, CheckpointManager(settings, store, events), store, events)
+        with pytest.raises(PauseRequested):
+            hook.safe_point(
+                SafePointType.EPOCH,
+                epoch=1,
+                global_step=1,
+                state_factory=lambda: {"epoch": 1},
+            )
+        paused = store.get_job(job.job_id)
+        assert paused is not None and paused.status == JobStatus.PAUSED and not paused.hold
+        assert paused.metadata["colocation_trial"]["decision"] == "timeout"
+        assert paused.latest_checkpoint_path
+
+
+def test_newcomer_finishing_at_trial_target_is_released_without_slowdown_stall() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir, parallel_job_cap=2)
+        store = SQLiteStateStore(settings)
+        active = _job("finish-active", "finish-active-sig")
+        candidate = _job("finish-candidate", "finish-candidate-sig")
+        active.max_epochs = active.config.max_epochs = 10
+        candidate.max_epochs = candidate.config.max_epochs = 2
+        started = datetime.now(timezone.utc) - timedelta(seconds=10)
+        for job in (active, candidate):
+            job.metadata.update(
+                {
+                    "placement_backend": "cuda_process",
+                    "resolved_batch_size": 4,
+                    "runtime_epoch_timing_history": [
+                        {
+                            "epoch": 2,
+                            "seconds": 3.0,
+                            "started_at": (started + timedelta(seconds=1)).isoformat(),
+                            "finished_at": (started + timedelta(seconds=4)).isoformat(),
+                        }
+                    ],
+                }
+            )
+            store.submit_job(job)
+            store.set_job_status(job.job_id, JobStatus.RUNNING, reason="test", hold=False)
+        store.update_job(candidate.job_id, metadata_updates={"last_completed_epoch": 2})
+        supervisor = _DrainSupervisor([active.job_id, candidate.job_id])
+        service = SchedulerService(settings, store=store, supervisor=supervisor)
+        service._colocation_trial = ColocationTrialState(
+            trial_id="finish-at-target",
+            candidate_job_id=candidate.job_id,
+            preexisting_job_ids=(active.job_id,),
+            started_at=started.isoformat(),
+            start_epoch=0,
+            target_epoch=2,
+            backend_name="cuda_process",
+            profile_key="finish-profile",
+            candidate_solo_epoch_seconds=1.0,
+            pretrial_epoch_seconds={active.job_id: 1.0},
+        )
+        service._evaluate_colocation_trial()
+        assert service._colocation_trial is None
+        assert service._colocation_stall is None
+        assert supervisor.paused == []
+        result = store.get_job(candidate.job_id)
+        assert result is not None
+        assert result.metadata["colocation_trial"]["decision"] == "accepted"
+
+
+def test_membership_change_restarts_trial_window_and_trial_state_recovers() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir, parallel_job_cap=3)
+        store = SQLiteStateStore(settings)
+        jobs = [_job("restart-a", "restart-a-sig"), _job("restart-b", "restart-b-sig"), _job("restart-c", "restart-c-sig")]
+        for job in jobs:
+            job.max_epochs = 10
+            job.config.max_epochs = 10
+            job.metadata.update(
+                {
+                    "placement_backend": "cuda_process",
+                    "runtime_observed_epoch_seconds": 1.0,
+                    "resolved_batch_size": 4,
+                }
+            )
+            store.submit_job(job)
+            store.set_job_status(job.job_id, JobStatus.RUNNING, reason="test", hold=False)
+        store.update_job("restart-c", metadata_updates={"last_completed_epoch": 2})
+        supervisor = _DrainSupervisor(["restart-a", "restart-c"])
+        service = SchedulerService(settings, store=store, supervisor=supervisor)
+        service._colocation_trial = ColocationTrialState(
+            trial_id="old-window",
+            candidate_job_id="restart-c",
+            preexisting_job_ids=("restart-a",),
+            started_at=(datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(),
+            start_epoch=0,
+            target_epoch=2,
+            backend_name="cuda_process",
+            profile_key="old-key",
+            candidate_solo_epoch_seconds=1.0,
+            pretrial_epoch_seconds={"restart-a": 1.0, "restart-b": 1.0},
+        )
+        service._persist_scheduler_decision_state()
+        recovered = SchedulerService(settings, store=store, supervisor=supervisor)
+        assert recovered._colocation_trial is not None
+        supervisor.active_ids = ["restart-b", "restart-c"]
+        recovered._evaluate_colocation_trial()
+        assert recovered._colocation_trial is not None
+        assert recovered._colocation_trial.trial_id != "old-window"
+        assert recovered._colocation_trial.preexisting_job_ids == ("restart-b",)
+        assert recovered._colocation_trial.start_epoch == 2
+        assert recovered._colocation_trial.target_epoch == 4
+
+
+def test_clean_epoch_trial_persists_exact_timing_and_pair_slowdown() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir)
+        store = SQLiteStateStore(settings)
+        planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
+        jobs = [_job("timing-a", "timing-a-sig"), _job("timing-b", "timing-b-sig")]
+        for job in jobs:
+            job.max_epochs = 10
+            job.config.max_epochs = 10
+            job.metadata.update({"placement_backend": "cuda_process", "resolved_batch_size": 4})
+            _seed_options(store, planner, job)
+        service = SchedulerService(settings, store=store, supervisor=_DrainSupervisor([job.job_id for job in jobs]))
+        descriptors = [service._member_descriptor(job, "cuda_process") for job in jobs]
+        trial = ColocationTrialState(
+            trial_id="clean-timing",
+            candidate_job_id="timing-b",
+            preexisting_job_ids=("timing-a",),
+            started_at=datetime.now(timezone.utc).isoformat(),
+            start_epoch=0,
+            target_epoch=2,
+            backend_name="cuda_process",
+            profile_key=build_colocation_profile_key(store.hardware_key(), descriptors),
+            candidate_solo_epoch_seconds=10.0,
+            pretrial_epoch_seconds={"timing-a": 10.0},
+        )
+        service._persist_colocation_timing_profile(
+            jobs,
+            {"timing-a": 12.0, "timing-b": 15.0},
+            trial,
+        )
+        profile = store.get_colocation_timing_profile(trial.profile_key)
+        assert profile is not None and len(profile.member_timings) == 2
+        pair = store.get_pair_profile("timing-a-sig", "timing-b-sig", backend_name="cuda_process")
+        assert pair is not None and pair.slowdown_ratio == pytest.approx(1.5)
+        assert set(pair.metadata["slowdown_sources"].values()) == {
+            "measured_epoch_against_exclusive_profile"
+        }
+
+
+def test_measured_slowdown_rejection_stalls_all_candidates_until_preexisting_member_leaves() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir, parallel_job_cap=4)
+        store = SQLiteStateStore(settings)
+        planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
+        active_jobs = [_job("stack-a", "stack-a-sig"), _job("stack-b", "stack-b-sig")]
+        candidate = _job("stack-c", "stack-c-sig")
+        later = _job("stack-d", "stack-d-sig")
+        started = datetime.now(timezone.utc) - timedelta(seconds=10)
+        for job in [*active_jobs, candidate, later]:
+            job.max_epochs = 10
+            job.config.max_epochs = 10
+            _seed_options(store, planner, job)
+            job.metadata.update({"placement_backend": "cuda_process", "resolved_batch_size": 4})
+            store.submit_job(job)
+        for job in active_jobs:
+            store.update_job(
+                job.job_id,
+                status=JobStatus.RUNNING,
+                hold=False,
+                metadata_updates={
+                    "runtime_epoch_timing_history": [
+                        {
+                            "epoch": 1,
+                            "seconds": 3.0,
+                            "started_at": (started + timedelta(seconds=1)).isoformat(),
+                            "finished_at": (started + timedelta(seconds=4)).isoformat(),
+                        }
+                    ]
+                },
+            )
+        store.update_job(
+            candidate.job_id,
+            status=JobStatus.RUNNING,
+            hold=False,
+            metadata_updates={
+                "last_completed_epoch": 2,
+                "runtime_epoch_timing_history": [
+                    {
+                        "epoch": 2,
+                        "seconds": 3.0,
+                        "started_at": (started + timedelta(seconds=1)).isoformat(),
+                        "finished_at": (started + timedelta(seconds=4)).isoformat(),
+                    }
+                ],
+            },
+        )
+        store.set_job_status(later.job_id, JobStatus.READY, reason="test", hold=False)
+        supervisor = _DrainSupervisor(["stack-a", "stack-b", "stack-c"])
+        service = SchedulerService(settings, store=store, supervisor=supervisor)
+        trial = ColocationTrialState(
+            trial_id="measured-rejection",
+            candidate_job_id=candidate.job_id,
+            preexisting_job_ids=("stack-a", "stack-b"),
+            started_at=started.isoformat(),
+            start_epoch=0,
+            target_epoch=2,
+            backend_name="cuda_process",
+            profile_key="measured-stack-key",
+            candidate_solo_epoch_seconds=1.0,
+            pretrial_epoch_seconds={"stack-a": 1.0, "stack-b": 1.0},
+        )
+        service._colocation_trial = trial
+        service._evaluate_colocation_trial()
+        assert supervisor.paused == ["stack-c"]
+        assert service._colocation_stall is not None
+        assert service._colocation_stall.preexisting_job_ids == ("stack-a", "stack-b")
+        service._dispatch_pending_work()
+        assert supervisor.dispatched == []
+
+        restored = SchedulerService(settings, store=store, supervisor=supervisor)
+        assert restored._colocation_stall is not None
+        supervisor.active_ids = ["stack-b"]
+        restored._refresh_colocation_stall()
+        assert restored._colocation_stall is None
+
+
+def test_trace_simulator_preserves_two_rejected_epochs_and_models_stall() -> None:
+    option = (TraceBatchOption(4, 100.0, 10.0),)
+    problem = TraceProblem(
+        jobs=(
+            TraceJob("a", 0.0, 0, option, planned_epochs=10),
+            TraceJob("b", 0.0, 0, option, planned_epochs=10),
+            TraceJob("c", 0.0, 0, option, planned_epochs=10),
+        ),
+        memory_budget_mb=500.0,
+        parallel_cap=2,
+        slowdown_by_pair={("a", "b"): 3.0, ("a", "c"): 1.0, ("b", "c"): 1.0},
+    )
+    result = simulate_recursive_time_aware(problem)
+    assert result.slowdown_rejections == 1
+    assert result.admission_stalls == 1
+    assert result.rejected_trial_epochs_preserved == pytest.approx(2.0)
+    assert result.colocation_trial_epochs >= 2.0
+
+
+def test_ml_epoch_prediction_requires_canonical_declared_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    legacy = object.__new__(MLVramPredictor)
+    legacy._target_names = ("train_mem", "train_time")
+    with pytest.raises(JobPredictionError, match="does not expose train_epoch_ms"):
+        legacy.predict_seconds_per_epoch_options(_job("legacy-ml", "legacy-ml-sig"), [4])
+
+    canonical = object.__new__(MLVramPredictor)
+    canonical._target_names = ("train_mem", "train_epoch_ms")
+    canonical.available = True
+    canonical._job_epoch_seconds = {}
+    canonical._prediction_key = lambda job, batch, spec: f"{job.job_id}:{batch}"  # type: ignore[method-assign]
+    canonical._convert_many = lambda specs: [object() for _ in specs]  # type: ignore[method-assign]
+
+    class _Scalar:
+        def __init__(self, value: float):
+            self.value = value
+
+        def item(self) -> float:
+            return self.value
+
+    class _Runtime:
+        def predict(self, encoded: object) -> list[_Scalar]:
+            return [_Scalar(100.0), _Scalar(2500.0)]
+
+    canonical._runtime = _Runtime()
+    monkeypatch.setattr(
+        "localml_scheduler.prediction.ml_predictor.model_specification_for_job",
+        lambda job, batch_size: object(),
+    )
+    assert canonical.predict_seconds_per_epoch_options(_job("canonical-ml", "canonical-ml-sig"), [4]) == {4: 2.5}
 
 
 def test_early_stopping_min_mode_min_epochs_missing_and_nan() -> None:

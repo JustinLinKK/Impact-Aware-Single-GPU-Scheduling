@@ -12,6 +12,8 @@ from .identity import (
     build_backend_scoped_pair_key,
     build_combination_key,
     build_runtime_profile_key,
+    build_colocation_profile_key,
+    normalize_colocation_members,
     decode_batch_vector,
 )
 from .jobs import CommandType, TrainingJob, normalize_runtime_probe_strategy
@@ -322,6 +324,51 @@ class CombinationProfile:
             fallback_order=[str(item) for item in fallback_order],
             updated_at=row["updated_at"],
             metadata=metadata,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_primitive(self)
+
+
+@dataclass(slots=True)
+class ColocationTimingProfile:
+    profile_key: str
+    hardware_key: str
+    members: list[dict[str, Any]] = field(default_factory=list)
+    member_timings: list[dict[str, Any]] = field(default_factory=list)
+    observations: int = 0
+    updated_at: str = field(default_factory=utc_now)
+    source: str = "live_training"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def create(
+        cls,
+        hardware_key: str,
+        members: list[dict[str, Any]],
+        member_timings: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> "ColocationTimingProfile":
+        normalized = normalize_colocation_members(members)
+        return cls(
+            profile_key=build_colocation_profile_key(hardware_key, normalized),
+            hardware_key=str(hardware_key),
+            members=normalized,
+            member_timings=[dict(item) for item in member_timings],
+            **kwargs,
+        )
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "ColocationTimingProfile":
+        return cls(
+            profile_key=row["profile_key"],
+            hardware_key=row["hardware_key"],
+            members=json.loads(row["members_json"] or "[]"),
+            member_timings=json.loads(row["member_timings_json"] or "[]"),
+            observations=int(row["observations"] or 0),
+            updated_at=row["updated_at"],
+            source=row["source"] or "live_training",
+            metadata=json.loads(row["metadata_json"] or "{}"),
         )
 
     def to_dict(self) -> dict[str, Any]:
