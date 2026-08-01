@@ -64,7 +64,6 @@ class CacheServer:
         address = self.settings.cache_address()
         if isinstance(address, str):
             socket_path = Path(address)
-            socket_path.parent.mkdir(parents=True, exist_ok=True)
             if socket_path.exists():
                 socket_path.unlink()
             server = _ThreadingUnixServer(address, CacheRequestHandler)

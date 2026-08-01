@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 import subprocess
 import uuid
 
@@ -12,8 +11,11 @@ from ..execution.backends import ExecutionBackend
 from ..execution.control import ControlPlane
 from ..execution.executor import SubprocessExecutor, WorkerProcessHandle
 from ..domain import JobStatus, PlacementDecision, TrainingJob
-from ..config import SchedulerSettings, SCHEDULER_MODE_PARALLEL_AUTO_PACK, effective_scheduler_mode
-from ..execution.process_utils import terminate_process_tree
+from ..config import (
+    SchedulerSettings,
+    SCHEDULER_MODE_PARALLEL_AUTO_PACK,
+    SCHEDULER_MODE_PARALLEL_TIME_AWARE,
+)
 from ..storage.state_store import StateStore
 
 
@@ -24,17 +26,6 @@ class WorkerSnapshot:
     alive: bool
     returncode: int | None = None
     reported_by: str = "process"
-    pid: int | None = None
-    process_command: list[str] = field(default_factory=list)
-    stdout_path: Path | None = None
-    stderr_path: Path | None = None
-
-
-def _process_command(process: subprocess.Popen) -> list[str]:
-    args = process.args
-    if isinstance(args, (list, tuple)):
-        return [str(item) for item in args]
-    return [str(args)]
 
 
 @dataclass(slots=True)
@@ -78,12 +69,13 @@ class WorkerSupervisor:
         self._groups: dict[str, PlacementGroupHandle] = {}
 
     def _concurrency_enabled(self) -> bool:
-        return (
-            effective_scheduler_mode(self.settings.gpu_scheduler.mode) == SCHEDULER_MODE_PARALLEL_AUTO_PACK
-            and self.settings.gpu_scheduler.concurrent_groups_enabled
-        )
+        if self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE:
+            return True
+        return self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK and self.settings.gpu_scheduler.concurrent_groups_enabled
 
     def _overlap_allowed_for_backend(self, backend_name: str) -> bool:
+        if self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE:
+            return backend_name != "exclusive" and backend_name in self.settings.gpu_scheduler.backend_priority
         return backend_name in set(self.settings.gpu_scheduler.concurrent_backend_allowlist)
 
     def available_backends(self) -> dict[str, bool]:
@@ -293,7 +285,12 @@ class WorkerSupervisor:
             for job_id, worker in list(group.workers.items()):
                 if worker.handle.monitor_via_store:
                     job = self.store.get_job(job_id)
-                    if job is None or job.status not in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.EARLY_STOPPED, JobStatus.PAUSED}:
+                    if job is None or job.status not in {
+                        JobStatus.COMPLETED,
+                        JobStatus.FAILED,
+                        JobStatus.CANCELLED,
+                        JobStatus.PAUSED,
+                    }:
                         continue
                     snapshots.append(
                         WorkerSnapshot(
@@ -302,10 +299,6 @@ class WorkerSupervisor:
                             alive=False,
                             returncode=worker.handle.process.poll(),
                             reported_by="store",
-                            pid=worker.handle.process.pid,
-                            process_command=_process_command(worker.handle.process),
-                            stdout_path=worker.handle.stdout_path,
-                            stderr_path=worker.handle.stderr_path,
                         )
                     )
                     del group.workers[job_id]
@@ -320,10 +313,6 @@ class WorkerSupervisor:
                         alive=False,
                         returncode=returncode,
                         reported_by="process",
-                        pid=worker.handle.process.pid,
-                        process_command=_process_command(worker.handle.process),
-                        stdout_path=worker.handle.stdout_path,
-                        stderr_path=worker.handle.stderr_path,
                     )
                 )
                 del group.workers[job_id]
@@ -342,20 +331,6 @@ class WorkerSupervisor:
         self.control_plane.request_cancel(job_id, reason=reason)
         return True
 
-    def request_early_stop(self, job_id: str, *, reason: str) -> bool:
-        if job_id not in self.active_job_ids():
-            return False
-        self.control_plane.request_early_stop(job_id, reason=reason)
-        return True
-
-    def request_fallback_pause(self, job_id: str, *, reason: str) -> bool:
-        for group in self._groups.values():
-            if job_id not in group.workers:
-                continue
-            self.control_plane.request_pause(job_id, reason=reason, hold=False)
-            return True
-        return False
-
     def shutdown(self) -> None:
         seen_processes: set[int] = set()
         for group in self._groups.values():
@@ -364,18 +339,19 @@ class WorkerSupervisor:
                 if process.pid in seen_processes or process.poll() is not None:
                     continue
                 seen_processes.add(process.pid)
-                terminate_process_tree(process, timeout=2.0)
+                process.terminate()
+                try:
+                    process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
         self._groups = {}
 
     def _refresh_group_shape(self, group_id: str) -> None:
         group = self._groups.get(group_id)
         if group is None:
             return
-        alive_workers = {
-            job_id: worker
-            for job_id, worker in group.workers.items()
-            if self._worker_is_alive(worker)
-        }
+        alive_workers = {job_id: worker for job_id, worker in group.workers.items() if self._worker_is_alive(worker)}
         group.workers = alive_workers
         group.fallback_order = [job_id for job_id in group.fallback_order if job_id in alive_workers]
         if not alive_workers:

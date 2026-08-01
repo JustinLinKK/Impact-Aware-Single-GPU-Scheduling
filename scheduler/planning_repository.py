@@ -5,18 +5,23 @@ from __future__ import annotations
 from typing import Protocol
 
 from ..hardware import HardwareProfile
-from ..domain import BatchProbeProfile, BatchSizeObservation, CombinationProfile, PairProfile, SoloProfile
+from ..domain import (
+    BatchProbeProfile,
+    BatchSizeObservation,
+    CombinationProfile,
+    ColocationTimingProfile,
+    PairProfile,
+    RuntimeProfile,
+    SoloProfile,
+)
 
 
 class PlanningRepository(Protocol):
-    def hardware_profile(self) -> HardwareProfile:
-        ...
+    def hardware_profile(self) -> HardwareProfile: ...
 
-    def hardware_key(self) -> str:
-        ...
+    def hardware_key(self) -> str: ...
 
-    def get_solo_profile(self, signature: str, *, hardware_key: str | None = None) -> SoloProfile | None:
-        ...
+    def get_solo_profile(self, signature: str, *, hardware_key: str | None = None) -> SoloProfile | None: ...
 
     def get_pair_profile(
         self,
@@ -25,22 +30,9 @@ class PlanningRepository(Protocol):
         *,
         hardware_key: str | None = None,
         backend_name: str | None = None,
-    ) -> PairProfile | None:
-        ...
+    ) -> PairProfile | None: ...
 
-    def get_batch_probe_profile(self, probe_key: str) -> BatchProbeProfile | None:
-        ...
-
-    def get_compatible_batch_probe_profile(
-        self,
-        *,
-        profile_namespace: str,
-        hardware_key: str,
-        shape_signature: str,
-        search_mode: str,
-        contract_version: int = 2,
-    ) -> BatchProbeProfile | None:
-        ...
+    def get_batch_probe_profile(self, probe_key: str) -> BatchProbeProfile | None: ...
 
     def get_batch_size_observation(
         self,
@@ -50,8 +42,7 @@ class PlanningRepository(Protocol):
         hardware_key: str,
         backend_name: str,
         batch_size: int,
-    ) -> BatchSizeObservation | None:
-        ...
+    ) -> BatchSizeObservation | None: ...
 
     def list_batch_size_observations(
         self,
@@ -60,8 +51,7 @@ class PlanningRepository(Protocol):
         shape_signature: str | None = None,
         hardware_key: str | None = None,
         backend_name: str | None = None,
-    ) -> list[BatchSizeObservation]:
-        ...
+    ) -> list[BatchSizeObservation]: ...
 
     def best_combination_profile(
         self,
@@ -70,5 +60,15 @@ class PlanningRepository(Protocol):
         hardware_key: str,
         backend_name: str,
         scheduler_mode: str,
-    ) -> CombinationProfile | None:
-        ...
+    ) -> CombinationProfile | None: ...
+
+    def get_runtime_profile(
+        self,
+        signature: str,
+        *,
+        resolved_batch_size: int,
+        backend_name: str | None = None,
+        hardware_key: str | None = None,
+    ) -> RuntimeProfile | None: ...
+
+    def get_colocation_timing_profile(self, profile_key: str) -> ColocationTimingProfile | None: ...

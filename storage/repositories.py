@@ -102,9 +102,6 @@ class ProfileRepository(Protocol):
     def get_batch_probe_profile(self, probe_key: str) -> BatchProbeProfile | None:
         ...
 
-    def get_compatible_batch_probe_profile(self, **kwargs: Any) -> BatchProbeProfile | None:
-        ...
-
     def upsert_batch_size_observation(self, observation: BatchSizeObservation) -> BatchSizeObservation:
         ...
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-CONTROL_SCHEMA_STATEMENTS = [
+SCHEMA_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS jobs (
         job_id TEXT PRIMARY KEY,
@@ -45,19 +45,6 @@ CONTROL_SCHEMA_STATEMENTS = [
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS job_metric_samples (
-        sample_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        job_id TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        epoch INTEGER,
-        global_step INTEGER,
-        avg_step_time_ms REAL,
-        estimated_total_runtime_seconds REAL,
-        remaining_runtime_seconds REAL,
-        metrics_json TEXT NOT NULL
-    )
-    """,
-    """
     CREATE TABLE IF NOT EXISTS cache_entries (
         model_id TEXT PRIMARY KEY,
         baseline_model_path TEXT NOT NULL,
@@ -71,35 +58,12 @@ CONTROL_SCHEMA_STATEMENTS = [
     )
     """,
     """
-    CREATE INDEX IF NOT EXISTS idx_jobs_status_priority
-    ON jobs(status, priority DESC, queue_sequence ASC)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_commands_processed_created
-    ON commands(processed_at, created_at)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_events_created_at
-    ON events(created_at)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_checkpoints_job_created
-    ON checkpoints(job_id, created_at DESC)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_job_metric_samples_job_created
-    ON job_metric_samples(job_id, created_at, sample_id)
-    """,
-]
-
-
-BRANCH_PROFILE_SCHEMA_STATEMENTS = [
-    """
     CREATE TABLE IF NOT EXISTS solo_profiles (
         signature TEXT NOT NULL,
         hardware_key TEXT NOT NULL DEFAULT '',
         family TEXT,
         peak_vram_mb INTEGER,
+        avg_vram_mb REAL,
         avg_gpu_utilization REAL,
         avg_memory_utilization REAL,
         sample_count INTEGER NOT NULL DEFAULT 0,
@@ -119,6 +83,7 @@ BRANCH_PROFILE_SCHEMA_STATEMENTS = [
         compatible INTEGER NOT NULL DEFAULT 1,
         observations INTEGER NOT NULL DEFAULT 0,
         peak_vram_mb INTEGER,
+        avg_vram_mb REAL,
         avg_gpu_utilization REAL,
         avg_memory_utilization REAL,
         slowdown_ratio REAL,
@@ -135,13 +100,10 @@ BRANCH_PROFILE_SCHEMA_STATEMENTS = [
         model_key TEXT NOT NULL,
         device_type TEXT NOT NULL,
         shape_signature TEXT NOT NULL,
-        profile_namespace TEXT,
-        hardware_key TEXT,
-        search_mode TEXT,
-        contract_version INTEGER NOT NULL DEFAULT 1,
         batch_param_name TEXT NOT NULL,
         resolved_batch_size INTEGER NOT NULL,
         peak_vram_mb INTEGER,
+        avg_vram_mb REAL,
         memory_total_mb INTEGER,
         target_budget_mb INTEGER,
         observations INTEGER NOT NULL DEFAULT 1,
@@ -160,6 +122,7 @@ BRANCH_PROFILE_SCHEMA_STATEMENTS = [
         batch_param_name TEXT NOT NULL,
         batch_size INTEGER NOT NULL,
         peak_vram_mb INTEGER,
+        avg_vram_mb REAL,
         memory_total_mb INTEGER,
         avg_step_time_ms REAL,
         avg_gpu_utilization REAL,
@@ -181,6 +144,7 @@ BRANCH_PROFILE_SCHEMA_STATEMENTS = [
         compatible INTEGER NOT NULL DEFAULT 1,
         observations INTEGER NOT NULL DEFAULT 0,
         peak_vram_mb INTEGER,
+        avg_vram_mb REAL,
         memory_total_mb INTEGER,
         avg_gpu_utilization REAL,
         avg_memory_utilization REAL,
@@ -215,6 +179,34 @@ BRANCH_PROFILE_SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS colocation_timing_profiles (
+        profile_key TEXT PRIMARY KEY,
+        hardware_key TEXT NOT NULL,
+        members_json TEXT NOT NULL,
+        member_timings_json TEXT NOT NULL,
+        observations INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'live_training',
+        metadata_json TEXT
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_jobs_status_priority
+    ON jobs(status, priority DESC, queue_sequence ASC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_commands_processed_created
+    ON commands(processed_at, created_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_events_created_at
+    ON events(created_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_checkpoints_job_created
+    ON checkpoints(job_id, created_at DESC)
+    """,
+    """
     CREATE INDEX IF NOT EXISTS idx_solo_profiles_family
     ON solo_profiles(family, hardware_key, updated_at DESC)
     """,
@@ -231,10 +223,6 @@ BRANCH_PROFILE_SCHEMA_STATEMENTS = [
     ON batch_probe_profiles(model_key, device_type, updated_at DESC)
     """,
     """
-    CREATE INDEX IF NOT EXISTS idx_batch_probe_profiles_compatibility
-    ON batch_probe_profiles(profile_namespace, hardware_key, shape_signature, search_mode, contract_version, updated_at DESC)
-    """,
-    """
     CREATE INDEX IF NOT EXISTS idx_batch_size_observations_lookup
     ON batch_size_observations(model_key, shape_signature, hardware_key, backend_name, batch_size, updated_at DESC)
     """,
@@ -246,26 +234,20 @@ BRANCH_PROFILE_SCHEMA_STATEMENTS = [
     CREATE INDEX IF NOT EXISTS idx_runtime_profiles_lookup
     ON runtime_profiles(signature, hardware_key, backend_name, resolved_batch_size, updated_at DESC)
     """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_colocation_timing_profiles_hardware
+    ON colocation_timing_profiles(hardware_key, updated_at DESC)
+    """,
 ]
 
-
-SCHEMA_STATEMENTS = CONTROL_SCHEMA_STATEMENTS
-
-PROFILE_TABLE_NAMES = (
-    "solo_profiles",
-    "pair_profiles",
-    "batch_probe_profiles",
-    "batch_size_observations",
-    "combination_profiles",
-    "runtime_profiles",
-)
 
 MIGRATION_STATEMENTS = [
     "ALTER TABLE solo_profiles ADD COLUMN hardware_key TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE pair_profiles ADD COLUMN hardware_key TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE pair_profiles ADD COLUMN backend_name TEXT NOT NULL DEFAULT 'exclusive'",
-    "ALTER TABLE batch_probe_profiles ADD COLUMN profile_namespace TEXT",
-    "ALTER TABLE batch_probe_profiles ADD COLUMN hardware_key TEXT",
-    "ALTER TABLE batch_probe_profiles ADD COLUMN search_mode TEXT",
-    "ALTER TABLE batch_probe_profiles ADD COLUMN contract_version INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE solo_profiles ADD COLUMN avg_vram_mb REAL",
+    "ALTER TABLE pair_profiles ADD COLUMN avg_vram_mb REAL",
+    "ALTER TABLE batch_probe_profiles ADD COLUMN avg_vram_mb REAL",
+    "ALTER TABLE batch_size_observations ADD COLUMN avg_vram_mb REAL",
+    "ALTER TABLE combination_profiles ADD COLUMN avg_vram_mb REAL",
 ]

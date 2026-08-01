@@ -6,11 +6,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 import json
-import logging
 
 from .common import parse_timestamp, stable_job_id, to_primitive, utc_now
-
-logger = logging.getLogger("localml_scheduler")
 
 
 class JobStatus(str, Enum):
@@ -19,7 +16,6 @@ class JobStatus(str, Enum):
     RUNNING = "RUNNING"
     PAUSING = "PAUSING"
     PAUSED = "PAUSED"
-    EARLY_STOPPED = "EARLY_STOPPED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
@@ -27,7 +23,12 @@ class JobStatus(str, Enum):
 
     @property
     def is_terminal(self) -> bool:
-        return self in {self.EARLY_STOPPED, self.COMPLETED, self.FAILED, self.CANCELLED}
+        return self in {self.COMPLETED, self.FAILED, self.CANCELLED}
+
+
+class SchedulingClass(str, Enum):
+    NORMAL = "normal"
+    EXCLUSIVE_PROBE = "exclusive_probe"
 
 
 class SafePointType(str, Enum):
@@ -53,13 +54,9 @@ RUNTIME_PROBE_STRATEGY_STEP_WINDOW = "step_window"
 
 
 def normalize_batch_probe_search_mode(value: str | None) -> str:
-    normalized = str(value or BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO).strip().lower().replace("-", "_")
+    normalized = str(value or BATCH_PROBE_SEARCH_MODE_BINARY).strip().lower().replace("-", "_")
     if normalized in {"binary", "default"}:
-        logger.warning(
-            "Batch probe search mode %r is deprecated; using power_of_two.",
-            value,
-        )
-        return BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO
+        return BATCH_PROBE_SEARCH_MODE_BINARY
     if normalized in {"power_of_two", "powers_of_two", "pow2", "2^n", "2n"}:
         return BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO
     raise ValueError(f"Unsupported batch probe search mode: {value}")
@@ -78,8 +75,14 @@ def normalize_runtime_probe_strategy(value: str | None) -> str:
 class ResourceRequirements:
     requires_gpu: bool = True
     estimated_vram_mb: int | None = None
+    estimated_avg_vram_mb: int | None = None
     estimated_ram_mb: int | None = None
     gpu_slots: int = 1
+
+    def __post_init__(self) -> None:
+        # Backward compatibility for clients that supplied the old ambiguous field.
+        if self.estimated_avg_vram_mb is None and self.estimated_vram_mb is not None:
+            self.estimated_avg_vram_mb = int(self.estimated_vram_mb)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "ResourceRequirements":
@@ -123,12 +126,6 @@ class BatchProbeSpec:
     model_key: str | None = None
     search_mode: str | None = None
     shape_hints: dict[str, Any] = field(default_factory=dict)
-    profile_key: str | None = None
-    profile_namespace: str | None = None
-    shape_signature_override: str | None = None
-    minimum_batch_size: int | None = None
-    contract_version: int = 2
-    reuse_only: bool = False
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "BatchProbeSpec":
@@ -164,7 +161,6 @@ class CheckpointPolicy:
     save_every_epoch: bool = True
     keep_last_n: int = 3
     pause_mode: SafePointType = SafePointType.STEP
-    preemptible: bool = True
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "CheckpointPolicy":
@@ -222,6 +218,8 @@ class JobSpec:
     baseline_model_path: str = ""
     task_type: str = "generic"
     priority: int = 0
+    scheduling_class: SchedulingClass = SchedulingClass.NORMAL
+    requested_batch_size: int | None = None
     config: JobConfig = field(default_factory=lambda: JobConfig(runner_target=""))
     resource_requirements: ResourceRequirements = field(default_factory=ResourceRequirements)
     packing: PackingSpec = field(default_factory=PackingSpec)
@@ -243,6 +241,8 @@ class JobSpec:
             baseline_model_path=job.baseline_model_path,
             task_type=job.task_type,
             priority=job.priority,
+            scheduling_class=job.scheduling_class,
+            requested_batch_size=job.requested_batch_size,
             config=job.config,
             resource_requirements=job.resource_requirements,
             packing=job.packing,
@@ -304,6 +304,8 @@ class TrainingJob:
     baseline_model_path: str = ""
     task_type: str = "generic"
     priority: int = 0
+    scheduling_class: SchedulingClass = SchedulingClass.NORMAL
+    requested_batch_size: int | None = None
     status: JobStatus = JobStatus.PENDING
     submitted_at: str = field(default_factory=utc_now)
     config: JobConfig = field(default_factory=lambda: JobConfig(runner_target=""))
@@ -339,6 +341,7 @@ class TrainingJob:
         workflow_id: str | None = None,
         task_type: str = "generic",
         priority: int = 0,
+        scheduling_class: SchedulingClass | str = SchedulingClass.NORMAL,
         runner_kwargs: dict[str, Any] | None = None,
         loader_target: str | None = None,
         resource_requirements: ResourceRequirements | None = None,
@@ -365,6 +368,12 @@ class TrainingJob:
             python_executable=python_executable,
             env=env or {},
         )
+        batch_param_name = (batch_probe.batch_param_name if batch_probe is not None else "batch_size") or "batch_size"
+        raw_requested_batch = config.runner_kwargs.get(batch_param_name)
+        try:
+            requested_batch_size = 1 if raw_requested_batch is None else max(1, int(raw_requested_batch))
+        except (TypeError, ValueError):
+            requested_batch_size = 1
         job = cls(
             job_id=stable_job_id(job_id),
             agent_id=agent_id,
@@ -373,6 +382,8 @@ class TrainingJob:
             baseline_model_path=baseline_model_path,
             task_type=task_type,
             priority=priority,
+            scheduling_class=SchedulingClass(scheduling_class),
+            requested_batch_size=requested_batch_size,
             status=JobStatus.PENDING,
             config=config,
             resource_requirements=resource_requirements or ResourceRequirements(),
@@ -393,6 +404,7 @@ class TrainingJob:
     def from_dict(cls, payload: dict[str, Any]) -> "TrainingJob":
         payload = dict(payload)
         payload["status"] = JobStatus(payload.get("status", JobStatus.PENDING.value))
+        payload["scheduling_class"] = SchedulingClass(payload.get("scheduling_class", SchedulingClass.NORMAL.value))
         payload["config"] = JobConfig.from_dict(payload["config"])
         payload["resource_requirements"] = ResourceRequirements.from_dict(payload.get("resource_requirements"))
         payload["packing"] = PackingSpec.from_dict(payload.get("packing"))
@@ -400,6 +412,13 @@ class TrainingJob:
         payload["runtime_probe"] = RuntimeProbeSpec.from_dict(payload.get("runtime_probe"))
         payload["checkpoint_policy"] = CheckpointPolicy.from_dict(payload.get("checkpoint_policy"))
         payload["preload_source"] = PreloadSource.from_dict(payload.get("preload_source"))
+        if payload.get("requested_batch_size") is None:
+            batch_param_name = payload["batch_probe"].batch_param_name or "batch_size"
+            raw_requested = payload["config"].runner_kwargs.get(batch_param_name)
+            try:
+                payload["requested_batch_size"] = max(1, int(raw_requested))
+            except (TypeError, ValueError):
+                payload["requested_batch_size"] = 1
         return cls(**payload)
 
     @classmethod
@@ -412,6 +431,8 @@ class TrainingJob:
             baseline_model_path=spec.baseline_model_path,
             task_type=spec.task_type,
             priority=spec.priority,
+            scheduling_class=spec.scheduling_class,
+            requested_batch_size=spec.requested_batch_size,
             status=run.status,
             submitted_at=run.submitted_at,
             config=spec.config,

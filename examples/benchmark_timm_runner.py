@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 import json
+import math
 import random
 import time
 
@@ -17,7 +18,7 @@ from ..profiling.runtime_probe import (
     estimate_total_runtime_from_step_window,
     planned_total_steps,
 )
-from ..domain import ProgressSnapshot
+from ..domain import SafePointType
 
 
 def _load_benchmark_modules():
@@ -53,6 +54,19 @@ def _build_dataloader(
 
     dataframe = pd.read_csv(f"{data_root}/train.csv").sample(n=subset_size, random_state=seed).reset_index(drop=True)
     image_dir = Path(data_root) / "train_images"
+    image_column = next(
+        (name for name in ("image_id", "id_code", "id") if name in dataframe.columns),
+        None,
+    )
+    label_column = next(
+        (name for name in ("label", "diagnosis", "target") if name in dataframe.columns),
+        None,
+    )
+    if image_column is None or label_column is None:
+        raise ValueError(
+            "benchmark train.csv must contain an image column (image_id/id_code/id) "
+            "and a label column (label/diagnosis/target)"
+        )
     transform = transforms.Compose(
         [
             transforms.Resize((224, 224)),
@@ -61,14 +75,20 @@ def _build_dataloader(
         ]
     )
 
-    class CassavaDataset(Dataset):
+    class CassavaDataset(Dataset):  # type: ignore[misc,valid-type]
         def __len__(self) -> int:
             return len(dataframe)
 
         def __getitem__(self, index: int):
             row = dataframe.iloc[index]
-            image = Image.open(image_dir / row["image_id"]).convert("RGB")
-            return transform(image), int(row["label"])
+            image_path = image_dir / str(row[image_column])
+            if not image_path.suffix:
+                image_path = next(
+                    (candidate for suffix in (".png", ".jpg", ".jpeg") if (candidate := image_path.with_suffix(suffix)).exists()),
+                    image_path,
+                )
+            image = Image.open(image_path).convert("RGB")
+            return transform(image), int(row[label_column])
 
     return DataLoader(
         CassavaDataset(),
@@ -99,10 +119,11 @@ def probe_timm_benchmark_batch_size(
     measure_steps: int,
 ):
     """Probe one candidate batch size using synthetic inputs for fast VRAM sizing."""
-    params = {
+    params: dict[str, Any] = {
         "model_name": None,
         "num_classes": 5,
         "batch_size": 16,
+        "subset_size": 4000,
         "learning_rate": 1e-3,
         "probe_max_batch_size": None,
     }
@@ -118,6 +139,7 @@ def probe_timm_benchmark_batch_size(
         return {
             "fits": False,
             "peak_vram_mb": synthetic_peak,
+            "avg_vram_mb": synthetic_peak,
             "memory_total_mb": None,
             "message": f"batch size {batch_size} exceeds configured probe_max_batch_size {probe_limit}",
         }
@@ -127,11 +149,15 @@ def probe_timm_benchmark_batch_size(
         synthetic_peak = None
         if estimated_vram is not None:
             synthetic_peak = int(float(estimated_vram) * (float(batch_size) / float(base_batch_size)))
+        steps_per_epoch = max(1, math.ceil(int(params["subset_size"]) / int(batch_size)))
         return {
             "fits": True,
             "peak_vram_mb": synthetic_peak,
+            "avg_vram_mb": synthetic_peak,
             "memory_total_mb": None,
             "avg_step_time_ms": 1.0,
+            "steps_per_epoch": steps_per_epoch,
+            "seconds_per_epoch": steps_per_epoch / 1000.0,
             "message": "synthetic CPU probe result",
         }
 
@@ -163,6 +189,7 @@ def probe_timm_benchmark_batch_size(
         criterion = nn.CrossEntropyLoss()
 
         start_time = None
+        measured_vram_mb: list[float] = []
         for step_index in range(total_steps):
             features = torch.randn(int(batch_size), 3, 224, 224, device=device)
             labels = torch.randint(0, num_classes, (int(batch_size),), device=device)
@@ -174,13 +201,30 @@ def probe_timm_benchmark_batch_size(
             if step_index == warmup:
                 torch.cuda.synchronize(device)
                 start_time = time.perf_counter()
+            if step_index >= warmup:
+                measured_vram_mb.append(
+                    float(torch.cuda.memory_allocated(device)) / (1024 * 1024)
+                )
         torch.cuda.synchronize(device)
         elapsed_ms = ((time.perf_counter() - start_time) * 1000.0) if start_time is not None else None
+        average_step_ms = (elapsed_ms / measured) if elapsed_ms is not None else None
+        steps_per_epoch = max(1, math.ceil(int(params["subset_size"]) / int(batch_size)))
         return {
             "fits": True,
             "peak_vram_mb": int(torch.cuda.max_memory_allocated(device) / (1024 * 1024)),
+            "avg_vram_mb": (
+                sum(measured_vram_mb) / len(measured_vram_mb)
+                if measured_vram_mb
+                else None
+            ),
             "memory_total_mb": int(torch.cuda.get_device_properties(device).total_memory / (1024 * 1024)),
-            "avg_step_time_ms": (elapsed_ms / measured) if elapsed_ms is not None else None,
+            "avg_step_time_ms": average_step_ms,
+            "steps_per_epoch": steps_per_epoch,
+            "seconds_per_epoch": (
+                average_step_ms * steps_per_epoch / 1000.0
+                if average_step_ms is not None
+                else None
+            ),
             "message": "cuda probe completed",
         }
     except RuntimeError as exc:
@@ -189,6 +233,7 @@ def probe_timm_benchmark_batch_size(
         return {
             "fits": False,
             "peak_vram_mb": int(torch.cuda.max_memory_allocated(device) / (1024 * 1024)),
+            "avg_vram_mb": float(torch.cuda.memory_allocated(device)) / (1024 * 1024),
             "memory_total_mb": int(torch.cuda.get_device_properties(device).total_memory / (1024 * 1024)),
             "message": str(exc),
         }
@@ -202,7 +247,7 @@ def probe_timm_benchmark_batch_size(
 
 def run_timm_benchmark_job(context: RunnerContext) -> dict[str, Any]:
     """Train one TIMM model on the cassava subset used by the benchmark harness."""
-    params = {
+    params: dict[str, Any] = {
         "data_root": "",
         "subset_size": 4000,
         "batch_size": 16,
@@ -214,6 +259,12 @@ def run_timm_benchmark_job(context: RunnerContext) -> dict[str, Any]:
         "num_classes": 5,
     }
     params.update(context.job.config.runner_kwargs)
+
+    if context.job.metadata.get("benchmark_probe_only"):
+        return {
+            "calibration_only": True,
+            "message": "five-option probe completed; training body intentionally skipped",
+        }
 
     seed = int(params.get("dataset_seed", 42))
     random.seed(seed)
@@ -247,6 +298,29 @@ def run_timm_benchmark_job(context: RunnerContext) -> dict[str, Any]:
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(params["learning_rate"]))
     criterion = nn.CrossEntropyLoss()
+    start_epoch = 0
+    global_step = 0
+    resume_state = context.load_resume_checkpoint()
+    if resume_state is not None:
+        if resume_state.get("model_state") is not None:
+            model.load_state_dict(resume_state["model_state"])
+        if resume_state.get("optimizer_state") is not None:
+            optimizer.load_state_dict(resume_state["optimizer_state"])
+            for optimizer_state in optimizer.state.values():
+                for key, value in optimizer_state.items():
+                    if torch.is_tensor(value):
+                        optimizer_state[key] = value.to(device)
+        start_epoch = max(0, int(resume_state.get("epoch", 0)))
+        global_step = max(0, int(resume_state.get("global_step", 0)))
+
+    def checkpoint_state(epoch: int) -> dict[str, Any]:
+        return {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "epoch": int(epoch),
+            "global_step": int(global_step),
+            "job_config": context.job.to_dict(),
+        }
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -256,7 +330,6 @@ def run_timm_benchmark_job(context: RunnerContext) -> dict[str, Any]:
     runtime_started_at = time.perf_counter()
     last_loss = 0.0
     n_samples = 0
-    global_step = 0
     first_epoch_step_durations_ms: list[float] = []
     runtime_profile = context.get_runtime_profile(backend_name=backend_name)
     estimated_total_runtime_seconds = (
@@ -266,7 +339,7 @@ def run_timm_benchmark_job(context: RunnerContext) -> dict[str, Any]:
     )
     profile_ready = runtime_profile is not None
     steps_per_epoch = len(dataloader)
-    for epoch_index in range(epochs):
+    for epoch_index in range(start_epoch, epochs):
         epoch_started_at = time.perf_counter()
         for features, labels in dataloader:
             if max_steps is not None and global_step >= int(max_steps):
@@ -327,30 +400,26 @@ def run_timm_benchmark_job(context: RunnerContext) -> dict[str, Any]:
                 },
             )
             profile_ready = True
-        heartbeat = ProgressSnapshot(
-            job_id=context.job.job_id,
+        avg_step_time_ms = (
+            sum(first_epoch_step_durations_ms) / max(1, len(first_epoch_step_durations_ms))
+            if first_epoch_step_durations_ms
+            else None
+        )
+        remaining_runtime_seconds = (
+            max(0.0, estimated_total_runtime_seconds - (time.perf_counter() - runtime_started_at))
+            if estimated_total_runtime_seconds is not None
+            else None
+        )
+        context.control_hook.safe_point(
+            SafePointType.EPOCH,
             epoch=epoch_index + 1,
             global_step=global_step,
-            phase="train",
             metrics={"loss": last_loss},
-            last_safe_point="epoch",
+            state_factory=lambda epoch=epoch_index + 1: checkpoint_state(epoch),
             steps_per_epoch=steps_per_epoch,
-            avg_step_time_ms=(sum(first_epoch_step_durations_ms) / max(1, len(first_epoch_step_durations_ms))) if first_epoch_step_durations_ms else None,
+            avg_step_time_ms=avg_step_time_ms,
             estimated_total_runtime_seconds=estimated_total_runtime_seconds,
-            remaining_runtime_seconds=max(0.0, estimated_total_runtime_seconds - (time.perf_counter() - runtime_started_at))
-            if estimated_total_runtime_seconds is not None
-            else None,
-        )
-        context.control_hook.control_plane.write_heartbeat(heartbeat)
-        context.store.update_job(
-            context.job.job_id,
-            last_heartbeat_at=heartbeat.heartbeat_at,
-            metadata_updates={
-                "runtime_estimated_total_runtime_seconds": estimated_total_runtime_seconds,
-                "runtime_remaining_runtime_seconds": heartbeat.remaining_runtime_seconds,
-                "runtime_steps_per_epoch": steps_per_epoch,
-                "runtime_avg_step_time_ms": heartbeat.avg_step_time_ms,
-            },
+            remaining_runtime_seconds=remaining_runtime_seconds,
         )
         if max_steps is not None and global_step >= int(max_steps):
             break
