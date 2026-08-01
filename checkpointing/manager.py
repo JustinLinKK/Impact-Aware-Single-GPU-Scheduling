@@ -89,9 +89,5 @@ class CheckpointManager:
         checkpoints = sorted(directory.glob("checkpoint_step_*.pt"))
         if len(checkpoints) <= keep_last_n:
             return
-        best_path = job.metadata.get("early_stopping_best_checkpoint_path")
-        preserved = Path(str(best_path)).resolve() if best_path else None
         for old_path in checkpoints[:-keep_last_n]:
-            if preserved is not None and old_path.resolve() == preserved:
-                continue
             old_path.unlink(missing_ok=True)

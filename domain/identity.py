@@ -9,13 +9,28 @@ import json
 from .jobs import normalize_batch_probe_search_mode, normalize_runtime_probe_strategy
 
 
-def build_batch_probe_key(model_key: str, device_type: str, shape_signature: str, *, search_mode: str | None = None) -> str:
+def build_batch_probe_key(
+    model_key: str,
+    device_type: str,
+    shape_signature: str,
+    *,
+    search_mode: str | None = None,
+    hardware_key: str | None = None,
+    profile_namespace: str | None = None,
+    contract_version: int = 1,
+) -> str:
     payload = {
         "device_type": device_type,
         "model_key": model_key,
         "search_mode": normalize_batch_probe_search_mode(search_mode),
         "shape_signature": shape_signature,
     }
+    if hardware_key is not None:
+        payload["hardware_key"] = str(hardware_key)
+    if profile_namespace is not None:
+        payload["profile_namespace"] = str(profile_namespace)
+    if int(contract_version) != 1:
+        payload["contract_version"] = int(contract_version)
     return sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
@@ -96,27 +111,5 @@ def build_runtime_profile_key(
         "backend_name": backend_name,
         "resolved_batch_size": int(resolved_batch_size),
         "strategy": normalize_runtime_probe_strategy(strategy),
-    }
-    return sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-
-
-def normalize_colocation_members(members: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return sorted(
-        (
-            {
-                "signature": str(member["signature"]),
-                "batch_size": int(member["batch_size"]),
-                "backend_name": str(member["backend_name"]),
-            }
-            for member in members
-        ),
-        key=lambda member: (member["signature"], member["batch_size"], member["backend_name"]),
-    )
-
-
-def build_colocation_profile_key(hardware_key: str, members: list[dict[str, Any]]) -> str:
-    payload = {
-        "hardware_key": str(hardware_key),
-        "members": normalize_colocation_members(members),
     }
     return sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()

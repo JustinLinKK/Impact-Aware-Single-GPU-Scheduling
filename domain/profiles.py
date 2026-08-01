@@ -4,18 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from hashlib import sha1
 from typing import Any
 import json
+import re
 
 from .common import parse_timestamp, to_primitive, utc_now
-from .identity import (
-    build_backend_scoped_pair_key,
-    build_combination_key,
-    build_runtime_profile_key,
-    build_colocation_profile_key,
-    normalize_colocation_members,
-    decode_batch_vector,
-)
+from .identity import build_backend_scoped_pair_key, build_combination_key, build_runtime_profile_key, decode_batch_vector
 from .jobs import CommandType, TrainingJob, normalize_runtime_probe_strategy
 
 
@@ -48,7 +43,6 @@ class SoloProfile:
     hardware_key: str = ""
     family: str | None = None
     peak_vram_mb: int | None = None
-    avg_vram_mb: float | None = None
     avg_gpu_utilization: float | None = None
     avg_memory_utilization: float | None = None
     sample_count: int = 0
@@ -64,7 +58,6 @@ class SoloProfile:
             hardware_key=row.get("hardware_key") or "",
             family=row["family"],
             peak_vram_mb=row["peak_vram_mb"],
-            avg_vram_mb=row.get("avg_vram_mb"),
             avg_gpu_utilization=row["avg_gpu_utilization"],
             avg_memory_utilization=row["avg_memory_utilization"],
             sample_count=row["sample_count"],
@@ -78,18 +71,54 @@ class SoloProfile:
 
 
 @dataclass(slots=True)
+class FailureDiagnostic:
+    kind: str
+    phase: str | None = None
+    exception_type: str | None = None
+    exception_message: str | None = None
+    fingerprint: str | None = None
+    batch_size: int | None = None
+    probe_key: str | None = None
+    returncode: int | None = None
+    timed_out: bool = False
+    stdout_head: str | None = None
+    stdout_tail: str | None = None
+    stderr_head: str | None = None
+    stderr_tail: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.fingerprint:
+            return
+        message = re.sub(r"0x[0-9a-fA-F]+|\b\d+(?:\.\d+)?\b", "<n>", str(self.exception_message or "").lower())
+        payload = f"{self.kind}|{self.phase or ''}|{self.exception_type or ''}|{message.strip()}"
+        self.fingerprint = sha1(payload.encode("utf-8")).hexdigest()[:20]
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "FailureDiagnostic | None":
+        return cls(**dict(payload)) if payload else None
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_primitive(self)
+
+
+@dataclass(slots=True)
 class BatchProbeTrialResult:
     fits: bool
     peak_vram_mb: int | None = None
-    avg_vram_mb: float | None = None
     memory_total_mb: int | None = None
     avg_step_time_ms: float | None = None
-    steps_per_epoch: int | None = None
-    seconds_per_epoch: float | None = None
     message: str | None = None
+    failure_kind: str | None = None
+    returncode: int | None = None
+    stdout_excerpt: str | None = None
+    stderr_excerpt: str | None = None
+    diagnostic: FailureDiagnostic | None = None
+    probe_completed: bool = False
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "BatchProbeTrialResult":
+        payload = dict(payload)
+        payload["diagnostic"] = FailureDiagnostic.from_dict(payload.get("diagnostic"))
         return cls(**payload)
 
     def to_dict(self) -> dict[str, Any]:
@@ -104,8 +133,11 @@ class BatchProbeProfile:
     shape_signature: str
     batch_param_name: str
     resolved_batch_size: int
+    profile_namespace: str | None = None
+    hardware_key: str | None = None
+    search_mode: str | None = None
+    contract_version: int = 1
     peak_vram_mb: int | None = None
-    avg_vram_mb: float | None = None
     memory_total_mb: int | None = None
     target_budget_mb: int | None = None
     observations: int = 1
@@ -121,10 +153,13 @@ class BatchProbeProfile:
             model_key=row["model_key"],
             device_type=row["device_type"],
             shape_signature=row["shape_signature"],
+            profile_namespace=row.get("profile_namespace"),
+            hardware_key=row.get("hardware_key"),
+            search_mode=row.get("search_mode"),
+            contract_version=int(row.get("contract_version") or 1),
             batch_param_name=row["batch_param_name"],
             resolved_batch_size=row["resolved_batch_size"],
             peak_vram_mb=row["peak_vram_mb"],
-            avg_vram_mb=row.get("avg_vram_mb"),
             memory_total_mb=row["memory_total_mb"],
             target_budget_mb=row["target_budget_mb"],
             observations=row["observations"],
@@ -147,7 +182,6 @@ class BatchSizeObservation:
     batch_param_name: str
     batch_size: int
     peak_vram_mb: int | None = None
-    avg_vram_mb: float | None = None
     memory_total_mb: int | None = None
     avg_step_time_ms: float | None = None
     avg_gpu_utilization: float | None = None
@@ -169,7 +203,6 @@ class BatchSizeObservation:
             batch_param_name=row["batch_param_name"],
             batch_size=row["batch_size"],
             peak_vram_mb=row["peak_vram_mb"],
-            avg_vram_mb=row.get("avg_vram_mb"),
             memory_total_mb=row["memory_total_mb"],
             avg_step_time_ms=row["avg_step_time_ms"],
             avg_gpu_utilization=row["avg_gpu_utilization"],
@@ -194,7 +227,6 @@ class PairProfile:
     compatible: bool = True
     observations: int = 0
     peak_vram_mb: int | None = None
-    avg_vram_mb: float | None = None
     avg_gpu_utilization: float | None = None
     avg_memory_utilization: float | None = None
     slowdown_ratio: float | None = None
@@ -232,7 +264,6 @@ class PairProfile:
             compatible=bool(row["compatible"]),
             observations=row["observations"],
             peak_vram_mb=row["peak_vram_mb"],
-            avg_vram_mb=row.get("avg_vram_mb"),
             avg_gpu_utilization=row["avg_gpu_utilization"],
             avg_memory_utilization=row["avg_memory_utilization"],
             slowdown_ratio=row["slowdown_ratio"],
@@ -261,7 +292,6 @@ class CombinationProfile:
     compatible: bool = True
     observations: int = 0
     peak_vram_mb: int | None = None
-    avg_vram_mb: float | None = None
     memory_total_mb: int | None = None
     avg_gpu_utilization: float | None = None
     avg_memory_utilization: float | None = None
@@ -284,13 +314,7 @@ class CombinationProfile:
         **kwargs: Any,
     ) -> "CombinationProfile":
         return cls(
-            combination_key=build_combination_key(
-                group_signature,
-                hardware_key,
-                backend_name,
-                scheduler_mode,
-                batch_vector,
-            ),
+            combination_key=build_combination_key(group_signature, hardware_key, backend_name, scheduler_mode, batch_vector),
             group_signature=group_signature,
             hardware_key=hardware_key,
             backend_name=backend_name,
@@ -313,7 +337,6 @@ class CombinationProfile:
             compatible=bool(row["compatible"]),
             observations=row["observations"],
             peak_vram_mb=row["peak_vram_mb"],
-            avg_vram_mb=row.get("avg_vram_mb"),
             memory_total_mb=row["memory_total_mb"],
             avg_gpu_utilization=row["avg_gpu_utilization"],
             avg_memory_utilization=row["avg_memory_utilization"],
@@ -324,51 +347,6 @@ class CombinationProfile:
             fallback_order=[str(item) for item in fallback_order],
             updated_at=row["updated_at"],
             metadata=metadata,
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return to_primitive(self)
-
-
-@dataclass(slots=True)
-class ColocationTimingProfile:
-    profile_key: str
-    hardware_key: str
-    members: list[dict[str, Any]] = field(default_factory=list)
-    member_timings: list[dict[str, Any]] = field(default_factory=list)
-    observations: int = 0
-    updated_at: str = field(default_factory=utc_now)
-    source: str = "live_training"
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    @classmethod
-    def create(
-        cls,
-        hardware_key: str,
-        members: list[dict[str, Any]],
-        member_timings: list[dict[str, Any]],
-        **kwargs: Any,
-    ) -> "ColocationTimingProfile":
-        normalized = normalize_colocation_members(members)
-        return cls(
-            profile_key=build_colocation_profile_key(hardware_key, normalized),
-            hardware_key=str(hardware_key),
-            members=normalized,
-            member_timings=[dict(item) for item in member_timings],
-            **kwargs,
-        )
-
-    @classmethod
-    def from_row(cls, row: dict[str, Any]) -> "ColocationTimingProfile":
-        return cls(
-            profile_key=row["profile_key"],
-            hardware_key=row["hardware_key"],
-            members=json.loads(row["members_json"] or "[]"),
-            member_timings=json.loads(row["member_timings_json"] or "[]"),
-            observations=int(row["observations"] or 0),
-            updated_at=row["updated_at"],
-            source=row["source"] or "live_training",
-            metadata=json.loads(row["metadata_json"] or "{}"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -475,7 +453,6 @@ class RunProfile:
     avg_ram_utilization: float | None = None
     avg_memory_utilization: float | None = None
     peak_vram_mb: int | None = None
-    avg_vram_mb: float | None = None
     memory_total_mb: int | None = None
     target_budget_mb: int | None = None
     slowdown_ratio: float | None = None
@@ -518,7 +495,6 @@ class RunProfile:
             avg_ram_utilization=row.get("avg_ram_utilization"),
             avg_memory_utilization=row.get("avg_memory_utilization"),
             peak_vram_mb=row.get("peak_vram_mb"),
-            avg_vram_mb=row.get("avg_vram_mb"),
             memory_total_mb=row.get("memory_total_mb"),
             target_budget_mb=row.get("target_budget_mb"),
             slowdown_ratio=row.get("slowdown_ratio"),
@@ -583,17 +559,6 @@ class SchedulerReport:
     cancelled_jobs: int = 0
     average_queue_wait_seconds: float = 0.0
     average_runtime_seconds: float = 0.0
-    trace_makespan_seconds: float = 0.0
-    total_flow_time_seconds: float = 0.0
-    mean_flow_time_seconds: float = 0.0
-    weighted_mean_flow_time_seconds: float = 0.0
-    median_flow_time_seconds: float = 0.0
-    p95_flow_time_seconds: float = 0.0
-    max_wait_time_seconds: float = 0.0
-    starvation_count: int = 0
-    jobs_per_hour: float = 0.0
-    early_stopped_epochs_saved: int = 0
-    early_stopped_wall_time_saved_seconds: float = 0.0
     cache_hit_rate: float = 0.0
     cache_hits: int = 0
     cache_misses: int = 0

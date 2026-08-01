@@ -25,19 +25,7 @@ class BatchResolution:
                 pass
         raw_value = job.config.runner_kwargs.get(batch_param_name)
         try:
-            return 1 if raw_value is None else max(1, int(raw_value))
-        except (TypeError, ValueError):
-            return 1
-
-    @staticmethod
-    def requested_batch_size(job: TrainingJob) -> int:
-        """Return the immutable batch requested when the job was submitted."""
-        if job.requested_batch_size is not None:
-            return max(1, int(job.requested_batch_size))
-        batch_param_name = BatchResolution.param_name(job)
-        raw_value = job.config.runner_kwargs.get(batch_param_name)
-        try:
-            return 1 if raw_value is None else max(1, int(raw_value))
+            return max(1, int(raw_value))
         except (TypeError, ValueError):
             return 1
 
@@ -52,12 +40,12 @@ class BatchResolution:
                 "placement_batch_param_name": batch_param_name,
             }
         )
-        if updated_job.requested_batch_size is None:
-            updated_job.requested_batch_size = BatchResolution.requested_batch_size(job)
         return updated_job
 
 
 def build_batch_probe_shape_signature(job: TrainingJob) -> str:
+    if job.batch_probe.shape_signature_override:
+        return str(job.batch_probe.shape_signature_override)
     batch_param_name = BatchResolution.param_name(job)
     ignored_runner_kwargs = {
         "script_path",
@@ -67,7 +55,11 @@ def build_batch_probe_shape_signature(job: TrainingJob) -> str:
         "probe_timeout_seconds",
         "probe_poll_interval_seconds",
     }
-    runner_kwargs = {key: value for key, value in dict(job.config.runner_kwargs).items() if key not in ignored_runner_kwargs}
+    runner_kwargs = {
+        key: value
+        for key, value in dict(job.config.runner_kwargs).items()
+        if key not in ignored_runner_kwargs
+    }
     runner_kwargs.pop(batch_param_name, None)
     payload = {
         "runner_target": job.config.runner_target,

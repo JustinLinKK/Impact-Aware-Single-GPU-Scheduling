@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from ..config import SchedulerSettings
-from .backends import CudaProcessBackend, ExclusiveBackend, ExecutionBackend, MPSBackend, StreamBackend
+from .backends import CudaProcessBackend, ExclusiveBackend, ExecutionBackend, MPSBackend, StreamBackend, StreamMPSBackend
 from .executor import SubprocessExecutor
 
 
@@ -21,6 +21,7 @@ class BackendRegistry:
         self.executor = executor
         self._backends = backends or {
             "exclusive": ExclusiveBackend(settings, executor),
+            "stream_mps": StreamMPSBackend(settings, executor),
             "mps": MPSBackend(settings, executor),
             "cuda_process": CudaProcessBackend(settings, executor),
             "stream": StreamBackend(settings, executor),
@@ -34,4 +35,3 @@ class BackendRegistry:
 
     def availability(self) -> dict[str, bool]:
         return {name: backend.available() for name, backend in self._backends.items()}
-

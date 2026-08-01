@@ -1,12 +1,207 @@
 from __future__ import annotations
 
+import json
+import subprocess
+from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from localml_scheduler.client import SchedulerClient
 from localml_scheduler.config import SchedulerConfig
 from localml_scheduler.domain import BatchProbeProfile, BatchResolution, JobRun, RuntimeProfile, TrainingJob
 from localml_scheduler.dto import SubmitJobRequest
+from localml_scheduler.graph_knowledge import SchedulerKnowledgeBase
+from hardware_knowledge_graph import HardwareKnowledgeClient, HardwareKnowledgeSettings
+
+
+class _MemoryCache:
+    def __init__(self):
+        self.values = {}
+
+    def _key(self, namespace, payload):
+        return (namespace, repr(sorted(payload.items())))
+
+    def get(self, namespace, payload):
+        return self.values.get(self._key(namespace, payload))
+
+    def set(self, namespace, payload, value):
+        self.values[self._key(namespace, payload)] = value
+
+    def invalidate_namespace(self, namespace):
+        for key in [key for key in self.values if key[0] == namespace]:
+            self.values.pop(key, None)
+
+
+class _FakeGraphStore:
+    def __init__(self):
+        self.settings = SchedulerConfig(runtime_root=tempfile.mkdtemp())
+        self.hardware_calls = 0
+        self.events = []
+
+    def hardware_profile(self):
+        self.hardware_calls += 1
+        return SimpleNamespace(
+            hardware_key="test-hw",
+            gpu_name="Test GPU",
+            total_vram_mb=24576,
+            compute_capability="9.0",
+            cuda_runtime="12.4",
+            torch_version="2.5.0",
+        )
+
+    def list_runtime_profiles(self, **kwargs):
+        del kwargs
+        return []
+
+    def list_solo_profiles(self, **kwargs):
+        del kwargs
+        return []
+
+    def list_pair_profiles(self, **kwargs):
+        del kwargs
+        return []
+
+    def list_batch_size_observations(self, **kwargs):
+        del kwargs
+        return []
+
+    def list_batch_probe_profiles(self):
+        return []
+
+    def list_events(self, *, job_id=None, event_type=None):
+        del job_id
+        if event_type is None:
+            return list(self.events)
+        return [event for event in self.events if event.get("event_type") == event_type]
+
+
+class _FakeHardwareKnowledgeStore:
+    def __init__(self):
+        self.neighborhood_calls = 0
+        self.detail_calls = []
+
+    def get_feature_neighborhood(self, *, hardware_terms, limit):
+        self.neighborhood_calls += 1
+        return {
+            "found": True,
+            "hardware": {"hardware_id": "nvidia.blackwell.geforce_rtx_5090.spec", "name": "GeForce RTX 5090"},
+            "features": [
+                {
+                    "feature_id": "bf16",
+                    "feature_name": "BF16",
+                    "category": "precision_optimization",
+                    "support_level": "native",
+                    "recommended": True,
+                    "performance_impact": "high",
+                    "frameworks": ["PyTorch"],
+                    "detail_text": "Use bf16 autocast.",
+                    "recommended_patterns": ["Use torch.autocast with bf16."],
+                },
+                {
+                    "feature_id": "fp8",
+                    "feature_name": "FP8",
+                    "category": "precision_optimization",
+                    "support_level": "supported",
+                    "recommended": False,
+                    "performance_impact": "medium",
+                    "frameworks": ["PyTorch"],
+                    "detail_text": "Use only when transformer engine is available.",
+                },
+            ],
+        }
+
+
+class HardwareKnowledgeClientTest(unittest.TestCase):
+    def test_probe_subprocess_supplies_current_hardware_without_scheduler(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = HardwareKnowledgeSettings.from_dict(
+                {
+                    "runtime_root": tmpdir,
+                }
+            )
+            payload = {
+                "hardware_key": "probe-hw",
+                "os_name": "linux",
+                "gpu_name": "Probe GPU",
+                "total_vram_mb": 32768,
+                "compute_capability": "9.0",
+                "cuda_runtime": "12.4",
+                "torch_version": "2.5.0",
+            }
+
+            with patch(
+                "hardware_knowledge_graph.client.subprocess.run",
+                return_value=subprocess.CompletedProcess(["python"], 0, stdout=json.dumps(payload) + "\n", stderr=""),
+            ) as run_probe:
+                client = HardwareKnowledgeClient(settings, probe_timeout_seconds=3)
+                context = client.get_hardware_context()
+                second = client.get_hardware_context()
+
+            self.assertEqual(run_probe.call_count, 1)
+            self.assertTrue(context["found"])
+            self.assertEqual(context["hardware"]["gpu_name"], "Probe GPU")
+            self.assertEqual(context["hardware_probe_source"], "hardware_probe_subprocess")
+            self.assertTrue(context["hardware_probe_success"])
+            self.assertEqual(second["hardware"]["hardware_key"], "probe-hw")
+            self.assertEqual(context["backend_capabilities"], {})
+            self.assertEqual(context["scheduler_limits"], {})
+
+    def test_probe_failure_is_explicit_and_does_not_start_scheduler(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = HardwareKnowledgeSettings.from_dict(
+                {
+                    "runtime_root": tmpdir,
+                }
+            )
+
+            with patch(
+                "hardware_knowledge_graph.client.subprocess.run",
+                return_value=subprocess.CompletedProcess(["python"], 7, stdout="", stderr="boom"),
+            ):
+                client = HardwareKnowledgeClient(settings, probe_timeout_seconds=3)
+                context = client.get_hardware_context()
+
+            self.assertFalse(context["found"])
+            self.assertEqual(context["source"], "hardware_probe_subprocess")
+            self.assertFalse(context["hardware_probe_success"])
+            self.assertIn("exited with code 7", context["reason"])
+
+    def test_scheduler_client_delegates_knowledge_surface(self) -> None:
+        class FakeHardwareKnowledge:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def get_optimization_context(self, *, candidate, limit):
+                self.calls.append((candidate, limit))
+                return {"hardware_context": {"found": True}, "confidence": 0.5}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            delegate = FakeHardwareKnowledge()
+            scheduler = SchedulerClient(
+                SchedulerConfig.from_dict({"runtime_root": tmpdir}),
+                hardware_knowledge_client=delegate,
+            )
+            result = scheduler.get_optimization_context(candidate={"stage": "draft"}, limit=4)
+
+        self.assertEqual(delegate.calls, [({"stage": "draft"}, 4)])
+        self.assertEqual(result["confidence"], 0.5)
+
+    def get_feature_details(self, *, hardware_terms, feature_ids, limit):
+        self.detail_calls.append((list(hardware_terms), list(feature_ids), limit))
+        return {
+            "found": True,
+            "hardware": {"hardware_id": "nvidia.blackwell.geforce_rtx_5090.spec", "name": "GeForce RTX 5090"},
+            "features": [
+                {
+                    "feature_id": feature_id,
+                    "feature_name": feature_id.upper(),
+                    "detail_text": f"detail for {feature_id}",
+                }
+                for feature_id in feature_ids
+            ],
+            "missing_feature_ids": [],
+        }
 
 
 class SchedulerClientSurfaceTest(unittest.TestCase):
@@ -32,6 +227,340 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
             self.assertEqual(stored.priority, 4)
             self.assertEqual(stored.metadata["source"], "client-test")
             self.assertIsNotNone(client.inspect(stored.job_id))
+
+    def test_submit_many_submits_full_round_before_polling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerConfig(runtime_root=tmpdir)
+            client = SchedulerClient(settings)
+            jobs = [
+                TrainingJob.create("module:runner", "baseline-a", "/tmp/a.pt"),
+                TrainingJob.create("module:runner", "baseline-b", "/tmp/b.pt"),
+            ]
+
+            submitted = client.submit_many(jobs)
+
+            self.assertEqual([job.job_id for job in submitted], [job.job_id for job in jobs])
+            self.assertEqual(len(client.list_jobs()), 2)
+
+    def test_plan_job_packet_returns_per_candidate_contexts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerConfig(runtime_root=tmpdir)
+            client = SchedulerClient(settings)
+            calls = []
+
+            def fake_context(*, candidate, limit):
+                calls.append((candidate, limit))
+                return {
+                    "hardware_context": {"found": True},
+                    "graph_evidence": {"exact_profiles": [], "similar_profiles": [], "packed_profiles": []},
+                    "recommendations": ["Use batch size 8."],
+                    "risk_flags": [],
+                    "evidence_refs": [f"graph:{candidate['node_id']}"],
+                    "confidence": 0.6,
+                }
+
+            client.get_optimization_context = fake_context  # type: ignore[method-assign]
+            client.get_packet_compatibility = lambda **_: {"found": False, "reason": "unit-test"}  # type: ignore[method-assign]
+
+            packet = client.plan_job_packet(
+                candidates=[
+                    {"node_id": "n1", "model_key": "m1"},
+                    {"node_id": "n2", "model_key": "m2"},
+                ],
+                limit=3,
+            )
+
+            self.assertTrue(packet["found"])
+            self.assertEqual(len(packet["jobs"]), 2)
+            self.assertEqual(len(calls), 2)
+            self.assertIn("graph:n1", packet["evidence_refs"])
+            self.assertEqual(len(packet["packet_compatibility"]), 1)
+
+    def test_model_design_hardware_context_ranks_candidate_families(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerConfig(runtime_root=tmpdir)
+            client = SchedulerClient(settings)
+            client.get_hardware_context = lambda *_, **__: {  # type: ignore[method-assign]
+                "found": True,
+                "hardware": {"gpu_name": "RTX 5090", "summary_text": "RTX 5090"},
+                "scheduler_limits": {"safe_vram_budget_mb": 24000},
+            }
+            client.get_stage_hardware_features = lambda *_, **__: {"found": False, "features": []}  # type: ignore[method-assign]
+            client.get_hardware_feature_index = lambda *_, **__: {  # type: ignore[method-assign]
+                "found": True,
+                "features": [
+                    {
+                        "feature_id": "bf16",
+                        "feature_name": "BF16 tensor core training",
+                        "category": "precision",
+                        "confidence": 0.8,
+                    }
+                ],
+            }
+
+            context = client.get_model_design_hardware_context(
+                workload_type="vision_training",
+                candidate_families=["vision_transformer", "convnet"],
+                limit=2,
+            )
+
+            self.assertTrue(context["found"])
+            self.assertEqual(context["model_options"][0]["model_family"], "vision_transformer")
+            self.assertIn("hardware_feature:bf16", context["evidence_refs"])
+            self.assertGreater(context["confidence"], 0.0)
+
+    def test_hardware_feature_index_prewarm_and_details_use_neighborhood_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerConfig(
+                runtime_root=tmpdir,
+                redis_cache={"enabled": True},
+            )
+            client = SchedulerClient(settings)
+            fake_store = _FakeHardwareKnowledgeStore()
+            client._hardware_knowledge_store = fake_store
+            client._hardware_neighborhood_cache = _MemoryCache()
+            client.get_hardware_context = lambda *_, **__: {  # type: ignore[method-assign]
+                "found": True,
+                "hardware": {
+                    "hardware_key": "hw-current",
+                    "gpu_name": "NVIDIA GeForce RTX 5090",
+                    "compute_capability": "12.0",
+                },
+            }
+
+            prewarm = client.prewarm_current_hardware_neighborhood()
+            index = client.get_hardware_feature_index()
+            details = client.get_hardware_feature_details(feature_ids=["bf16"])
+
+            self.assertTrue(prewarm["ok"])
+            self.assertEqual(prewarm["feature_count"], 2)
+            self.assertEqual(index["source"], "redis")
+            self.assertEqual([item["feature_id"] for item in index["features"]], ["bf16", "fp8"])
+            self.assertEqual(details["source"], "redis")
+            self.assertEqual([item["feature_id"] for item in details["features"]], ["bf16"])
+            self.assertEqual(fake_store.neighborhood_calls, 1)
+            self.assertEqual(fake_store.detail_calls, [])
+
+    def test_stage_hardware_features_use_static_pipeline_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = SchedulerClient(SchedulerConfig(runtime_root=tmpdir))
+            client.get_hardware_context = lambda *_, **__: {  # type: ignore[method-assign]
+                "found": True,
+                "hardware": {
+                    "hardware_key": "current",
+                    "gpu_name": "NVIDIA GeForce RTX 5090",
+                    "compute_capability": "12.0",
+                },
+            }
+
+            context = client.get_stage_hardware_features(pipeline_stage="training_parameters", limit=8)
+
+            self.assertTrue(context["found"])
+            self.assertEqual(context["stage_filter"], "training_parameters")
+            feature_ids = [item["feature_id"] for item in context["features"]]
+            self.assertIn("muon_optimizer", feature_ids)
+            self.assertIn("soap_optimizer", feature_ids)
+            self.assertIn("ademamix_optimizer", feature_ids)
+            self.assertIn("gram_newton_schulz_symmetric_gemm", feature_ids)
+            self.assertIn("bf16", feature_ids)
+            node = context["stages"][0]["node"]
+            stage_keys = {item[0] for item in node["stage_feature_keys"]}
+            not_recommended_keys = {item[0] for item in node["not_recommended_feature_keys"]}
+            recommended_keys = {item[0] for item in node.get("recommended_feature_keys", [])}
+            self.assertIn("soap_optimizer", stage_keys)
+            self.assertIn("soap_optimizer", not_recommended_keys)
+            self.assertNotIn("soap_optimizer", recommended_keys)
+            for row in node["stage_feature_keys"]:
+                self.assertEqual(len(row), 2)
+                self.assertTrue(row[1])
+            self.assertNotIn("node_id", node)
+            self.assertIn("recommended_patterns", node)
+            self.assertIn("avoid_patterns", node)
+            self.assertNotIn("https://", str(node))
+            self.assertNotIn("http://", str(node))
+
+            stale = client.get_stage_hardware_features(pipeline_stage="optimizer", limit=12)
+            self.assertFalse(stale["found"])
+            self.assertIn("unsupported hardware pipeline stage", stale["reason"])
+
+    def test_stage_hardware_features_map_composite_workflow_stages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = SchedulerClient(SchedulerConfig(runtime_root=tmpdir))
+            client.get_hardware_context = lambda *_, **__: {  # type: ignore[method-assign]
+                "found": True,
+                "hardware": {
+                    "hardware_key": "current",
+                    "gpu_name": "NVIDIA GeForce RTX 5090",
+                    "compute_capability": "12.0",
+                },
+            }
+
+            stage1 = client.get_stage_hardware_features(
+                pipeline_stage="stage1_candidate_construction",
+                limit=32,
+            )
+            stage1_ids = {item["feature_id"] for item in stage1["features"]}
+
+            self.assertEqual(stage1["stage_filter"], ["datatype", "model_structure"])
+            self.assertIn("dataset_decomposition", stage1_ids)
+            self.assertIn("tensor_cores", stage1_ids)
+            self.assertIn("sm_120", stage1_ids)
+            self.assertNotIn("bf16", stage1_ids)
+            self.assertNotIn("muon_optimizer", stage1_ids)
+
+            datatype_precision = client.get_stage_hardware_features(
+                pipeline_stage="datatype_precision",
+                limit=32,
+            )
+            datatype_precision_ids = {
+                item["feature_id"] for item in datatype_precision["features"]
+            }
+
+            self.assertEqual(datatype_precision["stage_filter"], ["datatype", "training_parameters"])
+            self.assertIn("dataset_decomposition", datatype_precision_ids)
+            self.assertIn("nvimagecodec_gpu_decode", datatype_precision_ids)
+            self.assertIn("amp", datatype_precision_ids)
+            self.assertIn("bf16", datatype_precision_ids)
+            self.assertIn("fp16", datatype_precision_ids)
+            self.assertIn("tf32", datatype_precision_ids)
+            self.assertNotIn("fp8_rowwise_scaling", datatype_precision_ids)
+            self.assertNotIn("fp4", datatype_precision_ids)
+            self.assertNotIn("int8", datatype_precision_ids)
+            self.assertNotIn("tensor_cores", datatype_precision_ids)
+            self.assertNotIn("muon_optimizer", datatype_precision_ids)
+            self.assertNotIn("gram_newton_schulz_symmetric_gemm", datatype_precision_ids)
+            self.assertNotIn("async_tensor_parallel", datatype_precision_ids)
+
+            precision_alias = client.get_stage_hardware_features(
+                pipeline_stage="precision",
+                limit=32,
+            )
+            precision_alias_ids = {
+                item["feature_id"] for item in precision_alias["features"]
+            }
+
+            self.assertEqual(precision_alias["stage_filter"], ["datatype", "training_parameters"])
+            self.assertEqual(precision_alias_ids, datatype_precision_ids)
+            self.assertIn("bf16", precision_alias_ids)
+            self.assertNotIn("fp8_rowwise_scaling", precision_alias_ids)
+            self.assertNotIn("muon_optimizer", precision_alias_ids)
+            self.assertNotIn("gram_newton_schulz_symmetric_gemm", precision_alias_ids)
+
+            training_default = client.get_stage_hardware_features(
+                pipeline_stage="training_evaluation",
+                limit=8,
+            )
+            training_default_ids = {
+                item["feature_id"] for item in training_default["features"]
+            }
+
+            self.assertEqual(training_default["stage_filter"], "training_parameters")
+            self.assertGreater(len(training_default["features"]), 8)
+            self.assertIn("muon_optimizer", training_default_ids)
+            self.assertIn("soap_optimizer", training_default_ids)
+            self.assertIn("ademamix_optimizer", training_default_ids)
+            self.assertIn("gram_newton_schulz_symmetric_gemm", training_default_ids)
+            self.assertIn("bf16", training_default_ids)
+
+            model_training = client.get_stage_hardware_features(
+                pipeline_stage=("model_structure", "training_parameters"),
+                limit=8,
+            )
+            model_training_ids = {
+                item["feature_id"] for item in model_training["features"]
+            }
+
+            self.assertEqual(model_training["stage_filter"], ["model_structure", "training_parameters"])
+            self.assertIn("tensor_cores", model_training_ids)
+            self.assertIn("muon_optimizer", model_training_ids)
+            self.assertIn("soap_optimizer", model_training_ids)
+            self.assertIn("bf16", model_training_ids)
+
+            training = client.get_stage_hardware_features(
+                pipeline_stage="training_evaluation",
+                limit=32,
+            )
+            training_ids = {item["feature_id"] for item in training["features"]}
+
+            self.assertEqual(training["stage_filter"], "training_parameters")
+            self.assertIn("muon_optimizer", training_ids)
+            self.assertIn("gram_newton_schulz_symmetric_gemm", training_ids)
+            self.assertIn("bf16", training_ids)
+            self.assertNotIn("fp8_rowwise_scaling", training_ids)
+            self.assertNotIn("fp4", training_ids)
+            self.assertNotIn("int8", training_ids)
+            self.assertIn("async_tensor_parallel", training_ids)
+
+    def test_hardware_knowledge_client_queries_graph_without_scheduler_client(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = HardwareKnowledgeSettings(
+                runtime_root=f"{tmpdir}/hardware",
+                branch_profile_db_path=f"{tmpdir}/scheduler/db/branch_profile.sqlite3",
+                graph={"enabled": False},
+                redis_cache={"enabled": False},
+            )
+            client = HardwareKnowledgeClient(settings, include_profile_evidence=True)
+            client.get_hardware_context = lambda *_, **__: {  # type: ignore[method-assign]
+                "found": True,
+                "hardware": {"gpu_name": "GeForce RTX 5090", "hardware_key": "rtx5090"},
+            }
+
+            result = client.get_stage_hardware_features(
+                hardware_id="current",
+                pipeline_stage="training_parameters",
+                limit=4,
+            )
+            evidence = client.get_profile_evidence(
+                candidate={"branch_name": "resnet50", "branch_profile_key": "branch-profile:resnet50"},
+                limit=2,
+            )
+
+            self.assertFalse(client.scheduler_context_attached)
+            self.assertTrue(result["found"])
+            self.assertEqual(result["source"], "hardware_knowledge_graph.json")
+            self.assertEqual(evidence["graph_evidence"]["exact_profiles"], [])
+
+    def test_optimization_context_attaches_candidate_stage_hardware_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = SchedulerClient(SchedulerConfig(runtime_root=tmpdir))
+            stage_calls = []
+
+            client.get_profile_evidence = lambda **_: {  # type: ignore[method-assign]
+                "hardware_context": {"found": True},
+                "graph_evidence": {"exact_profiles": [], "similar_profiles": [], "packed_profiles": []},
+                "derived_diagnosis": {"profile_symptoms": [], "optimization_targets": []},
+                "risk_flags": [],
+                "evidence_refs": [],
+                "confidence": 0.0,
+            }
+
+            def fake_stage_features(hardware_id, *, pipeline_stage, limit):
+                stage_calls.append((hardware_id, list(pipeline_stage), limit))
+                return {
+                    "found": True,
+                    "stage_filter": list(pipeline_stage),
+                    "stages": [
+                        {
+                            "stage": "training_parameters",
+                            "features": [{"feature_id": "bf16", "name": "BF16", "category": "precision"}],
+                            "feature_count": 1,
+                        }
+                    ],
+                    "features": [{"feature_id": "bf16", "name": "BF16", "category": "precision"}],
+                    "feature_count": 1,
+                    "source": "unit-test",
+                }
+
+            client.get_stage_hardware_features = fake_stage_features  # type: ignore[method-assign]
+
+            context = client.get_optimization_context(
+                candidate={"stage": "training_evaluation", "framework": "pytorch"},
+                limit=3,
+            )
+
+            self.assertEqual(stage_calls, [("current", ["training_parameters"], 3)])
+            self.assertEqual(context["stage_hardware_features"]["stage_filter"], ["training_parameters"])
+            self.assertEqual(context["stage_hardware_features"]["features"][0]["feature_id"], "bf16")
 
     def test_batch_resolution_apply_updates_runner_kwargs_and_metadata(self) -> None:
         job = TrainingJob.create(
@@ -112,6 +641,41 @@ class SchedulerClientSurfaceTest(unittest.TestCase):
             self.assertTrue(runtime_estimate["found"])
             self.assertTrue(tuning_outcome["ok"])
             self.assertEqual(len(client.list_events(job_id=job.job_id, event_type="tuning_outcome_recorded")), 1)
+
+    def test_graph_knowledge_context_uses_redis_cache_when_available(self) -> None:
+        store = _FakeGraphStore()
+        knowledge = SchedulerKnowledgeBase(store, redis_cache=_MemoryCache())
+
+        first = knowledge.get_hardware_context("current")
+        calls_after_first_read = store.hardware_calls
+        second = knowledge.get_hardware_context("current")
+
+        self.assertEqual(first, second)
+        self.assertGreater(calls_after_first_read, 0)
+        self.assertEqual(store.hardware_calls, calls_after_first_read)
+
+    def test_graph_knowledge_preserves_empty_auto_probe_backend_lists(self) -> None:
+        store = _FakeGraphStore()
+        store.events = [
+            {
+                "event_type": "scheduler_auto_backend_probe",
+                "payload": {
+                    "configured_mode": "auto",
+                    "effective_scheduler_mode": "parallel_auto_pack",
+                    "backend_priority": [],
+                    "concurrent_backend_allowlist": [],
+                },
+            }
+        ]
+        knowledge = SchedulerKnowledgeBase(store)
+
+        limits = knowledge._scheduler_limits()
+        capabilities = knowledge._backend_capabilities()
+
+        self.assertEqual(limits["backend_priority"], [])
+        self.assertEqual(limits["concurrent_backend_allowlist"], [])
+        self.assertEqual(capabilities["backend_priority"], [])
+        self.assertEqual(capabilities["concurrent_backend_allowlist"], [])
 
 
 if __name__ == "__main__":

@@ -34,10 +34,56 @@ def runtime_profile_for_job(
     )
 
 
+def _runtime_profile_is_successful(profile: RuntimeProfile, *, scheduler_session_id: str | None = None) -> bool:
+    metadata = dict(profile.metadata or {})
+    if scheduler_session_id is not None and metadata.get("scheduler_session_id") != scheduler_session_id:
+        return False
+    if metadata.get("success") is False:
+        return False
+    if metadata.get("candidate_returncode") not in (None, 0):
+        return False
+    return True
+
+
+def successful_runtime_profile_for_packing(
+    store: StateStore,
+    job: TrainingJob,
+    *,
+    backend_name: str,
+    scheduler_session_id: str | None = None,
+) -> RuntimeProfile | None:
+    """Return a trusted same-run profile usable for raw-script packing decisions."""
+    signature = job.packing.signature
+    if not signature:
+        return None
+
+    hardware_key = store.hardware_key()
+    list_profiles = getattr(store, "list_runtime_profiles", None)
+    profiles: list[RuntimeProfile] = []
+    if callable(list_profiles):
+        seen_keys: set[str] = set()
+        for candidate_backend in (backend_name, "exclusive"):
+            for profile in list_profiles(signature=signature, hardware_key=hardware_key, backend_name=candidate_backend):
+                if profile.profile_key in seen_keys:
+                    continue
+                seen_keys.add(profile.profile_key)
+                profiles.append(profile)
+    else:
+        for candidate_backend in (backend_name, "exclusive"):
+            profile = runtime_profile_for_job(store, job, backend_name=candidate_backend)
+            if profile is not None:
+                profiles.append(profile)
+
+    for profile in profiles:
+        if _runtime_profile_is_successful(profile, scheduler_session_id=scheduler_session_id):
+            return profile
+    return None
+
+
 def runtime_ready_for_packing(store: StateStore, job: TrainingJob, *, backend_name: str) -> bool:
     if not job.runtime_probe.enabled:
         return False
-    return runtime_profile_for_job(store, job, backend_name=backend_name) is not None
+    return successful_runtime_profile_for_packing(store, job, backend_name=backend_name) is not None
 
 
 def planned_total_epochs(job: TrainingJob) -> int | None:

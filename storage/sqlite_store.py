@@ -6,17 +6,15 @@ from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 import json
-import math
 import sqlite3
-import statistics
 
 from ..domain import (
     BatchSizeObservation,
     BatchProbeProfile,
     CombinationProfile,
-    ColocationTimingProfile,
     CommandType,
     JobCommand,
+    JobMetricSample,
     JobStatus,
     PairProfile,
     RuntimeProfile,
@@ -29,7 +27,7 @@ from ..domain import (
 )
 from ..hardware import HardwareProfile, detect_hardware_profile
 from ..config import SchedulerSettings
-from .models import MIGRATION_STATEMENTS, SCHEMA_STATEMENTS
+from .models import SCHEMA_STATEMENTS
 
 
 class SQLiteStateStore:
@@ -52,12 +50,6 @@ class SQLiteStateStore:
         with self._connect() as connection:
             for statement in SCHEMA_STATEMENTS:
                 connection.execute(statement)
-            for statement in MIGRATION_STATEMENTS:
-                try:
-                    connection.execute(statement)
-                except sqlite3.OperationalError as exc:
-                    if "duplicate column name" not in str(exc).lower():
-                        raise
             connection.commit()
 
     def hardware_profile(self) -> HardwareProfile:
@@ -179,14 +171,7 @@ class SQLiteStateStore:
         self.save_job(job)
         return job
 
-    def set_job_status(
-        self,
-        job_id: str,
-        status: JobStatus,
-        *,
-        reason: str | None = None,
-        hold: bool | None = None,
-    ) -> TrainingJob:
+    def set_job_status(self, job_id: str, status: JobStatus, *, reason: str | None = None, hold: bool | None = None) -> TrainingJob:
         return self.update_job(job_id, status=status, reason=reason, hold=hold)
 
     def delete_job(self, job_id: str) -> None:
@@ -194,13 +179,7 @@ class SQLiteStateStore:
             connection.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
             connection.commit()
 
-    def enqueue_command(
-        self,
-        command_type: CommandType,
-        *,
-        job_id: str | None = None,
-        payload: dict[str, Any] | None = None,
-    ) -> int:
+    def enqueue_command(self, command_type: CommandType, *, job_id: str | None = None, payload: dict[str, Any] | None = None) -> int:
         payload_json = json.dumps(payload or {}, sort_keys=True)
         created_at = utc_now()
         with self._connect() as connection:
@@ -212,7 +191,6 @@ class SQLiteStateStore:
                 (job_id, command_type.value, payload_json, created_at),
             )
             connection.commit()
-            assert cursor.lastrowid is not None
             return int(cursor.lastrowid)
 
     def fetch_pending_commands(self, limit: int = 100) -> list[JobCommand]:
@@ -231,31 +209,17 @@ class SQLiteStateStore:
 
     def mark_command_processed(self, command_id: int) -> None:
         with self._connect() as connection:
-            connection.execute(
-                "UPDATE commands SET processed_at = ? WHERE command_id = ?",
-                (utc_now(), command_id),
-            )
+            connection.execute("UPDATE commands SET processed_at = ? WHERE command_id = ?", (utc_now(), command_id))
             connection.commit()
 
-    def log_event(
-        self,
-        event_type: str,
-        *,
-        job_id: str | None = None,
-        payload: dict[str, Any] | None = None,
-    ) -> None:
+    def log_event(self, event_type: str, *, job_id: str | None = None, payload: dict[str, Any] | None = None) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO events(job_id, event_type, payload_json, created_at)
                 VALUES(?, ?, ?, ?)
                 """,
-                (
-                    job_id,
-                    event_type,
-                    json.dumps(payload or {}, sort_keys=True),
-                    utc_now(),
-                ),
+                (job_id, event_type, json.dumps(payload or {}, sort_keys=True), utc_now()),
             )
             connection.commit()
 
@@ -276,7 +240,7 @@ class SQLiteStateStore:
                 "event_id": row["event_id"],
                 "job_id": row["job_id"],
                 "event_type": row["event_type"],
-                "payload": (json.loads(row["payload_json"]) if row["payload_json"] else {}),
+                "payload": json.loads(row["payload_json"]) if row["payload_json"] else {},
                 "created_at": row["created_at"],
             }
             for row in rows
@@ -290,12 +254,7 @@ class SQLiteStateStore:
                 INSERT INTO checkpoints(job_id, checkpoint_path, created_at, metadata_json, is_latest)
                 VALUES(?, ?, ?, ?, 1)
                 """,
-                (
-                    job_id,
-                    checkpoint_path,
-                    utc_now(),
-                    json.dumps(metadata or {}, sort_keys=True),
-                ),
+                (job_id, checkpoint_path, utc_now(), json.dumps(metadata or {}, sort_keys=True)),
             )
             connection.commit()
         self.update_job(job_id, latest_checkpoint_path=checkpoint_path)
@@ -316,6 +275,79 @@ class SQLiteStateStore:
             return str(row["checkpoint_path"])
         job = self.get_job(job_id)
         return job.latest_checkpoint_path if job else None
+
+    def record_job_metric_sample(
+        self,
+        *,
+        job_id: str,
+        created_at: str,
+        epoch: int,
+        global_step: int,
+        avg_step_time_ms: float | None = None,
+        estimated_total_runtime_seconds: float | None = None,
+        remaining_runtime_seconds: float | None = None,
+        metrics: dict[str, Any] | None = None,
+    ) -> JobMetricSample:
+        numeric_metrics: dict[str, float] = {}
+        for key, value in dict(metrics or {}).items():
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                numeric_metrics[str(key)] = float(value)
+                continue
+            try:
+                numeric_metrics[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO job_metric_samples(
+                    job_id, created_at, epoch, global_step, avg_step_time_ms,
+                    estimated_total_runtime_seconds, remaining_runtime_seconds, metrics_json
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    created_at,
+                    int(epoch or 0),
+                    int(global_step or 0),
+                    avg_step_time_ms,
+                    estimated_total_runtime_seconds,
+                    remaining_runtime_seconds,
+                    json.dumps(numeric_metrics, sort_keys=True),
+                ),
+            )
+            connection.commit()
+            sample_id = int(cursor.lastrowid)
+        return JobMetricSample(
+            sample_id=sample_id,
+            job_id=job_id,
+            created_at=created_at,
+            epoch=int(epoch or 0),
+            global_step=int(global_step or 0),
+            avg_step_time_ms=avg_step_time_ms,
+            estimated_total_runtime_seconds=estimated_total_runtime_seconds,
+            remaining_runtime_seconds=remaining_runtime_seconds,
+            metrics=numeric_metrics,
+        )
+
+    def list_job_metric_samples(self, job_id: str, *, limit: int | None = None) -> list[JobMetricSample]:
+        query = """
+            SELECT sample_id, job_id, created_at, epoch, global_step, avg_step_time_ms,
+                   estimated_total_runtime_seconds, remaining_runtime_seconds, metrics_json
+            FROM job_metric_samples
+            WHERE job_id = ?
+            ORDER BY created_at ASC, sample_id ASC
+        """
+        params: list[Any] = [job_id]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [JobMetricSample.from_row(dict(row)) for row in rows]
 
     def update_cache_metadata(
         self,
@@ -361,7 +393,8 @@ class SQLiteStateStore:
 
     def cache_metadata_summary(self) -> dict[str, Any]:
         with self._connect() as connection:
-            row = connection.execute("""
+            row = connection.execute(
+                """
                 SELECT
                     COUNT(*) AS entries,
                     COALESCE(SUM(size_bytes), 0) AS used_bytes,
@@ -369,7 +402,8 @@ class SQLiteStateStore:
                     COALESCE(SUM(hits), 0) AS hits,
                     COALESCE(SUM(misses), 0) AS misses
                 FROM cache_entries
-                """).fetchone()
+                """
+            ).fetchone()
         return dict(row)
 
     def upsert_solo_profile(self, profile: SoloProfile) -> SoloProfile:
@@ -379,12 +413,11 @@ class SQLiteStateStore:
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO solo_profiles(signature, hardware_key, family, peak_vram_mb, avg_vram_mb, avg_gpu_utilization, avg_memory_utilization, sample_count, last_job_id, updated_at, metadata_json)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO solo_profiles(signature, hardware_key, family, peak_vram_mb, avg_gpu_utilization, avg_memory_utilization, sample_count, last_job_id, updated_at, metadata_json)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(signature, hardware_key) DO UPDATE SET
                     family=excluded.family,
                     peak_vram_mb=excluded.peak_vram_mb,
-                    avg_vram_mb=excluded.avg_vram_mb,
                     avg_gpu_utilization=excluded.avg_gpu_utilization,
                     avg_memory_utilization=excluded.avg_memory_utilization,
                     sample_count=excluded.sample_count,
@@ -397,7 +430,6 @@ class SQLiteStateStore:
                     profile.hardware_key,
                     profile.family,
                     profile.peak_vram_mb,
-                    profile.avg_vram_mb,
                     profile.avg_gpu_utilization,
                     profile.avg_memory_utilization,
                     profile.sample_count,
@@ -436,8 +468,8 @@ class SQLiteStateStore:
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO pair_profiles(pair_key, hardware_key, left_signature, right_signature, backend_name, compatible, observations, peak_vram_mb, avg_vram_mb, avg_gpu_utilization, avg_memory_utilization, slowdown_ratio, cooldown_until, last_failure_reason, updated_at, metadata_json)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO pair_profiles(pair_key, hardware_key, left_signature, right_signature, backend_name, compatible, observations, peak_vram_mb, avg_gpu_utilization, avg_memory_utilization, slowdown_ratio, cooldown_until, last_failure_reason, updated_at, metadata_json)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(pair_key, hardware_key) DO UPDATE SET
                     left_signature=excluded.left_signature,
                     right_signature=excluded.right_signature,
@@ -445,7 +477,6 @@ class SQLiteStateStore:
                     compatible=excluded.compatible,
                     observations=excluded.observations,
                     peak_vram_mb=excluded.peak_vram_mb,
-                    avg_vram_mb=excluded.avg_vram_mb,
                     avg_gpu_utilization=excluded.avg_gpu_utilization,
                     avg_memory_utilization=excluded.avg_memory_utilization,
                     slowdown_ratio=excluded.slowdown_ratio,
@@ -463,7 +494,6 @@ class SQLiteStateStore:
                     1 if profile.compatible else 0,
                     profile.observations,
                     profile.peak_vram_mb,
-                    profile.avg_vram_mb,
                     profile.avg_gpu_utilization,
                     profile.avg_memory_utilization,
                     profile.slowdown_ratio,
@@ -500,13 +530,7 @@ class SQLiteStateStore:
                     ORDER BY updated_at DESC
                     LIMIT 1
                     """,
-                    (
-                        hardware_key,
-                        left_signature,
-                        right_signature,
-                        right_signature,
-                        left_signature,
-                    ),
+                    (hardware_key, left_signature, right_signature, right_signature, left_signature),
                 ).fetchone()
             else:
                 pair_key = build_backend_scoped_pair_key(left_signature, right_signature, backend_name=backend_name)
@@ -652,10 +676,13 @@ class SQLiteStateStore:
                     model_key,
                     device_type,
                     shape_signature,
+                    profile_namespace,
+                    hardware_key,
+                    search_mode,
+                    contract_version,
                     batch_param_name,
                     resolved_batch_size,
                     peak_vram_mb,
-                    avg_vram_mb,
                     memory_total_mb,
                     target_budget_mb,
                     observations,
@@ -663,15 +690,18 @@ class SQLiteStateStore:
                     updated_at,
                     metadata_json
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(probe_key) DO UPDATE SET
                     model_key=excluded.model_key,
                     device_type=excluded.device_type,
                     shape_signature=excluded.shape_signature,
+                    profile_namespace=excluded.profile_namespace,
+                    hardware_key=excluded.hardware_key,
+                    search_mode=excluded.search_mode,
+                    contract_version=excluded.contract_version,
                     batch_param_name=excluded.batch_param_name,
                     resolved_batch_size=excluded.resolved_batch_size,
                     peak_vram_mb=excluded.peak_vram_mb,
-                    avg_vram_mb=excluded.avg_vram_mb,
                     memory_total_mb=excluded.memory_total_mb,
                     target_budget_mb=excluded.target_budget_mb,
                     observations=excluded.observations,
@@ -684,10 +714,13 @@ class SQLiteStateStore:
                     profile.model_key,
                     profile.device_type,
                     profile.shape_signature,
+                    profile.profile_namespace,
+                    profile.hardware_key,
+                    profile.search_mode,
+                    profile.contract_version,
                     profile.batch_param_name,
                     profile.resolved_batch_size,
                     profile.peak_vram_mb,
-                    profile.avg_vram_mb,
                     profile.memory_total_mb,
                     profile.target_budget_mb,
                     profile.observations,
@@ -702,6 +735,31 @@ class SQLiteStateStore:
     def get_batch_probe_profile(self, probe_key: str) -> BatchProbeProfile | None:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM batch_probe_profiles WHERE probe_key = ?", (probe_key,)).fetchone()
+        return BatchProbeProfile.from_row(dict(row)) if row else None
+
+    def get_compatible_batch_probe_profile(
+        self,
+        *,
+        profile_namespace: str,
+        hardware_key: str,
+        shape_signature: str,
+        search_mode: str,
+        contract_version: int = 2,
+    ) -> BatchProbeProfile | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM batch_probe_profiles
+                WHERE profile_namespace = ?
+                  AND hardware_key = ?
+                  AND shape_signature = ?
+                  AND search_mode = ?
+                  AND contract_version = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (profile_namespace, hardware_key, shape_signature, search_mode, int(contract_version)),
+            ).fetchone()
         return BatchProbeProfile.from_row(dict(row)) if row else None
 
     def list_batch_probe_profiles(self) -> list[BatchProbeProfile]:
@@ -723,7 +781,6 @@ class SQLiteStateStore:
                     batch_param_name,
                     batch_size,
                     peak_vram_mb,
-                    avg_vram_mb,
                     memory_total_mb,
                     avg_step_time_ms,
                     avg_gpu_utilization,
@@ -733,7 +790,7 @@ class SQLiteStateStore:
                     updated_at,
                     metadata_json
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(observation_key) DO UPDATE SET
                     model_key=excluded.model_key,
                     shape_signature=excluded.shape_signature,
@@ -742,7 +799,6 @@ class SQLiteStateStore:
                     batch_param_name=excluded.batch_param_name,
                     batch_size=excluded.batch_size,
                     peak_vram_mb=excluded.peak_vram_mb,
-                    avg_vram_mb=excluded.avg_vram_mb,
                     memory_total_mb=excluded.memory_total_mb,
                     avg_step_time_ms=excluded.avg_step_time_ms,
                     avg_gpu_utilization=excluded.avg_gpu_utilization,
@@ -761,7 +817,6 @@ class SQLiteStateStore:
                     observation.batch_param_name,
                     observation.batch_size,
                     observation.peak_vram_mb,
-                    observation.avg_vram_mb,
                     observation.memory_total_mb,
                     observation.avg_step_time_ms,
                     observation.avg_gpu_utilization,
@@ -792,13 +847,7 @@ class SQLiteStateStore:
                 ORDER BY updated_at DESC
                 LIMIT 1
                 """,
-                (
-                    model_key,
-                    shape_signature,
-                    hardware_key,
-                    backend_name,
-                    int(batch_size),
-                ),
+                (model_key, shape_signature, hardware_key, backend_name, int(batch_size)),
             ).fetchone()
         return BatchSizeObservation.from_row(dict(row)) if row else None
 
@@ -844,7 +893,6 @@ class SQLiteStateStore:
                     compatible,
                     observations,
                     peak_vram_mb,
-                    avg_vram_mb,
                     memory_total_mb,
                     avg_gpu_utilization,
                     avg_memory_utilization,
@@ -856,7 +904,7 @@ class SQLiteStateStore:
                     updated_at,
                     metadata_json
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(combination_key) DO UPDATE SET
                     group_signature=excluded.group_signature,
                     hardware_key=excluded.hardware_key,
@@ -866,7 +914,6 @@ class SQLiteStateStore:
                     compatible=excluded.compatible,
                     observations=excluded.observations,
                     peak_vram_mb=excluded.peak_vram_mb,
-                    avg_vram_mb=excluded.avg_vram_mb,
                     memory_total_mb=excluded.memory_total_mb,
                     avg_gpu_utilization=excluded.avg_gpu_utilization,
                     avg_memory_utilization=excluded.avg_memory_utilization,
@@ -888,7 +935,6 @@ class SQLiteStateStore:
                     1 if profile.compatible else 0,
                     profile.observations,
                     profile.peak_vram_mb,
-                    profile.avg_vram_mb,
                     profile.memory_total_mb,
                     profile.avg_gpu_utilization,
                     profile.avg_memory_utilization,
@@ -923,46 +969,6 @@ class SQLiteStateStore:
                 (group_signature, hardware_key, backend_name, scheduler_mode),
             ).fetchone()
         return CombinationProfile.from_row(dict(row)) if row else None
-
-    def upsert_colocation_timing_profile(self, profile: ColocationTimingProfile) -> ColocationTimingProfile:
-        profile.updated_at = utc_now()
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO colocation_timing_profiles(
-                    profile_key, hardware_key, members_json, member_timings_json,
-                    observations, updated_at, source, metadata_json
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(profile_key) DO UPDATE SET
-                    hardware_key=excluded.hardware_key,
-                    members_json=excluded.members_json,
-                    member_timings_json=excluded.member_timings_json,
-                    observations=excluded.observations,
-                    updated_at=excluded.updated_at,
-                    source=excluded.source,
-                    metadata_json=excluded.metadata_json
-                """,
-                (
-                    profile.profile_key,
-                    profile.hardware_key,
-                    json.dumps(profile.members, sort_keys=True),
-                    json.dumps(profile.member_timings, sort_keys=True),
-                    profile.observations,
-                    profile.updated_at,
-                    profile.source,
-                    json.dumps(profile.metadata or {}, sort_keys=True),
-                ),
-            )
-            connection.commit()
-        return profile
-
-    def get_colocation_timing_profile(self, profile_key: str) -> ColocationTimingProfile | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM colocation_timing_profiles WHERE profile_key = ?",
-                (profile_key,),
-            ).fetchone()
-        return ColocationTimingProfile.from_row(dict(row)) if row else None
 
     def list_combination_profiles(
         self,
@@ -1000,18 +1006,12 @@ class SQLiteStateStore:
         reason: str,
         cooldown_seconds: int,
         peak_vram_mb: int | None = None,
-        avg_vram_mb: float | None = None,
         avg_gpu_utilization: float | None = None,
         avg_memory_utilization: float | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> PairProfile:
         hardware_key = self.hardware_key()
-        existing = self.get_pair_profile(
-            left_signature,
-            right_signature,
-            hardware_key=hardware_key,
-            backend_name=backend_name,
-        )
+        existing = self.get_pair_profile(left_signature, right_signature, hardware_key=hardware_key, backend_name=backend_name)
         cooldown_until = None
         if cooldown_seconds > 0:
             cooldown_until = (parse_timestamp(utc_now()) + timedelta(seconds=cooldown_seconds)).isoformat()
@@ -1022,10 +1022,9 @@ class SQLiteStateStore:
             hardware_key=hardware_key,
             compatible=False,
             observations=(existing.observations + 1) if existing else 1,
-            peak_vram_mb=(peak_vram_mb if peak_vram_mb is not None else (existing.peak_vram_mb if existing else None)),
-            avg_vram_mb=(avg_vram_mb if avg_vram_mb is not None else (existing.avg_vram_mb if existing else None)),
-            avg_gpu_utilization=(avg_gpu_utilization if avg_gpu_utilization is not None else (existing.avg_gpu_utilization if existing else None)),
-            avg_memory_utilization=(avg_memory_utilization if avg_memory_utilization is not None else (existing.avg_memory_utilization if existing else None)),
+            peak_vram_mb=peak_vram_mb if peak_vram_mb is not None else (existing.peak_vram_mb if existing else None),
+            avg_gpu_utilization=avg_gpu_utilization if avg_gpu_utilization is not None else (existing.avg_gpu_utilization if existing else None),
+            avg_memory_utilization=avg_memory_utilization if avg_memory_utilization is not None else (existing.avg_memory_utilization if existing else None),
             slowdown_ratio=existing.slowdown_ratio if existing else None,
             cooldown_until=cooldown_until,
             last_failure_reason=reason,
@@ -1059,9 +1058,6 @@ class SQLiteStateStore:
         events = self.list_events(event_type=None)
         wait_times: list[float] = []
         runtimes: list[float] = []
-        flow_times: list[float] = []
-        release_times = []
-        finish_times = []
         for job in jobs:
             submitted = parse_timestamp(job.submitted_at)
             started = parse_timestamp(job.started_at)
@@ -1070,18 +1066,6 @@ class SQLiteStateStore:
                 wait_times.append((started - submitted).total_seconds())
             if started and finished:
                 runtimes.append((finished - started).total_seconds())
-            if submitted and finished:
-                flow_times.append((finished - submitted).total_seconds())
-                release_times.append(submitted)
-                finish_times.append(finished)
-        sorted_flows = sorted(flow_times)
-        completed_jobs_with_flow = [job for job in jobs if parse_timestamp(job.submitted_at) and parse_timestamp(job.finished_at)]
-        minimum_priority = min((job.priority for job in completed_jobs_with_flow), default=0)
-        priority_weight = float(self.settings.gpu_scheduler.objective.priority_weight)
-        flow_weights = [1.0 + priority_weight * (job.priority - minimum_priority) for job in completed_jobs_with_flow]
-        weighted_flow = sum(weight * flow for weight, flow in zip(flow_weights, flow_times, strict=True)) / max(1e-9, sum(flow_weights)) if flow_times else 0.0
-        p95_index = max(0, math.ceil(0.95 * len(sorted_flows)) - 1) if sorted_flows else 0
-        makespan = (max(finish_times) - min(release_times)).total_seconds() if finish_times and release_times else 0.0
         cache_summary = self.cache_metadata_summary()
         total_cache = int(cache_summary["hits"]) + int(cache_summary["misses"])
         return SchedulerReport(
@@ -1089,22 +1073,9 @@ class SQLiteStateStore:
             completed_jobs=sum(job.status == JobStatus.COMPLETED for job in jobs),
             failed_jobs=sum(job.status == JobStatus.FAILED for job in jobs),
             cancelled_jobs=sum(job.status == JobStatus.CANCELLED for job in jobs),
-            average_queue_wait_seconds=(sum(wait_times) / len(wait_times) if wait_times else 0.0),
+            average_queue_wait_seconds=sum(wait_times) / len(wait_times) if wait_times else 0.0,
             average_runtime_seconds=sum(runtimes) / len(runtimes) if runtimes else 0.0,
-            trace_makespan_seconds=makespan,
-            total_flow_time_seconds=sum(flow_times),
-            mean_flow_time_seconds=statistics.fmean(flow_times) if flow_times else 0.0,
-            weighted_mean_flow_time_seconds=weighted_flow,
-            median_flow_time_seconds=(statistics.median(flow_times) if flow_times else 0.0),
-            p95_flow_time_seconds=sorted_flows[p95_index] if sorted_flows else 0.0,
-            max_wait_time_seconds=max(wait_times, default=0.0),
-            starvation_count=sum(wait >= self.settings.gpu_scheduler.starvation_timeout_seconds for wait in wait_times),
-            jobs_per_hour=((3600.0 * len(flow_times) / makespan) if makespan > 0 else 0.0),
-            early_stopped_epochs_saved=sum(int((job.metadata.get("early_stopping_result") or {}).get("epochs_saved", 0)) for job in jobs),
-            early_stopped_wall_time_saved_seconds=sum(
-                float((job.metadata.get("early_stopping_result") or {}).get("estimated_wall_time_saved_seconds", 0.0)) for job in jobs
-            ),
-            cache_hit_rate=((int(cache_summary["hits"]) / total_cache) if total_cache else 0.0),
+            cache_hit_rate=(int(cache_summary["hits"]) / total_cache) if total_cache else 0.0,
             cache_hits=int(cache_summary["hits"]),
             cache_misses=int(cache_summary["misses"]),
             cache_evictions=sum(event["event_type"] == "cache_evicted" for event in events),

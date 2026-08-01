@@ -113,10 +113,19 @@ def mark_job_completed(
     current = store.get_job(job_id)
     if current is None:
         return 1
-    if current.status in {JobStatus.PAUSED, JobStatus.CANCELLED, JobStatus.FAILED}:
+    if current.status in {JobStatus.PAUSED, JobStatus.CANCELLED, JobStatus.EARLY_STOPPED, JobStatus.FAILED}:
+        return 0
+    payload = dict(result or {})
+    if result is not None and result.get("success") is False:
+        reason = str(result.get("candidate_exc_type") or result.get("outcome") or result.get("reason") or "candidate failed")
+        store.set_job_status(job_id, JobStatus.FAILED, reason=reason, hold=False)
+        if backend_name is not None:
+            payload["backend_name"] = backend_name
+        payload["failure_origin"] = "candidate"
+        event_logger.emit("job_candidate_failed", job_id=job_id, payload=payload)
+        logger.warning("Job %s candidate failed%s: %s", job_id, f" in {backend_name}" if backend_name else "", reason)
         return 0
     store.set_job_status(job_id, JobStatus.COMPLETED, reason=(result or {}).get("reason"), hold=False)
-    payload = dict(result or {})
     if backend_name is not None:
         payload["backend_name"] = backend_name
     event_logger.emit("job_completed", job_id=job_id, payload=payload)

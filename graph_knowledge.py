@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from statistics import median
-from typing import Any
+from typing import Any, Callable
 
+from .config import effective_scheduler_mode
 from .domain import RunProfile
+from .redis_cache import RedisLRUCache, graph_cache_enabled
 
 _JOB_DESIGN_CANDIDATE_KEYS = {
     "stage",
     "task_type",
     "model_key",
+    "branch_name",
+    "branch_profile_key",
     "model_family",
     "packing_family",
     "proposed_batch_size",
@@ -33,8 +37,32 @@ class SchedulerKnowledgeBase:
        storage layout.
     """
 
-    def __init__(self, store: Any):
+    def __init__(self, store: Any, *, redis_cache: Any | None = None):
         self.store = store
+        self._redis_cache = redis_cache
+        self._redis_cache_checked = redis_cache is not None
+
+    def _cache(self) -> Any | None:
+        if self._redis_cache is not None:
+            return self._redis_cache
+        settings = self._settings()
+        if settings is None or self._redis_cache_checked or not graph_cache_enabled(settings):
+            return None
+        self._redis_cache_checked = True
+        self._redis_cache = RedisLRUCache.from_settings(settings)
+        return self._redis_cache
+
+    def _cached_graph_result(self, method_name: str, payload: dict[str, Any], builder: Callable[[], Any]) -> Any:
+        cache = self._cache()
+        if cache is None:
+            return builder()
+        cache_payload = {"method": method_name, "payload": payload}
+        cached = cache.get("graph:knowledge", cache_payload)
+        if cached is not None:
+            return cached
+        result = builder()
+        cache.set("graph:knowledge", cache_payload, result)
+        return result
 
     def _current_hardware_profile(self) -> Any | None:
         try:
@@ -63,11 +91,12 @@ class SchedulerKnowledgeBase:
         settings = self._settings()
         gpu_scheduler = getattr(settings, "gpu_scheduler", None)
         memory = getattr(gpu_scheduler, "memory", None)
-        budget_gib = getattr(memory, "safe_vram_budget_gib", None)
-        if budget_gib is None:
+        if memory is None:
             return None
         try:
-            return int(float(budget_gib) * 1024.0)
+            profile = self._current_hardware_profile()
+            total_vram_mb = getattr(profile, "total_vram_mb", None) if profile is not None else None
+            return int(memory.budget_mb(total_vram_mb))
         except (TypeError, ValueError):
             return None
 
@@ -390,15 +419,23 @@ class SchedulerKnowledgeBase:
         if script_signature and signature == script_signature:
             return "signature_exact"
         model_key = self._model_key_for_signature(str(signature or ""))
+        reason = self._match_model_key(candidate.get("branch_profile_key"), model_key)
+        if reason:
+            return "branch_profile_key_exact" if reason == "model_key_exact" else reason
         reason = self._match_model_key(candidate.get("model_key"), model_key)
         if reason:
             return reason
+        reason = self._match_model_key(candidate.get("branch_name"), model_key)
+        if reason:
+            return "branch_name_exact" if reason == "model_key_exact" else reason
         return self._match_model_key(candidate.get("model_key"), signature)
 
     def _solo_match_reason(self, signature: str | None, family: str | None, candidate: dict[str, Any]) -> str | None:
         reason = self._runtime_match_reason(signature, candidate)
         if reason:
             return reason
+        if candidate.get("branch_name") and family and str(candidate["branch_name"]).strip().lower() == str(family).strip().lower():
+            return "branch_name_exact"
         if candidate.get("packing_family") and family and candidate["packing_family"] == family:
             return "packing_family_exact"
         if candidate.get("model_family") and family and candidate["model_family"] == family:
@@ -406,19 +443,34 @@ class SchedulerKnowledgeBase:
         return None
 
     def _batch_probe_match_reason(self, model_key: str | None, candidate: dict[str, Any]) -> str | None:
+        reason = self._match_model_key(candidate.get("branch_profile_key"), model_key)
+        if reason:
+            return "branch_profile_key_exact" if reason == "model_key_exact" else reason
         reason = self._match_model_key(candidate.get("model_key"), model_key)
         if reason:
             return reason
+        if candidate.get("branch_name"):
+            reason = self._match_model_key(candidate["branch_name"], model_key)
+            if reason:
+                return "branch_name_exact" if reason == "model_key_exact" else reason
         if candidate.get("packing_family"):
             return self._match_model_key(candidate["packing_family"], model_key)
+        if candidate.get("model_family"):
+            return self._match_model_key(candidate["model_family"], model_key)
         return None
 
     def _run_match_reason(self, profile: RunProfile, candidate: dict[str, Any]) -> str | None:
         if candidate.get("script_signature") and profile.signature == candidate["script_signature"]:
             return "signature_exact"
+        reason = self._match_model_key(candidate.get("branch_profile_key"), profile.model_key)
+        if reason:
+            return "branch_profile_key_exact" if reason == "model_key_exact" else reason
         reason = self._match_model_key(candidate.get("model_key"), profile.model_key)
         if reason:
             return reason
+        reason = self._match_model_key(candidate.get("branch_name"), profile.model_key)
+        if reason:
+            return "branch_name_exact" if reason == "model_key_exact" else reason
         return self._match_model_key(candidate.get("model_key"), profile.signature)
 
     def _evidence_score(self, kind: str, match_reason: str, backend_name: str | None, candidate: dict[str, Any]) -> int:
@@ -434,8 +486,10 @@ class SchedulerKnowledgeBase:
         }.get(kind, 0)
         match_weight = {
             "signature_exact": 30,
+            "branch_profile_key_exact": 24,
             "model_key_exact": 22,
             "model_key_contains": 12,
+            "branch_name_exact": 12,
             "packing_family_exact": 10,
             "model_family_exact": 8,
         }.get(match_reason, 0)
@@ -604,14 +658,23 @@ class SchedulerKnowledgeBase:
         gpu_scheduler = getattr(settings, "gpu_scheduler", None)
         if gpu_scheduler is None:
             return {}
+        probe_payload = self._latest_auto_backend_probe_payload()
         memory = getattr(gpu_scheduler, "memory", None)
         thresholds = getattr(gpu_scheduler, "thresholds", None)
         submission_defaults = getattr(gpu_scheduler, "submission_defaults", None)
+        mode = probe_payload.get("configured_mode", getattr(gpu_scheduler, "mode", None))
         return {
             "safe_vram_budget_mb": self._safe_vram_budget_mb(),
+            "mode": mode,
+            "effective_mode": probe_payload.get("effective_scheduler_mode") or effective_scheduler_mode(mode),
             "memory": memory.to_dict() if hasattr(memory, "to_dict") else {},
             "thresholds": thresholds.to_dict() if hasattr(thresholds, "to_dict") else {},
-            "backend_priority": list(getattr(gpu_scheduler, "backend_priority", []) or []),
+            "backend_priority": self._probe_payload_list_or_setting(probe_payload, "backend_priority", gpu_scheduler),
+            "concurrent_backend_allowlist": self._probe_payload_list_or_setting(
+                probe_payload,
+                "concurrent_backend_allowlist",
+                gpu_scheduler,
+            ),
             "submission_defaults": submission_defaults.to_dict() if hasattr(submission_defaults, "to_dict") else {},
         }
 
@@ -620,21 +683,74 @@ class SchedulerKnowledgeBase:
         gpu_scheduler = getattr(settings, "gpu_scheduler", None)
         if gpu_scheduler is None:
             return {}
+        probe_payload = self._latest_auto_backend_probe_payload()
+        mode = probe_payload.get("configured_mode", getattr(gpu_scheduler, "mode", None))
+        backend_availability = dict(probe_payload.get("backend_availability") or {})
+        stream_enabled = bool(getattr(getattr(gpu_scheduler, "stream", None), "enabled", False))
+        mps_enabled = bool(getattr(getattr(gpu_scheduler, "mps", None), "enabled", False))
+        cuda_process_enabled = bool(getattr(getattr(gpu_scheduler, "cuda_process", None), "enabled", False))
+        stream_mps_enabled = bool(stream_enabled and mps_enabled)
         enabled_backends = ["exclusive"]
-        if getattr(getattr(gpu_scheduler, "mps", None), "enabled", False):
-            enabled_backends.append("mps")
-        if getattr(getattr(gpu_scheduler, "cuda_process", None), "enabled", False):
-            enabled_backends.append("cuda_process")
-        if getattr(getattr(gpu_scheduler, "stream", None), "enabled", False):
-            enabled_backends.append("stream")
+        if backend_availability:
+            enabled_backends = [backend_name for backend_name, available in backend_availability.items() if available]
+            if "exclusive" not in enabled_backends:
+                enabled_backends.insert(0, "exclusive")
+        elif stream_mps_enabled:
+            enabled_backends.append("stream_mps")
+            if stream_enabled:
+                enabled_backends.append("stream")
+            if cuda_process_enabled:
+                enabled_backends.append("cuda_process")
+            if mps_enabled:
+                enabled_backends.append("mps")
+        else:
+            if stream_enabled:
+                enabled_backends.append("stream")
+            if cuda_process_enabled:
+                enabled_backends.append("cuda_process")
+            if mps_enabled:
+                enabled_backends.append("mps")
         return {
+            "mode": mode,
+            "effective_mode": probe_payload.get("effective_scheduler_mode") or effective_scheduler_mode(mode),
             "enabled_backends": enabled_backends,
-            "priority": list(getattr(gpu_scheduler, "backend_priority", []) or []),
+            "backend_priority": self._probe_payload_list_or_setting(probe_payload, "backend_priority", gpu_scheduler),
+            "stream_mps_enabled": stream_mps_enabled,
+            "stream_enabled": stream_enabled,
+            "mps_enabled": mps_enabled,
+            "cuda_process_enabled": cuda_process_enabled,
+            "stream_mps_available": bool(backend_availability.get("stream_mps", stream_mps_enabled)),
+            "stream_available": bool(backend_availability.get("stream", stream_enabled)),
+            "mps_available": bool(backend_availability.get("mps", mps_enabled)),
+            "cuda_process_available": bool(backend_availability.get("cuda_process", cuda_process_enabled)),
             "concurrent_groups_enabled": bool(getattr(gpu_scheduler, "concurrent_groups_enabled", False)),
-            "concurrent_backend_allowlist": list(getattr(gpu_scheduler, "concurrent_backend_allowlist", []) or []),
+            "concurrent_backend_allowlist": self._probe_payload_list_or_setting(
+                probe_payload,
+                "concurrent_backend_allowlist",
+                gpu_scheduler,
+            ),
             "max_packed_jobs_per_gpu": getattr(gpu_scheduler, "max_packed_jobs_per_gpu", None),
             "allow_three_way_packing": bool(getattr(gpu_scheduler, "allow_three_way_packing", False)),
         }
+
+    @staticmethod
+    def _probe_payload_list_or_setting(probe_payload: dict[str, Any], key: str, settings: Any) -> list[Any]:
+        if probe_payload and key in probe_payload:
+            return list(probe_payload.get(key) or [])
+        return list(getattr(settings, key, []) or [])
+
+    def _latest_auto_backend_probe_payload(self) -> dict[str, Any]:
+        list_events = getattr(self.store, "list_events", None)
+        if not callable(list_events):
+            return {}
+        try:
+            events = list(list_events(event_type="scheduler_auto_backend_probe"))
+        except Exception:
+            return {}
+        if not events:
+            return {}
+        payload = events[-1].get("payload") or {}
+        return dict(payload) if isinstance(payload, dict) else {}
 
     def _scheduler_guidance(self) -> dict[str, Any]:
         settings = self._settings()
@@ -747,101 +863,114 @@ class SchedulerKnowledgeBase:
         return profiles
 
     def search_hardware(self, *, query: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
-        normalized = str(query or "").strip().lower()
-        rows = list(self._hardware_inventory().values())
-        if normalized:
-            rows = [row for row in rows if normalized in self._hardware_query_text(row)]
-        rows.sort(key=lambda row: (not bool(row.get("is_current")), str(row.get("gpu_name") or ""), str(row.get("hardware_key") or "")))
-        trimmed = rows[: max(1, int(limit))]
-        return [
-            {
-                "hardware_key": row.get("hardware_key"),
-                "gpu_name": row.get("gpu_name"),
-                "total_vram_mb": row.get("total_vram_mb"),
-                "compute_capability": row.get("compute_capability"),
-                "toolkit_name": row.get("toolkit_name"),
-                "toolkit_version": row.get("toolkit_version"),
-                "torch_version": row.get("torch_version"),
-                "summary_text": row.get("summary_text"),
-                "is_current": bool(row.get("is_current")),
-            }
-            for row in trimmed
-        ]
+        def build() -> list[dict[str, Any]]:
+            normalized = str(query or "").strip().lower()
+            rows = list(self._hardware_inventory().values())
+            if normalized:
+                rows = [row for row in rows if normalized in self._hardware_query_text(row)]
+            rows.sort(key=lambda row: (not bool(row.get("is_current")), str(row.get("gpu_name") or ""), str(row.get("hardware_key") or "")))
+            trimmed = rows[: max(1, int(limit))]
+            return [
+                {
+                    "hardware_key": row.get("hardware_key"),
+                    "gpu_name": row.get("gpu_name"),
+                    "total_vram_mb": row.get("total_vram_mb"),
+                    "compute_capability": row.get("compute_capability"),
+                    "toolkit_name": row.get("toolkit_name"),
+                    "toolkit_version": row.get("toolkit_version"),
+                    "torch_version": row.get("torch_version"),
+                    "summary_text": row.get("summary_text"),
+                    "is_current": bool(row.get("is_current")),
+                }
+                for row in trimmed
+            ]
+
+        return self._cached_graph_result("search_hardware", {"query": query, "limit": limit}, build)
 
     def get_hardware_context(self, hardware_key: str = "current", include_scheduler_limits: bool = True) -> dict[str, Any]:
-        # This tool is intentionally read-only and returns a self-contained
-        # payload so callers do not need follow-up graph queries for basic
-        # hardware, toolkit, and scheduler-limit inspection.
-        record = self._lookup_hardware_record(hardware_key)
-        if record is None:
-            return {
-                "found": False,
-                "hardware": None,
-                "accelerator": None,
-                "toolkit": None,
-                "backend_capabilities": self._backend_capabilities(),
-                "scheduler_limits": self._scheduler_limits() if include_scheduler_limits else {},
-                "source": "not_found",
-            }
-        hardware = {
-            "hardware_key": record.get("hardware_key"),
-            "gpu_name": record.get("gpu_name"),
-            "total_vram_mb": record.get("total_vram_mb"),
-            "compute_capability": record.get("compute_capability"),
-            "toolkit_name": record.get("toolkit_name"),
-            "toolkit_version": record.get("toolkit_version"),
-            "torch_version": record.get("torch_version"),
-            "summary_text": record.get("summary_text"),
-            "is_current": bool(record.get("is_current")),
-        }
-        accelerator = record.get("accelerator") or (
-            {
-                "accelerator_key": record.get("hardware_key"),
-                "accelerator_name": record.get("gpu_name"),
-                "compute_capability": record.get("compute_capability"),
+        def build() -> dict[str, Any]:
+            # This tool is intentionally read-only and returns a self-contained
+            # payload so callers do not need follow-up graph queries for basic
+            # hardware, toolkit, and scheduler-limit inspection.
+            record = self._lookup_hardware_record(hardware_key)
+            if record is None:
+                return {
+                    "found": False,
+                    "hardware": None,
+                    "accelerator": None,
+                    "toolkit": None,
+                    "backend_capabilities": self._backend_capabilities(),
+                    "scheduler_limits": self._scheduler_limits() if include_scheduler_limits else {},
+                    "source": "not_found",
+                }
+            hardware = {
+                "hardware_key": record.get("hardware_key"),
+                "gpu_name": record.get("gpu_name"),
                 "total_vram_mb": record.get("total_vram_mb"),
-            }
-            if record.get("gpu_name") or record.get("total_vram_mb") is not None
-            else None
-        )
-        toolkit = record.get("toolkit") or (
-            {
-                "toolkit_key": f"{record.get('toolkit_name')}:{record.get('toolkit_version')}",
+                "compute_capability": record.get("compute_capability"),
                 "toolkit_name": record.get("toolkit_name"),
                 "toolkit_version": record.get("toolkit_version"),
                 "torch_version": record.get("torch_version"),
+                "summary_text": record.get("summary_text"),
+                "is_current": bool(record.get("is_current")),
             }
-            if record.get("toolkit_name") or record.get("toolkit_version")
-            else None
+            accelerator = record.get("accelerator") or (
+                {
+                    "accelerator_key": record.get("hardware_key"),
+                    "accelerator_name": record.get("gpu_name"),
+                    "compute_capability": record.get("compute_capability"),
+                    "total_vram_mb": record.get("total_vram_mb"),
+                }
+                if record.get("gpu_name") or record.get("total_vram_mb") is not None
+                else None
+            )
+            toolkit = record.get("toolkit") or (
+                {
+                    "toolkit_key": f"{record.get('toolkit_name')}:{record.get('toolkit_version')}",
+                    "toolkit_name": record.get("toolkit_name"),
+                    "toolkit_version": record.get("toolkit_version"),
+                    "torch_version": record.get("torch_version"),
+                }
+                if record.get("toolkit_name") or record.get("toolkit_version")
+                else None
+            )
+            return {
+                "found": True,
+                "hardware": hardware,
+                "accelerator": accelerator,
+                "toolkit": toolkit,
+                "backend_capabilities": self._backend_capabilities(),
+                "scheduler_limits": self._scheduler_limits() if include_scheduler_limits else {},
+                "source": record.get("source") or ("current_runtime" if hardware_key == "current" else "derived_profile_inventory"),
+            }
+
+        return self._cached_graph_result(
+            "get_hardware_context",
+            {"hardware_key": hardware_key, "include_scheduler_limits": include_scheduler_limits},
+            build,
         )
-        return {
-            "found": True,
-            "hardware": hardware,
-            "accelerator": accelerator,
-            "toolkit": toolkit,
-            "backend_capabilities": self._backend_capabilities(),
-            "scheduler_limits": self._scheduler_limits() if include_scheduler_limits else {},
-            "source": record.get("source") or ("current_runtime" if hardware_key == "current" else "derived_profile_inventory"),
-        }
 
     def get_job_graph_context(self, job_id: str) -> dict[str, Any]:
-        job = self.store.get_job(job_id)
-        if job is None:
-            raise KeyError(f"Unknown job_id: {job_id}")
-        signature = job.packing.signature
-        model_key = str(job.batch_probe.model_key or job.baseline_model_id)
-        return {
-            "job": job.to_dict(),
-            "events": self.store.list_events(job_id=job_id),
-            "run_profiles": [profile.to_dict() for profile in self.list_run_profiles(job_id=job_id)],
-            "runtime_profiles": [profile.to_dict() for profile in self.store.list_runtime_profiles(signature=signature)] if signature else [],
-            "solo_profile": self.store.get_solo_profile(signature).to_dict() if signature and self.store.get_solo_profile(signature) else None,
-            "batch_probe_profiles": [
-                profile.to_dict()
-                for profile in self.store.list_batch_probe_profiles()
-                if profile.model_key == model_key
-            ],
-        }
+        def build() -> dict[str, Any]:
+            job = self.store.get_job(job_id)
+            if job is None:
+                raise KeyError(f"Unknown job_id: {job_id}")
+            signature = job.packing.signature
+            model_key = str(job.batch_probe.model_key or job.baseline_model_id)
+            return {
+                "job": job.to_dict(),
+                "events": self.store.list_events(job_id=job_id),
+                "run_profiles": [profile.to_dict() for profile in self.list_run_profiles(job_id=job_id)],
+                "runtime_profiles": [profile.to_dict() for profile in self.store.list_runtime_profiles(signature=signature)] if signature else [],
+                "solo_profile": self.store.get_solo_profile(signature).to_dict() if signature and self.store.get_solo_profile(signature) else None,
+                "batch_probe_profiles": [
+                    profile.to_dict()
+                    for profile in self.store.list_batch_probe_profiles()
+                    if profile.model_key == model_key
+                ],
+            }
+
+        return self._cached_graph_result("get_job_graph_context", {"job_id": job_id}, build)
 
     def search_profiles(
         self,
@@ -852,33 +981,46 @@ class SchedulerKnowledgeBase:
         toolkit: str | None = None,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
-        model_name = str(model_name or "")
-        results: list[dict[str, Any]] = []
-        for profile in self.store.list_runtime_profiles():
-            if model_name and model_name not in str(self._model_key_for_signature(profile.signature) or profile.signature):
-                continue
-            if backend and backend != profile.backend_name:
-                continue
-            if not self._matches_toolkit(toolkit):
-                continue
-            if not self._record_matches_hardware_filter(hardware, hardware_key=profile.hardware_key):
-                continue
-            results.append({"kind": "runtime_profile", "data": profile.to_dict(), "summary_text": getattr(profile, "summary_text", None) or self._profile_summary("runtime_profile", profile.to_dict())})
-        for profile in self.store.list_batch_probe_profiles():
-            if model_name and model_name not in profile.model_key:
-                continue
-            if not self._record_matches_hardware_filter(hardware, device_type=profile.device_type):
-                continue
-            if not self._matches_toolkit(toolkit):
-                continue
-            results.append({"kind": "batch_probe_profile", "data": profile.to_dict(), "summary_text": profile.metadata.get("summary_text") or self._profile_summary("batch_probe_profile", profile.to_dict())})
-        for profile in self.store.list_solo_profiles():
-            if model_name and model_name not in str(self._model_key_for_signature(profile.signature) or profile.signature):
-                continue
-            if not self._record_matches_hardware_filter(hardware, hardware_key=profile.hardware_key):
-                continue
-            results.append({"kind": "solo_profile", "data": profile.to_dict(), "summary_text": profile.metadata.get("summary_text") or self._profile_summary("solo_profile", profile.to_dict())})
-        return results[: max(1, int(limit))]
+        def build() -> list[dict[str, Any]]:
+            normalized_model_name = str(model_name or "")
+            results: list[dict[str, Any]] = []
+            for profile in self.store.list_runtime_profiles():
+                if normalized_model_name and normalized_model_name not in str(self._model_key_for_signature(profile.signature) or profile.signature):
+                    continue
+                if backend and backend != profile.backend_name:
+                    continue
+                if not self._matches_toolkit(toolkit):
+                    continue
+                if not self._record_matches_hardware_filter(hardware, hardware_key=profile.hardware_key):
+                    continue
+                results.append({"kind": "runtime_profile", "data": profile.to_dict(), "summary_text": getattr(profile, "summary_text", None) or self._profile_summary("runtime_profile", profile.to_dict())})
+            for profile in self.store.list_batch_probe_profiles():
+                if normalized_model_name and normalized_model_name not in profile.model_key:
+                    continue
+                if not self._record_matches_hardware_filter(hardware, device_type=profile.device_type):
+                    continue
+                if not self._matches_toolkit(toolkit):
+                    continue
+                results.append({"kind": "batch_probe_profile", "data": profile.to_dict(), "summary_text": profile.metadata.get("summary_text") or self._profile_summary("batch_probe_profile", profile.to_dict())})
+            for profile in self.store.list_solo_profiles():
+                if normalized_model_name and normalized_model_name not in str(self._model_key_for_signature(profile.signature) or profile.signature):
+                    continue
+                if not self._record_matches_hardware_filter(hardware, hardware_key=profile.hardware_key):
+                    continue
+                results.append({"kind": "solo_profile", "data": profile.to_dict(), "summary_text": profile.metadata.get("summary_text") or self._profile_summary("solo_profile", profile.to_dict())})
+            return results[: max(1, int(limit))]
+
+        return self._cached_graph_result(
+            "search_profiles",
+            {
+                "model_name": model_name,
+                "hardware": hardware,
+                "backend": backend,
+                "toolkit": toolkit,
+                "limit": limit,
+            },
+            build,
+        )
 
     def get_runtime_estimate(
         self,
@@ -888,17 +1030,29 @@ class SchedulerKnowledgeBase:
         hardware: str | None = None,
         backend: str = "exclusive",
     ) -> dict[str, Any]:
-        signature = model_or_signature
-        profiles = self.store.list_runtime_profiles(signature=signature, backend_name=backend)
-        if not profiles:
-            profiles = [profile for profile in self.store.list_runtime_profiles(backend_name=backend) if model_or_signature in profile.signature]
-        if hardware:
-            profiles = [profile for profile in profiles if self._record_matches_hardware_filter(hardware, hardware_key=profile.hardware_key)]
-        if not profiles:
-            return {"found": False, "reason": "insufficient evidence"}
-        exact = [profile for profile in profiles if int(profile.resolved_batch_size) == int(batch_size)]
-        chosen = exact[0] if exact else profiles[0]
-        return {"found": True, "profile": chosen.to_dict(), "matched_exact_batch_size": bool(exact)}
+        def build() -> dict[str, Any]:
+            signature = model_or_signature
+            profiles = self.store.list_runtime_profiles(signature=signature, backend_name=backend)
+            if not profiles:
+                profiles = [profile for profile in self.store.list_runtime_profiles(backend_name=backend) if model_or_signature in profile.signature]
+            if hardware:
+                profiles = [profile for profile in profiles if self._record_matches_hardware_filter(hardware, hardware_key=profile.hardware_key)]
+            if not profiles:
+                return {"found": False, "reason": "insufficient evidence"}
+            exact = [profile for profile in profiles if int(profile.resolved_batch_size) == int(batch_size)]
+            chosen = exact[0] if exact else profiles[0]
+            return {"found": True, "profile": chosen.to_dict(), "matched_exact_batch_size": bool(exact)}
+
+        return self._cached_graph_result(
+            "get_runtime_estimate",
+            {
+                "model_or_signature": model_or_signature,
+                "batch_size": batch_size,
+                "hardware": hardware,
+                "backend": backend,
+            },
+            build,
+        )
 
     def recommend_batch_size(
         self,
@@ -909,43 +1063,56 @@ class SchedulerKnowledgeBase:
         shape_signature: str | None = None,
         current_batch_size: int | None = None,
     ) -> dict[str, Any]:
-        candidates = []
-        for profile in self.store.list_batch_probe_profiles():
-            if model_or_signature not in {profile.model_key, shape_signature and profile.shape_signature or ""} and model_or_signature not in profile.model_key:
-                continue
-            if shape_signature and profile.shape_signature != shape_signature:
-                continue
-            if not self._record_matches_hardware_filter(hardware, device_type=profile.device_type):
-                continue
-            if not self._matches_toolkit(toolkit):
-                continue
-            candidates.append(profile)
-        if not candidates:
-            observations = [
-                obs
-                for obs in self.store.list_batch_size_observations()
-                if model_or_signature in obs.model_key and self._record_matches_hardware_filter(hardware, hardware_key=obs.hardware_key)
-            ]
-            if not observations:
-                return {"found": False, "reason": "insufficient evidence"}
-            observations.sort(key=lambda item: (item.batch_size, item.observations), reverse=True)
-            best = observations[0]
+        def build() -> dict[str, Any]:
+            candidates = []
+            for profile in self.store.list_batch_probe_profiles():
+                if model_or_signature not in {profile.model_key, shape_signature and profile.shape_signature or ""} and model_or_signature not in profile.model_key:
+                    continue
+                if shape_signature and profile.shape_signature != shape_signature:
+                    continue
+                if not self._record_matches_hardware_filter(hardware, device_type=profile.device_type):
+                    continue
+                if not self._matches_toolkit(toolkit):
+                    continue
+                candidates.append(profile)
+            if not candidates:
+                observations = [
+                    obs
+                    for obs in self.store.list_batch_size_observations()
+                    if model_or_signature in obs.model_key and self._record_matches_hardware_filter(hardware, hardware_key=obs.hardware_key)
+                ]
+                if not observations:
+                    return {"found": False, "reason": "insufficient evidence"}
+                observations.sort(key=lambda item: (item.batch_size, item.observations), reverse=True)
+                best = observations[0]
+                return {
+                    "found": True,
+                    "recommended_batch_size": best.batch_size,
+                    "source": "batch_size_observation",
+                    "evidence": best.to_dict(),
+                    "current_batch_size": current_batch_size,
+                }
+            candidates.sort(key=lambda item: (item.resolved_batch_size, item.observations), reverse=True)
+            best = candidates[0]
             return {
                 "found": True,
-                "recommended_batch_size": best.batch_size,
-                "source": "batch_size_observation",
+                "recommended_batch_size": best.resolved_batch_size,
+                "source": "batch_probe_profile",
                 "evidence": best.to_dict(),
                 "current_batch_size": current_batch_size,
             }
-        candidates.sort(key=lambda item: (item.resolved_batch_size, item.observations), reverse=True)
-        best = candidates[0]
-        return {
-            "found": True,
-            "recommended_batch_size": best.resolved_batch_size,
-            "source": "batch_probe_profile",
-            "evidence": best.to_dict(),
-            "current_batch_size": current_batch_size,
-        }
+
+        return self._cached_graph_result(
+            "recommend_batch_size",
+            {
+                "model_or_signature": model_or_signature,
+                "hardware": hardware,
+                "toolkit": toolkit,
+                "shape_signature": shape_signature,
+                "current_batch_size": current_batch_size,
+            },
+            build,
+        )
 
     def recommend_epochs(
         self,
@@ -955,27 +1122,39 @@ class SchedulerKnowledgeBase:
         toolkit: str | None = None,
         current_epochs: int | None = None,
     ) -> dict[str, Any]:
-        if not self._matches_toolkit(toolkit):
-            return {"found": False, "reason": "insufficient evidence"}
-        jobs = []
-        for job in self.store.list_jobs():
-            if model_or_signature not in {job.baseline_model_id, job.packing.signature} and model_or_signature not in str(job.batch_probe.model_key or ""):
-                continue
-            if not self._record_matches_hardware_filter(hardware, hardware_key=self._current_hardware_key()):
-                continue
-            epochs = job.max_epochs or job.config.max_epochs
-            if epochs:
-                jobs.append(int(epochs))
-        if not jobs:
-            return {"found": False, "reason": "insufficient evidence", "current_epochs": current_epochs}
-        recommendation = int(median(jobs))
-        return {
-            "found": True,
-            "recommended_epochs": recommendation,
-            "source": "historical_jobs",
-            "evidence_count": len(jobs),
-            "current_epochs": current_epochs,
-        }
+        def build() -> dict[str, Any]:
+            if not self._matches_toolkit(toolkit):
+                return {"found": False, "reason": "insufficient evidence"}
+            jobs = []
+            for job in self.store.list_jobs():
+                if model_or_signature not in {job.baseline_model_id, job.packing.signature} and model_or_signature not in str(job.batch_probe.model_key or ""):
+                    continue
+                if not self._record_matches_hardware_filter(hardware, hardware_key=self._current_hardware_key()):
+                    continue
+                epochs = job.max_epochs or job.config.max_epochs
+                if epochs:
+                    jobs.append(int(epochs))
+            if not jobs:
+                return {"found": False, "reason": "insufficient evidence", "current_epochs": current_epochs}
+            recommendation = int(median(jobs))
+            return {
+                "found": True,
+                "recommended_epochs": recommendation,
+                "source": "historical_jobs",
+                "evidence_count": len(jobs),
+                "current_epochs": current_epochs,
+            }
+
+        return self._cached_graph_result(
+            "recommend_epochs",
+            {
+                "model_or_signature": model_or_signature,
+                "hardware": hardware,
+                "toolkit": toolkit,
+                "current_epochs": current_epochs,
+            },
+            build,
+        )
 
     def get_packet_compatibility(
         self,
@@ -985,31 +1164,41 @@ class SchedulerKnowledgeBase:
         hardware: str | None = None,
         backend: str = "exclusive",
     ) -> dict[str, Any]:
-        profiles = self.store.list_pair_profiles(backend_name=backend) if hasattr(self.store, "list_pair_profiles") else []
-        for profile in profiles:
-            if not self._record_matches_hardware_filter(hardware, hardware_key=profile.hardware_key):
-                continue
-            model_left = self._model_key_for_signature(profile.left_signature)
-            model_right = self._model_key_for_signature(profile.right_signature)
-            values = {str(model_left or profile.left_signature), str(model_right or profile.right_signature)}
-            if {model_a, model_b} == values:
-                return {"found": True, "compatible": profile.compatible, "profile": profile.to_dict()}
-        return {"found": False, "reason": "insufficient evidence"}
+        def build() -> dict[str, Any]:
+            profiles = self.store.list_pair_profiles(backend_name=backend) if hasattr(self.store, "list_pair_profiles") else []
+            for profile in profiles:
+                if not self._record_matches_hardware_filter(hardware, hardware_key=profile.hardware_key):
+                    continue
+                model_left = self._model_key_for_signature(profile.left_signature)
+                model_right = self._model_key_for_signature(profile.right_signature)
+                values = {str(model_left or profile.left_signature), str(model_right or profile.right_signature)}
+                if {model_a, model_b} == values:
+                    return {"found": True, "compatible": profile.compatible, "profile": profile.to_dict()}
+            return {"found": False, "reason": "insufficient evidence"}
+
+        return self._cached_graph_result(
+            "get_packet_compatibility",
+            {"model_a": model_a, "model_b": model_b, "hardware": hardware, "backend": backend},
+            build,
+        )
 
     def search_profile_summaries(self, *, query: str, limit: int = 20) -> list[dict[str, Any]]:
-        normalized = query.strip().lower()
-        rows: list[dict[str, Any]] = []
-        for entry in self.search_profiles(limit=max(20, limit * 2)):
-            summary_text = str(entry.get("summary_text") or entry["data"].get("summary_text") or "")
-            if normalized and normalized not in summary_text.lower():
-                continue
-            rows.append(entry)
-        for profile in self.list_run_profiles():
-            summary_text = profile.summary_text or self._profile_summary("run_profile", profile.to_dict())
-            if normalized and normalized not in summary_text.lower():
-                continue
-            rows.append({"kind": "run_profile", "data": profile.to_dict(), "summary_text": summary_text})
-        return rows[: max(1, int(limit))]
+        def build() -> list[dict[str, Any]]:
+            normalized = query.strip().lower()
+            rows: list[dict[str, Any]] = []
+            for entry in self.search_profiles(limit=max(20, limit * 2)):
+                summary_text = str(entry.get("summary_text") or entry["data"].get("summary_text") or "")
+                if normalized and normalized not in summary_text.lower():
+                    continue
+                rows.append(entry)
+            for profile in self.list_run_profiles():
+                summary_text = profile.summary_text or self._profile_summary("run_profile", profile.to_dict())
+                if normalized and normalized not in summary_text.lower():
+                    continue
+                rows.append({"kind": "run_profile", "data": profile.to_dict(), "summary_text": summary_text})
+            return rows[: max(1, int(limit))]
+
+        return self._cached_graph_result("search_profile_summaries", {"query": query, "limit": limit}, build)
 
     def _packed_profiles_for_candidate(self, candidate: dict[str, Any], limit: int) -> list[dict[str, Any]]:
         current_key = self._current_hardware_key()
@@ -1020,7 +1209,12 @@ class SchedulerKnowledgeBase:
                 right_model = self._model_key_for_signature(profile.right_signature) or profile.right_signature
                 model_key = str(candidate.get("model_key") or "")
                 signature = str(candidate.get("script_signature") or "")
-                packing_family = str(candidate.get("packing_family") or candidate.get("model_family") or "")
+                packing_family = str(
+                    candidate.get("branch_name")
+                    or candidate.get("packing_family")
+                    or candidate.get("model_family")
+                    or ""
+                )
                 values = {str(left_model), str(right_model), profile.left_signature, profile.right_signature}
                 if model_key and model_key not in values and signature and signature not in values:
                     if not packing_family:
@@ -1107,90 +1301,98 @@ class SchedulerKnowledgeBase:
         return {"profile_symptoms": symptoms, "optimization_targets": targets}
 
     def get_profile_evidence(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
-        design_context = self.get_job_design_context(candidate=candidate, limit=limit)
-        matched_profiles = list(design_context.get("matched_profiles") or [])
-        exact_reasons = {"signature_exact", "model_key_exact"}
-        exact_profiles = [entry for entry in matched_profiles if entry.get("match_reason") in exact_reasons]
-        similar_profiles = [entry for entry in matched_profiles if entry.get("match_reason") not in exact_reasons]
-        packed_profiles = self._packed_profiles_for_candidate(self._normalized_job_design_candidate(candidate), limit=limit)
-        evidence_refs = list(design_context.get("evidence_refs") or [])
-        evidence_refs.extend(entry["ref"] for entry in packed_profiles if entry.get("ref"))
-        return {
-            "hardware_context": design_context.get("hardware_context"),
-            "graph_evidence": {
-                "exact_profiles": exact_profiles,
-                "similar_profiles": similar_profiles,
-                "packed_profiles": packed_profiles,
-            },
-            "runtime_estimate": design_context.get("runtime_estimate"),
-            "batch_size_recommendation": design_context.get("batch_size_recommendation"),
-            "epoch_recommendation": design_context.get("epoch_recommendation"),
-            "scheduler_guidance": design_context.get("scheduler_guidance"),
-            "risk_flags": list(design_context.get("risk_flags") or []),
-            "derived_diagnosis": self._derive_diagnosis(
-                self._normalized_job_design_candidate(candidate),
-                matched_profiles=matched_profiles,
-                risk_flags=list(design_context.get("risk_flags") or []),
-            ),
-            "evidence_refs": evidence_refs,
-            "confidence": design_context.get("confidence", 0.0),
-            "legacy_job_design_context": design_context,
-        }
+        def build() -> dict[str, Any]:
+            design_context = self.get_job_design_context(candidate=candidate, limit=limit)
+            matched_profiles = list(design_context.get("matched_profiles") or [])
+            exact_reasons = {"signature_exact", "branch_profile_key_exact", "branch_name_exact", "model_key_exact"}
+            exact_profiles = [entry for entry in matched_profiles if entry.get("match_reason") in exact_reasons]
+            similar_profiles = [entry for entry in matched_profiles if entry.get("match_reason") not in exact_reasons]
+            packed_profiles = self._packed_profiles_for_candidate(self._normalized_job_design_candidate(candidate), limit=limit)
+            evidence_refs = list(design_context.get("evidence_refs") or [])
+            evidence_refs.extend(entry["ref"] for entry in packed_profiles if entry.get("ref"))
+            return {
+                "hardware_context": design_context.get("hardware_context"),
+                "graph_evidence": {
+                    "exact_profiles": exact_profiles,
+                    "similar_profiles": similar_profiles,
+                    "packed_profiles": packed_profiles,
+                },
+                "runtime_estimate": design_context.get("runtime_estimate"),
+                "batch_size_recommendation": design_context.get("batch_size_recommendation"),
+                "epoch_recommendation": design_context.get("epoch_recommendation"),
+                "scheduler_guidance": design_context.get("scheduler_guidance"),
+                "risk_flags": list(design_context.get("risk_flags") or []),
+                "derived_diagnosis": self._derive_diagnosis(
+                    self._normalized_job_design_candidate(candidate),
+                    matched_profiles=matched_profiles,
+                    risk_flags=list(design_context.get("risk_flags") or []),
+                ),
+                "evidence_refs": evidence_refs,
+                "confidence": design_context.get("confidence", 0.0),
+                "legacy_job_design_context": design_context,
+            }
+
+        return self._cached_graph_result("get_profile_evidence", {"candidate": candidate, "limit": limit}, build)
 
     def get_job_design_context(self, *, candidate: dict[str, Any], limit: int = 5) -> dict[str, Any]:
-        # Aggregate all scheduling-relevant evidence into one response instead
-        # of making future agent integrations orchestrate several low-level MCP
-        # calls and duplicate ranking logic on their side.
-        normalized_candidate = self._normalized_job_design_candidate(candidate)
-        matched_profiles = self._matched_profiles_for_candidate(normalized_candidate, limit=max(1, int(limit)))
-        runtime_estimate = self._runtime_estimate_for_candidate(normalized_candidate)
-        recommendation_key = str(
-            normalized_candidate.get("model_key")
-            or normalized_candidate.get("script_signature")
-            or normalized_candidate.get("packing_family")
-            or ""
-        )
-        if recommendation_key:
-            batch_size_recommendation = self.recommend_batch_size(
-                model_or_signature=recommendation_key,
-                hardware="current",
-                current_batch_size=normalized_candidate.get("proposed_batch_size"),
+        def build() -> dict[str, Any]:
+            # Aggregate all scheduling-relevant evidence into one response instead
+            # of making future agent integrations orchestrate several low-level MCP
+            # calls and duplicate ranking logic on their side.
+            normalized_candidate = self._normalized_job_design_candidate(candidate)
+            matched_profiles = self._matched_profiles_for_candidate(normalized_candidate, limit=max(1, int(limit)))
+            runtime_estimate = self._runtime_estimate_for_candidate(normalized_candidate)
+            recommendation_key = str(
+                normalized_candidate.get("branch_profile_key")
+                or normalized_candidate.get("model_key")
+                or normalized_candidate.get("branch_name")
+                or normalized_candidate.get("script_signature")
+                or normalized_candidate.get("packing_family")
+                or ""
             )
-            epoch_recommendation = self.recommend_epochs(
-                model_or_signature=recommendation_key,
-                hardware="current",
-                current_epochs=normalized_candidate.get("proposed_epochs"),
+            if recommendation_key:
+                batch_size_recommendation = self.recommend_batch_size(
+                    model_or_signature=recommendation_key,
+                    hardware="current",
+                    current_batch_size=normalized_candidate.get("proposed_batch_size"),
+                )
+                epoch_recommendation = self.recommend_epochs(
+                    model_or_signature=recommendation_key,
+                    hardware="current",
+                    current_epochs=normalized_candidate.get("proposed_epochs"),
+                )
+            else:
+                batch_size_recommendation = {"found": False, "reason": "insufficient evidence"}
+                epoch_recommendation = {"found": False, "reason": "insufficient evidence"}
+            scheduler_guidance = self._scheduler_guidance()
+            risk_flags = self._job_design_risk_flags(
+                normalized_candidate,
+                matched_profiles=matched_profiles,
+                runtime_estimate=runtime_estimate,
+                batch_size_recommendation=batch_size_recommendation,
+                epoch_recommendation=epoch_recommendation,
+                scheduler_guidance=scheduler_guidance,
             )
-        else:
-            batch_size_recommendation = {"found": False, "reason": "insufficient evidence"}
-            epoch_recommendation = {"found": False, "reason": "insufficient evidence"}
-        scheduler_guidance = self._scheduler_guidance()
-        risk_flags = self._job_design_risk_flags(
-            normalized_candidate,
-            matched_profiles=matched_profiles,
-            runtime_estimate=runtime_estimate,
-            batch_size_recommendation=batch_size_recommendation,
-            epoch_recommendation=epoch_recommendation,
-            scheduler_guidance=scheduler_guidance,
-        )
-        confidence = self._job_design_confidence(
-            matched_profiles=matched_profiles,
-            runtime_estimate=runtime_estimate,
-            batch_size_recommendation=batch_size_recommendation,
-            epoch_recommendation=epoch_recommendation,
-            risk_flags=risk_flags,
-        )
-        return {
-            "hardware_context": self.get_hardware_context("current", include_scheduler_limits=True),
-            "matched_profiles": matched_profiles,
-            "runtime_estimate": runtime_estimate,
-            "batch_size_recommendation": batch_size_recommendation,
-            "epoch_recommendation": epoch_recommendation,
-            "scheduler_guidance": scheduler_guidance,
-            "risk_flags": risk_flags,
-            "confidence": confidence,
-            "evidence_refs": [entry["ref"] for entry in matched_profiles],
-        }
+            confidence = self._job_design_confidence(
+                matched_profiles=matched_profiles,
+                runtime_estimate=runtime_estimate,
+                batch_size_recommendation=batch_size_recommendation,
+                epoch_recommendation=epoch_recommendation,
+                risk_flags=risk_flags,
+            )
+            return {
+                "hardware_context": self.get_hardware_context("current", include_scheduler_limits=True),
+                "matched_profiles": matched_profiles,
+                "runtime_estimate": runtime_estimate,
+                "batch_size_recommendation": batch_size_recommendation,
+                "epoch_recommendation": epoch_recommendation,
+                "scheduler_guidance": scheduler_guidance,
+                "risk_flags": risk_flags,
+                "confidence": confidence,
+                "evidence_refs": [entry["ref"] for entry in matched_profiles],
+            }
+
+        return self._cached_graph_result("get_job_design_context", {"candidate": candidate, "limit": limit}, build)
 
     def record_tuning_outcome(
         self,
