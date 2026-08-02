@@ -6,6 +6,7 @@ from pathlib import Path
 import random
 import tempfile
 import time
+from unittest.mock import Mock
 
 import pytest
 
@@ -52,7 +53,11 @@ from localml_scheduler.scheduler.telemetry import (
     GpuTelemetrySample,
     MemoryAdmissionGate,
 )
-from localml_scheduler.scheduler.time_objective import TimeAwareObjectiveScorer
+from localml_scheduler.scheduler.time_objective import (
+    EpochRateSet,
+    TimeAwareObjectiveScorer,
+    project_piecewise_drain,
+)
 from localml_scheduler.scheduler.service import ActiveRun, ColocationTrialState, SchedulerService
 from localml_scheduler.scheduler.supervisor import WorkerSnapshot
 from localml_scheduler.scheduler.trace_simulator import (
@@ -152,6 +157,23 @@ def _seed_options(store: SQLiteStateStore, planner: PlacementPlanner, job: Train
             )
 
 
+def _epoch_timing(
+    epoch: int,
+    seconds: float,
+    *,
+    started_at: datetime | None,
+    finished_at: datetime,
+    source: str = "safe_point_interval",
+) -> dict[str, object]:
+    return {
+        "epoch": epoch,
+        "seconds": seconds,
+        "started_at": started_at.isoformat() if started_at is not None else None,
+        "finished_at": finished_at.isoformat(),
+        "source": source,
+    }
+
+
 def test_five_batch_options_use_immutable_requested_batch_and_clip() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         settings = _settings(tmpdir)
@@ -179,10 +201,14 @@ def test_time_aware_configuration_validates_and_migrates_legacy_cap() -> None:
             gpu_scheduler=migrated.gpu_scheduler.to_dict(),
             early_stopping={"mode": "min", "patience_epochs": 2},
         )
-        assert restored.gpu_scheduler.objective.objective_version == "time_v4_colocation_gain"
+        assert restored.gpu_scheduler.objective.objective_version == "time_v6_verified_piecewise_drain"
         assert restored.gpu_scheduler.colocation.min_gain == 1.0
         assert restored.gpu_scheduler.colocation.trial_epochs == 2
         assert restored.gpu_scheduler.colocation.trial_decision_timeout_seconds == 30
+        assert restored.gpu_scheduler.colocation.trial_evidence_timeout_min_seconds == 300
+        assert restored.gpu_scheduler.colocation.trial_evidence_timeout_max_seconds == 1800
+        assert restored.gpu_scheduler.colocation.profile_rejection_min_bad_trials == 2
+        assert restored.gpu_scheduler.colocation.profile_rejection_ttl_seconds == 86400
         assert restored.gpu_scheduler.colocation.live_trial_enabled
         legacy_objective = SchedulerSettings(
             runtime_root=tmpdir,
@@ -191,13 +217,39 @@ def test_time_aware_configuration_validates_and_migrates_legacy_cap() -> None:
                 "objective": {"objective_version": "time_v3_flow_only"},
             },
         )
-        assert legacy_objective.gpu_scheduler.objective.objective_version == "time_v4_colocation_gain"
+        assert legacy_objective.gpu_scheduler.objective.objective_version == "time_v6_verified_piecewise_drain"
+        prior_objective = SchedulerSettings(
+            runtime_root=tmpdir,
+            gpu_scheduler={
+                "mode": "parallel_time_aware",
+                "objective": {"objective_version": "time_v4_colocation_gain"},
+            },
+        )
+        assert prior_objective.gpu_scheduler.objective.objective_version == "time_v6_verified_piecewise_drain"
+        piecewise_objective = SchedulerSettings(
+            runtime_root=tmpdir,
+            gpu_scheduler={
+                "mode": "parallel_time_aware",
+                "objective": {"objective_version": "time_v5_piecewise_drain"},
+            },
+        )
+        assert piecewise_objective.gpu_scheduler.objective.objective_version == "time_v6_verified_piecewise_drain"
         assert restored.early_stopping.mode == "min"
         serialized_gpu = restored.gpu_scheduler.to_dict()
         assert "pack_prefer_sm_active_lt" not in serialized_gpu["thresholds"]
         assert "pack_reject_sm_active_ge" not in serialized_gpu["thresholds"]
         assert "target_metric" not in serialized_gpu["auto_pack"]
         assert "target_sm_fraction" not in serialized_gpu["auto_pack"]
+        with pytest.raises(ValueError, match="timeout_max_seconds must be at least"):
+            _settings(
+                tmpdir,
+                colocation={
+                    "trial_evidence_timeout_min_seconds": 10,
+                    "trial_evidence_timeout_max_seconds": 5,
+                },
+            )
+        with pytest.raises(ValueError, match="min_bad_trials must be at least 1"):
+            _settings(tmpdir, colocation={"profile_rejection_min_bad_trials": 0})
         for removed_key in ("pack_prefer_sm_active_lt", "pack_reject_sm_active_ge"):
             with pytest.raises(ValueError, match="no longer supports SM scheduling controls"):
                 SchedulerSettings(
@@ -351,7 +403,7 @@ def test_time_score_starts_one_anchor_and_ignores_legacy_pair_slowdown() -> None
         assert plan is not None
         assert plan.mode == "stack_anchor"
         assert plan.job_ids == ("left",)
-        assert plan.objective_version == "time_v4_colocation_gain"
+        assert plan.objective_version == "time_v6_verified_piecewise_drain"
         assert plan.objective_breakdown["requires_live_trial"] is False
 
 
@@ -521,7 +573,7 @@ def test_stale_cached_fill_objective_cannot_influence_time_score() -> None:
             backend_available={"cuda_process": True, "exclusive": True},
         )
         assert plan is not None
-        assert plan.objective_version == "time_v4_colocation_gain"
+        assert plan.objective_version == "time_v6_verified_piecewise_drain"
         assert plan.mode == "stack_anchor"
         assert plan.batch_overrides == {"left": 1}
 
@@ -1088,6 +1140,247 @@ def test_colocation_gain_above_equal_and_below_one(packed_rate: float, expected_
     assert gain[0] == pytest.approx(expected_gain)
 
 
+@pytest.mark.parametrize(
+    ("active_epochs", "candidate_epochs"),
+    [(5, 10), (10, 5)],
+)
+def test_piecewise_gain_uses_mocked_singleton_speed_after_shorter_job_finishes(
+    active_epochs: int,
+    candidate_epochs: int,
+) -> None:
+    active = _job("piecewise-active", "piecewise-active-sig")
+    candidate = _job("piecewise-candidate", "piecewise-candidate-sig")
+    active.max_epochs = active.config.max_epochs = active_epochs
+    candidate.max_epochs = candidate.config.max_epochs = candidate_epochs
+
+    def mocked_tail_rates(member_ids: tuple[str, ...]) -> EpochRateSet:
+        return EpochRateSet(
+            epoch_seconds={job_id: 1.0 for job_id in member_ids},
+            sources={job_id: "mock_singleton" for job_id in member_ids},
+        )
+
+    result = TimeAwareObjectiveScorer.gain(
+        [active],
+        candidate,
+        active_epoch_seconds={active.job_id: 1.0},
+        candidate_solo_epoch_seconds=1.0,
+        packed_epoch_seconds={active.job_id: 1.5, candidate.job_id: 1.5},
+        active_tail_rate_resolver=mocked_tail_rates,
+        packed_tail_rate_resolver=mocked_tail_rates,
+    )
+
+    assert result is not None
+    assert result.sequential_drain_seconds == pytest.approx(15.0)
+    assert result.packed_drain_seconds == pytest.approx(12.5)
+    assert result.gain == pytest.approx(1.2)
+    assert [phase.duration_seconds for phase in result.packed_phases] == pytest.approx(
+        [7.5, 5.0]
+    )
+    assert result.packed_phases[1].timing_sources == {
+        (candidate.job_id if active_epochs < candidate_epochs else active.job_id): "mock_singleton"
+    }
+
+
+def test_estimate_gain_resolves_mocked_singleton_tail_from_estimator() -> None:
+    settings = SchedulerSettings(
+        gpu_scheduler={"mode": "parallel_time_aware"},
+        graph_db={"enabled": False},
+        hardware_feature_db={"enabled": False},
+    )
+    estimator = Mock()
+    estimator.repository.hardware_key.return_value = "mock-gpu"
+    estimator.repository.get_colocation_timing_profile.return_value = None
+    estimator.estimate_batch_options.return_value = [
+        BatchOptionEstimate(
+            job_id="mocked",
+            batch_size=4,
+            avg_vram_mb=100.0,
+            seconds_per_epoch=1.0,
+            remaining_epochs=1,
+            remaining_runtime_seconds=1.0,
+            source="mock_runtime_profile",
+            confidence=1.0,
+            estimate_version="time_v6_verified_piecewise_drain",
+        )
+    ]
+    scorer = TimeAwareObjectiveScorer(settings, estimator, Mock(), Mock())
+    active = _job("mock-tail-active", "mock-tail-active-sig")
+    candidate = _job("mock-tail-candidate", "mock-tail-candidate-sig")
+    active.max_epochs = active.config.max_epochs = 5
+    candidate.max_epochs = candidate.config.max_epochs = 10
+    active.metadata.update({"placement_backend": "cuda_process", "resolved_batch_size": 4})
+    candidate.metadata["resolved_batch_size"] = 4
+
+    result = scorer.estimate_gain(
+        [active],
+        candidate,
+        backend_name="cuda_process",
+        active_epoch_seconds={active.job_id: 1.0},
+        candidate_solo_epoch_seconds=1.0,
+        packed_epoch_seconds={active.job_id: 1.5, candidate.job_id: 1.5},
+        candidate_batch_size=4,
+        active_epoch_sources={active.job_id: "mock_live_epoch"},
+        packed_epoch_sources={
+            active.job_id: "mock_trial",
+            candidate.job_id: "mock_trial",
+        },
+    )
+
+    assert result is not None
+    assert result.packed_drain_seconds == pytest.approx(12.5)
+    assert result.packed_phases[-1].timing_sources == {
+        candidate.job_id: "mock_runtime_profile"
+    }
+    estimator.estimate_batch_options.assert_called_once_with(
+        candidate,
+        "cuda_process",
+        [4],
+    )
+
+
+def test_piecewise_drain_uses_mocked_subset_rates_for_three_jobs() -> None:
+    mocked_rates = {
+        ("b", "c"): EpochRateSet(
+            epoch_seconds={"b": 1.5, "c": 1.5},
+            sources={"b": "mock_pair", "c": "mock_pair"},
+        ),
+        ("c",): EpochRateSet(
+            epoch_seconds={"c": 1.0},
+            sources={"c": "mock_singleton"},
+        ),
+    }
+    projection = project_piecewise_drain(
+        {"a": 2.0, "b": 6.0, "c": 8.0},
+        {"a": 2.0, "b": 2.0, "c": 2.0},
+        tail_rate_resolver=lambda member_ids: mocked_rates.get(member_ids),
+    )
+
+    assert projection is not None
+    assert projection.total_seconds == pytest.approx(12.0)
+    assert [phase.member_ids for phase in projection.phases] == [
+        ("a", "b", "c"),
+        ("b", "c"),
+        ("c",),
+    ]
+    assert [phase.duration_seconds for phase in projection.phases] == pytest.approx(
+        [4.0, 6.0, 2.0]
+    )
+    assert not any(phase.inherited_parent_rates for phase in projection.phases)
+
+
+def test_piecewise_drain_conservatively_inherits_missing_mocked_subset_rates() -> None:
+    projection = project_piecewise_drain(
+        {"a": 2.0, "b": 6.0, "c": 8.0},
+        {"a": 2.0, "b": 2.0, "c": 2.0},
+        tail_rate_resolver=lambda _member_ids: None,
+    )
+
+    assert projection is not None
+    assert projection.total_seconds == pytest.approx(16.0)
+    assert [phase.duration_seconds for phase in projection.phases] == pytest.approx(
+        [4.0, 8.0, 4.0]
+    )
+    assert [phase.inherited_parent_rates for phase in projection.phases] == [False, True, True]
+    assert projection.phases[1].timing_sources == {
+        "b": "inherited_parent_rate",
+        "c": "inherited_parent_rate",
+    }
+
+
+def test_piecewise_drain_handles_simultaneous_completion_and_invalid_rates() -> None:
+    empty = project_piecewise_drain({"a": 0.0}, {"a": 1.0})
+    assert empty is not None
+    assert empty.total_seconds == 0.0
+    assert empty.phases == ()
+
+    simultaneous = project_piecewise_drain(
+        {"a": 5.0, "b": 5.0},
+        {"a": 2.0, "b": 2.0},
+    )
+    assert simultaneous is not None
+    assert simultaneous.total_seconds == pytest.approx(10.0)
+    assert len(simultaneous.phases) == 1
+    assert simultaneous.phases[0].completed_job_ids == ("a", "b")
+    assert project_piecewise_drain({"a": 1.0}, {"a": 0.0}) is None
+
+    malformed_tail = project_piecewise_drain(
+        {"a": 1.0, "b": 2.0},
+        {"a": 2.0, "b": 2.0},
+        tail_rate_resolver=lambda member_ids: EpochRateSet(
+            epoch_seconds={member_ids[0]: float("nan")},
+            sources={member_ids[0]: "malformed_mock"},
+        ),
+    )
+    assert malformed_tail is not None
+    assert malformed_tail.total_seconds == pytest.approx(4.0)
+    assert malformed_tail.phases[-1].inherited_parent_rates
+
+
+def test_piecewise_drain_refreshes_rates_before_first_phase_after_zero_work_member() -> None:
+    resolved_memberships: list[tuple[str, ...]] = []
+
+    def resolve(member_ids: tuple[str, ...]) -> EpochRateSet:
+        resolved_memberships.append(member_ids)
+        return EpochRateSet(
+            epoch_seconds={"live": 2.0},
+            sources={"live": "mocked_singleton"},
+        )
+
+    projection = project_piecewise_drain(
+        {"done": 0.0, "live": 5.0},
+        {"live": 20.0},
+        tail_rate_resolver=resolve,
+    )
+    assert projection is not None
+    assert projection.total_seconds == pytest.approx(10.0)
+    assert resolved_memberships == [("live",)]
+    assert projection.phases[0].timing_sources == {"live": "mocked_singleton"}
+    assert not projection.phases[0].inherited_parent_rates
+
+
+def test_piecewise_drain_inherits_parent_rate_when_initial_reduced_profile_is_missing() -> None:
+    projection = project_piecewise_drain(
+        {"done": 0.0, "live": 5.0},
+        {"live": 20.0},
+        tail_rate_resolver=lambda _: None,
+    )
+    assert projection is not None
+    assert projection.total_seconds == pytest.approx(100.0)
+    assert projection.phases[0].timing_sources == {"live": "inherited_parent_rate"}
+    assert projection.phases[0].inherited_parent_rates
+
+
+def test_gain_does_not_require_rates_for_zero_remaining_members() -> None:
+    active = _job("already-done", "already-done-sig")
+    candidate = _job("still-running", "still-running-sig")
+    active.max_epochs = active.config.max_epochs = 2
+    active.metadata["last_completed_epoch"] = 2
+    candidate.max_epochs = candidate.config.max_epochs = 5
+    result = TimeAwareObjectiveScorer.gain(
+        [active],
+        candidate,
+        active_epoch_seconds={},
+        candidate_solo_epoch_seconds=1.0,
+        packed_epoch_seconds={candidate.job_id: 2.0},
+    )
+    assert result is not None
+    assert result.sequential_drain_seconds == pytest.approx(5.0)
+    assert result.packed_drain_seconds == pytest.approx(10.0)
+
+    active.metadata["last_completed_epoch"] = 0
+    candidate.metadata["last_completed_epoch"] = 5
+    zero_candidate = TimeAwareObjectiveScorer.gain(
+        [active],
+        candidate,
+        active_epoch_seconds={active.job_id: 1.0},
+        candidate_solo_epoch_seconds=0.0,
+        packed_epoch_seconds={active.job_id: 2.0},
+    )
+    assert zero_candidate is not None
+    assert zero_candidate.sequential_drain_seconds == pytest.approx(2.0)
+    assert zero_candidate.packed_drain_seconds == pytest.approx(4.0)
+
+
 def test_colocation_profile_key_isolated_by_hardware_backend_batch_duplicates_and_size() -> None:
     base = [
         {"signature": "same", "batch_size": 4, "backend_name": "cuda_process"},
@@ -1137,12 +1430,20 @@ def test_exact_colocation_profile_below_gain_is_rejected_before_dispatch_and_sta
             {"signature": "known-active-sig", "batch_size": 4, "backend_name": "cuda_process"},
             {"signature": "known-candidate-sig", "batch_size": 1, "backend_name": "cuda_process"},
         ]
+        observed_at = datetime.now(timezone.utc).isoformat()
         store.upsert_colocation_timing_profile(
             ColocationTimingProfile.create(
                 store.hardware_key(),
                 members,
-                [{**member, "seconds_per_epoch": 20.0, "observations": 1} for member in members],
-                observations=1,
+                [{**member, "seconds_per_epoch": 20.0, "observations": 2} for member in members],
+                observations=2,
+                metadata={
+                    "evidence_policy": "fresh_member_epochs_v1",
+                    "recent_trial_outcomes": [
+                        {"trial_id": "known-bad-1", "decision": "rejected", "gain": 0.5, "observed_at": observed_at},
+                        {"trial_id": "known-bad-2", "decision": "rejected", "gain": 0.5, "observed_at": observed_at},
+                    ]
+                },
             )
         )
         plan = planner.choose_plan(
@@ -1161,6 +1462,159 @@ def test_exact_colocation_profile_below_gain_is_rejected_before_dispatch_and_sta
         assert service._colocation_stall is not None
         rejected = store.get_job(candidate.job_id)
         assert rejected is not None and rejected.status == JobStatus.PAUSED and not rejected.hold
+
+
+def test_single_bad_profile_requires_another_live_trial() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir, parallel_job_cap=2)
+        store = SQLiteStateStore(settings)
+        planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
+        active = _job("one-bad-active", "one-bad-active-sig")
+        candidate = _job("one-bad-candidate", "one-bad-candidate-sig")
+        for job in (active, candidate):
+            job.max_epochs = job.config.max_epochs = 10
+            _seed_options(store, planner, job)
+        active.metadata.update(
+            {
+                "placement_backend": "cuda_process",
+                "runtime_observed_epoch_seconds": 1.0,
+                "resolved_batch_size": 4,
+            }
+        )
+        members = [
+            {"signature": active.packing.signature, "batch_size": 4, "backend_name": "cuda_process"},
+            {"signature": candidate.packing.signature, "batch_size": 1, "backend_name": "cuda_process"},
+        ]
+        observed_at = datetime.now(timezone.utc).isoformat()
+        store.upsert_colocation_timing_profile(
+            ColocationTimingProfile.create(
+                store.hardware_key(),
+                members,
+                [{**member, "seconds_per_epoch": 20.0, "observations": 1} for member in members],
+                observations=1,
+                metadata={
+                    "evidence_policy": "fresh_member_epochs_v1",
+                    "recent_trial_outcomes": [
+                        {"trial_id": "single-bad", "decision": "rejected", "gain": 0.5, "observed_at": observed_at}
+                    ]
+                },
+            )
+        )
+        plan = planner.choose_plan(
+            [candidate],
+            backend_available={"cuda_process": True, "exclusive": True},
+            active_jobs=[active],
+            active_vram_mb=404.0,
+        )
+        assert plan is not None
+        assert plan.objective_breakdown["known_profile"]
+        assert not plan.objective_breakdown["trusted_profile"]
+        assert not plan.objective_breakdown["colocation_rejected"]
+        assert plan.objective_breakdown["requires_live_trial"]
+
+
+def test_profile_rejection_requires_two_recent_consecutive_bad_trials() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir)
+        store = SQLiteStateStore(settings)
+        planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
+        descriptor = {"signature": "profile-member", "batch_size": 4, "backend_name": "cuda_process"}
+        now = datetime.now(timezone.utc)
+
+        def profile(outcomes: list[dict[str, object]], *, updated_at: str | None = None) -> ColocationTimingProfile:
+            return ColocationTimingProfile.create(
+                store.hardware_key(),
+                [descriptor],
+                [{**descriptor, "seconds_per_epoch": 2.0, "observations": 2}],
+                observations=2,
+                updated_at=updated_at or now.isoformat(),
+                metadata={
+                    "evidence_policy": "fresh_member_epochs_v1",
+                    "recent_trial_outcomes": outcomes,
+                },
+            )
+
+        bad_1 = {"trial_id": "bad-1", "decision": "rejected", "gain": 0.8, "observed_at": now.isoformat()}
+        bad_2 = {"trial_id": "bad-2", "decision": "rejected", "gain": 0.8, "observed_at": now.isoformat()}
+        good = {"trial_id": "good", "decision": "accepted", "gain": 1.1, "observed_at": now.isoformat()}
+        assert planner.time_objective.profile_rejection_trusted(profile([bad_1, bad_2]), now=now)
+        assert not planner.time_objective.profile_rejection_trusted(profile([bad_1, good]), now=now)
+        assert not planner.time_objective.profile_rejection_trusted(profile([good, bad_2]), now=now)
+        stale_at = (now - timedelta(days=2)).isoformat()
+        assert not planner.time_objective.profile_rejection_trusted(
+            profile(
+                [
+                    {**bad_1, "observed_at": stale_at},
+                    {**bad_2, "observed_at": stale_at},
+                ],
+                updated_at=stale_at,
+            ),
+            now=now,
+        )
+        assert not planner.time_objective.profile_rejection_trusted(profile([]), now=now)
+        legacy = profile([bad_1, bad_2])
+        legacy.metadata.pop("evidence_policy")
+        assert not planner.time_objective.profile_rates_trusted(legacy, now=now)
+
+
+def test_expired_profile_is_replaced_instead_of_averaged() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir)
+        store = SQLiteStateStore(settings)
+        jobs = [_job("expired-a", "expired-a-sig"), _job("expired-b", "expired-b-sig")]
+        for job in jobs:
+            job.metadata.update({"placement_backend": "cuda_process", "resolved_batch_size": 4})
+        service = SchedulerService(
+            settings,
+            store=store,
+            supervisor=_DrainSupervisor([job.job_id for job in jobs]),
+        )
+        descriptors = [service._member_descriptor(job, "cuda_process") for job in jobs]
+        expired = ColocationTimingProfile.create(
+            store.hardware_key(),
+            descriptors,
+            [{**descriptor, "seconds_per_epoch": 100.0, "observations": 7} for descriptor in descriptors],
+            observations=7,
+            metadata={"recent_trial_outcomes": [{"decision": "rejected"}]},
+        )
+        store.upsert_colocation_timing_profile(expired)
+        with store._connect() as connection:
+            connection.execute(
+                "UPDATE colocation_timing_profiles SET updated_at = ? WHERE profile_key = ?",
+                ((datetime.now(timezone.utc) - timedelta(days=2)).isoformat(), expired.profile_key),
+            )
+            connection.commit()
+        started = datetime.now(timezone.utc)
+        trial = ColocationTrialState(
+            trial_id="expired-retry",
+            candidate_job_id=jobs[1].job_id,
+            preexisting_job_ids=(jobs[0].job_id,),
+            started_at=started.isoformat(),
+            start_epoch=0,
+            target_epoch=2,
+            backend_name="cuda_process",
+            profile_key=expired.profile_key,
+            candidate_solo_epoch_seconds=1.0,
+            pretrial_epoch_seconds={jobs[0].job_id: 1.0},
+        )
+        service._persist_colocation_timing_profile(
+            jobs,
+            {jobs[0].job_id: 2.0, jobs[1].job_id: 3.0},
+            trial,
+            gain=0.8,
+            decision="rejected",
+        )
+        service._persist_colocation_timing_profile(
+            jobs,
+            {jobs[0].job_id: 2.0, jobs[1].job_id: 3.0},
+            trial,
+            gain=0.8,
+            decision="rejected",
+        )
+        refreshed = store.get_colocation_timing_profile(expired.profile_key)
+        assert refreshed is not None and refreshed.observations == 1
+        assert [item["seconds_per_epoch"] for item in refreshed.member_timings] == [2.0, 3.0]
+        assert len(refreshed.metadata["recent_trial_outcomes"]) == 1
 
 
 def test_two_real_trial_epochs_hit_decision_barrier_and_rejection_preserves_checkpoint() -> None:
@@ -1295,7 +1749,221 @@ def test_trial_decision_timeout_checkpoints_and_pauses_as_unverified() -> None:
         assert paused.latest_checkpoint_path
 
 
-def test_newcomer_finishing_at_trial_target_is_released_without_slowdown_stall() -> None:
+def test_trial_evidence_uses_only_two_newest_fresh_member_epochs() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir)
+        store = SQLiteStateStore(settings)
+        service = SchedulerService(settings, store=store, supervisor=_DrainSupervisor([]))
+        trial_started = datetime.now(timezone.utc)
+        active = _job("evidence-active", "evidence-active-sig")
+        active.metadata.update(
+            {
+                "runtime_avg_step_time_ms": 999999.0,
+                "runtime_steps_per_epoch": 999,
+                "runtime_epoch_timing_history": [
+                    _epoch_timing(
+                        1,
+                        100.0,
+                        started_at=trial_started - timedelta(seconds=5),
+                        finished_at=trial_started - timedelta(seconds=1),
+                    ),
+                    _epoch_timing(
+                        2,
+                        50.0,
+                        started_at=trial_started - timedelta(seconds=1),
+                        finished_at=trial_started + timedelta(seconds=1),
+                    ),
+                    _epoch_timing(
+                        3,
+                        4.0,
+                        started_at=trial_started + timedelta(seconds=1),
+                        finished_at=trial_started + timedelta(seconds=5),
+                    ),
+                    _epoch_timing(
+                        4,
+                        6.0,
+                        started_at=trial_started + timedelta(seconds=6),
+                        finished_at=trial_started + timedelta(seconds=12),
+                    ),
+                    _epoch_timing(
+                        5,
+                        8.0,
+                        started_at=trial_started + timedelta(seconds=13),
+                        finished_at=trial_started + timedelta(seconds=21),
+                    ),
+                ],
+            }
+        )
+        candidate = _job("evidence-candidate", "evidence-candidate-sig")
+        candidate.metadata["runtime_epoch_timing_history"] = [
+            _epoch_timing(
+                1,
+                2.0,
+                started_at=None,
+                finished_at=trial_started + timedelta(seconds=2),
+                source="runner_step_time",
+            ),
+            _epoch_timing(
+                2,
+                4.0,
+                started_at=trial_started + timedelta(seconds=2),
+                finished_at=trial_started + timedelta(seconds=6),
+            ),
+        ]
+        trial = ColocationTrialState(
+            trial_id="fresh-evidence",
+            candidate_job_id=candidate.job_id,
+            preexisting_job_ids=(active.job_id,),
+            started_at=trial_started.isoformat(),
+            start_epoch=0,
+            target_epoch=2,
+            backend_name="cuda_process",
+            profile_key="fresh-evidence-profile",
+            candidate_solo_epoch_seconds=1.0,
+            member_start_epochs={active.job_id: 0, candidate.job_id: 0},
+            evidence_deadline_at=(trial_started + timedelta(minutes=5)).isoformat(),
+        )
+        active_evidence = service._trial_epoch_evidence(active, trial)
+        candidate_evidence = service._trial_epoch_evidence(candidate, trial)
+        assert active_evidence.samples == (6.0, 8.0)
+        assert active_evidence.seconds_per_epoch == pytest.approx(7.0)
+        assert candidate_evidence.samples == (2.0, 4.0)
+        assert candidate_evidence.seconds_per_epoch == pytest.approx(3.0)
+
+
+def test_missing_member_evidence_extends_candidate_target_without_profile_fallback() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir)
+        store = SQLiteStateStore(settings)
+        started = datetime.now(timezone.utc) - timedelta(seconds=10)
+        active = _job("extend-active", "extend-active-sig")
+        candidate = _job("extend-candidate", "extend-candidate-sig")
+        for job in (active, candidate):
+            job.max_epochs = job.config.max_epochs = 10
+            job.metadata.update({"placement_backend": "cuda_process", "resolved_batch_size": 4})
+            store.submit_job(job)
+            store.set_job_status(job.job_id, JobStatus.RUNNING, reason="test", hold=False)
+        store.update_job(
+            candidate.job_id,
+            metadata_updates={
+                "last_completed_epoch": 2,
+                "runtime_epoch_timing_history": [
+                    _epoch_timing(
+                        1,
+                        2.0,
+                        started_at=None,
+                        finished_at=started + timedelta(seconds=2),
+                        source="runner_step_time",
+                    ),
+                    _epoch_timing(
+                        2,
+                        2.0,
+                        started_at=started + timedelta(seconds=2),
+                        finished_at=started + timedelta(seconds=4),
+                    ),
+                ],
+            },
+        )
+        descriptors = [
+            {"signature": active.packing.signature, "batch_size": 4, "backend_name": "cuda_process"},
+            {"signature": candidate.packing.signature, "batch_size": 4, "backend_name": "cuda_process"},
+        ]
+        existing = ColocationTimingProfile.create(
+            store.hardware_key(),
+            descriptors,
+            [{**descriptor, "seconds_per_epoch": 99.0, "observations": 2} for descriptor in descriptors],
+            observations=2,
+        )
+        store.upsert_colocation_timing_profile(existing)
+        supervisor = _DrainSupervisor([active.job_id, candidate.job_id])
+        service = SchedulerService(settings, store=store, supervisor=supervisor)
+        service._colocation_trial = ColocationTrialState(
+            trial_id="extend-trial",
+            candidate_job_id=candidate.job_id,
+            preexisting_job_ids=(active.job_id,),
+            started_at=started.isoformat(),
+            start_epoch=0,
+            target_epoch=2,
+            backend_name="cuda_process",
+            profile_key=existing.profile_key,
+            candidate_solo_epoch_seconds=1.0,
+            pretrial_epoch_seconds={active.job_id: 1.0},
+            member_start_epochs={active.job_id: 0, candidate.job_id: 0},
+            evidence_deadline_at=(started + timedelta(minutes=5)).isoformat(),
+        )
+        service._evaluate_colocation_trial()
+        assert service._colocation_trial is not None
+        assert service._colocation_trial.target_epoch == 3
+        pending = store.get_job(candidate.job_id)
+        assert pending is not None
+        assert pending.metadata["colocation_trial"]["target_epoch"] == 3
+        assert pending.metadata["colocation_trial"]["evidence"]["evidence_counts"] == {
+            active.job_id: 0,
+            candidate.job_id: 2,
+        }
+        assert store.get_colocation_timing_profile(existing.profile_key).observations == 2
+        assert supervisor.paused == []
+
+
+def test_evidence_deadline_pauses_unverified_without_profile_or_stall() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir)
+        store = SQLiteStateStore(settings)
+        started = datetime.now(timezone.utc) - timedelta(minutes=10)
+        active = _job("deadline-active", "deadline-active-sig")
+        candidate = _job("deadline-candidate", "deadline-candidate-sig")
+        for job in (active, candidate):
+            job.max_epochs = job.config.max_epochs = 10
+            job.metadata.update({"placement_backend": "cuda_process", "resolved_batch_size": 4})
+            store.submit_job(job)
+            store.set_job_status(job.job_id, JobStatus.RUNNING, reason="test", hold=False)
+        store.update_job(candidate.job_id, metadata_updates={"last_completed_epoch": 2})
+        supervisor = _DrainSupervisor([active.job_id, candidate.job_id])
+        service = SchedulerService(settings, store=store, supervisor=supervisor)
+        descriptors = [service._member_descriptor(job, "cuda_process") for job in (active, candidate)]
+        profile_key = build_colocation_profile_key(store.hardware_key(), descriptors)
+        service._colocation_trial = ColocationTrialState(
+            trial_id="deadline-trial",
+            candidate_job_id=candidate.job_id,
+            preexisting_job_ids=(active.job_id,),
+            started_at=started.isoformat(),
+            start_epoch=0,
+            target_epoch=2,
+            backend_name="cuda_process",
+            profile_key=profile_key,
+            candidate_solo_epoch_seconds=1.0,
+            pretrial_epoch_seconds={active.job_id: 1.0},
+            member_start_epochs={active.job_id: 0, candidate.job_id: 0},
+            evidence_deadline_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+        )
+        service._evaluate_colocation_trial()
+        assert service._colocation_trial is None
+        assert service._colocation_stall is None
+        assert supervisor.paused == [candidate.job_id]
+        paused = store.get_job(candidate.job_id)
+        assert paused is not None and paused.status == JobStatus.PAUSING
+        assert paused.metadata["colocation_trial"]["decision"] == "timeout"
+        assert paused.metadata["colocation_unverified_profile_key"] == profile_key
+        assert store.get_colocation_timing_profile(profile_key) is None
+
+
+def test_control_hook_releases_wait_when_scheduler_advances_trial_target() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir)
+        job = _job("rolling-target", "rolling-target-sig")
+        waiting = job.copy(metadata={"colocation_trial": {"target_epoch": 2, "decision": "pending"}})
+        extended = job.copy(metadata={"colocation_trial": {"target_epoch": 3, "decision": "pending"}})
+        control = Mock()
+        control.settings = settings
+        control.read_command.return_value.action = "none"
+        store = Mock()
+        store.get_job.side_effect = [waiting, extended]
+        hook = TrainingControlHook(job, control, Mock(), store, Mock())
+        command = hook._trial_command_at_epoch(2)
+        assert command is not None and command.action == "none"
+
+
+def test_newcomer_finishing_without_full_evidence_is_completed_unverified() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         settings = _settings(tmpdir, parallel_job_cap=2)
         store = SQLiteStateStore(settings)
@@ -1335,6 +2003,8 @@ def test_newcomer_finishing_at_trial_target_is_released_without_slowdown_stall()
             profile_key="finish-profile",
             candidate_solo_epoch_seconds=1.0,
             pretrial_epoch_seconds={active.job_id: 1.0},
+            member_start_epochs={active.job_id: 0, candidate.job_id: 0},
+            evidence_deadline_at=(started + timedelta(minutes=5)).isoformat(),
         )
         service._evaluate_colocation_trial()
         assert service._colocation_trial is None
@@ -1342,7 +2012,18 @@ def test_newcomer_finishing_at_trial_target_is_released_without_slowdown_stall()
         assert supervisor.paused == []
         result = store.get_job(candidate.job_id)
         assert result is not None
-        assert result.metadata["colocation_trial"]["decision"] == "accepted"
+        assert result.metadata["colocation_trial"]["decision"] == "completed_unverified"
+        assert result.metadata["colocation_unverified_profile_key"] == "finish-profile"
+        assert store.get_colocation_timing_profile("finish-profile") is None
+        hook = TrainingControlHook(
+            result,
+            ControlPlane(settings),
+            Mock(),
+            store,
+            Mock(),
+        )
+        command = hook._trial_command_at_epoch(2)
+        assert command is not None and command.action == "none"
 
 
 def test_membership_change_restarts_trial_window_and_trial_state_recovers() -> None:
@@ -1455,7 +2136,15 @@ def test_measured_slowdown_rejection_stalls_all_candidates_until_preexisting_mem
                             "seconds": 3.0,
                             "started_at": (started + timedelta(seconds=1)).isoformat(),
                             "finished_at": (started + timedelta(seconds=4)).isoformat(),
-                        }
+                            "source": "safe_point_interval",
+                        },
+                        {
+                            "epoch": 2,
+                            "seconds": 3.0,
+                            "started_at": (started + timedelta(seconds=5)).isoformat(),
+                            "finished_at": (started + timedelta(seconds=8)).isoformat(),
+                            "source": "safe_point_interval",
+                        },
                     ]
                 },
             )
@@ -1467,11 +2156,19 @@ def test_measured_slowdown_rejection_stalls_all_candidates_until_preexisting_mem
                 "last_completed_epoch": 2,
                 "runtime_epoch_timing_history": [
                     {
-                        "epoch": 2,
+                        "epoch": 1,
                         "seconds": 3.0,
                         "started_at": (started + timedelta(seconds=1)).isoformat(),
                         "finished_at": (started + timedelta(seconds=4)).isoformat(),
-                    }
+                        "source": "safe_point_interval",
+                    },
+                    {
+                        "epoch": 2,
+                        "seconds": 3.0,
+                        "started_at": (started + timedelta(seconds=5)).isoformat(),
+                        "finished_at": (started + timedelta(seconds=8)).isoformat(),
+                        "source": "safe_point_interval",
+                    },
                 ],
             },
         )
@@ -1489,6 +2186,8 @@ def test_measured_slowdown_rejection_stalls_all_candidates_until_preexisting_mem
             profile_key="measured-stack-key",
             candidate_solo_epoch_seconds=1.0,
             pretrial_epoch_seconds={"stack-a": 1.0, "stack-b": 1.0},
+            member_start_epochs={"stack-a": 0, "stack-b": 0, "stack-c": 0},
+            evidence_deadline_at=(started + timedelta(minutes=5)).isoformat(),
         )
         service._colocation_trial = trial
         service._evaluate_colocation_trial()
@@ -1503,6 +2202,33 @@ def test_measured_slowdown_rejection_stalls_all_candidates_until_preexisting_mem
         supervisor.active_ids = ["stack-b"]
         restored._refresh_colocation_stall()
         assert restored._colocation_stall is None
+
+
+def test_trace_trial_waits_for_two_epochs_from_slowest_existing_member() -> None:
+    problem = TraceProblem(
+        jobs=(
+            TraceJob(
+                "slow-active",
+                0.0,
+                0,
+                (TraceBatchOption(4, 100.0, 300.0),),
+                planned_epochs=30,
+            ),
+            TraceJob(
+                "fast-candidate",
+                0.1,
+                0,
+                (TraceBatchOption(4, 100.0, 30.0),),
+                planned_epochs=30,
+            ),
+        ),
+        memory_budget_mb=500.0,
+        parallel_cap=2,
+        default_slowdown=1.0,
+        colocation_trial_epochs=2,
+    )
+    result = simulate_recursive_time_aware(problem)
+    assert result.colocation_trial_epochs == pytest.approx(20.0)
 
 
 def test_trace_simulator_preserves_two_rejected_epochs_and_models_stall() -> None:

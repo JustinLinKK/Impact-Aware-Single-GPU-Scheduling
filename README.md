@@ -159,17 +159,27 @@ starving job overrides that ordering. Each addition must pass scheduling class,
 parallel cap, backend and pair compatibility, live-admission, fixed-batch, and
 predicted average-VRAM checks before any concurrent work begins.
 
-The final admission check is a two-epoch live trial. These are ordinary training
-epochs: progress and checkpoints are retained whether the candidate is accepted
-or paused. After epoch two the newcomer waits at its epoch safe point while the
-scheduler compares sequential drain time with the measured packed drain time:
+The final admission check is a live trial requiring two fresh epochs from every
+member. These are ordinary training epochs: progress and checkpoints are retained
+whether the candidate is accepted or paused. If the newcomer reaches epoch two
+before an existing member has two complete post-join intervals, its target moves
+forward one epoch and it keeps training. Once every member has enough evidence,
+the scheduler compares sequential drain time with measured packed drain time:
 
 ```text
-D_active = max(active remaining_epochs * active pre-trial epoch_seconds)
+D_active = piecewise drain of the current active stack
 T_seq    = D_active + candidate remaining_epochs * candidate solo epoch_seconds
-T_pack   = max(all remaining_epochs * measured packed epoch_seconds)
+T_pack   = piecewise drain of the proposed packed stack
 gain     = T_seq / T_pack
 ```
+
+The piecewise drain advances to the next member completion, removes every job
+that completed at that boundary, and recalculates rates for the remaining
+membership. Exact hardware/backend/batch colocation timing is used for a
+remaining multi-job subset and same-backend runtime timing is used for a final
+singleton. When complete subset evidence is unavailable, surviving jobs inherit
+their parent phase rates so missing evidence never invents an optimistic
+speedup.
 
 Admission requires `gain >= gpu_scheduler.colocation.min_gain` (1.0 by
 default). A slowdown rejection pauses only the newcomer with `hold: false` and
@@ -179,22 +189,33 @@ Trial and stall state survive scheduler restart, and stale state is discarded
 when active membership no longer matches.
 
 Exact colocation timing profiles are isolated by hardware and the multiset of
-packing signature, resolved batch, and backend. Only clean epoch intervals are
-used; an interval crossing a membership change is ignored. Runner step timing
-is a fallback when `steps_per_epoch` is known. Whole-run elapsed time is never
-used as a slowdown estimate. Jobs without finite epoch progress, an epoch safe
-point, checkpoint support, safe memory evidence, or an overlap-capable backend
-run exclusively.
+packing signature, resolved batch, and backend. Existing members contribute only
+complete intervals that started after the newcomer joined; the newcomer may use
+its fresh first-epoch runner timing. Raw scalar step timing and stored profiles
+never fill missing live-trial evidence. The two newest valid samples per member
+are averaged. The trial window has an adaptive five-minute minimum and thirty-
+minute maximum; an unverified timeout pauses only the newcomer and writes no
+profile or admission stall.
+
+A stored profile must have at least two recent observations before its rates can
+be used. Immediate rejection additionally requires two consecutive bad live
+trials within 24 hours. An accepted trial clears bad confirmations, and the next
+trial replaces rather than averages with an expired profile. Legacy profiles
+without confirmation metadata are never trusted for immediate rejection.
 
 The local ML adapter consumes an epoch-time prediction only when the selected
 artifact explicitly declares the canonical `train_epoch_ms` target. Legacy
 PerfSeer `train_time` output is not treated as a full-epoch estimate.
 
 The former throughput controls `makespan_weight`, `flow_time_weight`, and
-`min_aggregate_gain` are no longer accepted. `time_v3_flow_only` is migrated to
-`time_v4_colocation_gain` with a warning. The `colocation` defaults are
-`min_gain: 1.0`, `trial_epochs: 2`, `trial_decision_timeout_seconds: 30`, and
-`live_trial_enabled: true`.
+`min_aggregate_gain` are no longer accepted. `time_v3_flow_only`,
+`time_v4_colocation_gain`, and `time_v5_piecewise_drain` are migrated to
+`time_v6_verified_piecewise_drain` with a warning. The `colocation` defaults are
+`min_gain: 1.0`, `trial_epochs: 2`, `trial_decision_timeout_seconds: 30`,
+`trial_evidence_timeout_min_seconds: 300`,
+`trial_evidence_timeout_max_seconds: 1800`,
+`profile_rejection_min_bad_trials: 2`,
+`profile_rejection_ttl_seconds: 86400`, and `live_trial_enabled: true`.
 
 Jobs with `scheduling_class: exclusive_probe` reserve the next idle boundary.
 Existing packs drain without preemption and no normal work is admitted during
@@ -205,6 +226,41 @@ Reports include saved epochs and estimated wall time saved when the runner
 provides a remaining-runtime estimate (or epoch step timing).
 Generic runners still own model-state restoration; `restore_best_checkpoint`
 is reserved for a runner-level restore hook and is not applied implicitly.
+
+### Recommended early-stopping baseline
+
+The repository's scheduler-aware example runners report `loss` at epoch safe
+points. The following is a conservative starting point for those runners. In
+the unified repository configuration, place this block under
+`scheduler.settings`:
+
+```yaml
+early_stopping:
+  enabled: true
+  metric_name: loss
+  mode: min
+  patience_epochs: 5
+  min_delta: 0.001
+  min_epochs: 10
+  save_best_checkpoint: true
+  restore_best_checkpoint: false
+  missing_metric_policy: ignore
+```
+
+This requires loss to decrease by more than `0.001` to reset patience, tolerates
+five consecutive non-improving epochs, and never stops before epoch 10. The
+absolute `min_delta` is metric-scale dependent and should be tuned when typical
+changes are much smaller or larger. Prefer an epoch-averaged validation metric
+such as `val_loss` when the runner exposes one; in that case, change
+`metric_name` to `val_loss` and keep `mode: min`.
+
+`min_epochs` is a stop gate rather than a warm-up reset: non-improving epochs
+before epoch 10 still count toward patience. With missing metrics configured as
+`ignore`, a missing or non-finite metric emits a warning but neither fails the
+job nor consumes patience. `save_best_checkpoint: true` requires the runner to
+provide a checkpoint `state_factory`. The raw MLEvolve subprocess adapter does
+not currently emit epoch safe points, so early stopping applies only to
+scheduler-aware runners that call the control hook.
 
 The deterministic validation fixture can be run with:
 

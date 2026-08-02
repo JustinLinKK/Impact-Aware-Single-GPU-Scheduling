@@ -104,20 +104,25 @@ class GpuMemorySettings:
 @dataclass(slots=True)
 class TimeObjectiveSettings:
     priority_weight: float = 0.10
-    objective_version: str = "time_v4_colocation_gain"
+    objective_version: str = "time_v6_verified_piecewise_drain"
 
     def __post_init__(self) -> None:
         if self.priority_weight < 0:
             raise ValueError("priority_weight must be non-negative")
         if not str(self.objective_version).strip():
             raise ValueError("objective_version is required")
-        if self.objective_version == "time_v3_flow_only":
+        if self.objective_version in {
+            "time_v3_flow_only",
+            "time_v4_colocation_gain",
+            "time_v5_piecewise_drain",
+        }:
+            previous_version = self.objective_version
             warnings.warn(
-                "time_v3_flow_only is migrated to time_v4_colocation_gain",
+                f"{previous_version} is migrated to time_v6_verified_piecewise_drain",
                 UserWarning,
                 stacklevel=2,
             )
-            self.objective_version = "time_v4_colocation_gain"
+            self.objective_version = "time_v6_verified_piecewise_drain"
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "TimeObjectiveSettings":
@@ -163,18 +168,36 @@ class ColocationSettings:
     min_gain: float = 1.0
     trial_epochs: int = 2
     trial_decision_timeout_seconds: float = 30.0
+    trial_evidence_timeout_min_seconds: float = 300.0
+    trial_evidence_timeout_max_seconds: float = 1800.0
+    profile_rejection_min_bad_trials: int = 2
+    profile_rejection_ttl_seconds: float = 86400.0
     live_trial_enabled: bool = True
 
     def __post_init__(self) -> None:
         self.min_gain = float(self.min_gain)
         self.trial_epochs = int(self.trial_epochs)
         self.trial_decision_timeout_seconds = float(self.trial_decision_timeout_seconds)
+        self.trial_evidence_timeout_min_seconds = float(self.trial_evidence_timeout_min_seconds)
+        self.trial_evidence_timeout_max_seconds = float(self.trial_evidence_timeout_max_seconds)
+        self.profile_rejection_min_bad_trials = int(self.profile_rejection_min_bad_trials)
+        self.profile_rejection_ttl_seconds = float(self.profile_rejection_ttl_seconds)
         if self.min_gain <= 0:
             raise ValueError("colocation.min_gain must be positive")
         if self.trial_epochs < 1:
             raise ValueError("colocation.trial_epochs must be at least 1")
         if self.trial_decision_timeout_seconds <= 0:
             raise ValueError("colocation.trial_decision_timeout_seconds must be positive")
+        if self.trial_evidence_timeout_min_seconds <= 0:
+            raise ValueError("colocation.trial_evidence_timeout_min_seconds must be positive")
+        if self.trial_evidence_timeout_max_seconds < self.trial_evidence_timeout_min_seconds:
+            raise ValueError(
+                "colocation.trial_evidence_timeout_max_seconds must be at least the minimum"
+            )
+        if self.profile_rejection_min_bad_trials < 1:
+            raise ValueError("colocation.profile_rejection_min_bad_trials must be at least 1")
+        if self.profile_rejection_ttl_seconds <= 0:
+            raise ValueError("colocation.profile_rejection_ttl_seconds must be positive")
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "ColocationSettings":
@@ -185,6 +208,10 @@ class ColocationSettings:
             "min_gain": self.min_gain,
             "trial_epochs": self.trial_epochs,
             "trial_decision_timeout_seconds": self.trial_decision_timeout_seconds,
+            "trial_evidence_timeout_min_seconds": self.trial_evidence_timeout_min_seconds,
+            "trial_evidence_timeout_max_seconds": self.trial_evidence_timeout_max_seconds,
+            "profile_rejection_min_bad_trials": self.profile_rejection_min_bad_trials,
+            "profile_rejection_ttl_seconds": self.profile_rejection_ttl_seconds,
             "live_trial_enabled": self.live_trial_enabled,
         }
 

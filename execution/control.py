@@ -131,7 +131,7 @@ class TrainingControlHook:
         if not trial or int(epoch) < int(trial.get("target_epoch") or 0):
             return None
         decision = str(trial.get("decision") or "pending")
-        if decision == "accepted":
+        if decision in {"accepted", "completed_unverified"}:
             return ControlCommand()
         if decision in {"rejected", "timeout"}:
             return ControlCommand(
@@ -149,8 +149,10 @@ class TrainingControlHook:
                 return command
             current = self.store.get_job(self.job.job_id)
             trial = dict((current.metadata if current is not None else {}).get("colocation_trial") or {})
+            if int(epoch) < int(trial.get("target_epoch") or 0):
+                return ControlCommand()
             decision = str(trial.get("decision") or "pending")
-            if decision == "accepted":
+            if decision in {"accepted", "completed_unverified"}:
                 return ControlCommand()
             if decision in {"rejected", "timeout"}:
                 return ControlCommand(

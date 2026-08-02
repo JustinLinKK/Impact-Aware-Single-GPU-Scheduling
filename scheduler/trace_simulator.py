@@ -12,6 +12,8 @@ import math
 import statistics
 from typing import Callable, Iterable
 
+from .time_objective import EpochRateSet, project_piecewise_drain
+
 
 @dataclass(frozen=True, slots=True)
 class TraceBatchOption:
@@ -140,6 +142,8 @@ class TraceProblem:
     starvation_timeout_seconds: float = 1800.0
     colocation_trial_epochs: int = 2
     colocation_min_gain: float = 1.0
+    trial_evidence_timeout_min_seconds: float = 300.0
+    trial_evidence_timeout_max_seconds: float = 1800.0
 
     def pair_slowdown(self, left: TraceJob, right: TraceJob) -> float:
         ordered = sorted((left.job_id, right.job_id))
@@ -539,37 +543,93 @@ def simulate_recursive_time_aware(problem: TraceProblem) -> TraceMetrics:
         pretrial_rates = {job_id: packed_epoch_seconds(job_id, preexisting) for job_id in preexisting}
         active.append(candidate_id)
         first_dispatch.setdefault(candidate_id, now)
+        measured_epochs = {job_id: 0.0 for job_id in active}
         measured_candidate_epochs = 0.0
-        trial_target = min(float(problem.colocation_trial_epochs), remaining_epochs[candidate_id])
-        while measured_candidate_epochs + epsilon < trial_target:
-            rate = packed_epoch_seconds(candidate_id, active)
-            wanted = (trial_target - measured_candidate_epochs) * rate
+
+        def evidence_deadline() -> float:
+            slowest_rate = max(
+                [solo_epoch_seconds(candidate_id, predicted=True), *pretrial_rates.values()],
+                default=0.0,
+            )
+            estimated_window = 3.0 * problem.colocation_trial_epochs * slowest_rate
+            timeout = min(
+                problem.trial_evidence_timeout_max_seconds,
+                max(problem.trial_evidence_timeout_min_seconds, estimated_window),
+            )
+            return now + timeout
+
+        deadline = evidence_deadline()
+        while any(
+            measured_epochs.get(job_id, 0.0) + epsilon < problem.colocation_trial_epochs
+            for job_id in active
+        ):
+            rates = {job_id: packed_epoch_seconds(job_id, active) for job_id in active}
+            wanted = min(
+                (
+                    (problem.colocation_trial_epochs - measured_epochs.get(job_id, 0.0))
+                    * rates[job_id]
+                    for job_id in active
+                    if measured_epochs.get(job_id, 0.0) + epsilon < problem.colocation_trial_epochs
+                ),
+                default=0.0,
+            )
+            wanted = min(wanted, max(0.0, deadline - now))
+            if wanted <= epsilon:
+                active = [job_id for job_id in active if job_id != candidate_id]
+                return "unverified"
             elapsed, finished, rates = advance(wanted)
+            for job_id, rate in rates.items():
+                measured_epochs[job_id] = measured_epochs.get(job_id, 0.0) + elapsed / rate
             candidate_progress = elapsed / rates[candidate_id] if candidate_id in rates else 0.0
             measured_candidate_epochs += candidate_progress
             lifecycle["trial_epochs"] = float(lifecycle["trial_epochs"]) + candidate_progress
             if candidate_id in finished:
                 return "completed"
             if finished.intersection(preexisting):
-                preexisting = list(active)
-                if preexisting == [candidate_id] or not [job_id for job_id in preexisting if job_id != candidate_id]:
-                    return "accepted"
                 preexisting = [job_id for job_id in active if job_id != candidate_id]
+                if not preexisting:
+                    return "accepted"
                 pretrial_rates = {job_id: packed_epoch_seconds(job_id, preexisting) for job_id in preexisting}
+                measured_epochs = {job_id: 0.0 for job_id in active}
                 measured_candidate_epochs = 0.0
-                trial_target = min(float(problem.colocation_trial_epochs), remaining_epochs[candidate_id])
+                deadline = evidence_deadline()
 
         packed_rates = {job_id: packed_epoch_seconds(job_id, active) for job_id in active}
-        active_drain = max(
-            (remaining_epochs[job_id] * pretrial_rates[job_id] for job_id in preexisting),
-            default=0.0,
+
+        def resolve_trace_rates(member_ids: tuple[str, ...]) -> EpochRateSet:
+            materialized = list(member_ids)
+            return EpochRateSet(
+                epoch_seconds={
+                    job_id: packed_epoch_seconds(job_id, materialized)
+                    for job_id in materialized
+                },
+                sources={job_id: "trace_membership_rate" for job_id in materialized},
+            )
+
+        active_projection = project_piecewise_drain(
+            {job_id: remaining_epochs[job_id] for job_id in preexisting},
+            pretrial_rates,
+            initial_sources={job_id: "trace_pretrial_rate" for job_id in preexisting},
+            tail_rate_resolver=resolve_trace_rates,
         )
-        sequential = active_drain + remaining_epochs[candidate_id] * solo_epoch_seconds(candidate_id, predicted=True)
-        packed_drain = max(
-            (remaining_epochs[job_id] * packed_rates[job_id] for job_id in active),
-            default=0.0,
+        packed_projection = project_piecewise_drain(
+            {job_id: remaining_epochs[job_id] for job_id in active},
+            packed_rates,
+            initial_sources={job_id: "trace_trial_rate" for job_id in active},
+            tail_rate_resolver=resolve_trace_rates,
         )
-        gain = sequential / packed_drain if packed_drain > epsilon else float("inf")
+        if active_projection is None or packed_projection is None:
+            gain = 0.0
+        else:
+            sequential = (
+                active_projection.total_seconds
+                + remaining_epochs[candidate_id] * solo_epoch_seconds(candidate_id, predicted=True)
+            )
+            gain = (
+                sequential / packed_projection.total_seconds
+                if packed_projection.total_seconds > epsilon
+                else float("inf")
+            )
         if gain + epsilon >= problem.colocation_min_gain:
             return "accepted"
         active = [job_id for job_id in active if job_id != candidate_id]
