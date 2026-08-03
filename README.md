@@ -203,6 +203,33 @@ trials within 24 hours. An accepted trial clears bad confirmations, and the next
 trial replaces rather than averages with an expired profile. Legacy profiles
 without confirmation metadata are never trusted for immediate rejection.
 
+### Task-scoped placement replay
+
+Jobs may provide a typed `workload_identity` with `task_key`, `dataset_key`,
+`architecture_key`, and `architecture_family`. The MLEvolve adapter also
+accepts these as direct arguments and uses `workflow_id` only as a legacy task
+fallback. Script introspection emits normalized exact and broad architecture
+keys when they can be inferred. A reliable task/dataset identity and an
+architecture identity are both required for replay.
+
+After three distinct membership episodes produce the same verified width and
+backend on the same hardware and scheduler mode, the scheduler persists a
+placement template. Width one replays as exclusive; larger widths start an
+anchor immediately and fill the first vacant slot as matching jobs arrive.
+Replayed jobs reuse the stored per-slot batch size and trusted runtime/VRAM
+profiles, bypassing batch probing, live colocation trials, gain scoring, and
+rejection stalls. Passive epoch timing and GPU telemetry continue.
+
+Replay is invalidated before dispatch when task, dataset, exact architecture,
+or architecture family changes, or when either predicted total training time
+or average VRAM changes by at least the configured symmetric ratio. Backend,
+parallel-cap, compatibility, cached-batch, live-memory, and aggregate-VRAM
+safety checks remain active. A closed live-memory gate waits without deleting
+the template; missing or low-confidence evidence and hard safety failures send
+the same job back through normal evaluation. Configure this under
+`gpu_scheduler.colocation.decision_replay`; the default observation count is
+three and both change fractions default to `0.25`.
+
 The local ML adapter consumes an epoch-time prediction only when the selected
 artifact explicitly declares the canonical `train_epoch_ms` target. Legacy
 PerfSeer `train_time` output is not treated as a full-epoch estimate.
@@ -216,6 +243,8 @@ The former throughput controls `makespan_weight`, `flow_time_weight`, and
 `trial_evidence_timeout_max_seconds: 1800`,
 `profile_rejection_min_bad_trials: 2`,
 `profile_rejection_ttl_seconds: 86400`, and `live_trial_enabled: true`.
+Decision replay defaults to enabled with `min_stable_observations: 3`,
+`training_time_change_fraction: 0.25`, and `vram_change_fraction: 0.25`.
 
 Jobs with `scheduling_class: exclusive_probe` reserve the next idle boundary.
 Existing packs drain without preemption and no normal work is admitted during

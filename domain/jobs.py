@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 import json
+import re
 
 from .common import parse_timestamp, stable_job_id, to_primitive, utc_now
 
@@ -91,6 +92,38 @@ class ResourceRequirements:
 
     def to_dict(self) -> dict[str, Any]:
         return to_primitive(self)
+
+
+@dataclass(slots=True)
+class WorkloadIdentity:
+    """Stable task and architecture identity used for placement replay."""
+
+    task_key: str | None = None
+    dataset_key: str | None = None
+    architecture_key: str | None = None
+    architecture_family: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("task_key", "dataset_key", "architecture_key", "architecture_family"):
+            value = getattr(self, name)
+            if value is not None:
+                normalized = re.sub(r"[^a-z0-9.+-]+", "-", str(value).strip().lower())
+                normalized = re.sub(r"-+", "-", normalized).strip("-")
+                setattr(self, name, normalized or None)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "WorkloadIdentity":
+        return cls(**dict(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_primitive(self)
+
+    @property
+    def replay_eligible(self) -> bool:
+        return bool(
+            (self.task_key or self.dataset_key)
+            and (self.architecture_key or self.architecture_family)
+        )
 
 
 @dataclass(slots=True)
@@ -217,6 +250,7 @@ class JobSpec:
     baseline_model_id: str = ""
     baseline_model_path: str = ""
     task_type: str = "generic"
+    workload_identity: WorkloadIdentity = field(default_factory=WorkloadIdentity)
     priority: int = 0
     scheduling_class: SchedulingClass = SchedulingClass.NORMAL
     requested_batch_size: int | None = None
@@ -231,6 +265,12 @@ class JobSpec:
     resume_from_checkpoint: str | None = None
     preload_source: PreloadSource | None = None
 
+    def __post_init__(self) -> None:
+        if self.workload_identity is None:
+            self.workload_identity = WorkloadIdentity()
+        elif isinstance(self.workload_identity, dict):
+            self.workload_identity = WorkloadIdentity.from_dict(self.workload_identity)
+
     @classmethod
     def from_training_job(cls, job: "TrainingJob") -> "JobSpec":
         return cls(
@@ -240,6 +280,7 @@ class JobSpec:
             baseline_model_id=job.baseline_model_id,
             baseline_model_path=job.baseline_model_path,
             task_type=job.task_type,
+            workload_identity=job.workload_identity,
             priority=job.priority,
             scheduling_class=job.scheduling_class,
             requested_batch_size=job.requested_batch_size,
@@ -303,6 +344,7 @@ class TrainingJob:
     baseline_model_id: str = ""
     baseline_model_path: str = ""
     task_type: str = "generic"
+    workload_identity: WorkloadIdentity = field(default_factory=WorkloadIdentity)
     priority: int = 0
     scheduling_class: SchedulingClass = SchedulingClass.NORMAL
     requested_batch_size: int | None = None
@@ -329,6 +371,12 @@ class TrainingJob:
     finished_at: str | None = None
     hold: bool = False
 
+    def __post_init__(self) -> None:
+        if self.workload_identity is None:
+            self.workload_identity = WorkloadIdentity()
+        elif isinstance(self.workload_identity, dict):
+            self.workload_identity = WorkloadIdentity.from_dict(self.workload_identity)
+
     @classmethod
     def create(
         cls,
@@ -340,6 +388,7 @@ class TrainingJob:
         agent_id: str | None = None,
         workflow_id: str | None = None,
         task_type: str = "generic",
+        workload_identity: WorkloadIdentity | None = None,
         priority: int = 0,
         scheduling_class: SchedulingClass | str = SchedulingClass.NORMAL,
         runner_kwargs: dict[str, Any] | None = None,
@@ -381,6 +430,7 @@ class TrainingJob:
             baseline_model_id=baseline_model_id,
             baseline_model_path=baseline_model_path,
             task_type=task_type,
+            workload_identity=workload_identity or WorkloadIdentity(),
             priority=priority,
             scheduling_class=SchedulingClass(scheduling_class),
             requested_batch_size=requested_batch_size,
@@ -407,6 +457,7 @@ class TrainingJob:
         payload["scheduling_class"] = SchedulingClass(payload.get("scheduling_class", SchedulingClass.NORMAL.value))
         payload["config"] = JobConfig.from_dict(payload["config"])
         payload["resource_requirements"] = ResourceRequirements.from_dict(payload.get("resource_requirements"))
+        payload["workload_identity"] = WorkloadIdentity.from_dict(payload.get("workload_identity"))
         payload["packing"] = PackingSpec.from_dict(payload.get("packing"))
         payload["batch_probe"] = BatchProbeSpec.from_dict(payload.get("batch_probe"))
         payload["runtime_probe"] = RuntimeProbeSpec.from_dict(payload.get("runtime_probe"))
@@ -430,6 +481,7 @@ class TrainingJob:
             baseline_model_id=spec.baseline_model_id,
             baseline_model_path=spec.baseline_model_path,
             task_type=spec.task_type,
+            workload_identity=spec.workload_identity,
             priority=spec.priority,
             scheduling_class=spec.scheduling_class,
             requested_batch_size=spec.requested_batch_size,

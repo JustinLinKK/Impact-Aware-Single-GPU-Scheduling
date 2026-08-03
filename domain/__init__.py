@@ -42,6 +42,7 @@ from .jobs import (
     SafePointType,
     SchedulingClass,
     TrainingJob,
+    WorkloadIdentity,
     normalize_batch_probe_search_mode,
     normalize_runtime_probe_strategy,
 )
@@ -101,6 +102,7 @@ __all__ = [
     "SchedulerReport",
     "SoloProfile",
     "TrainingJob",
+    "WorkloadIdentity",
     "build_backend_scoped_pair_key",
     "build_batch_probe_key",
     "build_batch_probe_shape_signature",

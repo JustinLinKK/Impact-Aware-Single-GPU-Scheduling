@@ -7,7 +7,16 @@ from typing import Any
 import json
 
 from ..client import SchedulerClient
-from ..domain import BatchProbeSpec, CheckpointPolicy, PackingSpec, PreloadSource, ResourceRequirements, RuntimeProbeSpec, TrainingJob
+from ..domain import (
+    BatchProbeSpec,
+    CheckpointPolicy,
+    PackingSpec,
+    PreloadSource,
+    ResourceRequirements,
+    RuntimeProbeSpec,
+    TrainingJob,
+    WorkloadIdentity,
+)
 
 
 def build_packing_signature(
@@ -58,6 +67,11 @@ def build_mlevolve_job(
     max_epochs: int | None = None,
     preload_source: PreloadSource | None = None,
     metadata: dict[str, Any] | None = None,
+    workload_identity: WorkloadIdentity | dict[str, Any] | None = None,
+    task_key: str | None = None,
+    dataset_key: str | None = None,
+    architecture_key: str | None = None,
+    architecture_family: str | None = None,
 ) -> TrainingJob:
     """Build a scheduler job from an MLEvolve candidate-training request."""
     computed_signature = packing_signature
@@ -77,12 +91,39 @@ def build_mlevolve_job(
             enabled=(runner_target != "localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job"),
             strategy="epoch_1",
         )
+    job_metadata = dict(metadata or {})
+    supplied_identity = (
+        WorkloadIdentity.from_dict(workload_identity)
+        if isinstance(workload_identity, dict)
+        else workload_identity or WorkloadIdentity()
+    )
+    identity = WorkloadIdentity(
+        task_key=supplied_identity.task_key or task_key or job_metadata.get("task_key") or workflow_id,
+        dataset_key=supplied_identity.dataset_key or dataset_key or job_metadata.get("dataset_key"),
+        architecture_key=(
+            supplied_identity.architecture_key
+            or architecture_key
+            or job_metadata.get("architecture_key")
+            or job_metadata.get("branch_name")
+            or job_metadata.get("model_name")
+            or packing_family
+        ),
+        architecture_family=(
+            supplied_identity.architecture_family
+            or architecture_family
+            or job_metadata.get("architecture_family")
+            or job_metadata.get("architecture_type")
+            or job_metadata.get("model_family")
+            or packing_family
+        ),
+    )
     return TrainingJob.create(
         runner_target=runner_target,
         baseline_model_id=baseline_model_id,
         baseline_model_path=baseline_model_path,
         workflow_id=workflow_id,
         task_type=task_type,
+        workload_identity=identity,
         priority=priority,
         runner_kwargs=runner_kwargs or {},
         loader_target=loader_target,
@@ -100,7 +141,7 @@ def build_mlevolve_job(
         runtime_probe=default_runtime_probe,
         max_steps=max_steps,
         max_epochs=max_epochs,
-        metadata=metadata or {},
+        metadata=job_metadata,
     )
 
 

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from math import isfinite
 from pathlib import Path
+from statistics import fmean, median
 from threading import Event, Thread
 from typing import Any
 import json
@@ -28,6 +29,7 @@ from ..domain import (
     SchedulingClass,
     SoloProfile,
     TrainingJob,
+    WorkloadIdentity,
     build_group_signature,
     build_colocation_profile_key,
     parse_timestamp,
@@ -162,6 +164,169 @@ class ColocationStallState:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class PlacementProfileSnapshot:
+    batch_size: int
+    total_training_seconds: float
+    avg_vram_mb: float
+    source: str
+    confidence: float | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "batch_size": self.batch_size,
+            "total_training_seconds": self.total_training_seconds,
+            "avg_vram_mb": self.avg_vram_mb,
+            "source": self.source,
+            "confidence": self.confidence,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> "PlacementProfileSnapshot":
+        confidence = payload.get("confidence")
+        return cls(
+            batch_size=int(payload["batch_size"]),
+            total_training_seconds=float(payload["total_training_seconds"]),
+            avg_vram_mb=float(payload["avg_vram_mb"]),
+            source=str(payload.get("source") or "unknown"),
+            confidence=float(confidence) if confidence is not None else None,
+        )
+
+
+@dataclass(slots=True)
+class PlacementPatternObservation:
+    identity: WorkloadIdentity
+    hardware_key: str
+    scheduler_mode: str
+    target_width: int
+    backend_name: str
+    slot_profiles: list[PlacementProfileSnapshot]
+    member_job_ids: tuple[str, ...]
+    reason: str
+    observed_at: str = field(default_factory=utc_now)
+
+    @property
+    def member_fingerprint(self) -> str:
+        return "|".join(sorted(self.member_job_ids))
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "identity": self.identity.to_dict(),
+            "hardware_key": self.hardware_key,
+            "scheduler_mode": self.scheduler_mode,
+            "target_width": self.target_width,
+            "backend_name": self.backend_name,
+            "slot_profiles": [profile.to_dict() for profile in self.slot_profiles],
+            "member_job_ids": list(self.member_job_ids),
+            "reason": self.reason,
+            "observed_at": self.observed_at,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> "PlacementPatternObservation":
+        return cls(
+            identity=WorkloadIdentity.from_dict(dict(payload.get("identity") or {})),
+            hardware_key=str(payload.get("hardware_key") or ""),
+            scheduler_mode=str(payload.get("scheduler_mode") or ""),
+            target_width=int(payload["target_width"]),
+            backend_name=str(payload["backend_name"]),
+            slot_profiles=[
+                PlacementProfileSnapshot.from_dict(dict(item))
+                for item in list(payload.get("slot_profiles") or [])
+                if isinstance(item, dict)
+            ],
+            member_job_ids=tuple(str(item) for item in list(payload.get("member_job_ids") or [])),
+            reason=str(payload.get("reason") or "unknown"),
+            observed_at=str(payload.get("observed_at") or utc_now()),
+        )
+
+
+@dataclass(slots=True)
+class PlacementReplayTemplate:
+    identity: WorkloadIdentity
+    hardware_key: str
+    scheduler_mode: str
+    target_width: int
+    backend_name: str
+    slot_profiles: list[PlacementProfileSnapshot]
+    observation_count: int
+    activated_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "identity": self.identity.to_dict(),
+            "hardware_key": self.hardware_key,
+            "scheduler_mode": self.scheduler_mode,
+            "target_width": self.target_width,
+            "backend_name": self.backend_name,
+            "slot_profiles": [profile.to_dict() for profile in self.slot_profiles],
+            "observation_count": self.observation_count,
+            "activated_at": self.activated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> "PlacementReplayTemplate":
+        return cls(
+            identity=WorkloadIdentity.from_dict(dict(payload.get("identity") or {})),
+            hardware_key=str(payload.get("hardware_key") or ""),
+            scheduler_mode=str(payload.get("scheduler_mode") or ""),
+            target_width=int(payload["target_width"]),
+            backend_name=str(payload["backend_name"]),
+            slot_profiles=[
+                PlacementProfileSnapshot.from_dict(dict(item))
+                for item in list(payload.get("slot_profiles") or [])
+                if isinstance(item, dict)
+            ],
+            observation_count=int(payload.get("observation_count") or 0),
+            activated_at=str(payload.get("activated_at") or utc_now()),
+        )
+
+
+@dataclass(slots=True)
+class PlacementReplayState:
+    observations: list[PlacementPatternObservation] = field(default_factory=list)
+    pending_observation: PlacementPatternObservation | None = None
+    template: PlacementReplayTemplate | None = None
+    suppressed_probes: int = 0
+    suppressed_trials: int = 0
+    suppressed_decisions: int = 0
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "observations": [observation.to_dict() for observation in self.observations],
+            "pending_observation": self.pending_observation.to_dict() if self.pending_observation else None,
+            "template": self.template.to_dict() if self.template else None,
+            "suppressed_probes": self.suppressed_probes,
+            "suppressed_trials": self.suppressed_trials,
+            "suppressed_decisions": self.suppressed_decisions,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> "PlacementReplayState":
+        pending = payload.get("pending_observation")
+        template = payload.get("template")
+        return cls(
+            observations=[
+                PlacementPatternObservation.from_dict(dict(item))
+                for item in list(payload.get("observations") or [])
+                if isinstance(item, dict)
+            ],
+            pending_observation=(
+                PlacementPatternObservation.from_dict(dict(pending))
+                if isinstance(pending, dict)
+                else None
+            ),
+            template=(
+                PlacementReplayTemplate.from_dict(dict(template))
+                if isinstance(template, dict)
+                else None
+            ),
+            suppressed_probes=int(payload.get("suppressed_probes") or 0),
+            suppressed_trials=int(payload.get("suppressed_trials") or 0),
+            suppressed_decisions=int(payload.get("suppressed_decisions") or 0),
+        )
+
+
 class SchedulerService:
     """Single-process scheduler with optional pairwise packed execution."""
 
@@ -210,6 +375,7 @@ class SchedulerService:
         self._exclusive_probe_job_id: str | None = None
         self._colocation_trial: ColocationTrialState | None = None
         self._colocation_stall: ColocationStallState | None = None
+        self._placement_replay = PlacementReplayState()
         self._restore_scheduler_decision_state()
 
     @property
@@ -236,6 +402,7 @@ class SchedulerService:
             "exclusive_probe_job_id": self._exclusive_probe_job_id,
             "colocation_trial": self._colocation_trial.to_dict() if self._colocation_trial else None,
             "colocation_stall": self._colocation_stall.to_dict() if self._colocation_stall else None,
+            "placement_replay": self._placement_replay.to_dict(),
             "updated_at": utc_now(),
         }
         tmp_path = self._decision_state_path.with_suffix(".json.tmp")
@@ -266,6 +433,11 @@ class SchedulerService:
             self._colocation_trial = ColocationTrialState.from_dict(trial) if isinstance(trial, dict) else None
             stall = payload.get("colocation_stall")
             self._colocation_stall = ColocationStallState.from_dict(stall) if isinstance(stall, dict) else None
+            replay = payload.get("placement_replay")
+            if self.settings.gpu_scheduler.colocation.decision_replay.enabled and isinstance(replay, dict):
+                self._placement_replay = PlacementReplayState.from_dict(replay)
+            else:
+                self._placement_replay = PlacementReplayState()
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self.logger.warning("Ignoring invalid scheduler decision state: %s", exc)
 
@@ -589,6 +761,7 @@ class SchedulerService:
                 run.group_signature = build_group_signature(
                     [(self.store.get_job(job_id).packing.signature or job_id) for job_id in remaining_job_ids if self.store.get_job(job_id) is not None]
                 )
+        self._finalize_pending_pattern()
 
     def _handle_worker_exit(self, snapshot: WorkerSnapshot, *, run_context: ActiveRun | None) -> None:
         job = self.store.get_job(snapshot.job_id)
@@ -658,6 +831,14 @@ class SchedulerService:
             return
         run.fallback_triggered = True
         run.fallback_reason = reason
+        for job_id in run.job_ids:
+            replayed_job = self.store.get_job(job_id)
+            if replayed_job is not None and replayed_job.metadata.get("skip_active_scheduler_probes"):
+                self._clear_replay_job_metadata(replayed_job)
+        self._invalidate_placement_replay(
+            reason="packed backend failure",
+            details={"backend_name": run.backend_name, "failure_reason": reason},
+        )
         self.event_logger.emit(
             "packed_group_fallback",
             payload={"job_ids": list(run.job_ids), "reason": reason, **payload},
@@ -1032,6 +1213,525 @@ class SchedulerService:
             "batch_size": BatchResolution.resolved_batch_size(job),
             "backend_name": str(job.metadata.get("placement_backend") or fallback_backend),
         }
+
+    def _workload_identity(self, job: TrainingJob) -> WorkloadIdentity:
+        metadata = dict(job.metadata or {})
+        supplied = job.workload_identity
+        identity = WorkloadIdentity(
+            task_key=supplied.task_key or metadata.get("task_key") or job.workflow_id,
+            dataset_key=supplied.dataset_key or metadata.get("dataset_key"),
+            architecture_key=(
+                supplied.architecture_key
+                or metadata.get("architecture_key")
+                or metadata.get("branch_name")
+                or metadata.get("model_name")
+                or job.packing.family
+            ),
+            architecture_family=(
+                supplied.architecture_family
+                or metadata.get("architecture_family")
+                or metadata.get("architecture_type")
+                or metadata.get("model_family")
+                or job.packing.family
+            ),
+        )
+        generic_architectures = {"unknown", "generic", "mlevolve-script", "mlevolve-candidate"}
+        if identity.architecture_key in generic_architectures:
+            identity.architecture_key = None
+        if identity.architecture_family in generic_architectures:
+            identity.architecture_family = None
+        return identity
+
+    @staticmethod
+    def _identities_match(left: WorkloadIdentity, right: WorkloadIdentity) -> bool:
+        return left.to_dict() == right.to_dict()
+
+    @staticmethod
+    def _replay_slot(job: TrainingJob, target_width: int | None = None) -> int | None:
+        raw_slot = job.metadata.get("placement_replay_slot")
+        if raw_slot is None:
+            return None
+        try:
+            slot = int(raw_slot)
+        except (TypeError, ValueError):
+            return None
+        if slot < 0 or (target_width is not None and slot >= target_width):
+            return None
+        return slot
+
+    def _placement_profile_snapshot(
+        self,
+        job: TrainingJob,
+        *,
+        backend_name: str,
+        batch_size: int,
+    ) -> PlacementProfileSnapshot | None:
+        total_epochs = job.max_epochs or job.config.max_epochs
+        try:
+            planned_epochs = int(total_epochs) if total_epochs is not None else 0
+        except (TypeError, ValueError):
+            return None
+        if planned_epochs <= 0:
+            return None
+        options = self.planner.estimator.estimate_batch_options(
+            job,
+            backend_name,
+            [max(1, int(batch_size))],
+        )
+        if not options:
+            return None
+        option = options[0]
+        snapshot = PlacementProfileSnapshot(
+            batch_size=option.batch_size,
+            total_training_seconds=float(option.seconds_per_epoch) * planned_epochs,
+            avg_vram_mb=float(option.avg_vram_mb),
+            source=str(option.source),
+            confidence=option.confidence,
+        )
+        if not (
+            isfinite(snapshot.total_training_seconds)
+            and snapshot.total_training_seconds > 0
+            and isfinite(snapshot.avg_vram_mb)
+            and snapshot.avg_vram_mb > 0
+        ):
+            return None
+        source = snapshot.source.lower().replace("-", "_")
+        if (
+            "out_of_distribution" in source
+            or source == "ood"
+            or source.startswith("ood_")
+            or source.endswith("_ood")
+            or "invalid" in source
+            or "missing" in source
+        ):
+            return None
+        if (
+            snapshot.confidence is None
+            or snapshot.confidence
+            < self.settings.gpu_scheduler.profiling.reuse_profile_if_confidence_ge
+        ):
+            return None
+        return snapshot
+
+    def _profile_change(
+        self,
+        reference: PlacementProfileSnapshot,
+        candidate: PlacementProfileSnapshot,
+    ) -> tuple[bool, dict[str, float]]:
+        runtime_ratio = max(reference.total_training_seconds, candidate.total_training_seconds) / max(
+            1e-9,
+            min(reference.total_training_seconds, candidate.total_training_seconds),
+        )
+        vram_ratio = max(reference.avg_vram_mb, candidate.avg_vram_mb) / max(
+            1e-9,
+            min(reference.avg_vram_mb, candidate.avg_vram_mb),
+        )
+        settings = self.settings.gpu_scheduler.colocation.decision_replay
+        significant = (
+            runtime_ratio >= 1.0 + settings.training_time_change_fraction
+            or vram_ratio >= 1.0 + settings.vram_change_fraction
+        )
+        return significant, {
+            "training_time_ratio": runtime_ratio,
+            "vram_ratio": vram_ratio,
+        }
+
+    def _build_pattern_observation(
+        self,
+        jobs: list[TrainingJob],
+        *,
+        target_width: int,
+        backend_name: str,
+        reason: str,
+    ) -> PlacementPatternObservation | None:
+        replay_settings = self.settings.gpu_scheduler.colocation.decision_replay
+        if not replay_settings.enabled or not jobs or target_width < 1:
+            return None
+        ordered = sorted(
+            jobs,
+            key=lambda job: (
+                self._replay_slot(job) if self._replay_slot(job) is not None else 1_000_000,
+                job.queue_sequence,
+                job.job_id,
+            ),
+        )[:target_width]
+        if len(ordered) != target_width:
+            return None
+        identity = self._workload_identity(ordered[0])
+        if not identity.replay_eligible:
+            return None
+        if any(not self._identities_match(identity, self._workload_identity(job)) for job in ordered[1:]):
+            return None
+        stable_backend = "exclusive" if target_width == 1 else str(backend_name)
+        profiles: list[PlacementProfileSnapshot] = []
+        for job in ordered:
+            profile = self._placement_profile_snapshot(
+                job,
+                backend_name=stable_backend,
+                batch_size=BatchResolution.resolved_batch_size(job),
+            )
+            if profile is None:
+                return None
+            profiles.append(profile)
+        return PlacementPatternObservation(
+            identity=identity,
+            hardware_key=self.store.hardware_key(),
+            scheduler_mode=self.settings.gpu_scheduler.mode,
+            target_width=target_width,
+            backend_name=stable_backend,
+            slot_profiles=profiles,
+            member_job_ids=tuple(job.job_id for job in ordered),
+            reason=reason,
+        )
+
+    def _observations_match(
+        self,
+        left: PlacementPatternObservation,
+        right: PlacementPatternObservation,
+    ) -> bool:
+        if (
+            not self._identities_match(left.identity, right.identity)
+            or left.hardware_key != right.hardware_key
+            or left.scheduler_mode != right.scheduler_mode
+            or left.target_width != right.target_width
+            or left.backend_name != right.backend_name
+            or len(left.slot_profiles) != len(right.slot_profiles)
+        ):
+            return False
+        return all(
+            not self._profile_change(reference, candidate)[0]
+            for reference, candidate in zip(left.slot_profiles, right.slot_profiles, strict=True)
+        )
+
+    def _activate_replay_template(self) -> None:
+        observations = self._placement_replay.observations
+        required = self.settings.gpu_scheduler.colocation.decision_replay.min_stable_observations
+        if len(observations) < required:
+            return
+        selected = observations[-required:]
+        first = selected[0]
+        slot_profiles: list[PlacementProfileSnapshot] = []
+        for index in range(first.target_width):
+            samples = [observation.slot_profiles[index] for observation in selected]
+            confidences = [sample.confidence for sample in samples if sample.confidence is not None]
+            slot_profiles.append(
+                PlacementProfileSnapshot(
+                    batch_size=max(1, int(round(median(sample.batch_size for sample in samples)))),
+                    total_training_seconds=float(median(sample.total_training_seconds for sample in samples)),
+                    avg_vram_mb=float(fmean(sample.avg_vram_mb for sample in samples)),
+                    source="placement_replay_reference",
+                    confidence=min(confidences) if confidences else None,
+                )
+            )
+        self._placement_replay.template = PlacementReplayTemplate(
+            identity=first.identity,
+            hardware_key=first.hardware_key,
+            scheduler_mode=first.scheduler_mode,
+            target_width=first.target_width,
+            backend_name=first.backend_name,
+            slot_profiles=slot_profiles,
+            observation_count=len(selected),
+        )
+        self._placement_replay.pending_observation = None
+        self._persist_scheduler_decision_state()
+        self.event_logger.emit(
+            "placement_replay_activated",
+            payload=self._placement_replay.template.to_dict(),
+        )
+
+    def _record_pattern_observation(self, observation: PlacementPatternObservation | None) -> None:
+        if observation is None or self._placement_replay.template is not None:
+            return
+        if any(
+            previous.member_fingerprint == observation.member_fingerprint
+            for previous in self._placement_replay.observations
+        ):
+            return
+        if (
+            self._placement_replay.observations
+            and not self._observations_match(self._placement_replay.observations[-1], observation)
+        ):
+            self._placement_replay.observations = []
+        self._placement_replay.observations.append(observation)
+        required = self.settings.gpu_scheduler.colocation.decision_replay.min_stable_observations
+        self._placement_replay.observations = self._placement_replay.observations[-required:]
+        self._persist_scheduler_decision_state()
+        self.event_logger.emit(
+            "placement_pattern_observed",
+            payload={
+                **observation.to_dict(),
+                "observation_count": len(self._placement_replay.observations),
+                "required_observations": required,
+            },
+        )
+        self._activate_replay_template()
+
+    def _stage_successful_pattern(self, jobs: list[TrainingJob], *, backend_name: str) -> None:
+        observation = self._build_pattern_observation(
+            jobs,
+            target_width=len(jobs),
+            backend_name=backend_name,
+            reason="verified_colocation_accepted",
+        )
+        if observation is None:
+            return
+        pending = self._placement_replay.pending_observation
+        if pending is not None:
+            pending_members = set(pending.member_job_ids)
+            new_members = set(observation.member_job_ids)
+            if (
+                self._identities_match(pending.identity, observation.identity)
+                and pending.backend_name == observation.backend_name
+                and pending_members.issubset(new_members)
+                and observation.target_width >= pending.target_width
+            ):
+                self._placement_replay.pending_observation = observation
+            else:
+                self._record_pattern_observation(pending)
+                self._placement_replay.pending_observation = observation
+        else:
+            self._placement_replay.pending_observation = observation
+        cap = self.settings.gpu_scheduler.parallel_job_cap
+        if cap is not None and observation.target_width >= cap:
+            self._placement_replay.pending_observation = None
+            self._record_pattern_observation(observation)
+        else:
+            self._persist_scheduler_decision_state()
+
+    def _finalize_pending_pattern(self) -> None:
+        pending = self._placement_replay.pending_observation
+        if pending is None:
+            return
+        active_ids = set(self._supervisor_active_job_ids())
+        if set(pending.member_job_ids).issubset(active_ids):
+            return
+        self._placement_replay.pending_observation = None
+        self._record_pattern_observation(pending)
+
+    def _clear_replay_job_metadata(self, job: TrainingJob) -> None:
+        self.store.update_job(
+            job.job_id,
+            metadata_updates={
+                "placement_replay": False,
+                "placement_replay_slot": None,
+                "placement_replay_target_width": None,
+                "skip_active_scheduler_probes": False,
+            },
+        )
+
+    def _invalidate_placement_replay(
+        self,
+        *,
+        reason: str,
+        job: TrainingJob | None = None,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        previous = self._placement_replay.template
+        had_learning_state = bool(self._placement_replay.observations or self._placement_replay.pending_observation)
+        if previous is None and not had_learning_state:
+            return
+        self._placement_replay.template = None
+        self._placement_replay.observations = []
+        self._placement_replay.pending_observation = None
+        if job is not None and job.metadata.get("skip_active_scheduler_probes"):
+            self._clear_replay_job_metadata(job)
+        self._persist_scheduler_decision_state()
+        self.event_logger.emit(
+            "placement_replay_invalidated",
+            job_id=job.job_id if job is not None else None,
+            payload={
+                "reason": reason,
+                "previous_template": previous.to_dict() if previous else None,
+                **(details or {}),
+            },
+        )
+
+    def _choose_placement_replay_plan(
+        self,
+        runnable: list[TrainingJob],
+        *,
+        active_jobs: list[TrainingJob],
+        backend_available: dict[str, bool],
+    ) -> tuple[bool, DispatchPlan | None]:
+        if not self.settings.gpu_scheduler.colocation.decision_replay.enabled:
+            return False, None
+        template = self._placement_replay.template
+        ordered = RunnableJobQueue(policy=self.policy, jobs=runnable).ordered()
+        if not ordered:
+            return (template is not None), None
+        candidate = ordered[0]
+        candidate_identity = self._workload_identity(candidate)
+        if template is None:
+            learning_reference = (
+                self._placement_replay.pending_observation
+                or (self._placement_replay.observations[-1] if self._placement_replay.observations else None)
+            )
+            if learning_reference is not None and (
+                not self._identities_match(learning_reference.identity, candidate_identity)
+                or learning_reference.hardware_key != self.store.hardware_key()
+                or learning_reference.scheduler_mode != self.settings.gpu_scheduler.mode
+            ):
+                self._invalidate_placement_replay(
+                    reason="placement learning scope changed",
+                    job=candidate,
+                    details={"new_identity": candidate_identity.to_dict()},
+                )
+            return False, None
+        if (
+            template.hardware_key != self.store.hardware_key()
+            or template.scheduler_mode != self.settings.gpu_scheduler.mode
+        ):
+            self._invalidate_placement_replay(
+                reason="hardware or scheduler mode changed",
+                job=candidate,
+                details={
+                    "hardware_key": self.store.hardware_key(),
+                    "scheduler_mode": self.settings.gpu_scheduler.mode,
+                },
+            )
+            return False, None
+        if not self._identities_match(template.identity, candidate_identity):
+            self._invalidate_placement_replay(
+                reason="workload identity changed",
+                job=candidate,
+                details={"new_identity": candidate_identity.to_dict()},
+            )
+            return False, None
+
+        if template.target_width < 1 or len(template.slot_profiles) != template.target_width:
+            self._invalidate_placement_replay(reason="invalid cached template", job=candidate)
+            return False, None
+        configured_cap = self.settings.gpu_scheduler.parallel_job_cap
+        if configured_cap is not None and template.target_width > configured_cap:
+            self._invalidate_placement_replay(reason="parallel cap changed", job=candidate)
+            return False, None
+        if active_jobs and any(
+            not self._identities_match(template.identity, self._workload_identity(job))
+            for job in active_jobs
+        ):
+            return True, None
+        if active_jobs and any(
+            str(job.metadata.get("placement_backend") or "exclusive") != template.backend_name
+            for job in active_jobs
+        ):
+            return True, None
+        if len(active_jobs) >= template.target_width:
+            return True, None
+        if template.target_width > 1 and not self._admission_gate.is_open:
+            return True, None
+        if not backend_available.get(template.backend_name, template.backend_name == "exclusive"):
+            self._invalidate_placement_replay(
+                reason="cached backend is unavailable",
+                job=candidate,
+                details={"backend_name": template.backend_name},
+            )
+            return False, None
+
+        assigned_slots = [self._replay_slot(job, template.target_width) for job in active_jobs]
+        occupied_slots = {slot for slot in assigned_slots if slot is not None}
+        unassigned_members = sum(
+            1
+            for slot in assigned_slots
+            if slot is None
+        )
+        for fallback_slot in (
+            index for index in range(template.target_width) if index not in occupied_slots
+        ):
+            if unassigned_members <= 0:
+                break
+            occupied_slots.add(fallback_slot)
+            unassigned_members -= 1
+        slot_index = next(
+            (index for index in range(template.target_width) if index not in occupied_slots),
+            None,
+        )
+        if slot_index is None:
+            return True, None
+        reference = template.slot_profiles[slot_index]
+        try:
+            supported_batches = self.planner.candidate_generator.candidate_batch_sizes(
+                candidate,
+                scheduler_mode=SCHEDULER_MODE_PARALLEL_TIME_AWARE,
+            )
+        except ValueError:
+            supported_batches = []
+        if reference.batch_size not in supported_batches:
+            self._invalidate_placement_replay(
+                reason="cached batch size is unsupported",
+                job=candidate,
+                details={"slot": slot_index, "batch_size": reference.batch_size},
+            )
+            return False, None
+        profile = self._placement_profile_snapshot(
+            candidate,
+            backend_name=template.backend_name,
+            batch_size=reference.batch_size,
+        )
+        if profile is None:
+            self._invalidate_placement_replay(reason="trusted predictor profile unavailable", job=candidate)
+            return False, None
+        significant, ratios = self._profile_change(reference, profile)
+        if significant:
+            self._invalidate_placement_replay(
+                reason="training-time or VRAM profile changed",
+                job=candidate,
+                details={"slot": slot_index, **ratios},
+            )
+            return False, None
+
+        if template.target_width > 1:
+            if not self.planner.compatibility.pack_eligible(candidate, backend_name=template.backend_name):
+                self._invalidate_placement_replay(reason="candidate is not pack eligible", job=candidate)
+                return False, None
+            if not self.planner.compatibility.compatible_group(
+                [*active_jobs, candidate],
+                backend_name=template.backend_name,
+            ):
+                self._invalidate_placement_replay(reason="known incompatibility or cooldown", job=candidate)
+                return False, None
+        predicted_vram_mb = profile.avg_vram_mb
+        for active_index, active_job in enumerate(active_jobs):
+            active_slot = self._replay_slot(active_job, template.target_width)
+            if active_slot is None:
+                active_slot = active_index
+            active_slot = min(max(0, active_slot), template.target_width - 1)
+            active_profile = self._placement_profile_snapshot(
+                active_job,
+                backend_name=template.backend_name,
+                batch_size=template.slot_profiles[active_slot].batch_size,
+            )
+            if active_profile is None:
+                self._invalidate_placement_replay(reason="active member profile unavailable", job=candidate)
+                return False, None
+            predicted_vram_mb += active_profile.avg_vram_mb
+        if predicted_vram_mb > self.planner.estimator.safe_budget_mb() + 1e-9:
+            self._invalidate_placement_replay(
+                reason="predicted aggregate VRAM exceeds budget",
+                job=candidate,
+                details={"predicted_vram_mb": predicted_vram_mb},
+            )
+            return False, None
+
+        return True, DispatchPlan(
+            mode=(
+                "exclusive"
+                if template.target_width == 1
+                else "concurrent_group" if active_jobs else "stack_anchor"
+            ),
+            backend_name=template.backend_name,
+            job_ids=(candidate.job_id,),
+            reason=f"replayed stable placement width {template.target_width}",
+            batch_overrides={candidate.job_id: reference.batch_size},
+            objective_breakdown={
+                "placement_replay": True,
+                "placement_replay_slot": slot_index,
+                "placement_replay_target_width": template.target_width,
+                "profile_ratios": ratios,
+                "predicted_group_vram_mb": predicted_vram_mb,
+                "requires_live_trial": False,
+            },
+            objective_version=self.settings.gpu_scheduler.objective.objective_version,
+        )
 
     def _activate_colocation_stall(
         self,
@@ -1540,6 +2240,8 @@ class SchedulerService:
             decision = {**trial.to_dict(), "decision": "accepted", "reason": reason, "result": payload}
             self.store.update_job(candidate.job_id, metadata_updates={"colocation_trial": decision})
             self.event_logger.emit("colocation_trial_accepted", job_id=candidate.job_id, payload=payload)
+            if result is not None and gain + 1e-9 >= self.settings.gpu_scheduler.colocation.min_gain:
+                self._stage_successful_pattern(all_jobs, backend_name=trial.backend_name)
             self._colocation_trial = None
             self._persist_scheduler_decision_state()
             return
@@ -1558,6 +2260,15 @@ class SchedulerService:
         )
         self.event_logger.emit("colocation_trial_rejected", job_id=candidate.job_id, payload=payload)
         if result is not None:
+            self._placement_replay.pending_observation = None
+            self._record_pattern_observation(
+                self._build_pattern_observation(
+                    current_preexisting,
+                    target_width=len(current_preexisting),
+                    backend_name=trial.backend_name,
+                    reason="verified_addition_rejected",
+                )
+            )
             self._activate_colocation_stall(
                 preexisting_job_ids=trial.preexisting_job_ids,
                 candidate_job_id=candidate.job_id,
@@ -1717,6 +2428,24 @@ class SchedulerService:
                 )
                 for job in selected_jobs
             ]
+        replayed = bool(plan.objective_breakdown.get("placement_replay"))
+        if replayed:
+            replay_slot = int(plan.objective_breakdown.get("placement_replay_slot", 0))
+            replay_width = int(plan.objective_breakdown.get("placement_replay_target_width", 1))
+            persisted_jobs: list[TrainingJob] = []
+            for job in selected_jobs:
+                updated = job.copy(
+                    metadata={
+                        **job.metadata,
+                        "placement_replay": True,
+                        "placement_replay_slot": replay_slot,
+                        "placement_replay_target_width": replay_width,
+                        "skip_active_scheduler_probes": True,
+                    }
+                )
+                self.store.save_job(updated)
+                persisted_jobs.append(updated)
+            selected_jobs = persisted_jobs
         for job in selected_jobs:
             self._preload_job_baseline(job)
 
@@ -1732,6 +2461,14 @@ class SchedulerService:
             )
         except Exception as exc:
             self._cancel_prepared_colocation_trial(prepared_trial, reason="trial dispatch failed")
+            if replayed:
+                self._invalidate_placement_replay(
+                    reason="replayed backend dispatch failed",
+                    job=selected_jobs[0] if selected_jobs else None,
+                    details={"backend_name": plan.backend_name, "error": str(exc)},
+                )
+                self.logger.warning("Replayed dispatch failed for job %s: %s", plan.job_ids[0], exc)
+                return False
             self.logger.warning("Dispatch failed for jobs %s: %s", ",".join(plan.job_ids), exc)
             if plan.backend_name != "exclusive" and selected_jobs and not self._active_runs:
                 fallback_job = selected_jobs[0]
@@ -1781,6 +2518,12 @@ class SchedulerService:
             return False
         if not dispatched.can_run:
             self._cancel_prepared_colocation_trial(prepared_trial, reason=dispatched.reason)
+            if replayed:
+                self._invalidate_placement_replay(
+                    reason="replayed dispatch was rejected",
+                    job=selected_jobs[0] if selected_jobs else None,
+                    details={"backend_name": plan.backend_name, "error": dispatched.reason},
+                )
             self.logger.info(
                 "Skipping dispatch for %s: %s",
                 ",".join(plan.job_ids),
@@ -1814,6 +2557,29 @@ class SchedulerService:
                 "colocation_trial_started",
                 job_id=prepared_trial.candidate_job_id,
                 payload=prepared_trial.to_dict(),
+            )
+
+        if replayed:
+            self._placement_replay.suppressed_probes += 1
+            self._placement_replay.suppressed_trials += 1
+            self._placement_replay.suppressed_decisions += 1
+            self._persist_scheduler_decision_state()
+            replay_job = selected_jobs[0] if selected_jobs else None
+            self.event_logger.emit(
+                "placement_replayed",
+                job_id=replay_job.job_id if replay_job else None,
+                payload={
+                    "backend_name": plan.backend_name,
+                    "mode": plan.mode,
+                    "slot": plan.objective_breakdown.get("placement_replay_slot"),
+                    "target_width": plan.objective_breakdown.get("placement_replay_target_width"),
+                    "batch_size": (
+                        plan.batch_overrides.get(replay_job.job_id)
+                        if replay_job is not None
+                        else None
+                    ),
+                    "skipped": ["batch_probe", "runtime_probe", "colocation_trial", "gain_scoring"],
+                },
             )
 
         for index, job in enumerate(selected_jobs):
@@ -1928,6 +2694,24 @@ class SchedulerService:
             runnable = [job for job in self._runnable_jobs() if job.job_id not in active_job_ids]
             if not runnable:
                 return
+            active_jobs = self._active_jobs()
+            backend_available = self.supervisor.available_backends()
+            replay_handled, replay_plan = self._choose_placement_replay_plan(
+                runnable,
+                active_jobs=active_jobs,
+                backend_available=backend_available,
+            )
+            if replay_handled:
+                if replay_plan is None:
+                    return
+                replay_dispatched = self._dispatch_plan(replay_plan)
+                if not replay_dispatched:
+                    if self._placement_replay.template is None:
+                        continue
+                    return
+                if replay_plan.backend_name == "exclusive":
+                    return
+                continue
             if scheduler_mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE and self.settings.gpu_scheduler.exclusive_probe.enabled:
                 probes = [job for job in runnable if job.scheduling_class == SchedulingClass.EXCLUSIVE_PROBE]
                 if self._exclusive_probe_job_id is None and probes:
@@ -1955,10 +2739,9 @@ class SchedulerService:
                         continue
                     runnable = [reserved]
             active_vram_mb = self._active_vram_occupancy()
-            active_jobs = self._active_jobs()
             plan = self.planner.choose_plan(
                 runnable,
-                backend_available=self.supervisor.available_backends(),
+                backend_available=backend_available,
                 active_vram_mb=active_vram_mb,
                 active_jobs=active_jobs,
                 admission_open=self._admission_gate.is_open,
@@ -1984,6 +2767,8 @@ class SchedulerService:
             "packing_admission_stalled": self._colocation_stall is not None,
             "colocation_stall": self._colocation_stall.to_dict() if self._colocation_stall else None,
             "colocation_trial": self._colocation_trial.to_dict() if self._colocation_trial else None,
+            "placement_replay_active": self._placement_replay.template is not None,
+            "placement_replay": self._placement_replay.to_dict(),
         }
 
     def cache_stats(self) -> dict[str, Any]:

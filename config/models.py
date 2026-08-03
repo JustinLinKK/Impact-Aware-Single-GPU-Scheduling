@@ -164,6 +164,37 @@ class BatchOptionSettings:
 
 
 @dataclass(slots=True)
+class DecisionReplaySettings:
+    enabled: bool = True
+    min_stable_observations: int = 3
+    training_time_change_fraction: float = 0.25
+    vram_change_fraction: float = 0.25
+
+    def __post_init__(self) -> None:
+        self.min_stable_observations = int(self.min_stable_observations)
+        self.training_time_change_fraction = float(self.training_time_change_fraction)
+        self.vram_change_fraction = float(self.vram_change_fraction)
+        if self.min_stable_observations < 1:
+            raise ValueError("colocation.decision_replay.min_stable_observations must be at least 1")
+        if self.training_time_change_fraction <= 0:
+            raise ValueError("colocation.decision_replay.training_time_change_fraction must be positive")
+        if self.vram_change_fraction <= 0:
+            raise ValueError("colocation.decision_replay.vram_change_fraction must be positive")
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "DecisionReplaySettings":
+        return cls(**dict(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "min_stable_observations": self.min_stable_observations,
+            "training_time_change_fraction": self.training_time_change_fraction,
+            "vram_change_fraction": self.vram_change_fraction,
+        }
+
+
+@dataclass(slots=True)
 class ColocationSettings:
     min_gain: float = 1.0
     trial_epochs: int = 2
@@ -173,6 +204,7 @@ class ColocationSettings:
     profile_rejection_min_bad_trials: int = 2
     profile_rejection_ttl_seconds: float = 86400.0
     live_trial_enabled: bool = True
+    decision_replay: DecisionReplaySettings = field(default_factory=DecisionReplaySettings)
 
     def __post_init__(self) -> None:
         self.min_gain = float(self.min_gain)
@@ -182,6 +214,10 @@ class ColocationSettings:
         self.trial_evidence_timeout_max_seconds = float(self.trial_evidence_timeout_max_seconds)
         self.profile_rejection_min_bad_trials = int(self.profile_rejection_min_bad_trials)
         self.profile_rejection_ttl_seconds = float(self.profile_rejection_ttl_seconds)
+        if self.decision_replay is None:
+            self.decision_replay = DecisionReplaySettings()
+        if isinstance(self.decision_replay, dict):
+            self.decision_replay = DecisionReplaySettings.from_dict(self.decision_replay)
         if self.min_gain <= 0:
             raise ValueError("colocation.min_gain must be positive")
         if self.trial_epochs < 1:
@@ -213,6 +249,7 @@ class ColocationSettings:
             "profile_rejection_min_bad_trials": self.profile_rejection_min_bad_trials,
             "profile_rejection_ttl_seconds": self.profile_rejection_ttl_seconds,
             "live_trial_enabled": self.live_trial_enabled,
+            "decision_replay": self.decision_replay.to_dict(),
         }
 
 

@@ -118,6 +118,8 @@ def _is_raw_script_job(job: TrainingJob) -> bool:
 
 
 def _requires_probe(job: TrainingJob) -> bool:
+    if bool(job.metadata.get("skip_active_scheduler_probes")):
+        return False
     backend_name = str(job.metadata.get("placement_backend", ""))
     return job.resource_requirements.requires_gpu and job.batch_probe.enabled and backend_name == "exclusive"
 

@@ -1,7 +1,14 @@
 """Reusable local ML job scheduler with GPU-aware single-node execution."""
 
 from .client import SchedulerClient
-from .config import BaselineCacheSettings, EarlyStoppingSettings, GpuSchedulerSettings, HardwareFeatureDBSettings, SchedulerConfig
+from .config import (
+    BaselineCacheSettings,
+    DecisionReplaySettings,
+    EarlyStoppingSettings,
+    GpuSchedulerSettings,
+    HardwareFeatureDBSettings,
+    SchedulerConfig,
+)
 from .dto import JobCommandRequest, JobQuery, PreloadRequest, ReportQuery, SubmitJobRequest
 from .domain import (
     BatchProbeProfile,
@@ -21,6 +28,7 @@ from .domain import (
     RuntimeProfile,
     SchedulingClass,
     TrainingJob,
+    WorkloadIdentity,
 )
 from .engine import SchedulerEngine
 
@@ -30,6 +38,7 @@ __all__ = [
     "BatchProbeTrialResult",
     "CacheStats",
     "CheckpointPolicy",
+    "DecisionReplaySettings",
     "EarlyStoppingSettings",
     "JobConfig",
     "JobCommandRequest",
@@ -54,4 +63,5 @@ __all__ = [
     "SchedulerEngine",
     "SubmitJobRequest",
     "TrainingJob",
+    "WorkloadIdentity",
 ]
