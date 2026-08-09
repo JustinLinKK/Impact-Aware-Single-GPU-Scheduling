@@ -11,10 +11,17 @@ from unittest.mock import MagicMock, patch
 
 from localml_scheduler.client import SchedulerClient
 from localml_scheduler.config import SchedulerConfig
-from localml_scheduler.domain import BatchProbeProfile, BatchProbeSpec, PackingSpec, RuntimeProfile, SoloProfile, TrainingJob
+from localml_scheduler.domain import (
+    BatchProbeProfile,
+    BatchProbeSpec,
+    PackingSpec,
+    RuntimeProfile,
+    SoloProfile,
+    TrainingJob,
+)
 from localml_scheduler.hardware import HardwareProfile
 from localml_scheduler.mcp_server import build_mcp_server
-from localml_scheduler.storage import LegacySQLiteStateStore
+from localml_scheduler.storage import SQLiteStateStore
 from localml_scheduler.storage.models import SCHEMA_STATEMENTS
 from localml_scheduler.storage.neo4j_store import Neo4jStateStore
 from localml_scheduler.storage.state_store import StateStore
@@ -71,7 +78,9 @@ class _FakeNeo4jSession:
     def __exit__(self, exc_type, exc, tb) -> bool:
         return False
 
-    def run(self, cypher: str, params: dict[str, object] | None = None) -> _FakeNeo4jResult:
+    def run(
+        self, cypher: str, params: dict[str, object] | None = None
+    ) -> _FakeNeo4jResult:
         return _FakeNeo4jResult(self.driver.handle(cypher, params or {}))
 
 
@@ -99,10 +108,22 @@ class _FakeNeo4jDriver:
 
         if normalized == "MATCH (j:Job) RETURN count(j) AS value":
             return [{"value": len(self.jobs)}]
-        if normalized == "MATCH (j:Job) RETURN coalesce(max(j.queue_sequence), 0) + 1 AS value":
-            next_value = max((int(job.get("queue_sequence") or 0) for job in self.jobs.values()), default=0) + 1
+        if (
+            normalized
+            == "MATCH (j:Job) RETURN coalesce(max(j.queue_sequence), 0) + 1 AS value"
+        ):
+            next_value = (
+                max(
+                    (int(job.get("queue_sequence") or 0) for job in self.jobs.values()),
+                    default=0,
+                )
+                + 1
+            )
             return [{"value": next_value}]
-        if "MERGE (s:Sequence {name: $name})" in normalized and "RETURN s.value AS value" in normalized:
+        if (
+            "MERGE (s:Sequence {name: $name})" in normalized
+            and "RETURN s.value AS value" in normalized
+        ):
             name = str(params["name"])
             next_value = self.sequences.get(name, 0) + 1
             self.sequences[name] = next_value
@@ -110,10 +131,15 @@ class _FakeNeo4jDriver:
         if normalized == "MERGE (j:Job {job_id: $job_id}) SET j += $props":
             self.jobs[str(params["job_id"])] = dict(params["props"])
             return []
-        if normalized == "MATCH (j:Job {job_id: $job_id}) RETURN j.payload_json AS payload_json":
+        if (
+            normalized
+            == "MATCH (j:Job {job_id: $job_id}) RETURN j.payload_json AS payload_json"
+        ):
             job = self.jobs.get(str(params["job_id"]))
             return [{"payload_json": job["payload_json"]}] if job else []
-        if normalized.startswith("MATCH (j:Job) WHERE j.status IN $statuses RETURN j.payload_json AS payload_json"):
+        if normalized.startswith(
+            "MATCH (j:Job) WHERE j.status IN $statuses RETURN j.payload_json AS payload_json"
+        ):
             statuses = {str(item) for item in params["statuses"]}
             rows = [
                 {"payload_json": job["payload_json"]}
@@ -126,7 +152,9 @@ class _FakeNeo4jDriver:
         if normalized == "MERGE (c:Command {command_id: $command_id}) SET c += $props":
             self.commands[int(params["command_id"])] = dict(params["props"])
             return []
-        if normalized.startswith("MATCH (c:Command) WHERE c.processed_at IS NULL RETURN c.command_id AS command_id"):
+        if normalized.startswith(
+            "MATCH (c:Command) WHERE c.processed_at IS NULL RETURN c.command_id AS command_id"
+        ):
             rows = [
                 {
                     "command_id": command["command_id"],
@@ -136,11 +164,15 @@ class _FakeNeo4jDriver:
                     "created_at": command["created_at"],
                     "processed_at": command["processed_at"],
                 }
-                for command in sorted(self.commands.values(), key=lambda item: int(item["command_id"]))
+                for command in sorted(
+                    self.commands.values(), key=lambda item: int(item["command_id"])
+                )
                 if not command.get("processed_at")
             ]
             return rows[: int(params["limit"])]
-        if normalized.startswith("MATCH (c:Command {command_id: $command_id}) SET c.processed_at = $processed_at"):
+        if normalized.startswith(
+            "MATCH (c:Command {command_id: $command_id}) SET c.processed_at = $processed_at"
+        ):
             command = self.commands.get(int(params["command_id"]))
             if command is not None:
                 command["processed_at"] = params["processed_at"]
@@ -151,10 +183,18 @@ class _FakeNeo4jDriver:
             return []
         if normalized.startswith("MATCH (e:Event) WHERE 1 = 1"):
             rows = []
-            for event in sorted(self.events.values(), key=lambda item: int(item["event_id"])):
-                if params.get("job_id") is not None and event.get("job_id") != params["job_id"]:
+            for event in sorted(
+                self.events.values(), key=lambda item: int(item["event_id"])
+            ):
+                if (
+                    params.get("job_id") is not None
+                    and event.get("job_id") != params["job_id"]
+                ):
                     continue
-                if params.get("event_type") is not None and event.get("event_type") != params["event_type"]:
+                if (
+                    params.get("event_type") is not None
+                    and event.get("event_type") != params["event_type"]
+                ):
                     continue
                 rows.append(
                     {
@@ -166,18 +206,33 @@ class _FakeNeo4jDriver:
                     }
                 )
             return rows
-        if normalized == "MERGE (p:BatchProbeProfile {probe_key: $probe_key}) SET p += $props":
+        if (
+            normalized
+            == "MERGE (p:BatchProbeProfile {probe_key: $probe_key}) SET p += $props"
+        ):
             self.batch_probe_profiles[str(params["probe_key"])] = dict(params["props"])
             return []
-        if normalized == "MATCH (p:BatchProbeProfile {probe_key: $probe_key}) RETURN properties(p) AS row LIMIT 1":
+        if (
+            normalized
+            == "MATCH (p:BatchProbeProfile {probe_key: $probe_key}) RETURN properties(p) AS row LIMIT 1"
+        ):
             profile = self.batch_probe_profiles.get(str(params["probe_key"]))
             return [{"row": dict(profile)}] if profile else []
-        if normalized.startswith("MATCH (p:BatchProbeProfile) RETURN properties(p) AS row"):
-            return [{"row": dict(profile)} for profile in self.batch_probe_profiles.values()]
-        if normalized == "MERGE (r:RuntimeProfile {profile_key: $profile_key}) SET r += $props":
+        if normalized.startswith(
+            "MATCH (p:BatchProbeProfile) RETURN properties(p) AS row"
+        ):
+            return [
+                {"row": dict(profile)} for profile in self.batch_probe_profiles.values()
+            ]
+        if (
+            normalized
+            == "MERGE (r:RuntimeProfile {profile_key: $profile_key}) SET r += $props"
+        ):
             self.runtime_profiles[str(params["profile_key"])] = dict(params["props"])
             return []
-        if normalized.startswith("MATCH (r:RuntimeProfile {signature: $signature, hardware_key: $hardware_key, backend_name: $backend_name, resolved_batch_size: $resolved_batch_size})"):
+        if normalized.startswith(
+            "MATCH (r:RuntimeProfile {signature: $signature, hardware_key: $hardware_key, backend_name: $backend_name, resolved_batch_size: $resolved_batch_size})"
+        ):
             rows = []
             for profile in self.runtime_profiles.values():
                 if profile.get("signature") != params["signature"]:
@@ -186,39 +241,74 @@ class _FakeNeo4jDriver:
                     continue
                 if profile.get("backend_name") != params["backend_name"]:
                     continue
-                if int(profile.get("resolved_batch_size") or 0) != int(params["resolved_batch_size"]):
+                if int(profile.get("resolved_batch_size") or 0) != int(
+                    params["resolved_batch_size"]
+                ):
                     continue
                 rows.append({"row": dict(profile)})
             return rows[:1]
-        if normalized.startswith("MATCH (r:RuntimeProfile) WHERE 1 = 1") and "RETURN properties(r) AS row" in normalized:
+        if (
+            normalized.startswith("MATCH (r:RuntimeProfile) WHERE 1 = 1")
+            and "RETURN properties(r) AS row" in normalized
+        ):
             rows = []
             for profile in self.runtime_profiles.values():
-                if params.get("signature") is not None and profile.get("signature") != params["signature"]:
+                if (
+                    params.get("signature") is not None
+                    and profile.get("signature") != params["signature"]
+                ):
                     continue
-                if params.get("hardware_key") is not None and profile.get("hardware_key") != params["hardware_key"]:
+                if (
+                    params.get("hardware_key") is not None
+                    and profile.get("hardware_key") != params["hardware_key"]
+                ):
                     continue
-                if params.get("backend_name") is not None and profile.get("backend_name") != params["backend_name"]:
+                if (
+                    params.get("backend_name") is not None
+                    and profile.get("backend_name") != params["backend_name"]
+                ):
                     continue
                 rows.append({"row": dict(profile)})
             return rows
-        if normalized == "MERGE (r:RunProfile {run_profile_id: $run_profile_id}) SET r += $props":
+        if (
+            normalized
+            == "MERGE (r:RunProfile {run_profile_id: $run_profile_id}) SET r += $props"
+        ):
             self.run_profiles[str(params["run_profile_id"])] = dict(params["props"])
             return []
-        if normalized.startswith("MATCH (r:RunProfile) WHERE 1 = 1") and "RETURN properties(r) AS row" in normalized:
+        if (
+            normalized.startswith("MATCH (r:RunProfile) WHERE 1 = 1")
+            and "RETURN properties(r) AS row" in normalized
+        ):
             rows = []
             for profile in self.run_profiles.values():
-                if params.get("job_id") is not None and profile.get("job_id") != params["job_id"]:
+                if (
+                    params.get("job_id") is not None
+                    and profile.get("job_id") != params["job_id"]
+                ):
                     continue
-                if params.get("model_key") is not None and profile.get("model_key") != params["model_key"]:
+                if (
+                    params.get("model_key") is not None
+                    and profile.get("model_key") != params["model_key"]
+                ):
                     continue
-                if params.get("signature") is not None and profile.get("signature") != params["signature"]:
+                if (
+                    params.get("signature") is not None
+                    and profile.get("signature") != params["signature"]
+                ):
                     continue
                 rows.append({"row": dict(profile)})
             return rows
-        if normalized == "MATCH (s:WorkloadSignature {signature: $signature}) RETURN s.model_key AS model_key LIMIT 1":
+        if (
+            normalized
+            == "MATCH (s:WorkloadSignature {signature: $signature}) RETURN s.model_key AS model_key LIMIT 1"
+        ):
             model_key = self.signatures.get(str(params["signature"]))
             return [{"model_key": model_key}] if model_key else []
-        if "MERGE (s:WorkloadSignature {signature: $signature})" in normalized and "s.model_key = $model_key" in normalized:
+        if (
+            "MERGE (s:WorkloadSignature {signature: $signature})" in normalized
+            and "s.model_key = $model_key" in normalized
+        ):
             signature = params.get("signature")
             model_key = params.get("model_key")
             if signature and model_key:
@@ -277,18 +367,22 @@ class GraphDatabaseValidationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerConfig(runtime_root=tmpdir)
             settings.graph_db.bootstrap_constraints = False
-            settings.graph_db.auto_import_legacy_sqlite = False
-            settings.graph_db.allow_legacy_fallback = False
+            settings.graph_db.import_sqlite_evidence = False
+            settings.graph_db.allow_sqlite_fallback = False
             job = TrainingJob.create(
                 "module:runner",
                 "baseline-a",
                 "/tmp/a.pt",
-                packing=PackingSpec(eligible=True, signature="sig-1", family="family-a"),
+                packing=PackingSpec(
+                    eligible=True, signature="sig-1", family="family-a"
+                ),
                 batch_probe=BatchProbeSpec(enabled=True, model_key="baseline-a"),
                 max_epochs=4,
                 runner_kwargs={"batch_size": 2},
             )
-            with patch("localml_scheduler.storage.neo4j_store.GraphDatabase", graph_database), patch(
+            with patch(
+                "localml_scheduler.storage.neo4j_store.GraphDatabase", graph_database
+            ), patch(
                 "localml_scheduler.storage.neo4j_store.detect_hardware_profile",
                 return_value=_test_hardware_profile(),
             ):
@@ -320,11 +414,22 @@ class GraphDatabaseValidationTest(unittest.TestCase):
                 store.upsert_batch_probe_profile(batch_probe)
                 store.upsert_runtime_profile(runtime_profile)
 
-                self.assertEqual(store.get_job(submitted.job_id).job_id, submitted.job_id)
+                self.assertEqual(
+                    store.get_job(submitted.job_id).job_id, submitted.job_id
+                )
                 self.assertEqual(len(store.list_jobs()), 1)
                 self.assertEqual(len(store.fetch_pending_commands()), 1)
-                self.assertEqual(len(store.list_events(job_id=submitted.job_id, event_type="job_submitted")), 1)
-                self.assertEqual(store.get_batch_probe_profile("probe-1").resolved_batch_size, 8)
+                self.assertEqual(
+                    len(
+                        store.list_events(
+                            job_id=submitted.job_id, event_type="job_submitted"
+                        )
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    store.get_batch_probe_profile("probe-1").resolved_batch_size, 8
+                )
                 self.assertEqual(
                     store.get_runtime_profile(
                         "sig-1",
@@ -335,27 +440,40 @@ class GraphDatabaseValidationTest(unittest.TestCase):
                 )
                 run_profiles = store.list_run_profiles(job_id=submitted.job_id)
                 self.assertEqual(len(run_profiles), 2)
-                self.assertEqual({profile.run_kind for profile in run_profiles}, {"batch_probe", "runtime_probe"})
+                self.assertEqual(
+                    {profile.run_kind for profile in run_profiles},
+                    {"batch_probe", "runtime_probe"},
+                )
 
                 pending = store.fetch_pending_commands()
                 store.mark_command_processed(pending[0].command_id)
                 self.assertEqual(store.fetch_pending_commands(), [])
 
-    def test_state_store_falls_back_to_legacy_sqlite_when_neo4j_boot_fails(self) -> None:
+    def test_state_store_falls_back_to_legacy_sqlite_when_neo4j_boot_fails(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerConfig(runtime_root=tmpdir)
-            settings.graph_db.allow_legacy_fallback = True
-            with patch("localml_scheduler.storage.state_store.Neo4jStateStore", side_effect=RuntimeError("boom")):
+            settings.graph_db.allow_sqlite_fallback = True
+            with patch(
+                "localml_scheduler.storage.state_store.Neo4jStateStore",
+                side_effect=RuntimeError("boom"),
+            ):
                 store = StateStore(settings)
-            self.assertIsInstance(store.backend, LegacySQLiteStateStore)
+            self.assertIsInstance(store.backend, SQLiteStateStore)
 
-    def test_state_store_uses_sqlite_primary_with_best_effort_graph_mirror(self) -> None:
+    def test_state_store_uses_sqlite_primary_with_best_effort_graph_mirror(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerConfig(runtime_root=tmpdir)
             settings.graph_db.mode = "mirror"
             settings.graph_db.enabled = True
             mirror = MagicMock()
-            with patch("localml_scheduler.storage.state_store.Neo4jStateStore", side_effect=lambda current_settings: mirror):
+            with patch(
+                "localml_scheduler.storage.state_store.Neo4jStateStore",
+                side_effect=lambda current_settings: mirror,
+            ):
                 store = StateStore(settings)
 
             job = TrainingJob.create(
@@ -378,22 +496,27 @@ class GraphDatabaseValidationTest(unittest.TestCase):
 
             store.upsert_batch_probe_profile(profile)
 
-            self.assertIsInstance(store.backend, LegacySQLiteStateStore)
+            self.assertIsInstance(store.backend, SQLiteStateStore)
             self.assertEqual(store.get_job(submitted.job_id).job_id, submitted.job_id)
             mirror.record_scheduler_job_evidence.assert_called()
             mirror.log_event.assert_not_called()
             mirror.record_batch_probe_evidence.assert_called_once()
 
-    def test_state_store_mirror_mode_degrades_to_sqlite_when_graph_unavailable(self) -> None:
+    def test_state_store_mirror_mode_degrades_to_sqlite_when_graph_unavailable(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerConfig(runtime_root=tmpdir)
             settings.graph_db.mode = "mirror"
             settings.graph_db.enabled = True
-            with patch("localml_scheduler.storage.state_store.Neo4jStateStore", side_effect=RuntimeError("boom")):
+            with patch(
+                "localml_scheduler.storage.state_store.Neo4jStateStore",
+                side_effect=RuntimeError("boom"),
+            ):
                 store = StateStore(settings)
-            self.assertIsInstance(store.backend, LegacySQLiteStateStore)
+            self.assertIsInstance(store.backend, SQLiteStateStore)
 
-    def test_legacy_sqlite_import_bootstraps_evidence_records_only(self) -> None:
+    def test_sqlite_import_bootstraps_evidence_records_only(self) -> None:
         driver = _FakeNeo4jDriver()
         graph_database = SimpleNamespace(driver=lambda uri, auth=None: driver)
         imported: dict[str, list[object]] = {
@@ -402,17 +525,22 @@ class GraphDatabaseValidationTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = os.path.join(tmpdir, "runtime")
-            legacy_path = os.path.join(tmpdir, "legacy.sqlite3")
+            sqlite_path = os.path.join(tmpdir, "scheduler.sqlite3")
             settings = SchedulerConfig(runtime_root=runtime_root)
             settings.graph_db.bootstrap_constraints = False
-            settings.graph_db.auto_import_legacy_sqlite = True
-            settings.graph_db.allow_legacy_fallback = False
-            settings.graph_db.legacy_sqlite_path = legacy_path
+            settings.graph_db.import_sqlite_evidence = True
+            settings.graph_db.allow_sqlite_fallback = False
+            settings.graph_db.sqlite_evidence_path = sqlite_path
 
-            with sqlite3.connect(legacy_path) as connection:
+            with sqlite3.connect(sqlite_path) as connection:
                 for statement in SCHEMA_STATEMENTS:
                     connection.execute(statement)
-                job = TrainingJob.create("module:runner", "baseline-a", "/tmp/a.pt", runner_kwargs={"batch_size": 2})
+                job = TrainingJob.create(
+                    "module:runner",
+                    "baseline-a",
+                    "/tmp/a.pt",
+                    runner_kwargs={"batch_size": 2},
+                )
                 connection.execute(
                     """
                     INSERT INTO jobs(job_id, status, priority, baseline_model_id, submitted_at, queue_sequence, payload_json, updated_at)
@@ -434,28 +562,58 @@ class GraphDatabaseValidationTest(unittest.TestCase):
                     INSERT INTO commands(command_id, job_id, command_type, payload_json, created_at, processed_at)
                     VALUES(?, ?, ?, ?, ?, ?)
                     """,
-                    (1, job.job_id, "submit", json.dumps({"priority": job.priority}, sort_keys=True), job.submitted_at, None),
+                    (
+                        1,
+                        job.job_id,
+                        "submit",
+                        json.dumps({"priority": job.priority}, sort_keys=True),
+                        job.submitted_at,
+                        None,
+                    ),
                 )
                 connection.execute(
                     """
                     INSERT INTO events(event_id, job_id, event_type, payload_json, created_at)
                     VALUES(?, ?, ?, ?, ?)
                     """,
-                    (1, job.job_id, "job_submitted", json.dumps({"priority": job.priority}, sort_keys=True), job.submitted_at),
+                    (
+                        1,
+                        job.job_id,
+                        "job_submitted",
+                        json.dumps({"priority": job.priority}, sort_keys=True),
+                        job.submitted_at,
+                    ),
                 )
                 connection.execute(
                     """
                     INSERT INTO checkpoints(checkpoint_id, job_id, checkpoint_path, created_at, metadata_json, is_latest)
                     VALUES(?, ?, ?, ?, ?, ?)
                     """,
-                    (1, job.job_id, "/tmp/checkpoint.pt", job.submitted_at, json.dumps({"epoch": 1}, sort_keys=True), 1),
+                    (
+                        1,
+                        job.job_id,
+                        "/tmp/checkpoint.pt",
+                        job.submitted_at,
+                        json.dumps({"epoch": 1}, sort_keys=True),
+                        1,
+                    ),
                 )
                 connection.execute(
                     """
                     INSERT INTO cache_entries(model_id, baseline_model_path, size_bytes, pinned, hits, misses, last_loaded_at, last_accessed_at, metadata_json)
                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    ("baseline-a", "/tmp/a.pt", 1024, 1, 3, 1, job.submitted_at, job.submitted_at, json.dumps({"source": "test"}, sort_keys=True)),
+                    (
+                        "baseline-a",
+                        "/tmp/a.pt",
+                        1024,
+                        1,
+                        3,
+                        1,
+                        job.submitted_at,
+                        job.submitted_at,
+                        json.dumps({"source": "test"}, sort_keys=True),
+                    ),
                 )
                 connection.commit()
 
@@ -465,10 +623,14 @@ class GraphDatabaseValidationTest(unittest.TestCase):
             def _record_batch_probe(self, profile: BatchProbeProfile) -> None:
                 imported["batch_probe"].append(profile)
 
-            with patch("localml_scheduler.storage.neo4j_store.GraphDatabase", graph_database), patch(
+            with patch(
+                "localml_scheduler.storage.neo4j_store.GraphDatabase", graph_database
+            ), patch(
                 "localml_scheduler.storage.neo4j_store.detect_hardware_profile",
                 return_value=_test_hardware_profile(),
-            ), patch.object(Neo4jStateStore, "record_scheduler_job_evidence", _record_job), patch.object(
+            ), patch.object(
+                Neo4jStateStore, "record_scheduler_job_evidence", _record_job
+            ), patch.object(
                 Neo4jStateStore, "record_batch_probe_evidence", _record_batch_probe
             ):
                 Neo4jStateStore(settings)
@@ -483,7 +645,13 @@ class GraphDatabaseValidationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerConfig(runtime_root=tmpdir)
             settings.log_db.enabled = True
-            with patch.dict(os.environ, {settings.log_db.dsn_env: "postgresql://scheduler:test@localhost/scheduler"}, clear=False), patch(
+            with patch.dict(
+                os.environ,
+                {
+                    settings.log_db.dsn_env: "postgresql://scheduler:test@localhost/scheduler"
+                },
+                clear=False,
+            ), patch(
                 "localml_scheduler.storage.log_store.psycopg",
                 fake_psycopg,
             ):
@@ -601,11 +769,19 @@ class GraphDatabaseValidationTest(unittest.TestCase):
         self.assertIsNotNone(session_id)
         self.assertTrue(store._warned)
 
-    def test_log_store_warns_but_does_not_fail_when_postgres_is_unreachable(self) -> None:
+    def test_log_store_warns_but_does_not_fail_when_postgres_is_unreachable(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerConfig(runtime_root=tmpdir)
             settings.log_db.enabled = True
-            with patch.dict(os.environ, {settings.log_db.dsn_env: "postgresql://scheduler:test@localhost/scheduler"}, clear=False), patch(
+            with patch.dict(
+                os.environ,
+                {
+                    settings.log_db.dsn_env: "postgresql://scheduler:test@localhost/scheduler"
+                },
+                clear=False,
+            ), patch(
                 "localml_scheduler.storage.log_store.psycopg",
                 _FailingPsycopg(),
             ):
@@ -627,7 +803,9 @@ class GraphDatabaseValidationTest(unittest.TestCase):
                 "module:runner",
                 "resnet50-baseline",
                 "/tmp/resnet50.pt",
-                packing=PackingSpec(eligible=True, signature="sig-resnet50", family="cnn"),
+                packing=PackingSpec(
+                    eligible=True, signature="sig-resnet50", family="cnn"
+                ),
                 batch_probe=BatchProbeSpec(enabled=True, model_key="resnet50"),
                 max_epochs=4,
                 runner_kwargs={"batch_size": 32},
@@ -700,10 +878,14 @@ class GraphDatabaseValidationTest(unittest.TestCase):
             self.assertFalse(rows["hw-other-002"]["is_current"])
 
             filtered = api.search_hardware(query="hw-other-002", limit=10)
-            self.assertEqual([row["hardware_key"] for row in filtered], ["hw-other-002"])
+            self.assertEqual(
+                [row["hardware_key"] for row in filtered], ["hw-other-002"]
+            )
             self.assertEqual(api.search_hardware(query="does-not-exist", limit=10), [])
 
-    def test_get_hardware_context_supports_current_explicit_and_missing_keys(self) -> None:
+    def test_get_hardware_context_supports_current_explicit_and_missing_keys(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             api = _sqlite_client_with_test_hardware(tmpdir)
             api.upsert_runtime_profile(
@@ -722,7 +904,10 @@ class GraphDatabaseValidationTest(unittest.TestCase):
 
             current = api.get_hardware_context()
             self.assertTrue(current["found"])
-            self.assertEqual(current["hardware"]["hardware_key"], _test_hardware_profile().hardware_key)
+            self.assertEqual(
+                current["hardware"]["hardware_key"],
+                _test_hardware_profile().hardware_key,
+            )
             self.assertIn("safe_vram_budget_mb", current["scheduler_limits"])
             self.assertIn("enabled_backends", current["backend_capabilities"])
 
@@ -782,7 +967,9 @@ class GraphDatabaseValidationTest(unittest.TestCase):
             self.assertEqual(context["matched_profiles"], [])
             self.assertFalse(context["runtime_estimate"]["found"])
             self.assertFalse(context["batch_size_recommendation"]["found"])
-            self.assertIn("no_matching_profiles_for_current_hardware", context["risk_flags"])
+            self.assertIn(
+                "no_matching_profiles_for_current_hardware", context["risk_flags"]
+            )
 
     def test_get_job_design_context_supports_model_key_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -800,7 +987,12 @@ class GraphDatabaseValidationTest(unittest.TestCase):
             )
 
             self.assertTrue(context["batch_size_recommendation"]["found"])
-            self.assertTrue(any(entry["kind"] == "batch_probe_profile" for entry in context["matched_profiles"]))
+            self.assertTrue(
+                any(
+                    entry["kind"] == "batch_probe_profile"
+                    for entry in context["matched_profiles"]
+                )
+            )
 
     def test_get_job_design_context_supports_script_signature_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -817,7 +1009,12 @@ class GraphDatabaseValidationTest(unittest.TestCase):
             )
 
             self.assertTrue(context["runtime_estimate"]["found"])
-            self.assertTrue(any(entry["match_reason"] == "signature_exact" for entry in context["matched_profiles"]))
+            self.assertTrue(
+                any(
+                    entry["match_reason"] == "signature_exact"
+                    for entry in context["matched_profiles"]
+                )
+            )
 
     def test_get_job_design_context_flags_other_hardware_only_matches(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -846,7 +1043,9 @@ class GraphDatabaseValidationTest(unittest.TestCase):
             )
 
             self.assertEqual(context["matched_profiles"], [])
-            self.assertIn("matching_profiles_exist_for_other_hardware_only", context["risk_flags"])
+            self.assertIn(
+                "matching_profiles_exist_for_other_hardware_only", context["risk_flags"]
+            )
 
     def test_get_optimization_context_returns_new_agent_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -873,8 +1072,14 @@ class GraphDatabaseValidationTest(unittest.TestCase):
             self.assertIn("exact_profiles", context["graph_evidence"])
             self.assertIn("similar_profiles", context["graph_evidence"])
             self.assertIn("packed_profiles", context["graph_evidence"])
-            self.assertIn("precision_not_optimized", context["derived_diagnosis"]["profile_symptoms"])
-            self.assertIn("enable_tensor_core", context["derived_diagnosis"]["optimization_targets"])
+            self.assertIn(
+                "precision_not_optimized",
+                context["derived_diagnosis"]["profile_symptoms"],
+            )
+            self.assertIn(
+                "enable_tensor_core",
+                context["derived_diagnosis"]["optimization_targets"],
+            )
             self.assertIn("recipes", context["vector_evidence"])
             self.assertIn("recommendations", context)
             self.assertIn("risk_flags", context)
@@ -889,26 +1094,48 @@ class GraphDatabaseValidationTest(unittest.TestCase):
             api.search_hardware(limit=10)
             api.get_hardware_context()
             api.get_job_design_context(
-                candidate={"model_key": "resnet50", "script_signature": "sig-resnet50", "proposed_batch_size": 32},
+                candidate={
+                    "model_key": "resnet50",
+                    "script_signature": "sig-resnet50",
+                    "proposed_batch_size": 32,
+                },
                 limit=5,
             )
             api.get_profile_evidence(
-                candidate={"model_key": "resnet50", "script_signature": "sig-resnet50", "proposed_batch_size": 32},
+                candidate={
+                    "model_key": "resnet50",
+                    "script_signature": "sig-resnet50",
+                    "proposed_batch_size": 32,
+                },
                 limit=5,
             )
-            api.search_code_knowledge(query="pytorch amp", filters={"framework": "pytorch"}, limit=3)
+            api.search_code_knowledge(
+                query="pytorch amp", filters={"framework": "pytorch"}, limit=3
+            )
             api.get_code_optimization_context(
-                candidate={"model_key": "resnet50", "script_signature": "sig-resnet50", "proposed_batch_size": 32},
+                candidate={
+                    "model_key": "resnet50",
+                    "script_signature": "sig-resnet50",
+                    "proposed_batch_size": 32,
+                },
                 limit=3,
             )
             api.get_optimization_context(
-                candidate={"model_key": "resnet50", "script_signature": "sig-resnet50", "proposed_batch_size": 32},
+                candidate={
+                    "model_key": "resnet50",
+                    "script_signature": "sig-resnet50",
+                    "proposed_batch_size": 32,
+                },
                 limit=3,
             )
             api.search_hardware_features(query="cuda training", limit=3)
             api.get_hardware_feature_context(workload_type="vision_training", limit=3)
             api.get_hardware_optimization_context(
-                candidate={"model_key": "resnet50", "script_signature": "sig-resnet50", "proposed_batch_size": 32},
+                candidate={
+                    "model_key": "resnet50",
+                    "script_signature": "sig-resnet50",
+                    "proposed_batch_size": 32,
+                },
                 limit=3,
             )
 

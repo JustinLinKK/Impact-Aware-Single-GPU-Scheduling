@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import hashlib
 import sys
+import tempfile
 import warnings
 
 import yaml
@@ -21,14 +23,18 @@ PREDICTION_MODE_ML_PREDICTOR = "ml_predictor"
 
 
 def normalize_prediction_mode(value: str | None) -> str:
-    normalized = str(value or PREDICTION_MODE_BRANCH_PROFILE).strip().lower().replace("-", "_")
+    normalized = (
+        str(value or PREDICTION_MODE_BRANCH_PROFILE).strip().lower().replace("-", "_")
+    )
     if normalized not in {PREDICTION_MODE_BRANCH_PROFILE, PREDICTION_MODE_ML_PREDICTOR}:
         raise ValueError(f"Unsupported prediction mode: {value}")
     return normalized
 
 
 def normalize_scheduler_mode(value: str | None) -> str:
-    normalized = str(value or SCHEDULER_MODE_PARALLEL_DEFAULT).strip().lower().replace("-", "_")
+    normalized = (
+        str(value or SCHEDULER_MODE_PARALLEL_DEFAULT).strip().lower().replace("-", "_")
+    )
     allowed = {
         SCHEDULER_MODE_SERIAL_BASIC,
         SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED,
@@ -81,8 +87,15 @@ class GpuMemorySettings:
             raise ValueError("gpu_vram_gib must be positive")
         if not 0 < self.predicted_budget_fraction <= 1:
             raise ValueError("predicted_budget_fraction must be in (0, 1]")
-        if not 0 < self.live_admission_resume_fraction < self.live_admission_stop_fraction <= 1:
-            raise ValueError("live admission fractions must satisfy 0 < resume < stop <= 1")
+        if (
+            not 0
+            < self.live_admission_resume_fraction
+            < self.live_admission_stop_fraction
+            <= 1
+        ):
+            raise ValueError(
+                "live admission fractions must satisfy 0 < resume < stop <= 1"
+            )
         if self.admission_average_window_seconds <= 0:
             raise ValueError("admission_average_window_seconds must be positive")
 
@@ -127,7 +140,11 @@ class TimeObjectiveSettings:
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "TimeObjectiveSettings":
         raw = dict(payload or {})
-        removed = sorted({"makespan_weight", "flow_time_weight", "min_aggregate_gain"}.intersection(raw))
+        removed = sorted(
+            {"makespan_weight", "flow_time_weight", "min_aggregate_gain"}.intersection(
+                raw
+            )
+        )
         if removed:
             raise ValueError(
                 "gpu_scheduler.objective no longer supports throughput scheduling controls: "
@@ -150,7 +167,9 @@ class BatchOptionSettings:
     def __post_init__(self) -> None:
         self.exponent_offsets = [int(value) for value in self.exponent_offsets]
         if len(self.exponent_offsets) != 5 or len(set(self.exponent_offsets)) != 5:
-            raise ValueError("batch_options.exponent_offsets must contain five distinct offsets")
+            raise ValueError(
+                "batch_options.exponent_offsets must contain five distinct offsets"
+            )
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "BatchOptionSettings":
@@ -175,11 +194,17 @@ class DecisionReplaySettings:
         self.training_time_change_fraction = float(self.training_time_change_fraction)
         self.vram_change_fraction = float(self.vram_change_fraction)
         if self.min_stable_observations < 1:
-            raise ValueError("colocation.decision_replay.min_stable_observations must be at least 1")
+            raise ValueError(
+                "colocation.decision_replay.min_stable_observations must be at least 1"
+            )
         if self.training_time_change_fraction <= 0:
-            raise ValueError("colocation.decision_replay.training_time_change_fraction must be positive")
+            raise ValueError(
+                "colocation.decision_replay.training_time_change_fraction must be positive"
+            )
         if self.vram_change_fraction <= 0:
-            raise ValueError("colocation.decision_replay.vram_change_fraction must be positive")
+            raise ValueError(
+                "colocation.decision_replay.vram_change_fraction must be positive"
+            )
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "DecisionReplaySettings":
@@ -204,36 +229,57 @@ class ColocationSettings:
     profile_rejection_min_bad_trials: int = 2
     profile_rejection_ttl_seconds: float = 86400.0
     live_trial_enabled: bool = True
-    decision_replay: DecisionReplaySettings = field(default_factory=DecisionReplaySettings)
+    decision_replay: DecisionReplaySettings = field(
+        default_factory=DecisionReplaySettings
+    )
 
     def __post_init__(self) -> None:
         self.min_gain = float(self.min_gain)
         self.trial_epochs = int(self.trial_epochs)
         self.trial_decision_timeout_seconds = float(self.trial_decision_timeout_seconds)
-        self.trial_evidence_timeout_min_seconds = float(self.trial_evidence_timeout_min_seconds)
-        self.trial_evidence_timeout_max_seconds = float(self.trial_evidence_timeout_max_seconds)
-        self.profile_rejection_min_bad_trials = int(self.profile_rejection_min_bad_trials)
+        self.trial_evidence_timeout_min_seconds = float(
+            self.trial_evidence_timeout_min_seconds
+        )
+        self.trial_evidence_timeout_max_seconds = float(
+            self.trial_evidence_timeout_max_seconds
+        )
+        self.profile_rejection_min_bad_trials = int(
+            self.profile_rejection_min_bad_trials
+        )
         self.profile_rejection_ttl_seconds = float(self.profile_rejection_ttl_seconds)
         if self.decision_replay is None:
             self.decision_replay = DecisionReplaySettings()
         if isinstance(self.decision_replay, dict):
-            self.decision_replay = DecisionReplaySettings.from_dict(self.decision_replay)
+            self.decision_replay = DecisionReplaySettings.from_dict(
+                self.decision_replay
+            )
         if self.min_gain <= 0:
             raise ValueError("colocation.min_gain must be positive")
         if self.trial_epochs < 1:
             raise ValueError("colocation.trial_epochs must be at least 1")
         if self.trial_decision_timeout_seconds <= 0:
-            raise ValueError("colocation.trial_decision_timeout_seconds must be positive")
+            raise ValueError(
+                "colocation.trial_decision_timeout_seconds must be positive"
+            )
         if self.trial_evidence_timeout_min_seconds <= 0:
-            raise ValueError("colocation.trial_evidence_timeout_min_seconds must be positive")
-        if self.trial_evidence_timeout_max_seconds < self.trial_evidence_timeout_min_seconds:
+            raise ValueError(
+                "colocation.trial_evidence_timeout_min_seconds must be positive"
+            )
+        if (
+            self.trial_evidence_timeout_max_seconds
+            < self.trial_evidence_timeout_min_seconds
+        ):
             raise ValueError(
                 "colocation.trial_evidence_timeout_max_seconds must be at least the minimum"
             )
         if self.profile_rejection_min_bad_trials < 1:
-            raise ValueError("colocation.profile_rejection_min_bad_trials must be at least 1")
+            raise ValueError(
+                "colocation.profile_rejection_min_bad_trials must be at least 1"
+            )
         if self.profile_rejection_ttl_seconds <= 0:
-            raise ValueError("colocation.profile_rejection_ttl_seconds must be positive")
+            raise ValueError(
+                "colocation.profile_rejection_ttl_seconds must be positive"
+            )
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "ColocationSettings":
@@ -260,7 +306,9 @@ class ExclusiveProbeSettings:
 
     def __post_init__(self) -> None:
         if self.enabled and not self.drain_without_preemption:
-            raise ValueError("exclusive probes only support non-preemptive drain semantics")
+            raise ValueError(
+                "exclusive probes only support non-preemptive drain semantics"
+            )
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "ExclusiveProbeSettings":
@@ -297,7 +345,9 @@ class EarlyStoppingSettings:
             raise ValueError("early_stopping.min_delta must be non-negative")
         self.missing_metric_policy = str(self.missing_metric_policy).strip().lower()
         if self.missing_metric_policy not in {"ignore", "error"}:
-            raise ValueError("early_stopping.missing_metric_policy must be 'ignore' or 'error'")
+            raise ValueError(
+                "early_stopping.missing_metric_policy must be 'ignore' or 'error'"
+            )
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "EarlyStoppingSettings":
@@ -435,7 +485,9 @@ class AutoPackSettings:
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "AutoPackSettings":
         raw = dict(payload or {})
-        removed_sm_controls = sorted({"target_metric", "target_sm_fraction"}.intersection(raw))
+        removed_sm_controls = sorted(
+            {"target_metric", "target_sm_fraction"}.intersection(raw)
+        )
         if removed_sm_controls:
             raise ValueError(
                 "gpu_scheduler.auto_pack is always VRAM-only and no longer supports target selection controls: "
@@ -523,7 +575,9 @@ class PredictionSettings:
 
     def __post_init__(self) -> None:
         self.mode = normalize_prediction_mode(self.mode)
-        self.conversion_timeout_seconds = max(0.1, float(self.conversion_timeout_seconds))
+        self.conversion_timeout_seconds = max(
+            0.1, float(self.conversion_timeout_seconds)
+        )
         self.cache_size = max(1, int(self.cache_size))
         if not self.test_override_enabled:
             self.test_model_path = None
@@ -539,7 +593,9 @@ class PredictionSettings:
             for key, value in nested.items():
                 raw[aliases.get(key, key)] = value
         if "source_conversion_timeout_seconds" in raw:
-            raw["conversion_timeout_seconds"] = raw.pop("source_conversion_timeout_seconds")
+            raw["conversion_timeout_seconds"] = raw.pop(
+                "source_conversion_timeout_seconds"
+            )
         return cls(**raw)
 
     def to_dict(self) -> dict[str, Any]:
@@ -558,31 +614,42 @@ class PredictionSettings:
 @dataclass(slots=True)
 class GraphDBSettings:
     enabled: bool = True
-    mode: str = "primary"
+    mode: str = "mirror"
     provider: str = "neo4j"
     uri: str = "bolt://127.0.0.1:7687"
     username: str = "neo4j"
     password_env: str = "LOCALML_SCHEDULER_NEO4J_PASSWORD"
     database: str = "neo4j"
     bootstrap_constraints: bool = True
-    auto_import_legacy_sqlite: bool = True
-    legacy_sqlite_path: str | None = None
-    allow_legacy_fallback: bool = True
+    import_sqlite_evidence: bool = True
+    sqlite_evidence_path: str | None = None
+    allow_sqlite_fallback: bool = True
 
     def __post_init__(self) -> None:
         self.enabled = bool(self.enabled)
-        self.mode = str(self.mode or "primary").strip().lower().replace("-", "_")
-        if self.mode not in {"off", "mirror", "primary"}:
-            self.mode = "primary"
+        self.mode = str(self.mode or "mirror").strip().lower().replace("-", "_")
+        if self.mode == "primary":
+            self.mode = "mirror"
+        if self.mode not in {"off", "mirror"}:
+            self.mode = "mirror"
         if not self.enabled:
             self.mode = "off"
         self.provider = str(self.provider or "neo4j").strip().lower().replace("-", "_")
-        if self.provider in {"sqlite", "legacy_sqlite"}:
-            self.provider = "sqlite_legacy"
+        if self.provider == "legacy_sqlite":
+            self.provider = "sqlite"
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "GraphDBSettings":
-        return cls(**(payload or {}))
+        raw = dict(payload or {})
+        aliases = {
+            "auto_import_legacy_sqlite": "import_sqlite_evidence",
+            "legacy_sqlite_path": "sqlite_evidence_path",
+            "allow_legacy_fallback": "allow_sqlite_fallback",
+        }
+        for old_name, current_name in aliases.items():
+            if old_name in raw and current_name not in raw:
+                raw[current_name] = raw.pop(old_name)
+        return cls(**raw)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -594,9 +661,9 @@ class GraphDBSettings:
             "password_env": self.password_env,
             "database": self.database,
             "bootstrap_constraints": self.bootstrap_constraints,
-            "auto_import_legacy_sqlite": self.auto_import_legacy_sqlite,
-            "legacy_sqlite_path": self.legacy_sqlite_path,
-            "allow_legacy_fallback": self.allow_legacy_fallback,
+            "import_sqlite_evidence": self.import_sqlite_evidence,
+            "sqlite_evidence_path": self.sqlite_evidence_path,
+            "allow_sqlite_fallback": self.allow_sqlite_fallback,
         }
 
 
@@ -619,13 +686,27 @@ class HardwareFeatureDBSettings:
         self.enabled = bool(self.enabled)
         self.provider = str(self.provider or "qdrant").strip().lower().replace("-", "_")
         self.url = str(self.url or "http://127.0.0.1:6333").strip()
-        self.api_key_env = str(self.api_key_env or "LOCALML_SCHEDULER_QDRANT_API_KEY").strip()
-        self.collection_name = str(self.collection_name or "hardware_feature_knowledge").strip()
-        self.code_doc_collection_name = str(self.code_doc_collection_name or "code_doc_chunks").strip()
-        self.optimization_recipe_collection_name = str(self.optimization_recipe_collection_name or "optimization_recipe_chunks").strip()
-        self.api_symbol_collection_name = str(self.api_symbol_collection_name or "api_symbol_chunks").strip()
-        self.embedding_model_type = str(self.embedding_model_type or "local").strip().lower()
-        self.embedding_model_name = str(self.embedding_model_name or "BAAI/bge-base-en-v1.5").strip()
+        self.api_key_env = str(
+            self.api_key_env or "LOCALML_SCHEDULER_QDRANT_API_KEY"
+        ).strip()
+        self.collection_name = str(
+            self.collection_name or "hardware_feature_knowledge"
+        ).strip()
+        self.code_doc_collection_name = str(
+            self.code_doc_collection_name or "code_doc_chunks"
+        ).strip()
+        self.optimization_recipe_collection_name = str(
+            self.optimization_recipe_collection_name or "optimization_recipe_chunks"
+        ).strip()
+        self.api_symbol_collection_name = str(
+            self.api_symbol_collection_name or "api_symbol_chunks"
+        ).strip()
+        self.embedding_model_type = (
+            str(self.embedding_model_type or "local").strip().lower()
+        )
+        self.embedding_model_name = str(
+            self.embedding_model_name or "BAAI/bge-base-en-v1.5"
+        ).strip()
         self.embedding_device = str(self.embedding_device or "cpu").strip().lower()
         self.distance = str(self.distance or "Cosine").strip()
 
@@ -658,7 +739,9 @@ class LogDBSettings:
     enabled: bool = False
 
     def __post_init__(self) -> None:
-        self.provider = str(self.provider or "postgres").strip().lower().replace("-", "_")
+        self.provider = (
+            str(self.provider or "postgres").strip().lower().replace("-", "_")
+        )
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "LogDBSettings":
@@ -682,7 +765,9 @@ class SchedulerSubmissionDefaults:
     packing_eligible: bool = False
     packing_family: str = "mlevolve_script"
     packing_max_slowdown_ratio: float | None = None
-    backend_allowlist: list[str] = field(default_factory=lambda: ["mps", "cuda_process"])
+    backend_allowlist: list[str] = field(
+        default_factory=lambda: ["mps", "cuda_process"]
+    )
     batch_probe_enabled: bool = True
     batch_probe_model_key: str | None = None
     batch_probe_probe_timeout_seconds: int = 45
@@ -700,9 +785,16 @@ class SchedulerSubmissionDefaults:
         if instance.backend_allowlist is None:
             instance.backend_allowlist = ["mps", "cuda_process"]
         else:
-            instance.backend_allowlist = [str(item) for item in instance.backend_allowlist]
+            instance.backend_allowlist = [
+                str(item) for item in instance.backend_allowlist
+            ]
         instance.batch_probe_search_mode = instance.batch_probe_search_mode or "binary"
-        instance.runtime_probe_strategy = str(instance.runtime_probe_strategy or "epoch_1").strip().lower().replace("-", "_")
+        instance.runtime_probe_strategy = (
+            str(instance.runtime_probe_strategy or "epoch_1")
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
         return instance
 
     def to_dict(self) -> dict[str, Any]:
@@ -732,7 +824,9 @@ class SchedulerSubmissionDefaults:
 class GpuSchedulerSettings:
     enabled: bool = True
     mode: str = SCHEDULER_MODE_PARALLEL_DEFAULT
-    backend_priority: list[str] = field(default_factory=lambda: ["mps", "stream", "cuda_process", "exclusive"])
+    backend_priority: list[str] = field(
+        default_factory=lambda: ["mps", "stream", "cuda_process", "exclusive"]
+    )
     max_packed_jobs_per_gpu: int = 2
     parallel_job_cap: int | None = None
     priority_window_size: int = 8
@@ -745,7 +839,9 @@ class GpuSchedulerSettings:
     device_index: int = 0
     fallback_cooldown_seconds: int = 900
     concurrent_groups_enabled: bool = False
-    concurrent_backend_allowlist: list[str] = field(default_factory=lambda: ["mps", "stream"])
+    concurrent_backend_allowlist: list[str] = field(
+        default_factory=lambda: ["mps", "stream"]
+    )
     batch_probe_enabled: bool = True
     batch_probe_target_memory_fraction: float = 0.97
     batch_probe_min_batch_size: int = 1
@@ -757,12 +853,18 @@ class GpuSchedulerSettings:
     thresholds: GpuThresholdSettings = field(default_factory=GpuThresholdSettings)
     telemetry: GpuTelemetrySettings = field(default_factory=GpuTelemetrySettings)
     auto_pack: AutoPackSettings = field(default_factory=AutoPackSettings)
-    parallel_optimizer: ParallelOptimizerSettings = field(default_factory=ParallelOptimizerSettings)
+    parallel_optimizer: ParallelOptimizerSettings = field(
+        default_factory=ParallelOptimizerSettings
+    )
     objective: TimeObjectiveSettings = field(default_factory=TimeObjectiveSettings)
     batch_options: BatchOptionSettings = field(default_factory=BatchOptionSettings)
     colocation: ColocationSettings = field(default_factory=ColocationSettings)
-    exclusive_probe: ExclusiveProbeSettings = field(default_factory=ExclusiveProbeSettings)
-    submission_defaults: SchedulerSubmissionDefaults = field(default_factory=SchedulerSubmissionDefaults)
+    exclusive_probe: ExclusiveProbeSettings = field(
+        default_factory=ExclusiveProbeSettings
+    )
+    submission_defaults: SchedulerSubmissionDefaults = field(
+        default_factory=SchedulerSubmissionDefaults
+    )
     mps: MPSSettings = field(default_factory=MPSSettings)
     cuda_process: CudaProcessSettings = field(default_factory=CudaProcessSettings)
     stream: StreamSettings = field(default_factory=StreamSettings)
@@ -776,12 +878,16 @@ class GpuSchedulerSettings:
         if self.concurrent_backend_allowlist is None:
             self.concurrent_backend_allowlist = ["mps", "stream"]
         else:
-            self.concurrent_backend_allowlist = [str(item) for item in self.concurrent_backend_allowlist]
+            self.concurrent_backend_allowlist = [
+                str(item) for item in self.concurrent_backend_allowlist
+            ]
         if self.parallel_job_cap is not None:
             self.parallel_job_cap = max(1, int(self.parallel_job_cap))
         self.priority_window_size = max(1, int(self.priority_window_size))
         self.oldest_window_size = max(1, int(self.oldest_window_size))
-        self.starvation_timeout_seconds = max(0.0, float(self.starvation_timeout_seconds))
+        self.starvation_timeout_seconds = max(
+            0.0, float(self.starvation_timeout_seconds)
+        )
         self.beam_width = max(1, int(self.beam_width))
         self.exact_search_max_jobs = max(1, int(self.exact_search_max_jobs))
         if self.profiling is None:
@@ -807,7 +913,9 @@ class GpuSchedulerSettings:
         if self.parallel_optimizer is None:
             self.parallel_optimizer = ParallelOptimizerSettings()
         if isinstance(self.parallel_optimizer, dict):
-            self.parallel_optimizer = ParallelOptimizerSettings.from_dict(self.parallel_optimizer)
+            self.parallel_optimizer = ParallelOptimizerSettings.from_dict(
+                self.parallel_optimizer
+            )
         if self.objective is None:
             self.objective = TimeObjectiveSettings()
         if isinstance(self.objective, dict):
@@ -823,8 +931,14 @@ class GpuSchedulerSettings:
         if self.exclusive_probe is None:
             self.exclusive_probe = ExclusiveProbeSettings()
         if isinstance(self.exclusive_probe, dict):
-            self.exclusive_probe = ExclusiveProbeSettings.from_dict(self.exclusive_probe)
-        if self.mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE and self.memory.predicted_budget_fraction > self.memory.live_admission_stop_fraction:
+            self.exclusive_probe = ExclusiveProbeSettings.from_dict(
+                self.exclusive_probe
+            )
+        if (
+            self.mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE
+            and self.memory.predicted_budget_fraction
+            > self.memory.live_admission_stop_fraction
+        ):
             warnings.warn(
                 "predicted_budget_fraction exceeds live_admission_stop_fraction; a newly admitted pack may close admission immediately",
                 UserWarning,
@@ -833,7 +947,9 @@ class GpuSchedulerSettings:
         if self.submission_defaults is None:
             self.submission_defaults = SchedulerSubmissionDefaults()
         if isinstance(self.submission_defaults, dict):
-            self.submission_defaults = SchedulerSubmissionDefaults.from_dict(self.submission_defaults)
+            self.submission_defaults = SchedulerSubmissionDefaults.from_dict(
+                self.submission_defaults
+            )
         if self.mps is None:
             self.mps = MPSSettings()
         if isinstance(self.mps, dict):
@@ -904,16 +1020,24 @@ class SchedulerConfig:
     aging_priority_increment: int = 1
     enable_priority_aging: bool = True
     preempt_check_interval_seconds: float = 0.5
-    baseline_cache: BaselineCacheSettings | dict[str, Any] = field(default_factory=BaselineCacheSettings)
+    baseline_cache: BaselineCacheSettings | dict[str, Any] = field(
+        default_factory=BaselineCacheSettings
+    )
     cache_server_host: str = "127.0.0.1"
     cache_server_port: int = 8765
     cache_socket_name: str = "cache_server.sock"
     auto_resume_recoverable: bool = False
     gpu_scheduler: GpuSchedulerSettings = field(default_factory=GpuSchedulerSettings)
-    early_stopping: EarlyStoppingSettings | dict[str, Any] = field(default_factory=EarlyStoppingSettings)
-    prediction: PredictionSettings | dict[str, Any] = field(default_factory=PredictionSettings)
+    early_stopping: EarlyStoppingSettings | dict[str, Any] = field(
+        default_factory=EarlyStoppingSettings
+    )
+    prediction: PredictionSettings | dict[str, Any] = field(
+        default_factory=PredictionSettings
+    )
     graph_db: GraphDBSettings | dict[str, Any] = field(default_factory=GraphDBSettings)
-    hardware_feature_db: HardwareFeatureDBSettings | dict[str, Any] = field(default_factory=HardwareFeatureDBSettings)
+    hardware_feature_db: HardwareFeatureDBSettings | dict[str, Any] = field(
+        default_factory=HardwareFeatureDBSettings
+    )
     log_db: LogDBSettings | dict[str, Any] = field(default_factory=LogDBSettings)
     python_executable: str = field(default_factory=lambda: sys.executable)
     sqlite_busy_timeout_ms: int = 10_000
@@ -951,7 +1075,9 @@ class SchedulerConfig:
         if self.hardware_feature_db is None:
             self.hardware_feature_db = HardwareFeatureDBSettings()
         if isinstance(self.hardware_feature_db, dict):
-            self.hardware_feature_db = HardwareFeatureDBSettings.from_dict(self.hardware_feature_db)
+            self.hardware_feature_db = HardwareFeatureDBSettings.from_dict(
+                self.hardware_feature_db
+            )
         if self.log_db is None:
             self.log_db = LogDBSettings()
         if isinstance(self.log_db, dict):
@@ -967,11 +1093,26 @@ class SchedulerConfig:
         self.scheduler_log_path = self.logs_dir / "scheduler.log"
         self.cache_socket_path = self.runtime_root / self.cache_socket_name
         self.service_heartbeat_path = self.runtime_root / "service_heartbeat.json"
-        if not self.graph_db.legacy_sqlite_path:
-            self.graph_db.legacy_sqlite_path = str(self.db_path)
+        if not self.graph_db.sqlite_evidence_path:
+            self.graph_db.sqlite_evidence_path = str(self.db_path)
 
     @classmethod
-    def from_file(cls, path: str | Path | None = None, **overrides: Any) -> "SchedulerConfig":
+    def from_dict(
+        cls, payload: dict[str, Any] | None = None, **overrides: Any
+    ) -> "SchedulerConfig":
+        """Build settings from an in-memory mapping.
+
+        Replay tools and embedding applications use this path after applying
+        their own overlays, while :meth:`from_file` handles YAML input.
+        """
+        data = dict(payload or {})
+        data.update(overrides)
+        return cls(**data)
+
+    @classmethod
+    def from_file(
+        cls, path: str | Path | None = None, **overrides: Any
+    ) -> "SchedulerConfig":
         payload: dict[str, Any] = {}
         if path:
             with Path(path).open("r", encoding="utf-8") as handle:
@@ -1004,7 +1145,16 @@ class SchedulerConfig:
 
     def cache_address(self) -> str | tuple[str, int]:
         if sys.platform != "win32":
-            return str(self.cache_socket_path)
+            address = str(self.cache_socket_path)
+            # Unix-domain socket paths are commonly limited to roughly 100
+            # bytes. Deep temporary/replay roots therefore use a stable short
+            # path while all other runtime files remain under runtime_root.
+            if len(address.encode()) >= 100:
+                digest = hashlib.sha256(address.encode()).hexdigest()[:20]
+                return str(
+                    Path(tempfile.gettempdir()) / f"localml-scheduler-{digest}.sock"
+                )
+            return address
         return (self.cache_server_host, self.cache_server_port)
 
     def to_dict(self) -> dict[str, Any]:

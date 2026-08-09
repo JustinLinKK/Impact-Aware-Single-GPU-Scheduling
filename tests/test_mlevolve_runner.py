@@ -5,12 +5,20 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from localml_scheduler.adapters.mlevolve_runner import probe_mlevolve_script_job, run_mlevolve_script_job
+from localml_scheduler.adapters.mlevolve_runner import (
+    probe_mlevolve_script_job,
+    run_mlevolve_script_job,
+)
 from localml_scheduler.checkpointing.manager import CheckpointManager
 from localml_scheduler.execution.control import ControlPlane, TrainingControlHook
 from localml_scheduler.execution.runner_protocol import RunnerContext
 from localml_scheduler.observability.events import EventLogger
-from localml_scheduler.domain import BatchProbeSpec, CheckpointPolicy, SafePointType, TrainingJob
+from localml_scheduler.domain import (
+    BatchProbeSpec,
+    CheckpointPolicy,
+    SafePointType,
+    TrainingJob,
+)
 from localml_scheduler.config import SchedulerSettings
 from localml_scheduler.storage.sqlite_store import SQLiteStateStore
 
@@ -22,7 +30,9 @@ def _build_context(settings: SchedulerSettings, job: TrainingJob) -> RunnerConte
     checkpoint_manager = CheckpointManager(settings, store, event_logger)
     control_plane = ControlPlane(settings)
     control_plane.initialize_job(job.job_id)
-    control_hook = TrainingControlHook(job, control_plane, checkpoint_manager, store, event_logger)
+    control_hook = TrainingControlHook(
+        job, control_plane, checkpoint_manager, store, event_logger
+    )
     return RunnerContext(
         job=job,
         settings=settings,
@@ -45,8 +55,10 @@ class MLEvolveRunnerTest(unittest.TestCase):
                 "\n".join(
                     [
                         "from pathlib import Path",
+                        "from torch.utils.data import DataLoader",
                         "batch_size = 4",
-                        "Path('batch_size.txt').write_text(str(batch_size), encoding='utf-8')",
+                        "train_loader = DataLoader(list(range(20)), batch_size=batch_size, shuffle=True)",
+                        "Path('batch_size.txt').write_text(str(train_loader.batch_size), encoding='utf-8')",
                     ]
                 ),
                 encoding="utf-8",
@@ -67,7 +79,9 @@ class MLEvolveRunnerTest(unittest.TestCase):
                     enabled=True,
                     probe_target="localml_scheduler.adapters.mlevolve_runner:probe_mlevolve_script_job",
                 ),
-                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
+                checkpoint_policy=CheckpointPolicy(
+                    save_every_n_steps=1, pause_mode=SafePointType.STEP
+                ),
                 metadata={"resolved_batch_size": 9, "placement_backend": "exclusive"},
             )
             context = _build_context(settings, job)
@@ -76,7 +90,9 @@ class MLEvolveRunnerTest(unittest.TestCase):
 
             self.assertEqual(result["candidate_returncode"], 0)
             self.assertEqual(result["batch_size_override"], 9)
-            self.assertEqual((working_dir / "batch_size.txt").read_text(encoding="utf-8"), "9")
+            self.assertEqual(
+                (working_dir / "batch_size.txt").read_text(encoding="utf-8"), "9"
+            )
 
     def test_probe_script_job_runs_successfully_with_batch_rewrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -111,12 +127,16 @@ class MLEvolveRunnerTest(unittest.TestCase):
                     enabled=True,
                     probe_target="localml_scheduler.adapters.mlevolve_runner:probe_mlevolve_script_job",
                 ),
-                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
+                checkpoint_policy=CheckpointPolicy(
+                    save_every_n_steps=1, pause_mode=SafePointType.STEP
+                ),
                 metadata={"placement_backend": "exclusive"},
             )
             context = _build_context(settings, job)
 
-            result = probe_mlevolve_script_job(context, batch_size=5, warmup_steps=1, measure_steps=1)
+            result = probe_mlevolve_script_job(
+                context, batch_size=5, warmup_steps=1, measure_steps=1
+            )
 
             self.assertTrue(result.fits)
             self.assertIn("probe", result.message or "")
@@ -136,9 +156,9 @@ class MLEvolveRunnerTest(unittest.TestCase):
                         "batch_size = 2",
                         "num_epochs = 5",
                         "trace = []",
-                        "loader = DataLoader(list(range(20)), batch_size=batch_size)",
+                        "train_loader = DataLoader(list(range(20)), batch_size=batch_size)",
                         "for epoch in range(num_epochs):",
-                        "    for step, batch in enumerate(loader):",
+                        "    for step, batch in enumerate(train_loader):",
                         "        trace.append({'epoch': epoch, 'step': step, 'size': int(len(batch))})",
                         "Path('probe_trace.json').write_text(json.dumps(trace), encoding='utf-8')",
                     ]
@@ -164,15 +184,21 @@ class MLEvolveRunnerTest(unittest.TestCase):
                     enabled=True,
                     probe_target="localml_scheduler.adapters.mlevolve_runner:probe_mlevolve_script_job",
                 ),
-                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
+                checkpoint_policy=CheckpointPolicy(
+                    save_every_n_steps=1, pause_mode=SafePointType.STEP
+                ),
                 metadata={"placement_backend": "exclusive"},
             )
             context = _build_context(settings, job)
 
-            result = probe_mlevolve_script_job(context, batch_size=7, warmup_steps=1, measure_steps=1)
+            result = probe_mlevolve_script_job(
+                context, batch_size=7, warmup_steps=1, measure_steps=1
+            )
 
             self.assertTrue(result.fits)
-            trace = json.loads((working_dir / "probe_trace.json").read_text(encoding="utf-8"))
+            trace = json.loads(
+                (working_dir / "probe_trace.json").read_text(encoding="utf-8")
+            )
             self.assertEqual(len(trace), 3)
             self.assertEqual({entry["epoch"] for entry in trace}, {0})
             self.assertEqual([entry["step"] for entry in trace], [0, 1, 2])

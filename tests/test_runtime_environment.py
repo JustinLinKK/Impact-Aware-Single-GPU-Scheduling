@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
-
-from localml_scheduler.client import SchedulerClient
-from localml_scheduler.config import SchedulerConfig
 from localml_scheduler.runtime_environment import (
+    detect_runtime_environment,
     repair_generated_training_code,
+    validate_generated_training_code,
     validate_model_api_contracts,
 )
 
@@ -29,10 +27,8 @@ def _future_vision_contract() -> dict:
     }
 
 
-def test_runtime_environment_reports_torch_scheduler_signature(tmp_path: Path) -> None:
-    client = SchedulerClient(SchedulerConfig(runtime_root=tmp_path / "runtime"))
-
-    env = client.get_runtime_environment(
+def test_runtime_environment_reports_torch_scheduler_signature() -> None:
+    env = detect_runtime_environment(
         include_package_versions=False,
         include_precision_checks=True,
     )
@@ -47,8 +43,7 @@ def test_runtime_environment_reports_torch_scheduler_signature(tmp_path: Path) -
     assert "precision_checks" in env
 
 
-def test_validate_generated_training_code_flags_known_runtime_failures(tmp_path: Path) -> None:
-    client = SchedulerClient(SchedulerConfig(runtime_root=tmp_path / "runtime"))
+def test_validate_generated_training_code_flags_known_runtime_failures() -> None:
     code = """
 import torch
 from torch import optim
@@ -58,7 +53,7 @@ scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_eta_min=1e-6, T_ma
 scaler = torch.cuda.amp.GradScaler()
 """
 
-    result = client.validate_generated_training_code(code, stage="code_review")
+    result = validate_generated_training_code(code, stage="code_review")
 
     assert result["ok"] is False
     categories = {issue["category"] for issue in result["issues"]}
@@ -68,8 +63,7 @@ scaler = torch.cuda.amp.GradScaler()
     assert result["critical_count"] == 2
 
 
-def test_validate_generated_training_code_flags_diff_marker_fragments(tmp_path: Path) -> None:
-    client = SchedulerClient(SchedulerConfig(runtime_root=tmp_path / "runtime"))
+def test_validate_generated_training_code_flags_diff_marker_fragments() -> None:
     open_marker = "<" * 7 + " SEARCH"
     middle_marker = "=" * 7
     close_marker = ">" * 7 + " REPLACE"
@@ -85,14 +79,17 @@ def test_validate_generated_training_code_flags_diff_marker_fragments(tmp_path: 
         ]
     )
 
-    result = client.validate_generated_training_code(code, stage="debug")
+    result = validate_generated_training_code(code, stage="debug")
 
     assert result["ok"] is False
-    assert "diff_marker_or_conflict_fragment" in {issue["category"] for issue in result["issues"]}
+    assert "diff_marker_or_conflict_fragment" in {
+        issue["category"] for issue in result["issues"]
+    }
 
 
-def test_validate_generated_training_code_flags_engineered_feature_dim_mismatch(tmp_path: Path) -> None:
-    client = SchedulerClient(SchedulerConfig(runtime_root=tmp_path / "runtime"))
+def test_validate_generated_training_code_flags_engineered_feature_dim_mismatch() -> (
+    None
+):
     code = """
 import numpy as np
 from torch import nn
@@ -106,19 +103,21 @@ feature_dim = 16
 norm = nn.LayerNorm(16)
 """
 
-    result = client.validate_generated_training_code(code, stage="code_review")
+    result = validate_generated_training_code(code, stage="code_review")
 
     categories = {issue["category"] for issue in result["issues"]}
     assert "engineered_feature_dim_mismatch" in categories
-    issue = next(item for item in result["issues"] if item["category"] == "engineered_feature_dim_mismatch")
+    issue = next(
+        item
+        for item in result["issues"]
+        if item["category"] == "engineered_feature_dim_mismatch"
+    )
     assert "feature_dim" in issue["evidence"]
     assert "LayerNorm" in issue["evidence"]
 
 
-def test_runtime_environment_reports_precision_export_policy(tmp_path: Path) -> None:
-    client = SchedulerClient(SchedulerConfig(runtime_root=tmp_path / "runtime"))
-
-    env = client.get_runtime_environment(
+def test_runtime_environment_reports_precision_export_policy() -> None:
+    env = detect_runtime_environment(
         include_package_versions=False,
         include_precision_checks=True,
     )
@@ -126,11 +125,12 @@ def test_runtime_environment_reports_precision_export_policy(tmp_path: Path) -> 
     checks = env["precision_checks"]
     assert "low_precision_numpy_export_policy" in checks
     assert "pytorch_float8_dtypes" in checks
-    assert "torch.float32" in checks["low_precision_numpy_export_policy"]["safe_pattern"]
+    assert (
+        "torch.float32" in checks["low_precision_numpy_export_policy"]["safe_pattern"]
+    )
 
 
-def test_validate_generated_training_code_flags_generic_low_precision_exports(tmp_path: Path) -> None:
-    client = SchedulerClient(SchedulerConfig(runtime_root=tmp_path / "runtime"))
+def test_validate_generated_training_code_flags_generic_low_precision_exports() -> None:
     code = """
 import transformer_engine.pytorch as te
 PRECISION = "nvfp4"
@@ -140,7 +140,7 @@ ids_np = ids.cpu().numpy()
 safe_np = probs.detach().to(torch.float32).cpu().numpy()
 """
 
-    result = client.validate_generated_training_code(code, stage="code_review")
+    result = validate_generated_training_code(code, stage="code_review")
 
     categories = [issue["category"] for issue in result["issues"]]
     assert categories == ["low_precision_numpy_export"]
@@ -149,15 +149,14 @@ safe_np = probs.detach().to(torch.float32).cpu().numpy()
     assert "preds.cpu().numpy()" in issue["evidence"]
 
 
-def test_validate_generated_training_code_flags_torchao_fp8_exports(tmp_path: Path) -> None:
-    client = SchedulerClient(SchedulerConfig(runtime_root=tmp_path / "runtime"))
+def test_validate_generated_training_code_flags_torchao_fp8_exports() -> None:
     code = """
 from torchao.float8 import convert_to_float8_training
 model = convert_to_float8_training(model)
 logits_np = logits.cpu().numpy()
 """
 
-    result = client.validate_generated_training_code(code, stage="code_review")
+    result = validate_generated_training_code(code, stage="code_review")
 
     assert result["ok"] is False
     assert result["issues"][0]["category"] == "low_precision_numpy_export"
@@ -199,15 +198,16 @@ preds_np = preds.cpu().numpy()
     assert "preds.detach().to(torch.float32).cpu().numpy()" in repair["code"]
 
 
-def test_validate_generated_training_code_flags_hf_repo_built_from_sanitized_branch(tmp_path: Path) -> None:
-    client = SchedulerClient(SchedulerConfig(runtime_root=tmp_path / "runtime"))
+def test_validate_generated_training_code_flags_hf_repo_built_from_sanitized_branch() -> (
+    None
+):
     code = """
 from transformers import AutoProcessor
 MODEL_BRANCH = "siglip2_so400m_patch16_256"
 processor = AutoProcessor.from_pretrained(f"google/{MODEL_BRANCH}")
 """
 
-    result = client.validate_generated_training_code(code, stage="code_review")
+    result = validate_generated_training_code(code, stage="code_review")
 
     assert result["ok"] is False
     assert result["critical_count"] == 1
@@ -230,7 +230,10 @@ model = AutoModel.from_pretrained(f"google/{MODEL_BRANCH}")
     assert repair["changed"] is True
     assert repair["replacement_count"] == 2
     assert 'MODEL_BRANCH = "siglip2_so400m_patch16_256"' in repair["code"]
-    assert repair["code"].count("from_pretrained('google/siglip2-so400m-patch16-256')") == 2
+    assert (
+        repair["code"].count("from_pretrained('google/siglip2-so400m-patch16-256')")
+        == 2
+    )
     assert repair["validation"]["ok"] is True
 
 
@@ -245,8 +248,9 @@ def test_repair_generated_training_code_fixes_known_direct_invalid_hf_repo() -> 
     assert repair["validation"]["ok"] is True
 
 
-def test_validate_generated_training_code_flags_zip_extractall_directory_mismatch(tmp_path: Path) -> None:
-    client = SchedulerClient(SchedulerConfig(runtime_root=tmp_path / "runtime"))
+def test_validate_generated_training_code_flags_zip_extractall_directory_mismatch() -> (
+    None
+):
     code = """
 with zipfile.ZipFile(TRAIN_ZIP_PATH, 'r') as zip_ref:
     zip_ref.extractall(WORKING_DIR)
@@ -256,7 +260,7 @@ train_filepaths = list(TRAIN_DIR.glob('*.jpg'))
 test_filepaths = list(TEST_DIR.glob('*.jpg'))
 """
 
-    result = client.validate_generated_training_code(code, stage="code_review")
+    result = validate_generated_training_code(code, stage="code_review")
 
     assert result["ok"] is False
     assert result["critical_count"] == 1
@@ -265,7 +269,9 @@ test_filepaths = list(TEST_DIR.glob('*.jpg'))
     assert issue["autofixable"] is True
 
 
-def test_repair_generated_training_code_fixes_zip_extractall_directory_mismatch() -> None:
+def test_repair_generated_training_code_fixes_zip_extractall_directory_mismatch() -> (
+    None
+):
     code = """
 with zipfile.ZipFile(TRAIN_ZIP_PATH, 'r') as zip_ref:
     zip_ref.extractall(WORKING_DIR)
@@ -285,7 +291,9 @@ test_filepaths = list(TEST_DIR.glob('*.jpg'))
     assert repair["validation"]["ok"] is True
 
 
-def test_repair_generated_training_code_fixes_configured_zip_extractall_directory_mismatch() -> None:
+def test_repair_generated_training_code_fixes_configured_zip_extractall_directory_mismatch() -> (
+    None
+):
     code = """
 class DataConfig:
     WORKING_PATH = Path('./working')
@@ -312,14 +320,14 @@ def extract_data(config):
 
 
 def test_validate_model_api_contracts_is_model_family_agnostic() -> None:
-    code = '''
+    code = """
 MODEL_ID = "vendor/future-vision"
 IMAGE_SIZE = 224
 model = AutoModel.from_pretrained(MODEL_ID)
 features = model.encode_images(pixel_values=pixel_values)
 pooled = features.pooler_output
 classifier = Linear(model.config.hidden_size, 2)
-'''
+"""
 
     issues = validate_model_api_contracts(code, [_future_vision_contract()])
 
@@ -333,13 +341,13 @@ classifier = Linear(model.config.hidden_size, 2)
 
 
 def test_validate_model_api_contracts_accepts_contract_compliant_code() -> None:
-    code = '''
+    code = """
 MODEL_ID = "vendor/future-vision"
 IMAGE_SIZE = 384
 model = AutoModel.from_pretrained(MODEL_ID)
 features = model.encode_images(pixel_values=pixel_values)
 classifier = Linear(model.config.vision_config.hidden_size, 2)
-'''
+"""
 
     assert validate_model_api_contracts(code, [_future_vision_contract()]) == []
 
@@ -359,12 +367,12 @@ def test_validate_model_api_contracts_catches_observed_siglip_tensor_misuse() ->
             }
         ],
     }
-    code = '''
+    code = """
 MODEL_ID = "google/siglip2-so400m-patch16-256"
 model = AutoModel.from_pretrained(MODEL_ID)
 vision_outputs = model.get_image_features(pixel_values=pixel_values)
 pooled_output = vision_outputs.pooler_output
-'''
+"""
 
     issues = validate_model_api_contracts(code, [contract])
 

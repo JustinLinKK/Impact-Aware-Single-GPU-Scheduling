@@ -62,8 +62,14 @@ def _accelerator_key(device_name: str) -> str:
 
 def _coerce_run_summary(profile: RunProfile) -> str:
     model_name = profile.model_key or "unknown-model"
-    hardware = profile.metadata.get("gpu_name") or profile.metadata.get("device_type") or "unknown-hardware"
-    batch = profile.resolved_batch_size if profile.resolved_batch_size is not None else "?"
+    hardware = (
+        profile.metadata.get("gpu_name")
+        or profile.metadata.get("device_type")
+        or "unknown-hardware"
+    )
+    batch = (
+        profile.resolved_batch_size if profile.resolved_batch_size is not None else "?"
+    )
     return (
         f"Model {model_name} ran on {hardware} with batch size {batch}, "
         f"avg SM {profile.avg_sm_utilization or 0.0:.1%}, "
@@ -82,27 +88,37 @@ class Neo4jStateStore:
     """
 
     def __init__(self, settings: SchedulerSettings):
-        if GraphDatabase is None:  # pragma: no cover - exercised only when dependency missing
+        if (
+            GraphDatabase is None
+        ):  # pragma: no cover - exercised only when dependency missing
             raise RuntimeError("neo4j python driver is not installed")
         self.settings = settings
         self._hardware_profile: HardwareProfile | None = None
         self.settings.ensure_runtime_layout()
         password = os.getenv(self.settings.graph_db.password_env, "")
-        auth = (self.settings.graph_db.username, password) if self.settings.graph_db.username else None
+        auth = (
+            (self.settings.graph_db.username, password)
+            if self.settings.graph_db.username
+            else None
+        )
         self._driver = GraphDatabase.driver(self.settings.graph_db.uri, auth=auth)
         self.initialize()
 
     def _session(self):
         return self._driver.session(database=self.settings.graph_db.database)
 
-    def _run(self, cypher: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    def _run(
+        self, cypher: str, params: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
         with self._session() as session:
             result = session.run(cypher, params or {})
             rows = [record.data() for record in result]
             result.consume()
             return rows
 
-    def _run_write(self, cypher: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    def _run_write(
+        self, cypher: str, params: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
         return self._run(cypher, params)
 
     def initialize(self) -> None:
@@ -110,14 +126,20 @@ class Neo4jStateStore:
         if self.settings.graph_db.bootstrap_constraints:
             self._apply_constraints()
         self._ensure_hardware_dimensions(self.hardware_profile())
-        if self.settings.graph_db.auto_import_legacy_sqlite:
-            self._import_legacy_sqlite_if_needed()
+        if self.settings.graph_db.import_sqlite_evidence:
+            self._import_sqlite_evidence_if_needed()
 
     def _apply_constraints(self) -> None:
-        schema_path = Path(__file__).resolve().parents[2] / "schema" / "neo4j_constraints.cypher"
+        schema_path = (
+            Path(__file__).resolve().parents[2] / "schema" / "neo4j_constraints.cypher"
+        )
         if not schema_path.exists():
             return
-        statements = [statement.strip() for statement in schema_path.read_text(encoding="utf-8").split(";") if statement.strip()]
+        statements = [
+            statement.strip()
+            for statement in schema_path.read_text(encoding="utf-8").split(";")
+            if statement.strip()
+        ]
         for statement in statements:
             self._run_write(statement)
 
@@ -125,30 +147,48 @@ class Neo4jStateStore:
         rows = self._run("MATCH (j:Job) RETURN count(j) AS value")
         return bool(rows and int(rows[0]["value"]) > 0)
 
-    def _import_legacy_sqlite_if_needed(self) -> None:
-        legacy_path = Path(self.settings.graph_db.legacy_sqlite_path or self.settings.db_path)
-        if self._graph_has_jobs() or not legacy_path.exists():
+    def _import_sqlite_evidence_if_needed(self) -> None:
+        sqlite_path = Path(
+            self.settings.graph_db.sqlite_evidence_path or self.settings.db_path
+        )
+        if self._graph_has_jobs() or not sqlite_path.exists():
             return
-        with sqlite3.connect(legacy_path) as connection:
+        with sqlite3.connect(sqlite_path) as connection:
             connection.row_factory = sqlite3.Row
-            for row in connection.execute("SELECT payload_json FROM jobs ORDER BY queue_sequence ASC").fetchall():
-                self.record_scheduler_job_evidence(TrainingJob.from_dict(json.loads(row["payload_json"])))
+            for row in connection.execute(
+                "SELECT payload_json FROM jobs ORDER BY queue_sequence ASC"
+            ).fetchall():
+                self.record_scheduler_job_evidence(
+                    TrainingJob.from_dict(json.loads(row["payload_json"]))
+                )
             for row in connection.execute("SELECT * FROM solo_profiles").fetchall():
                 self.record_solo_profile_evidence(SoloProfile.from_row(dict(row)))
             for row in connection.execute("SELECT * FROM pair_profiles").fetchall():
                 self.record_pair_profile_evidence(PairProfile.from_row(dict(row)))
             for row in connection.execute("SELECT * FROM runtime_profiles").fetchall():
                 self.record_runtime_profile_evidence(RuntimeProfile.from_row(dict(row)))
-            for row in connection.execute("SELECT * FROM batch_probe_profiles").fetchall():
+            for row in connection.execute(
+                "SELECT * FROM batch_probe_profiles"
+            ).fetchall():
                 self.record_batch_probe_evidence(BatchProbeProfile.from_row(dict(row)))
-            for row in connection.execute("SELECT * FROM batch_size_observations").fetchall():
-                self.record_batch_size_observation_evidence(BatchSizeObservation.from_row(dict(row)))
-            for row in connection.execute("SELECT * FROM combination_profiles").fetchall():
-                self.record_combination_profile_evidence(CombinationProfile.from_row(dict(row)))
+            for row in connection.execute(
+                "SELECT * FROM batch_size_observations"
+            ).fetchall():
+                self.record_batch_size_observation_evidence(
+                    BatchSizeObservation.from_row(dict(row))
+                )
+            for row in connection.execute(
+                "SELECT * FROM combination_profiles"
+            ).fetchall():
+                self.record_combination_profile_evidence(
+                    CombinationProfile.from_row(dict(row))
+                )
 
     def hardware_profile(self) -> HardwareProfile:
         if self._hardware_profile is None:
-            self._hardware_profile = detect_hardware_profile(device_index=self.settings.gpu_scheduler.device_index)
+            self._hardware_profile = detect_hardware_profile(
+                device_index=self.settings.gpu_scheduler.device_index
+            )
         return self._hardware_profile
 
     def hardware_key(self) -> str:
@@ -299,7 +339,9 @@ class Neo4jStateStore:
         return [self._build_hardware_record(row) for row in rows]
 
     def next_queue_sequence(self) -> int:
-        rows = self._run("MATCH (j:Job) RETURN coalesce(max(j.queue_sequence), 0) + 1 AS value")
+        rows = self._run(
+            "MATCH (j:Job) RETURN coalesce(max(j.queue_sequence), 0) + 1 AS value"
+        )
         return int(rows[0]["value"]) if rows else 1
 
     def _ensure_model_and_signature(self, job: TrainingJob) -> None:
@@ -311,9 +353,14 @@ class Neo4jStateStore:
             "task_type": job.task_type,
             "runner_target": job.config.runner_target,
             "signature": job.packing.signature,
-            "signature_uid": (f"signature::{job.packing.signature}" if job.packing.signature else None),
+            "signature_uid": (
+                f"signature::{job.packing.signature}" if job.packing.signature else None
+            ),
             "family": job.packing.family,
-            "default_batch_size": int(job.config.runner_kwargs.get(job.batch_probe.batch_param_name, 0) or 0) or None,
+            "default_batch_size": int(
+                job.config.runner_kwargs.get(job.batch_probe.batch_param_name, 0) or 0
+            )
+            or None,
             "default_epochs": job.max_epochs or job.config.max_epochs,
             "default_steps": job.max_steps or job.config.max_steps,
             "updated_at": utc_now(),
@@ -445,7 +492,9 @@ class Neo4jStateStore:
         job.mark_status(JobStatus.PENDING, reason=job.status_reason)
         self.save_job(job)
         self.enqueue_command(CommandType.SUBMIT, job_id=job.job_id)
-        self.log_event("job_submitted", job_id=job.job_id, payload={"priority": job.priority})
+        self.log_event(
+            "job_submitted", job_id=job.job_id, payload={"priority": job.priority}
+        )
         return job
 
     def get_job(self, job_id: str) -> TrainingJob | None:
@@ -457,10 +506,15 @@ class Neo4jStateStore:
             return None
         return TrainingJob.from_dict(json.loads(rows[0]["payload_json"]))
 
-    def list_jobs(self, statuses: Iterable[JobStatus | str] | None = None) -> list[TrainingJob]:
+    def list_jobs(
+        self, statuses: Iterable[JobStatus | str] | None = None
+    ) -> list[TrainingJob]:
         params: dict[str, Any] = {}
         if statuses:
-            normalized = [status.value if isinstance(status, JobStatus) else status for status in statuses]
+            normalized = [
+                status.value if isinstance(status, JobStatus) else status
+                for status in statuses
+            ]
             rows = self._run(
                 """
                 MATCH (j:Job)
@@ -538,7 +592,9 @@ class Neo4jStateStore:
         return self.update_job(job_id, status=status, reason=reason, hold=hold)
 
     def delete_job(self, job_id: str) -> None:
-        self._run_write("MATCH (j:Job {job_id: $job_id}) DETACH DELETE j", {"job_id": job_id})
+        self._run_write(
+            "MATCH (j:Job {job_id: $job_id}) DETACH DELETE j", {"job_id": job_id}
+        )
 
     def _next_sequence(self, name: str) -> int:
         rows = self._run_write(
@@ -680,7 +736,9 @@ class Neo4jStateStore:
             created_at=utc_now(),
         )
 
-    def list_events(self, *, job_id: str | None = None, event_type: str | None = None) -> list[dict[str, Any]]:
+    def list_events(
+        self, *, job_id: str | None = None, event_type: str | None = None
+    ) -> list[dict[str, Any]]:
         clauses = ["MATCH (e:Event) WHERE 1 = 1"]
         params: dict[str, Any] = {}
         if job_id is not None:
@@ -743,7 +801,9 @@ class Neo4jStateStore:
             {"job_id": job_id, "checkpoint_id": checkpoint_id},
         )
 
-    def record_checkpoint(self, job_id: str, checkpoint_path: str, metadata: dict[str, Any] | None = None) -> None:
+    def record_checkpoint(
+        self, job_id: str, checkpoint_path: str, metadata: dict[str, Any] | None = None
+    ) -> None:
         checkpoint_id = self._next_sequence("checkpoint_id")
         self._upsert_checkpoint(
             checkpoint_id=checkpoint_id,
@@ -853,7 +913,9 @@ class Neo4jStateStore:
         return "partial"
 
     def _canonical_json_key(self, prefix: str, payload: dict[str, Any]) -> str:
-        digest = sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
+        digest = sha1(
+            json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:24]
         return f"{prefix}:{digest}"
 
     def _hardware_key_for_device_type(self, device_type: str | None = None) -> str:
@@ -907,7 +969,9 @@ class Neo4jStateStore:
                 "input_signature": config.get("input_signature"),
                 "batch_size": config.get("batch_size"),
                 "effective_batch_size": config.get("effective_batch_size"),
-                "gradient_accumulation_steps": config.get("gradient_accumulation_steps"),
+                "gradient_accumulation_steps": config.get(
+                    "gradient_accumulation_steps"
+                ),
                 "epochs": config.get("epochs"),
                 "max_steps": config.get("max_steps"),
                 "steps_per_epoch": config.get("steps_per_epoch"),
@@ -921,7 +985,9 @@ class Neo4jStateStore:
                 "total_vram_mb": profile.total_vram_mb,
                 "compute_capability": profile.compute_capability,
                 "toolkit_name": "cuda" if profile.cuda_runtime else "unknown",
-                "toolkit_version": (str(profile.cuda_runtime) if profile.cuda_runtime else "unknown"),
+                "toolkit_version": (
+                    str(profile.cuda_runtime) if profile.cuda_runtime else "unknown"
+                ),
                 "hardware_technology_keys": ["cuda"] if profile.cuda_runtime else [],
                 "updated_at": utc_now(),
             },
@@ -995,7 +1061,11 @@ class Neo4jStateStore:
             "status": status,
             "hardware_set_key": hardware_key,
             "technology_keys": technology_keys,
-            "technology_set_key": (self._canonical_json_key("tech", {"technology_keys": technology_keys}) if technology_keys else None),
+            "technology_set_key": (
+                self._canonical_json_key("tech", {"technology_keys": technology_keys})
+                if technology_keys
+                else None
+            ),
             "run_scope": config.get("run_scope") or "fixed_steps",
             "confidence": props.get("confidence") if props else None,
             "model_key": model_key,
@@ -1005,7 +1075,9 @@ class Neo4jStateStore:
             "finished_at": props.get("finished_at") if props else None,
         }
         if props:
-            base_props.update({key: value for key, value in props.items() if value is not None})
+            base_props.update(
+                {key: value for key, value in props.items() if value is not None}
+            )
         self._run_write(
             "MERGE (j:Job:SingleJob {job_id: $job_id}) SET j += $props",
             {"job_id": job_id, "props": base_props},
@@ -1049,10 +1121,13 @@ class Neo4jStateStore:
             technology_keys.append("pytorch_amp")
         config = {
             "input_signature": job.packing.signature,
-            "batch_size": resolved_batch_size or job.config.runner_kwargs.get(job.batch_probe.batch_param_name),
+            "batch_size": resolved_batch_size
+            or job.config.runner_kwargs.get(job.batch_probe.batch_param_name),
             "epochs": job.max_epochs or job.config.max_epochs,
             "max_steps": job.max_steps or job.config.max_steps,
-            "run_scope": ("full_training" if job.status == JobStatus.COMPLETED else "fixed_steps"),
+            "run_scope": (
+                "full_training" if job.status == JobStatus.COMPLETED else "fixed_steps"
+            ),
             "model_family": job.packing.family,
             "task_type": job.task_type,
             "hyperparams": job.config.runner_kwargs,
@@ -1074,7 +1149,9 @@ class Neo4jStateStore:
                 "primary_metric_name": metrics.get("primary_metric_name"),
                 "primary_metric_value": metrics.get("primary_metric_value"),
                 "metrics_json": _json_dumps(metrics),
-                "error_message": (job.status_reason if job.status != JobStatus.COMPLETED else None),
+                "error_message": (
+                    job.status_reason if job.status != JobStatus.COMPLETED else None
+                ),
                 "started_at": job.started_at,
                 "finished_at": job.finished_at,
             },
@@ -1087,7 +1164,11 @@ class Neo4jStateStore:
             status="succeeded",
             model_key=profile.model_key,
             hardware_key=self._hardware_key_for_device_type(profile.device_type),
-            technology_keys=(["power_of_two_batch_optimizer"] if profile.metadata.get("search_mode") == "power_of_two" else []),
+            technology_keys=(
+                ["power_of_two_batch_optimizer"]
+                if profile.metadata.get("search_mode") == "power_of_two"
+                else []
+            ),
             config={
                 "input_signature": profile.shape_signature,
                 "batch_size": profile.resolved_batch_size,
@@ -1100,13 +1181,17 @@ class Neo4jStateStore:
                 "peak_vram_mb": profile.peak_vram_mb,
                 "avg_vram_mb": profile.avg_vram_mb,
                 "confidence": min(1.0, 0.5 + 0.1 * float(profile.observations or 0)),
-                "measurement_window_steps": profile.metadata.get("measurement_window_steps"),
+                "measurement_window_steps": profile.metadata.get(
+                    "measurement_window_steps"
+                ),
                 "finished_at": profile.updated_at,
                 "metrics_json": _json_dumps(profile.metadata),
             },
         )
 
-    def record_batch_size_observation_evidence(self, observation: BatchSizeObservation) -> None:
+    def record_batch_size_observation_evidence(
+        self, observation: BatchSizeObservation
+    ) -> None:
         self._upsert_single_job_evidence(
             job_id=f"batch_observation::{observation.observation_key}",
             purpose="batch_size_probe",
@@ -1127,7 +1212,9 @@ class Neo4jStateStore:
                 "observed_avg_step_time_ms": observation.avg_step_time_ms,
                 "avg_gpu_utilization_pct": observation.avg_gpu_utilization,
                 "avg_vram_utilization_pct": observation.avg_memory_utilization,
-                "confidence": min(1.0, 0.5 + 0.1 * float(observation.observations or 0)),
+                "confidence": min(
+                    1.0, 0.5 + 0.1 * float(observation.observations or 0)
+                ),
                 "finished_at": observation.updated_at,
                 "metrics_json": _json_dumps(observation.metadata),
             },
@@ -1157,7 +1244,11 @@ class Neo4jStateStore:
                 "observed_avg_step_time_ms": profile.avg_step_time_ms,
                 "estimated_epoch_seconds": profile.epoch_1_seconds,
                 "estimated_total_training_seconds": profile.estimated_total_runtime_seconds,
-                "estimation_method": ("step_time_extrapolation" if profile.avg_step_time_ms else "partial_epoch_extrapolation"),
+                "estimation_method": (
+                    "step_time_extrapolation"
+                    if profile.avg_step_time_ms
+                    else "partial_epoch_extrapolation"
+                ),
                 "estimate_confidence": profile.confidence,
                 "confidence": profile.confidence,
                 "finished_at": profile.updated_at,
@@ -1225,14 +1316,20 @@ class Neo4jStateStore:
             "status": "succeeded" if compatible else "failed",
             "hardware_set_key": hardware_key,
             "technology_keys": technology_keys,
-            "technology_set_key": (self._canonical_json_key("tech", {"technology_keys": technology_keys}) if technology_keys else None),
+            "technology_set_key": (
+                self._canonical_json_key("tech", {"technology_keys": technology_keys})
+                if technology_keys
+                else None
+            ),
             "run_scope": "fixed_steps",
             "packing_group_key": packing_group_key,
             "packing_strategy": backend_name or "scheduler_packing",
             "compatible": bool(compatible),
             "config_key": config_key,
         }
-        packed_props.update({key: value for key, value in props.items() if value is not None})
+        packed_props.update(
+            {key: value for key, value in props.items() if value is not None}
+        )
         self._run_write(
             "MERGE (p:Job:PackedJob {job_id: $job_id}) SET p += $props",
             {"job_id": job_id, "props": packed_props},
@@ -1313,7 +1410,9 @@ class Neo4jStateStore:
         )
 
     def record_combination_profile_evidence(self, profile: CombinationProfile) -> None:
-        member_signatures = list(profile.batch_vector.keys()) or [profile.group_signature]
+        member_signatures = list(profile.batch_vector.keys()) or [
+            profile.group_signature
+        ]
         self._upsert_packed_job_evidence(
             job_id=f"combination_profile::{profile.combination_key}",
             packing_group_key=profile.group_signature,
@@ -1331,7 +1430,9 @@ class Neo4jStateStore:
                 "error_message": profile.last_failure_reason,
                 "finished_at": profile.updated_at,
                 "confidence": min(1.0, 0.5 + 0.1 * float(profile.observations or 0)),
-                "metrics_json": _json_dumps({"batch_vector": profile.batch_vector, **profile.metadata}),
+                "metrics_json": _json_dumps(
+                    {"batch_vector": profile.batch_vector, **profile.metadata}
+                ),
             },
         )
 
@@ -1418,7 +1519,11 @@ class Neo4jStateStore:
             run_kind = "packed_training"
             probe_kind = None
         else:
-            run_kind = "training_resume" if job and (job.latest_checkpoint_path or job.resume_from_checkpoint) else "training"
+            run_kind = (
+                "training_resume"
+                if job and (job.latest_checkpoint_path or job.resume_from_checkpoint)
+                else "training"
+            )
             probe_kind = None
         model_key = None
         signature = None
@@ -1431,10 +1536,17 @@ class Neo4jStateStore:
             probe_kind=probe_kind,
             status=(job.status.value if job else event_type.upper()),
             job_id=job_id,
-            backend_name=str((job.metadata.get("placement_backend") if job else None) or payload.get("backend_name") or "exclusive"),
+            backend_name=str(
+                (job.metadata.get("placement_backend") if job else None)
+                or payload.get("backend_name")
+                or "exclusive"
+            ),
             model_key=model_key,
             signature=signature,
-            resolved_batch_size=(job.metadata.get("resolved_batch_size") if job else None) or payload.get("resolved_batch_size"),
+            resolved_batch_size=(
+                job.metadata.get("resolved_batch_size") if job else None
+            )
+            or payload.get("resolved_batch_size"),
             epochs=job.max_epochs if job else None,
             total_steps=job.max_steps if job else None,
             avg_sm_utilization=payload.get("avg_gpu_utilization"),
@@ -1559,7 +1671,9 @@ class Neo4jStateStore:
         )
         return rows[0]["model_key"] if rows and rows[0].get("model_key") else None
 
-    def get_solo_profile(self, signature: str, *, hardware_key: str | None = None) -> SoloProfile | None:
+    def get_solo_profile(
+        self, signature: str, *, hardware_key: str | None = None
+    ) -> SoloProfile | None:
         hardware_key = hardware_key or self.hardware_key()
         rows = self._run(
             """
@@ -1583,7 +1697,9 @@ class Neo4jStateStore:
         )
         return SoloProfile.from_row(rows[0]["row"]) if rows else None
 
-    def list_solo_profiles(self, *, hardware_key: str | None = None) -> list[SoloProfile]:
+    def list_solo_profiles(
+        self, *, hardware_key: str | None = None
+    ) -> list[SoloProfile]:
         if hardware_key is None:
             rows = self._run("""
                 MATCH (s:SoloProfile)
@@ -1672,7 +1788,9 @@ class Neo4jStateStore:
                 run_kind="packed_training",
                 status="COMPATIBLE" if profile.compatible else "INCOMPATIBLE",
                 backend_name=profile.backend_name,
-                signature=build_group_signature([profile.left_signature, profile.right_signature]),
+                signature=build_group_signature(
+                    [profile.left_signature, profile.right_signature]
+                ),
                 avg_sm_utilization=profile.avg_gpu_utilization,
                 avg_gpu_utilization=profile.avg_gpu_utilization,
                 avg_memory_utilization=profile.avg_memory_utilization,
@@ -1780,7 +1898,9 @@ class Neo4jStateStore:
                 },
             )
         else:
-            pair_key = build_backend_scoped_pair_key(left_signature, right_signature, backend_name=backend_name)
+            pair_key = build_backend_scoped_pair_key(
+                left_signature, right_signature, backend_name=backend_name
+            )
             rows = self._run(
                 """
                 MATCH (p:PacketProfile {profile_scope: 'pair', hardware_key: $hardware_key, pair_key: $pair_key})
@@ -1808,7 +1928,9 @@ class Neo4jStateStore:
             )
         return PairProfile.from_row(rows[0]["row"]) if rows else None
 
-    def list_pair_profiles(self, *, hardware_key: str | None = None, backend_name: str | None = None) -> list[PairProfile]:
+    def list_pair_profiles(
+        self, *, hardware_key: str | None = None, backend_name: str | None = None
+    ) -> list[PairProfile]:
         clauses = ["MATCH (p:PacketProfile {profile_scope: 'pair'}) WHERE 1 = 1"]
         params: dict[str, Any] = {}
         if hardware_key is not None:
@@ -1964,11 +2086,15 @@ class Neo4jStateStore:
         if backend_name is not None:
             clauses.append("AND r.backend_name = $backend_name")
             params["backend_name"] = backend_name
-        clauses.append("RETURN properties(r) AS row ORDER BY CASE r.source WHEN 'probe' THEN 0 ELSE 1 END, r.confidence DESC, r.updated_at DESC")
+        clauses.append(
+            "RETURN properties(r) AS row ORDER BY CASE r.source WHEN 'probe' THEN 0 ELSE 1 END, r.confidence DESC, r.updated_at DESC"
+        )
         rows = self._run("\n".join(clauses), params)
         return [RuntimeProfile.from_row(row["row"]) for row in rows]
 
-    def upsert_batch_probe_profile(self, profile: BatchProbeProfile) -> BatchProbeProfile:
+    def upsert_batch_probe_profile(
+        self, profile: BatchProbeProfile
+    ) -> BatchProbeProfile:
         profile.updated_at = utc_now()
         props = {
             "uid": f"batch_probe::{profile.probe_key}",
@@ -2050,10 +2176,14 @@ class Neo4jStateStore:
         return BatchProbeProfile.from_row(rows[0]["row"]) if rows else None
 
     def list_batch_probe_profiles(self) -> list[BatchProbeProfile]:
-        rows = self._run("MATCH (p:BatchProbeProfile) RETURN properties(p) AS row ORDER BY p.updated_at DESC")
+        rows = self._run(
+            "MATCH (p:BatchProbeProfile) RETURN properties(p) AS row ORDER BY p.updated_at DESC"
+        )
         return [BatchProbeProfile.from_row(row["row"]) for row in rows]
 
-    def upsert_batch_size_observation(self, observation: BatchSizeObservation) -> BatchSizeObservation:
+    def upsert_batch_size_observation(
+        self, observation: BatchSizeObservation
+    ) -> BatchSizeObservation:
         observation.updated_at = utc_now()
         props = {
             "uid": f"batch_obs::{observation.observation_key}",
@@ -2170,7 +2300,9 @@ class Neo4jStateStore:
         rows = self._run("\n".join(clauses), params)
         return [BatchSizeObservation.from_row(row["row"]) for row in rows]
 
-    def upsert_combination_profile(self, profile: CombinationProfile) -> CombinationProfile:
+    def upsert_combination_profile(
+        self, profile: CombinationProfile
+    ) -> CombinationProfile:
         profile.updated_at = utc_now()
         packet_profile_id = f"group::{profile.combination_key}"
         props = {
@@ -2208,7 +2340,9 @@ class Neo4jStateStore:
             {"packet_profile_id": packet_profile_id, "props": props},
         )
         signatures = [sig for sig in str(profile.group_signature).split("::") if sig]
-        self._link_packet_profile(packet_profile_id, signatures, profile.hardware_key, profile.backend_name)
+        self._link_packet_profile(
+            packet_profile_id, signatures, profile.hardware_key, profile.backend_name
+        )
         return profile
 
     def best_combination_profile(
@@ -2330,7 +2464,9 @@ class Neo4jStateStore:
         )
         cooldown_until = None
         if cooldown_seconds > 0:
-            cooldown_until = (parse_timestamp(utc_now()) + timedelta(seconds=cooldown_seconds)).isoformat()
+            cooldown_until = (
+                parse_timestamp(utc_now()) + timedelta(seconds=cooldown_seconds)
+            ).isoformat()
         profile = PairProfile.create(
             left_signature,
             right_signature,
@@ -2338,10 +2474,26 @@ class Neo4jStateStore:
             hardware_key=hardware_key,
             compatible=False,
             observations=(existing.observations + 1) if existing else 1,
-            peak_vram_mb=(peak_vram_mb if peak_vram_mb is not None else (existing.peak_vram_mb if existing else None)),
-            avg_vram_mb=(avg_vram_mb if avg_vram_mb is not None else (existing.avg_vram_mb if existing else None)),
-            avg_gpu_utilization=(avg_gpu_utilization if avg_gpu_utilization is not None else (existing.avg_gpu_utilization if existing else None)),
-            avg_memory_utilization=(avg_memory_utilization if avg_memory_utilization is not None else (existing.avg_memory_utilization if existing else None)),
+            peak_vram_mb=(
+                peak_vram_mb
+                if peak_vram_mb is not None
+                else (existing.peak_vram_mb if existing else None)
+            ),
+            avg_vram_mb=(
+                avg_vram_mb
+                if avg_vram_mb is not None
+                else (existing.avg_vram_mb if existing else None)
+            ),
+            avg_gpu_utilization=(
+                avg_gpu_utilization
+                if avg_gpu_utilization is not None
+                else (existing.avg_gpu_utilization if existing else None)
+            ),
+            avg_memory_utilization=(
+                avg_memory_utilization
+                if avg_memory_utilization is not None
+                else (existing.avg_memory_utilization if existing else None)
+            ),
             slowdown_ratio=existing.slowdown_ratio if existing else None,
             cooldown_until=cooldown_until,
             last_failure_reason=reason,
@@ -2391,13 +2543,36 @@ class Neo4jStateStore:
                 release_times.append(submitted)
                 finish_times.append(finished)
         sorted_flows = sorted(flow_times)
-        completed_jobs_with_flow = [job for job in jobs if parse_timestamp(job.submitted_at) and parse_timestamp(job.finished_at)]
-        minimum_priority = min((job.priority for job in completed_jobs_with_flow), default=0)
+        completed_jobs_with_flow = [
+            job
+            for job in jobs
+            if parse_timestamp(job.submitted_at) and parse_timestamp(job.finished_at)
+        ]
+        minimum_priority = min(
+            (job.priority for job in completed_jobs_with_flow), default=0
+        )
         priority_weight = float(self.settings.gpu_scheduler.objective.priority_weight)
-        flow_weights = [1.0 + priority_weight * (job.priority - minimum_priority) for job in completed_jobs_with_flow]
-        weighted_flow = sum(weight * flow for weight, flow in zip(flow_weights, flow_times, strict=True)) / max(1e-9, sum(flow_weights)) if flow_times else 0.0
-        p95_index = max(0, math.ceil(0.95 * len(sorted_flows)) - 1) if sorted_flows else 0
-        makespan = (max(finish_times) - min(release_times)).total_seconds() if finish_times and release_times else 0.0
+        flow_weights = [
+            1.0 + priority_weight * (job.priority - minimum_priority)
+            for job in completed_jobs_with_flow
+        ]
+        weighted_flow = (
+            sum(
+                weight * flow
+                for weight, flow in zip(flow_weights, flow_times, strict=True)
+            )
+            / max(1e-9, sum(flow_weights))
+            if flow_times
+            else 0.0
+        )
+        p95_index = (
+            max(0, math.ceil(0.95 * len(sorted_flows)) - 1) if sorted_flows else 0
+        )
+        makespan = (
+            (max(finish_times) - min(release_times)).total_seconds()
+            if finish_times and release_times
+            else 0.0
+        )
         cache_summary = self.cache_metadata_summary()
         total_cache = int(cache_summary["hits"]) + int(cache_summary["misses"])
         return SchedulerReport(
@@ -2405,25 +2580,57 @@ class Neo4jStateStore:
             completed_jobs=sum(job.status == JobStatus.COMPLETED for job in jobs),
             failed_jobs=sum(job.status == JobStatus.FAILED for job in jobs),
             cancelled_jobs=sum(job.status == JobStatus.CANCELLED for job in jobs),
-            average_queue_wait_seconds=(sum(wait_times) / len(wait_times) if wait_times else 0.0),
+            average_queue_wait_seconds=(
+                sum(wait_times) / len(wait_times) if wait_times else 0.0
+            ),
             average_runtime_seconds=sum(runtimes) / len(runtimes) if runtimes else 0.0,
             trace_makespan_seconds=makespan,
             total_flow_time_seconds=sum(flow_times),
             mean_flow_time_seconds=statistics.fmean(flow_times) if flow_times else 0.0,
             weighted_mean_flow_time_seconds=weighted_flow,
-            median_flow_time_seconds=(statistics.median(flow_times) if flow_times else 0.0),
+            median_flow_time_seconds=(
+                statistics.median(flow_times) if flow_times else 0.0
+            ),
             p95_flow_time_seconds=sorted_flows[p95_index] if sorted_flows else 0.0,
             max_wait_time_seconds=max(wait_times, default=0.0),
-            starvation_count=sum(wait >= self.settings.gpu_scheduler.starvation_timeout_seconds for wait in wait_times),
-            jobs_per_hour=((3600.0 * len(flow_times) / makespan) if makespan > 0 else 0.0),
-            early_stopped_epochs_saved=sum(int((job.metadata.get("early_stopping_result") or {}).get("epochs_saved", 0)) for job in jobs),
-            early_stopped_wall_time_saved_seconds=sum(
-                float((job.metadata.get("early_stopping_result") or {}).get("estimated_wall_time_saved_seconds", 0.0)) for job in jobs
+            starvation_count=sum(
+                wait >= self.settings.gpu_scheduler.starvation_timeout_seconds
+                for wait in wait_times
             ),
-            cache_hit_rate=((int(cache_summary["hits"]) / total_cache) if total_cache else 0.0),
+            jobs_per_hour=(
+                (3600.0 * len(flow_times) / makespan) if makespan > 0 else 0.0
+            ),
+            early_stopped_epochs_saved=sum(
+                int(
+                    (job.metadata.get("early_stopping_result") or {}).get(
+                        "epochs_saved", 0
+                    )
+                )
+                for job in jobs
+            ),
+            early_stopped_wall_time_saved_seconds=sum(
+                float(
+                    (job.metadata.get("early_stopping_result") or {}).get(
+                        "estimated_wall_time_saved_seconds", 0.0
+                    )
+                )
+                for job in jobs
+            ),
+            cache_hit_rate=(
+                (int(cache_summary["hits"]) / total_cache) if total_cache else 0.0
+            ),
             cache_hits=int(cache_summary["hits"]),
             cache_misses=int(cache_summary["misses"]),
-            cache_evictions=sum(event["event_type"] == "cache_evicted" for event in events),
-            packed_dispatches=sum(event["event_type"] in {"packed_pair_dispatched", "packed_group_dispatched"} for event in events),
-            packed_fallbacks=sum(event["event_type"] in {"packed_pair_fallback", "packed_group_fallback"} for event in events),
+            cache_evictions=sum(
+                event["event_type"] == "cache_evicted" for event in events
+            ),
+            packed_dispatches=sum(
+                event["event_type"]
+                in {"packed_pair_dispatched", "packed_group_dispatched"}
+                for event in events
+            ),
+            packed_fallbacks=sum(
+                event["event_type"] in {"packed_pair_fallback", "packed_group_fallback"}
+                for event in events
+            ),
         )

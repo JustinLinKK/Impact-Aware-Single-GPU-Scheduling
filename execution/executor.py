@@ -10,6 +10,7 @@ import sys
 
 from ..domain import TrainingJob
 from ..config import SchedulerSettings
+from .process_utils import start_new_session_kwargs
 
 
 @dataclass(slots=True)
@@ -28,16 +29,24 @@ class SubprocessExecutor:
         self.settings = settings
         self.project_root = Path(__file__).resolve().parents[2]
 
-    def start(self, job: TrainingJob, *, extra_env: dict[str, str] | None = None) -> WorkerProcessHandle:
+    def start(
+        self, job: TrainingJob, *, extra_env: dict[str, str] | None = None
+    ) -> WorkerProcessHandle:
         runtime_dir = self.settings.job_runtime_dir(job.job_id)
         runtime_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = runtime_dir / "stdout.log"
         stderr_path = runtime_dir / "stderr.log"
-        python_executable = job.config.python_executable or self.settings.python_executable or sys.executable
+        python_executable = (
+            job.config.python_executable
+            or self.settings.python_executable
+            or sys.executable
+        )
 
         env = os.environ.copy()
         existing_pythonpath = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = str(self.project_root) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+        env["PYTHONPATH"] = str(self.project_root) + (
+            os.pathsep + existing_pythonpath if existing_pythonpath else ""
+        )
         env.update(job.config.env)
         if extra_env:
             env.update(extra_env)
@@ -59,7 +68,13 @@ class SubprocessExecutor:
             stdout=stdout_handle,
             stderr=stderr_handle,
             text=True,
+            **start_new_session_kwargs(),
         )
         stdout_handle.close()
         stderr_handle.close()
-        return WorkerProcessHandle(job_id=job.job_id, process=process, stdout_path=stdout_path, stderr_path=stderr_path)
+        return WorkerProcessHandle(
+            job_id=job.job_id,
+            process=process,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )

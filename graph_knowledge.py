@@ -84,7 +84,9 @@ class SchedulerKnowledgeBase:
         return None
 
     def _format_hardware_summary(self, record: dict[str, Any]) -> str:
-        headline = record.get("gpu_name") or record.get("hardware_key") or "unknown hardware"
+        headline = (
+            record.get("gpu_name") or record.get("hardware_key") or "unknown hardware"
+        )
         details: list[str] = []
         if record.get("total_vram_mb") is not None:
             details.append(f"{record['total_vram_mb']} MiB VRAM")
@@ -116,7 +118,11 @@ class SchedulerKnowledgeBase:
         # The current runtime hardware is the only source that is guaranteed to
         # exist even when the graph backend is disabled or sparsely populated.
         toolkit_name = "cuda" if getattr(profile, "cuda_runtime", None) else "unknown"
-        toolkit_version = str(profile.cuda_runtime) if getattr(profile, "cuda_runtime", None) else "unknown"
+        toolkit_version = (
+            str(profile.cuda_runtime)
+            if getattr(profile, "cuda_runtime", None)
+            else "unknown"
+        )
         record = {
             "hardware_key": str(profile.hardware_key),
             "gpu_name": str(profile.gpu_name),
@@ -154,13 +160,29 @@ class SchedulerKnowledgeBase:
         toolkit = dict(payload.get("toolkit") or {})
         record = {
             "hardware_key": payload.get("hardware_key") or hardware.get("hardware_key"),
-            "gpu_name": payload.get("gpu_name") or hardware.get("gpu_name") or accelerator.get("accelerator_name"),
-            "total_vram_mb": payload.get("total_vram_mb") if payload.get("total_vram_mb") is not None else hardware.get("total_vram_mb"),
-            "compute_capability": payload.get("compute_capability") or hardware.get("compute_capability") or accelerator.get("compute_capability"),
-            "toolkit_name": payload.get("toolkit_name") or hardware.get("toolkit_name") or toolkit.get("toolkit_name"),
-            "toolkit_version": payload.get("toolkit_version") or hardware.get("toolkit_version") or toolkit.get("toolkit_version"),
-            "torch_version": payload.get("torch_version") or hardware.get("torch_version") or toolkit.get("torch_version"),
-            "summary_text": payload.get("summary_text") or hardware.get("summary_text") or "",
+            "gpu_name": payload.get("gpu_name")
+            or hardware.get("gpu_name")
+            or accelerator.get("accelerator_name"),
+            "total_vram_mb": (
+                payload.get("total_vram_mb")
+                if payload.get("total_vram_mb") is not None
+                else hardware.get("total_vram_mb")
+            ),
+            "compute_capability": payload.get("compute_capability")
+            or hardware.get("compute_capability")
+            or accelerator.get("compute_capability"),
+            "toolkit_name": payload.get("toolkit_name")
+            or hardware.get("toolkit_name")
+            or toolkit.get("toolkit_name"),
+            "toolkit_version": payload.get("toolkit_version")
+            or hardware.get("toolkit_version")
+            or toolkit.get("toolkit_version"),
+            "torch_version": payload.get("torch_version")
+            or hardware.get("torch_version")
+            or toolkit.get("torch_version"),
+            "summary_text": payload.get("summary_text")
+            or hardware.get("summary_text")
+            or "",
             "is_current": bool(payload.get("is_current")),
             "source": payload.get("source") or "graph_hardware_node",
             "accelerator": accelerator or None,
@@ -171,7 +193,9 @@ class SchedulerKnowledgeBase:
             record["summary_text"] = self._format_hardware_summary(record)
         return record
 
-    def _merge_hardware_record(self, inventory: dict[str, dict[str, Any]], payload: dict[str, Any]) -> None:
+    def _merge_hardware_record(
+        self, inventory: dict[str, dict[str, Any]], payload: dict[str, Any]
+    ) -> None:
         # Hardware can be discovered from multiple sources: current runtime,
         # persisted Hardware nodes, and profile-only evidence. Merge into one
         # record keyed by hardware_key and keep the richest known fields.
@@ -193,9 +217,15 @@ class SchedulerKnowledgeBase:
             "summary_text",
             "source",
         ):
-            if current.get(key) in {None, "", "unknown"} and record.get(key) not in {None, "", "unknown"}:
+            if current.get(key) in {None, "", "unknown"} and record.get(key) not in {
+                None,
+                "",
+                "unknown",
+            }:
                 current[key] = record[key]
-        current["is_current"] = bool(current.get("is_current") or record.get("is_current"))
+        current["is_current"] = bool(
+            current.get("is_current") or record.get("is_current")
+        )
         if not current.get("accelerator") and record.get("accelerator"):
             current["accelerator"] = record["accelerator"]
         if not current.get("toolkit") and record.get("toolkit"):
@@ -205,7 +235,9 @@ class SchedulerKnowledgeBase:
             stats[key] = int(stats.get(key, 0) or 0) + int(value or 0)
         current["summary_text"] = self._format_hardware_summary(current)
 
-    def _touch_hardware_stat(self, inventory: dict[str, dict[str, Any]], hardware_key: str, stat_key: str) -> None:
+    def _touch_hardware_stat(
+        self, inventory: dict[str, dict[str, Any]], hardware_key: str, stat_key: str
+    ) -> None:
         # Some backends do not materialize explicit Hardware nodes for every
         # observed key. This fallback keeps hardware discoverable from profile
         # evidence alone.
@@ -250,18 +282,28 @@ class SchedulerKnowledgeBase:
             except Exception:
                 pass
         for runtime_profile in self.store.list_runtime_profiles():
-            self._touch_hardware_stat(inventory, str(runtime_profile.hardware_key), "runtime_profiles")
+            self._touch_hardware_stat(
+                inventory, str(runtime_profile.hardware_key), "runtime_profiles"
+            )
         for solo_profile in self.store.list_solo_profiles():
-            self._touch_hardware_stat(inventory, str(solo_profile.hardware_key), "solo_profiles")
+            self._touch_hardware_stat(
+                inventory, str(solo_profile.hardware_key), "solo_profiles"
+            )
         if hasattr(self.store, "list_pair_profiles"):
             for pair_profile in self.store.list_pair_profiles():
-                self._touch_hardware_stat(inventory, str(pair_profile.hardware_key), "pair_profiles")
+                self._touch_hardware_stat(
+                    inventory, str(pair_profile.hardware_key), "pair_profiles"
+                )
         for observation in self.store.list_batch_size_observations():
-            self._touch_hardware_stat(inventory, str(observation.hardware_key), "batch_size_observations")
+            self._touch_hardware_stat(
+                inventory, str(observation.hardware_key), "batch_size_observations"
+            )
             record = inventory.get(str(observation.hardware_key))
             if record is not None and observation.memory_total_mb is not None:
                 current_total = record.get("total_vram_mb")
-                if current_total is None or int(observation.memory_total_mb) > int(current_total):
+                if current_total is None or int(observation.memory_total_mb) > int(
+                    current_total
+                ):
                     record["total_vram_mb"] = int(observation.memory_total_mb)
                     record["summary_text"] = self._format_hardware_summary(record)
         current_name = self._current_hardware_name()
@@ -269,7 +311,9 @@ class SchedulerKnowledgeBase:
         if current_name and current_key:
             for batch_probe_profile in self.store.list_batch_probe_profiles():
                 if batch_probe_profile.device_type == current_name:
-                    self._touch_hardware_stat(inventory, current_key, "batch_probe_profiles")
+                    self._touch_hardware_stat(
+                        inventory, current_key, "batch_probe_profiles"
+                    )
         return inventory
 
     def _lookup_hardware_record(self, hardware_key: str) -> dict[str, Any] | None:
@@ -324,7 +368,11 @@ class SchedulerKnowledgeBase:
             if hardware_key and hardware_key == current_key:
                 return True
             current_name = self._current_hardware_name().lower()
-            return bool(device_type and current_name and current_name in str(device_type).lower())
+            return bool(
+                device_type
+                and current_name
+                and current_name in str(device_type).lower()
+            )
         if device_type and normalized in str(device_type).lower():
             return True
         if hardware_key:
@@ -340,7 +388,10 @@ class SchedulerKnowledgeBase:
             return True
         current_name, current_version = self._current_toolkit()
         normalized = toolkit.lower()
-        return normalized in {current_name.lower(), f"{current_name.lower()}:{current_version.lower()}"}
+        return normalized in {
+            current_name.lower(),
+            f"{current_name.lower()}:{current_version.lower()}",
+        }
 
     def _profile_summary(self, kind: str, payload: dict[str, Any]) -> str:
         if kind == "runtime_profile":
@@ -363,14 +414,18 @@ class SchedulerKnowledgeBase:
                 f" observed peak VRAM {payload.get('peak_vram_mb')} MiB."
             )
         if kind == "run_profile":
-            model_key = payload.get("model_key") or payload.get("signature") or "unknown-model"
+            model_key = (
+                payload.get("model_key") or payload.get("signature") or "unknown-model"
+            )
             return (
                 f"Run profile {payload.get('run_profile_id')} for {model_key}"
                 f" ended with status {payload.get('status')}."
             )
         return f"{kind} evidence"
 
-    def _match_model_key(self, candidate_model_key: str | None, value: str | None) -> str | None:
+    def _match_model_key(
+        self, candidate_model_key: str | None, value: str | None
+    ) -> str | None:
         if not candidate_model_key or not value:
             return None
         left = str(candidate_model_key).strip().lower()
@@ -383,7 +438,9 @@ class SchedulerKnowledgeBase:
             return "model_key_contains"
         return None
 
-    def _runtime_match_reason(self, signature: str | None, candidate: dict[str, Any]) -> str | None:
+    def _runtime_match_reason(
+        self, signature: str | None, candidate: dict[str, Any]
+    ) -> str | None:
         # Signature matches are stronger than model-key fallbacks because they
         # preserve the scheduler's exact workload identity.
         script_signature = candidate.get("script_signature")
@@ -395,17 +452,29 @@ class SchedulerKnowledgeBase:
             return reason
         return self._match_model_key(candidate.get("model_key"), signature)
 
-    def _solo_match_reason(self, signature: str | None, family: str | None, candidate: dict[str, Any]) -> str | None:
+    def _solo_match_reason(
+        self, signature: str | None, family: str | None, candidate: dict[str, Any]
+    ) -> str | None:
         reason = self._runtime_match_reason(signature, candidate)
         if reason:
             return reason
-        if candidate.get("packing_family") and family and candidate["packing_family"] == family:
+        if (
+            candidate.get("packing_family")
+            and family
+            and candidate["packing_family"] == family
+        ):
             return "packing_family_exact"
-        if candidate.get("model_family") and family and candidate["model_family"] == family:
+        if (
+            candidate.get("model_family")
+            and family
+            and candidate["model_family"] == family
+        ):
             return "model_family_exact"
         return None
 
-    def _batch_probe_match_reason(self, model_key: str | None, candidate: dict[str, Any]) -> str | None:
+    def _batch_probe_match_reason(
+        self, model_key: str | None, candidate: dict[str, Any]
+    ) -> str | None:
         reason = self._match_model_key(candidate.get("model_key"), model_key)
         if reason:
             return reason
@@ -413,15 +482,26 @@ class SchedulerKnowledgeBase:
             return self._match_model_key(candidate["packing_family"], model_key)
         return None
 
-    def _run_match_reason(self, profile: RunProfile, candidate: dict[str, Any]) -> str | None:
-        if candidate.get("script_signature") and profile.signature == candidate["script_signature"]:
+    def _run_match_reason(
+        self, profile: RunProfile, candidate: dict[str, Any]
+    ) -> str | None:
+        if (
+            candidate.get("script_signature")
+            and profile.signature == candidate["script_signature"]
+        ):
             return "signature_exact"
         reason = self._match_model_key(candidate.get("model_key"), profile.model_key)
         if reason:
             return reason
         return self._match_model_key(candidate.get("model_key"), profile.signature)
 
-    def _evidence_score(self, kind: str, match_reason: str, backend_name: str | None, candidate: dict[str, Any]) -> int:
+    def _evidence_score(
+        self,
+        kind: str,
+        match_reason: str,
+        backend_name: str | None,
+        candidate: dict[str, Any],
+    ) -> int:
         # Ranking is intentionally heuristic: runtime profiles are the strongest
         # scheduling evidence, followed by batch probes, then broader solo/run
         # history. This keeps the aggregate MCP response deterministic without
@@ -440,7 +520,10 @@ class SchedulerKnowledgeBase:
             "model_family_exact": 8,
         }.get(match_reason, 0)
         backend_bonus = 0
-        if candidate.get("backend_preference") and backend_name == candidate["backend_preference"]:
+        if (
+            candidate.get("backend_preference")
+            and backend_name == candidate["backend_preference"]
+        ):
             backend_bonus = 5
         return kind_weight + match_weight + backend_bonus
 
@@ -450,7 +533,9 @@ class SchedulerKnowledgeBase:
         if kind == "batch_probe_profile":
             return f"batch_probe_profile:{payload.get('probe_key')}"
         if kind == "solo_profile":
-            return f"solo_profile:{payload.get('hardware_key')}:{payload.get('signature')}"
+            return (
+                f"solo_profile:{payload.get('hardware_key')}:{payload.get('signature')}"
+            )
         if kind == "run_profile":
             return f"run_profile:{payload.get('run_profile_id')}"
         return f"{kind}:unknown"
@@ -465,7 +550,9 @@ class SchedulerKnowledgeBase:
         candidate: dict[str, Any],
         backend_name: str | None = None,
     ) -> None:
-        summary_text = str(payload.get("summary_text") or self._profile_summary(kind, payload))
+        summary_text = str(
+            payload.get("summary_text") or self._profile_summary(kind, payload)
+        )
         entry = {
             "kind": kind,
             "match_reason": match_reason,
@@ -473,9 +560,13 @@ class SchedulerKnowledgeBase:
             "ref": self._evidence_ref(kind, payload),
             "data": payload,
         }
-        rows.append((self._evidence_score(kind, match_reason, backend_name, candidate), entry))
+        rows.append(
+            (self._evidence_score(kind, match_reason, backend_name, candidate), entry)
+        )
 
-    def _normalized_job_design_candidate(self, candidate: dict[str, Any] | None) -> dict[str, Any]:
+    def _normalized_job_design_candidate(
+        self, candidate: dict[str, Any] | None
+    ) -> dict[str, Any]:
         # Only accept the fixed public contract here so future callers get
         # predictable behavior even if they over-send fields.
         normalized: dict[str, Any] = {}
@@ -491,7 +582,9 @@ class SchedulerKnowledgeBase:
                 normalized[key] = None
         return normalized
 
-    def _current_runtime_profiles_for_candidate(self, candidate: dict[str, Any]) -> list[tuple[str, Any]]:
+    def _current_runtime_profiles_for_candidate(
+        self, candidate: dict[str, Any]
+    ) -> list[tuple[str, Any]]:
         current_key = self._current_hardware_key()
         profiles = self.store.list_runtime_profiles(hardware_key=current_key or None)
         rows: list[tuple[str, Any]] = []
@@ -501,7 +594,9 @@ class SchedulerKnowledgeBase:
                 rows.append((match_reason, profile))
         return rows
 
-    def _runtime_estimate_for_candidate(self, candidate: dict[str, Any]) -> dict[str, Any]:
+    def _runtime_estimate_for_candidate(
+        self, candidate: dict[str, Any]
+    ) -> dict[str, Any]:
         runtime_matches = self._current_runtime_profiles_for_candidate(candidate)
         if not runtime_matches:
             return {"found": False, "reason": "insufficient evidence"}
@@ -515,7 +610,7 @@ class SchedulerKnowledgeBase:
                 for match_reason, profile in runtime_matches
                 if int(profile.resolved_batch_size or 0) == int(proposed_batch_size)
             ]
-        chosen_match_reason, chosen_profile = (exact[0] if exact else runtime_matches[0])
+        chosen_match_reason, chosen_profile = exact[0] if exact else runtime_matches[0]
         payload = chosen_profile.to_dict()
         return {
             "found": True,
@@ -537,15 +632,21 @@ class SchedulerKnowledgeBase:
         for solo_profile in self.store.list_solo_profiles():
             if solo_profile.hardware_key == current_key:
                 continue
-            if self._solo_match_reason(solo_profile.signature, solo_profile.family, candidate):
+            if self._solo_match_reason(
+                solo_profile.signature, solo_profile.family, candidate
+            ):
                 return True
         return False
 
-    def _matched_profiles_for_candidate(self, candidate: dict[str, Any], limit: int) -> list[dict[str, Any]]:
+    def _matched_profiles_for_candidate(
+        self, candidate: dict[str, Any], limit: int
+    ) -> list[dict[str, Any]]:
         current_key = self._current_hardware_key()
         current_name = self._current_hardware_name()
         rows: list[tuple[int, dict[str, Any]]] = []
-        for profile in self.store.list_runtime_profiles(hardware_key=current_key or None):
+        for profile in self.store.list_runtime_profiles(
+            hardware_key=current_key or None
+        ):
             match_reason = self._runtime_match_reason(profile.signature, candidate)
             if not match_reason:
                 continue
@@ -571,7 +672,9 @@ class SchedulerKnowledgeBase:
                 candidate=candidate,
             )
         for profile in self.store.list_solo_profiles(hardware_key=current_key or None):
-            match_reason = self._solo_match_reason(profile.signature, profile.family, candidate)
+            match_reason = self._solo_match_reason(
+                profile.signature, profile.family, candidate
+            )
             if not match_reason:
                 continue
             self._append_evidence(
@@ -610,9 +713,17 @@ class SchedulerKnowledgeBase:
         return {
             "safe_vram_budget_mb": self._safe_vram_budget_mb(),
             "memory": memory.to_dict() if hasattr(memory, "to_dict") else {},
-            "thresholds": thresholds.to_dict() if hasattr(thresholds, "to_dict") else {},
-            "backend_priority": list(getattr(gpu_scheduler, "backend_priority", []) or []),
-            "submission_defaults": submission_defaults.to_dict() if hasattr(submission_defaults, "to_dict") else {},
+            "thresholds": (
+                thresholds.to_dict() if hasattr(thresholds, "to_dict") else {}
+            ),
+            "backend_priority": list(
+                getattr(gpu_scheduler, "backend_priority", []) or []
+            ),
+            "submission_defaults": (
+                submission_defaults.to_dict()
+                if hasattr(submission_defaults, "to_dict")
+                else {}
+            ),
         }
 
     def _backend_capabilities(self) -> dict[str, Any]:
@@ -630,10 +741,18 @@ class SchedulerKnowledgeBase:
         return {
             "enabled_backends": enabled_backends,
             "priority": list(getattr(gpu_scheduler, "backend_priority", []) or []),
-            "concurrent_groups_enabled": bool(getattr(gpu_scheduler, "concurrent_groups_enabled", False)),
-            "concurrent_backend_allowlist": list(getattr(gpu_scheduler, "concurrent_backend_allowlist", []) or []),
-            "max_packed_jobs_per_gpu": getattr(gpu_scheduler, "max_packed_jobs_per_gpu", None),
-            "allow_three_way_packing": bool(getattr(gpu_scheduler, "allow_three_way_packing", False)),
+            "concurrent_groups_enabled": bool(
+                getattr(gpu_scheduler, "concurrent_groups_enabled", False)
+            ),
+            "concurrent_backend_allowlist": list(
+                getattr(gpu_scheduler, "concurrent_backend_allowlist", []) or []
+            ),
+            "max_packed_jobs_per_gpu": getattr(
+                gpu_scheduler, "max_packed_jobs_per_gpu", None
+            ),
+            "allow_three_way_packing": bool(
+                getattr(gpu_scheduler, "allow_three_way_packing", False)
+            ),
         }
 
     def _scheduler_guidance(self) -> dict[str, Any]:
@@ -642,16 +761,28 @@ class SchedulerKnowledgeBase:
         submission_defaults = getattr(gpu_scheduler, "submission_defaults", None)
         recommended_allowlist = []
         if submission_defaults is not None:
-            recommended_allowlist = list(getattr(submission_defaults, "backend_allowlist", []) or [])
+            recommended_allowlist = list(
+                getattr(submission_defaults, "backend_allowlist", []) or []
+            )
         if not recommended_allowlist and gpu_scheduler is not None:
-            recommended_allowlist = list(getattr(gpu_scheduler, "backend_priority", []) or [])
+            recommended_allowlist = list(
+                getattr(gpu_scheduler, "backend_priority", []) or []
+            )
         return {
             "recommended_backend_allowlist": recommended_allowlist,
-            "batch_probe_enabled": bool(getattr(submission_defaults, "batch_probe_enabled", False)),
-            "runtime_probe_enabled": bool(getattr(submission_defaults, "runtime_probe_enabled", False)),
+            "batch_probe_enabled": bool(
+                getattr(submission_defaults, "batch_probe_enabled", False)
+            ),
+            "runtime_probe_enabled": bool(
+                getattr(submission_defaults, "runtime_probe_enabled", False)
+            ),
             "safe_vram_budget_mb": self._safe_vram_budget_mb(),
-            "packing_eligible_default": bool(getattr(submission_defaults, "packing_eligible", False)),
-            "packing_family_default": getattr(submission_defaults, "packing_family", None),
+            "packing_eligible_default": bool(
+                getattr(submission_defaults, "packing_eligible", False)
+            ),
+            "packing_family_default": getattr(
+                submission_defaults, "packing_family", None
+            ),
         }
 
     def _job_design_risk_flags(
@@ -681,11 +812,19 @@ class SchedulerKnowledgeBase:
         if proposed_epochs is not None and recommended_epochs is not None:
             if int(proposed_epochs) > int(recommended_epochs):
                 flags.append("proposed_epochs_above_historical_median")
-        if runtime_estimate.get("found") and not runtime_estimate.get("matched_exact_batch_size", False):
+        if runtime_estimate.get("found") and not runtime_estimate.get(
+            "matched_exact_batch_size", False
+        ):
             flags.append("runtime_estimate_reused_nearest_batch_size")
         backend_preference = candidate.get("backend_preference")
-        recommended_allowlist = scheduler_guidance.get("recommended_backend_allowlist") or []
-        if backend_preference and recommended_allowlist and backend_preference not in recommended_allowlist:
+        recommended_allowlist = (
+            scheduler_guidance.get("recommended_backend_allowlist") or []
+        )
+        if (
+            backend_preference
+            and recommended_allowlist
+            and backend_preference not in recommended_allowlist
+        ):
             flags.append("backend_preference_not_in_recommended_allowlist")
         return flags
 
@@ -711,9 +850,17 @@ class SchedulerKnowledgeBase:
             confidence -= 0.10
         return max(0.0, min(1.0, round(confidence, 3)))
 
-    def list_run_profiles(self, *, job_id: str | None = None, model_key: str | None = None, signature: str | None = None) -> list[RunProfile]:
+    def list_run_profiles(
+        self,
+        *,
+        job_id: str | None = None,
+        model_key: str | None = None,
+        signature: str | None = None,
+    ) -> list[RunProfile]:
         if hasattr(self.store, "list_run_profiles"):
-            return self.store.list_run_profiles(job_id=job_id, model_key=model_key, signature=signature)
+            return self.store.list_run_profiles(
+                job_id=job_id, model_key=model_key, signature=signature
+            )
         profiles: list[RunProfile] = []
         jobs = [self.store.get_job(job_id)] if job_id else self.store.list_jobs()
         toolkit_name, toolkit_version = self._current_toolkit()
@@ -727,10 +874,16 @@ class SchedulerKnowledgeBase:
             profiles.append(
                 RunProfile(
                     run_profile_id=f"run::job::{job.job_id}",
-                    run_kind="training_resume" if (job.latest_checkpoint_path or job.resume_from_checkpoint) else "training",
+                    run_kind=(
+                        "training_resume"
+                        if (job.latest_checkpoint_path or job.resume_from_checkpoint)
+                        else "training"
+                    ),
                     status=job.status.value,
                     job_id=job.job_id,
-                    backend_name=str(job.metadata.get("placement_backend") or "exclusive"),
+                    backend_name=str(
+                        job.metadata.get("placement_backend") or "exclusive"
+                    ),
                     toolkit_name=toolkit_name,
                     toolkit_version=toolkit_version,
                     model_key=model,
@@ -746,12 +899,20 @@ class SchedulerKnowledgeBase:
             )
         return profiles
 
-    def search_hardware(self, *, query: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+    def search_hardware(
+        self, *, query: str | None = None, limit: int = 10
+    ) -> list[dict[str, Any]]:
         normalized = str(query or "").strip().lower()
         rows = list(self._hardware_inventory().values())
         if normalized:
             rows = [row for row in rows if normalized in self._hardware_query_text(row)]
-        rows.sort(key=lambda row: (not bool(row.get("is_current")), str(row.get("gpu_name") or ""), str(row.get("hardware_key") or "")))
+        rows.sort(
+            key=lambda row: (
+                not bool(row.get("is_current")),
+                str(row.get("gpu_name") or ""),
+                str(row.get("hardware_key") or ""),
+            )
+        )
         trimmed = rows[: max(1, int(limit))]
         return [
             {
@@ -768,7 +929,9 @@ class SchedulerKnowledgeBase:
             for row in trimmed
         ]
 
-    def get_hardware_context(self, hardware_key: str = "current", include_scheduler_limits: bool = True) -> dict[str, Any]:
+    def get_hardware_context(
+        self, hardware_key: str = "current", include_scheduler_limits: bool = True
+    ) -> dict[str, Any]:
         # This tool is intentionally read-only and returns a self-contained
         # payload so callers do not need follow-up graph queries for basic
         # hardware, toolkit, and scheduler-limit inspection.
@@ -780,7 +943,9 @@ class SchedulerKnowledgeBase:
                 "accelerator": None,
                 "toolkit": None,
                 "backend_capabilities": self._backend_capabilities(),
-                "scheduler_limits": self._scheduler_limits() if include_scheduler_limits else {},
+                "scheduler_limits": (
+                    self._scheduler_limits() if include_scheduler_limits else {}
+                ),
                 "source": "not_found",
             }
         hardware = {
@@ -820,8 +985,15 @@ class SchedulerKnowledgeBase:
             "accelerator": accelerator,
             "toolkit": toolkit,
             "backend_capabilities": self._backend_capabilities(),
-            "scheduler_limits": self._scheduler_limits() if include_scheduler_limits else {},
-            "source": record.get("source") or ("current_runtime" if hardware_key == "current" else "derived_profile_inventory"),
+            "scheduler_limits": (
+                self._scheduler_limits() if include_scheduler_limits else {}
+            ),
+            "source": record.get("source")
+            or (
+                "current_runtime"
+                if hardware_key == "current"
+                else "derived_profile_inventory"
+            ),
         }
 
     def get_job_graph_context(self, job_id: str) -> dict[str, Any]:
@@ -833,9 +1005,22 @@ class SchedulerKnowledgeBase:
         return {
             "job": job.to_dict(),
             "events": self.store.list_events(job_id=job_id),
-            "run_profiles": [profile.to_dict() for profile in self.list_run_profiles(job_id=job_id)],
-            "runtime_profiles": [profile.to_dict() for profile in self.store.list_runtime_profiles(signature=signature)] if signature else [],
-            "solo_profile": self.store.get_solo_profile(signature).to_dict() if signature and self.store.get_solo_profile(signature) else None,
+            "run_profiles": [
+                profile.to_dict() for profile in self.list_run_profiles(job_id=job_id)
+            ],
+            "runtime_profiles": (
+                [
+                    profile.to_dict()
+                    for profile in self.store.list_runtime_profiles(signature=signature)
+                ]
+                if signature
+                else []
+            ),
+            "solo_profile": (
+                self.store.get_solo_profile(signature).to_dict()
+                if signature and self.store.get_solo_profile(signature)
+                else None
+            ),
             "batch_probe_profiles": [
                 profile.to_dict()
                 for profile in self.store.list_batch_probe_profiles()
@@ -855,29 +1040,60 @@ class SchedulerKnowledgeBase:
         model_name = str(model_name or "")
         results: list[dict[str, Any]] = []
         for profile in self.store.list_runtime_profiles():
-            if model_name and model_name not in str(self._model_key_for_signature(profile.signature) or profile.signature):
+            if model_name and model_name not in str(
+                self._model_key_for_signature(profile.signature) or profile.signature
+            ):
                 continue
             if backend and backend != profile.backend_name:
                 continue
             if not self._matches_toolkit(toolkit):
                 continue
-            if not self._record_matches_hardware_filter(hardware, hardware_key=profile.hardware_key):
+            if not self._record_matches_hardware_filter(
+                hardware, hardware_key=profile.hardware_key
+            ):
                 continue
-            results.append({"kind": "runtime_profile", "data": profile.to_dict(), "summary_text": getattr(profile, "summary_text", None) or self._profile_summary("runtime_profile", profile.to_dict())})
+            results.append(
+                {
+                    "kind": "runtime_profile",
+                    "data": profile.to_dict(),
+                    "summary_text": getattr(profile, "summary_text", None)
+                    or self._profile_summary("runtime_profile", profile.to_dict()),
+                }
+            )
         for profile in self.store.list_batch_probe_profiles():
             if model_name and model_name not in profile.model_key:
                 continue
-            if not self._record_matches_hardware_filter(hardware, device_type=profile.device_type):
+            if not self._record_matches_hardware_filter(
+                hardware, device_type=profile.device_type
+            ):
                 continue
             if not self._matches_toolkit(toolkit):
                 continue
-            results.append({"kind": "batch_probe_profile", "data": profile.to_dict(), "summary_text": profile.metadata.get("summary_text") or self._profile_summary("batch_probe_profile", profile.to_dict())})
+            results.append(
+                {
+                    "kind": "batch_probe_profile",
+                    "data": profile.to_dict(),
+                    "summary_text": profile.metadata.get("summary_text")
+                    or self._profile_summary("batch_probe_profile", profile.to_dict()),
+                }
+            )
         for profile in self.store.list_solo_profiles():
-            if model_name and model_name not in str(self._model_key_for_signature(profile.signature) or profile.signature):
+            if model_name and model_name not in str(
+                self._model_key_for_signature(profile.signature) or profile.signature
+            ):
                 continue
-            if not self._record_matches_hardware_filter(hardware, hardware_key=profile.hardware_key):
+            if not self._record_matches_hardware_filter(
+                hardware, hardware_key=profile.hardware_key
+            ):
                 continue
-            results.append({"kind": "solo_profile", "data": profile.to_dict(), "summary_text": profile.metadata.get("summary_text") or self._profile_summary("solo_profile", profile.to_dict())})
+            results.append(
+                {
+                    "kind": "solo_profile",
+                    "data": profile.to_dict(),
+                    "summary_text": profile.metadata.get("summary_text")
+                    or self._profile_summary("solo_profile", profile.to_dict()),
+                }
+            )
         return results[: max(1, int(limit))]
 
     def get_runtime_estimate(
@@ -889,16 +1105,36 @@ class SchedulerKnowledgeBase:
         backend: str = "exclusive",
     ) -> dict[str, Any]:
         signature = model_or_signature
-        profiles = self.store.list_runtime_profiles(signature=signature, backend_name=backend)
+        profiles = self.store.list_runtime_profiles(
+            signature=signature, backend_name=backend
+        )
         if not profiles:
-            profiles = [profile for profile in self.store.list_runtime_profiles(backend_name=backend) if model_or_signature in profile.signature]
+            profiles = [
+                profile
+                for profile in self.store.list_runtime_profiles(backend_name=backend)
+                if model_or_signature in profile.signature
+            ]
         if hardware:
-            profiles = [profile for profile in profiles if self._record_matches_hardware_filter(hardware, hardware_key=profile.hardware_key)]
+            profiles = [
+                profile
+                for profile in profiles
+                if self._record_matches_hardware_filter(
+                    hardware, hardware_key=profile.hardware_key
+                )
+            ]
         if not profiles:
             return {"found": False, "reason": "insufficient evidence"}
-        exact = [profile for profile in profiles if int(profile.resolved_batch_size) == int(batch_size)]
+        exact = [
+            profile
+            for profile in profiles
+            if int(profile.resolved_batch_size) == int(batch_size)
+        ]
         chosen = exact[0] if exact else profiles[0]
-        return {"found": True, "profile": chosen.to_dict(), "matched_exact_batch_size": bool(exact)}
+        return {
+            "found": True,
+            "profile": chosen.to_dict(),
+            "matched_exact_batch_size": bool(exact),
+        }
 
     def recommend_batch_size(
         self,
@@ -911,11 +1147,20 @@ class SchedulerKnowledgeBase:
     ) -> dict[str, Any]:
         candidates = []
         for profile in self.store.list_batch_probe_profiles():
-            if model_or_signature not in {profile.model_key, shape_signature and profile.shape_signature or ""} and model_or_signature not in profile.model_key:
+            if (
+                model_or_signature
+                not in {
+                    profile.model_key,
+                    shape_signature and profile.shape_signature or "",
+                }
+                and model_or_signature not in profile.model_key
+            ):
                 continue
             if shape_signature and profile.shape_signature != shape_signature:
                 continue
-            if not self._record_matches_hardware_filter(hardware, device_type=profile.device_type):
+            if not self._record_matches_hardware_filter(
+                hardware, device_type=profile.device_type
+            ):
                 continue
             if not self._matches_toolkit(toolkit):
                 continue
@@ -924,11 +1169,16 @@ class SchedulerKnowledgeBase:
             observations = [
                 obs
                 for obs in self.store.list_batch_size_observations()
-                if model_or_signature in obs.model_key and self._record_matches_hardware_filter(hardware, hardware_key=obs.hardware_key)
+                if model_or_signature in obs.model_key
+                and self._record_matches_hardware_filter(
+                    hardware, hardware_key=obs.hardware_key
+                )
             ]
             if not observations:
                 return {"found": False, "reason": "insufficient evidence"}
-            observations.sort(key=lambda item: (item.batch_size, item.observations), reverse=True)
+            observations.sort(
+                key=lambda item: (item.batch_size, item.observations), reverse=True
+            )
             best = observations[0]
             return {
                 "found": True,
@@ -937,7 +1187,9 @@ class SchedulerKnowledgeBase:
                 "evidence": best.to_dict(),
                 "current_batch_size": current_batch_size,
             }
-        candidates.sort(key=lambda item: (item.resolved_batch_size, item.observations), reverse=True)
+        candidates.sort(
+            key=lambda item: (item.resolved_batch_size, item.observations), reverse=True
+        )
         best = candidates[0]
         return {
             "found": True,
@@ -959,15 +1211,24 @@ class SchedulerKnowledgeBase:
             return {"found": False, "reason": "insufficient evidence"}
         jobs = []
         for job in self.store.list_jobs():
-            if model_or_signature not in {job.baseline_model_id, job.packing.signature} and model_or_signature not in str(job.batch_probe.model_key or ""):
+            if model_or_signature not in {
+                job.baseline_model_id,
+                job.packing.signature,
+            } and model_or_signature not in str(job.batch_probe.model_key or ""):
                 continue
-            if not self._record_matches_hardware_filter(hardware, hardware_key=self._current_hardware_key()):
+            if not self._record_matches_hardware_filter(
+                hardware, hardware_key=self._current_hardware_key()
+            ):
                 continue
             epochs = job.max_epochs or job.config.max_epochs
             if epochs:
                 jobs.append(int(epochs))
         if not jobs:
-            return {"found": False, "reason": "insufficient evidence", "current_epochs": current_epochs}
+            return {
+                "found": False,
+                "reason": "insufficient evidence",
+                "current_epochs": current_epochs,
+            }
         recommendation = int(median(jobs))
         return {
             "found": True,
@@ -985,44 +1246,93 @@ class SchedulerKnowledgeBase:
         hardware: str | None = None,
         backend: str = "exclusive",
     ) -> dict[str, Any]:
-        profiles = self.store.list_pair_profiles(backend_name=backend) if hasattr(self.store, "list_pair_profiles") else []
+        profiles = (
+            self.store.list_pair_profiles(backend_name=backend)
+            if hasattr(self.store, "list_pair_profiles")
+            else []
+        )
         for profile in profiles:
-            if not self._record_matches_hardware_filter(hardware, hardware_key=profile.hardware_key):
+            if not self._record_matches_hardware_filter(
+                hardware, hardware_key=profile.hardware_key
+            ):
                 continue
             model_left = self._model_key_for_signature(profile.left_signature)
             model_right = self._model_key_for_signature(profile.right_signature)
-            values = {str(model_left or profile.left_signature), str(model_right or profile.right_signature)}
+            values = {
+                str(model_left or profile.left_signature),
+                str(model_right or profile.right_signature),
+            }
             if {model_a, model_b} == values:
-                return {"found": True, "compatible": profile.compatible, "profile": profile.to_dict()}
+                return {
+                    "found": True,
+                    "compatible": profile.compatible,
+                    "profile": profile.to_dict(),
+                }
         return {"found": False, "reason": "insufficient evidence"}
 
-    def search_profile_summaries(self, *, query: str, limit: int = 20) -> list[dict[str, Any]]:
+    def search_profile_summaries(
+        self, *, query: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
         normalized = query.strip().lower()
         rows: list[dict[str, Any]] = []
         for entry in self.search_profiles(limit=max(20, limit * 2)):
-            summary_text = str(entry.get("summary_text") or entry["data"].get("summary_text") or "")
+            summary_text = str(
+                entry.get("summary_text") or entry["data"].get("summary_text") or ""
+            )
             if normalized and normalized not in summary_text.lower():
                 continue
             rows.append(entry)
         for profile in self.list_run_profiles():
-            summary_text = profile.summary_text or self._profile_summary("run_profile", profile.to_dict())
+            summary_text = profile.summary_text or self._profile_summary(
+                "run_profile", profile.to_dict()
+            )
             if normalized and normalized not in summary_text.lower():
                 continue
-            rows.append({"kind": "run_profile", "data": profile.to_dict(), "summary_text": summary_text})
+            rows.append(
+                {
+                    "kind": "run_profile",
+                    "data": profile.to_dict(),
+                    "summary_text": summary_text,
+                }
+            )
         return rows[: max(1, int(limit))]
 
-    def _packed_profiles_for_candidate(self, candidate: dict[str, Any], limit: int) -> list[dict[str, Any]]:
+    def _packed_profiles_for_candidate(
+        self, candidate: dict[str, Any], limit: int
+    ) -> list[dict[str, Any]]:
         current_key = self._current_hardware_key()
         rows: list[dict[str, Any]] = []
         if hasattr(self.store, "list_pair_profiles"):
-            for profile in self.store.list_pair_profiles(hardware_key=current_key or None):
-                left_model = self._model_key_for_signature(profile.left_signature) or profile.left_signature
-                right_model = self._model_key_for_signature(profile.right_signature) or profile.right_signature
+            for profile in self.store.list_pair_profiles(
+                hardware_key=current_key or None
+            ):
+                left_model = (
+                    self._model_key_for_signature(profile.left_signature)
+                    or profile.left_signature
+                )
+                right_model = (
+                    self._model_key_for_signature(profile.right_signature)
+                    or profile.right_signature
+                )
                 model_key = str(candidate.get("model_key") or "")
                 signature = str(candidate.get("script_signature") or "")
-                packing_family = str(candidate.get("packing_family") or candidate.get("model_family") or "")
-                values = {str(left_model), str(right_model), profile.left_signature, profile.right_signature}
-                if model_key and model_key not in values and signature and signature not in values:
+                packing_family = str(
+                    candidate.get("packing_family")
+                    or candidate.get("model_family")
+                    or ""
+                )
+                values = {
+                    str(left_model),
+                    str(right_model),
+                    profile.left_signature,
+                    profile.right_signature,
+                }
+                if (
+                    model_key
+                    and model_key not in values
+                    and signature
+                    and signature not in values
+                ):
                     if not packing_family:
                         continue
                 rows.append(
@@ -1037,7 +1347,9 @@ class SchedulerKnowledgeBase:
                     }
                 )
         if hasattr(self.store, "list_combination_profiles"):
-            for profile in self.store.list_combination_profiles(hardware_key=current_key or None):
+            for profile in self.store.list_combination_profiles(
+                hardware_key=current_key or None
+            ):
                 rows.append(
                     {
                         "kind": "packed_group_profile",
@@ -1071,12 +1383,19 @@ class SchedulerKnowledgeBase:
         if risk_flags and any("batch_size_above" in flag for flag in risk_flags):
             add("high_vram_pressure", "reduce_vram", "avoid_oom")
         if not candidate.get("uses_amp"):
-            add("precision_not_optimized", "improve_precision_efficiency", "enable_tensor_core")
+            add(
+                "precision_not_optimized",
+                "improve_precision_efficiency",
+                "enable_tensor_core",
+            )
             add("tensor_core_not_used", "enable_tensor_core", "improve_throughput")
         for entry in matched_profiles:
             data = entry.get("data") or {}
             status = str(data.get("status") or "").lower()
-            if status == "oom" or "oom" in str(data.get("last_failure_reason") or "").lower():
+            if (
+                status == "oom"
+                or "oom" in str(data.get("last_failure_reason") or "").lower()
+            ):
                 add("oom", "reduce_vram", "avoid_oom")
             if status == "timeout":
                 add("timeout", "reduce_step_time", "improve_throughput")
@@ -1090,10 +1409,16 @@ class SchedulerKnowledgeBase:
                 if sm_value <= 1.0:
                     sm_value *= 100.0
                 if sm_value and sm_value < 45.0:
-                    add("low_sm_utilization", "improve_sm_utilization", "improve_throughput")
+                    add(
+                        "low_sm_utilization",
+                        "improve_sm_utilization",
+                        "improve_throughput",
+                    )
             except (TypeError, ValueError):
                 pass
-            memory_util = data.get("avg_memory_utilization") or data.get("peak_vram_utilization_pct")
+            memory_util = data.get("avg_memory_utilization") or data.get(
+                "peak_vram_utilization_pct"
+            )
             try:
                 memory_value = float(memory_util)
                 if memory_value <= 1.0:
@@ -1106,15 +1431,29 @@ class SchedulerKnowledgeBase:
             add("insufficient_graph_evidence", "improve_throughput")
         return {"profile_symptoms": symptoms, "optimization_targets": targets}
 
-    def get_profile_evidence(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
+    def get_profile_evidence(
+        self, *, candidate: dict[str, Any], limit: int = 8
+    ) -> dict[str, Any]:
         design_context = self.get_job_design_context(candidate=candidate, limit=limit)
         matched_profiles = list(design_context.get("matched_profiles") or [])
         exact_reasons = {"signature_exact", "model_key_exact"}
-        exact_profiles = [entry for entry in matched_profiles if entry.get("match_reason") in exact_reasons]
-        similar_profiles = [entry for entry in matched_profiles if entry.get("match_reason") not in exact_reasons]
-        packed_profiles = self._packed_profiles_for_candidate(self._normalized_job_design_candidate(candidate), limit=limit)
+        exact_profiles = [
+            entry
+            for entry in matched_profiles
+            if entry.get("match_reason") in exact_reasons
+        ]
+        similar_profiles = [
+            entry
+            for entry in matched_profiles
+            if entry.get("match_reason") not in exact_reasons
+        ]
+        packed_profiles = self._packed_profiles_for_candidate(
+            self._normalized_job_design_candidate(candidate), limit=limit
+        )
         evidence_refs = list(design_context.get("evidence_refs") or [])
-        evidence_refs.extend(entry["ref"] for entry in packed_profiles if entry.get("ref"))
+        evidence_refs.extend(
+            entry["ref"] for entry in packed_profiles if entry.get("ref")
+        )
         return {
             "hardware_context": design_context.get("hardware_context"),
             "graph_evidence": {
@@ -1123,7 +1462,9 @@ class SchedulerKnowledgeBase:
                 "packed_profiles": packed_profiles,
             },
             "runtime_estimate": design_context.get("runtime_estimate"),
-            "batch_size_recommendation": design_context.get("batch_size_recommendation"),
+            "batch_size_recommendation": design_context.get(
+                "batch_size_recommendation"
+            ),
             "epoch_recommendation": design_context.get("epoch_recommendation"),
             "scheduler_guidance": design_context.get("scheduler_guidance"),
             "risk_flags": list(design_context.get("risk_flags") or []),
@@ -1134,15 +1475,18 @@ class SchedulerKnowledgeBase:
             ),
             "evidence_refs": evidence_refs,
             "confidence": design_context.get("confidence", 0.0),
-            "legacy_job_design_context": design_context,
         }
 
-    def get_job_design_context(self, *, candidate: dict[str, Any], limit: int = 5) -> dict[str, Any]:
+    def get_job_design_context(
+        self, *, candidate: dict[str, Any], limit: int = 5
+    ) -> dict[str, Any]:
         # Aggregate all scheduling-relevant evidence into one response instead
         # of making future agent integrations orchestrate several low-level MCP
         # calls and duplicate ranking logic on their side.
         normalized_candidate = self._normalized_job_design_candidate(candidate)
-        matched_profiles = self._matched_profiles_for_candidate(normalized_candidate, limit=max(1, int(limit)))
+        matched_profiles = self._matched_profiles_for_candidate(
+            normalized_candidate, limit=max(1, int(limit))
+        )
         runtime_estimate = self._runtime_estimate_for_candidate(normalized_candidate)
         recommendation_key = str(
             normalized_candidate.get("model_key")
@@ -1162,7 +1506,10 @@ class SchedulerKnowledgeBase:
                 current_epochs=normalized_candidate.get("proposed_epochs"),
             )
         else:
-            batch_size_recommendation = {"found": False, "reason": "insufficient evidence"}
+            batch_size_recommendation = {
+                "found": False,
+                "reason": "insufficient evidence",
+            }
             epoch_recommendation = {"found": False, "reason": "insufficient evidence"}
         scheduler_guidance = self._scheduler_guidance()
         risk_flags = self._job_design_risk_flags(
@@ -1181,7 +1528,9 @@ class SchedulerKnowledgeBase:
             risk_flags=risk_flags,
         )
         return {
-            "hardware_context": self.get_hardware_context("current", include_scheduler_limits=True),
+            "hardware_context": self.get_hardware_context(
+                "current", include_scheduler_limits=True
+            ),
             "matched_profiles": matched_profiles,
             "runtime_estimate": runtime_estimate,
             "batch_size_recommendation": batch_size_recommendation,

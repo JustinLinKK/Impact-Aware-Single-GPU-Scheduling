@@ -15,28 +15,39 @@ import sys
 from ..domain import TrainingJob
 from ..config import SchedulerSettings
 from .executor import SubprocessExecutor, WorkerProcessHandle
+from .process_utils import start_new_session_kwargs
 
 
 class ExecutionBackend(Protocol):
     name: str
 
-    def available(self) -> bool:
-        ...
+    def available(self) -> bool: ...
 
-    def launch(self, jobs: list[TrainingJob]) -> list[WorkerProcessHandle]:
-        ...
+    def launch(self, jobs: list[TrainingJob]) -> list[WorkerProcessHandle]: ...
 
 
-def _group_log_paths(settings: SchedulerSettings, jobs: list[TrainingJob], suffix: str) -> tuple[Path, Path]:
-    group_key = hashlib.sha1(",".join(sorted(job.job_id for job in jobs)).encode("utf-8")).hexdigest()[:12]
+def _group_log_paths(
+    settings: SchedulerSettings, jobs: list[TrainingJob], suffix: str
+) -> tuple[Path, Path]:
+    group_key = hashlib.sha1(
+        ",".join(sorted(job.job_id for job in jobs)).encode("utf-8")
+    ).hexdigest()[:12]
     runtime_dir = settings.job_runtime_dir(jobs[0].job_id)
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    return runtime_dir / f"{suffix}_{group_key}.stdout.log", runtime_dir / f"{suffix}_{group_key}.stderr.log"
+    return (
+        runtime_dir / f"{suffix}_{group_key}.stdout.log",
+        runtime_dir / f"{suffix}_{group_key}.stderr.log",
+    )
 
 
 def _cuda_runtime_visible(device_index: int) -> bool:
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if visible_devices is not None and visible_devices.strip() in {"", "-1", "none", "None"}:
+    if visible_devices is not None and visible_devices.strip() in {
+        "",
+        "-1",
+        "none",
+        "None",
+    }:
         return False
     try:
         torch = importlib.import_module("torch")
@@ -65,7 +76,9 @@ class ExclusiveBackend:
         job = jobs[0]
         extra_env: dict[str, str] = {}
         if job.resource_requirements.requires_gpu:
-            extra_env["CUDA_VISIBLE_DEVICES"] = str(self.settings.gpu_scheduler.device_index)
+            extra_env["CUDA_VISIBLE_DEVICES"] = str(
+                self.settings.gpu_scheduler.device_index
+            )
         return [self.executor.start(job, extra_env=extra_env)]
 
 
@@ -83,8 +96,12 @@ class CudaProcessBackend:
             raise ValueError("cuda_process backend expects at least one job")
         base_env = {
             "CUDA_VISIBLE_DEVICES": str(self.settings.gpu_scheduler.device_index),
-            "OMP_NUM_THREADS": str(self.settings.gpu_scheduler.cuda_process.default_omp_num_threads),
-            "MKL_NUM_THREADS": str(self.settings.gpu_scheduler.cuda_process.default_mkl_num_threads),
+            "OMP_NUM_THREADS": str(
+                self.settings.gpu_scheduler.cuda_process.default_omp_num_threads
+            ),
+            "MKL_NUM_THREADS": str(
+                self.settings.gpu_scheduler.cuda_process.default_mkl_num_threads
+            ),
         }
         return [self.executor.start(job, extra_env=base_env) for job in jobs]
 
@@ -139,7 +156,13 @@ class MPSBackend:
             secondary_count = max(1, len(jobs) - 1)
             secondary_pct = max(1, remaining // secondary_count)
             percentages = [primary] + [secondary_pct] * secondary_count
-        return [{**pipe_env, "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(max(1, min(100, pct)))} for pct in percentages[: len(jobs)]]
+        return [
+            {
+                **pipe_env,
+                "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(max(1, min(100, pct))),
+            }
+            for pct in percentages[: len(jobs)]
+        ]
 
     def _ensure_runtime(self) -> None:
         if not self.available() or not self.mps_binary:
@@ -147,14 +170,24 @@ class MPSBackend:
         daemon_env = self._daemon_env()
         Path(daemon_env["CUDA_MPS_PIPE_DIRECTORY"]).mkdir(parents=True, exist_ok=True)
         Path(daemon_env["CUDA_MPS_LOG_DIRECTORY"]).mkdir(parents=True, exist_ok=True)
-        subprocess.run([self.mps_binary, "-d"], check=False, capture_output=True, text=True, timeout=5.0, env=daemon_env)
+        subprocess.run(
+            [self.mps_binary, "-d"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            env=daemon_env,
+        )
 
     def launch(self, jobs: list[TrainingJob]) -> list[WorkerProcessHandle]:
         if not jobs:
             raise ValueError("mps backend expects at least one job")
         self._ensure_runtime()
         job_envs = self._client_envs(jobs)
-        return [self.executor.start(job, extra_env=job_env) for job, job_env in zip(jobs, job_envs, strict=True)]
+        return [
+            self.executor.start(job, extra_env=job_env)
+            for job, job_env in zip(jobs, job_envs, strict=True)
+        ]
 
 
 @dataclass(slots=True)
@@ -170,14 +203,22 @@ class StreamBackend:
         if not jobs:
             raise ValueError("stream backend expects at least one job")
         stdout_path, stderr_path = _group_log_paths(self.settings, jobs, "stream_host")
-        python_executable = jobs[0].config.python_executable or self.settings.python_executable or sys.executable
+        python_executable = (
+            jobs[0].config.python_executable
+            or self.settings.python_executable
+            or sys.executable
+        )
         env = os.environ.copy()
         project_root = self.executor.project_root
         existing_pythonpath = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = str(project_root) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+        env["PYTHONPATH"] = str(project_root) + (
+            os.pathsep + existing_pythonpath if existing_pythonpath else ""
+        )
         env["CUDA_VISIBLE_DEVICES"] = str(self.settings.gpu_scheduler.device_index)
 
-        with stdout_path.open("a", encoding="utf-8") as stdout_handle, stderr_path.open("a", encoding="utf-8") as stderr_handle:
+        with stdout_path.open("a", encoding="utf-8") as stdout_handle, stderr_path.open(
+            "a", encoding="utf-8"
+        ) as stderr_handle:
             process = subprocess.Popen(
                 [
                     python_executable,
@@ -192,6 +233,7 @@ class StreamBackend:
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 text=True,
+                **start_new_session_kwargs(),
             )
         return [
             WorkerProcessHandle(

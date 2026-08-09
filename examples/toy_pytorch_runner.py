@@ -32,7 +32,14 @@ class ToyMLP(nn.Module):
         return self.layers(x)
 
 
-def create_toy_baseline_checkpoint(path: str | Path, *, input_dim: int = 16, hidden_dim: int = 32, output_dim: int = 2, seed: int = 13) -> str:
+def create_toy_baseline_checkpoint(
+    path: str | Path,
+    *,
+    input_dim: int = 16,
+    hidden_dim: int = 32,
+    output_dim: int = 2,
+    seed: int = 13,
+) -> str:
     """Create a small baseline checkpoint used by example and tests."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -69,7 +76,15 @@ def _restore_rng_state(state: dict[str, Any] | None) -> None:
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
-def _build_batches(num_samples: int, input_dim: int, output_dim: int, batch_size: int, *, dataset_seed: int, device: torch.device) -> list[tuple[torch.Tensor, torch.Tensor]]:
+def _build_batches(
+    num_samples: int,
+    input_dim: int,
+    output_dim: int,
+    batch_size: int,
+    *,
+    dataset_seed: int,
+    device: torch.device,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
     generator = torch.Generator().manual_seed(dataset_seed)
     features = torch.randn(num_samples, input_dim, generator=generator)
     labels = torch.randint(0, output_dim, (num_samples,), generator=generator)
@@ -103,7 +118,9 @@ def probe_toy_training_batch_size(
 
     limit = params.get("probe_max_batch_size")
     synthetic_memory_total_mb = int(params.get("probe_memory_total_mb", 4096))
-    synthetic_peak_vram_mb = int(params.get("probe_base_memory_mb", 256)) + (int(batch_size) * int(params.get("probe_memory_per_sample_mb", 32)))
+    synthetic_peak_vram_mb = int(params.get("probe_base_memory_mb", 256)) + (
+        int(batch_size) * int(params.get("probe_memory_per_sample_mb", 32))
+    )
     if limit is not None and int(batch_size) > int(limit):
         return {
             "fits": False,
@@ -123,7 +140,11 @@ def probe_toy_training_batch_size(
             "message": "synthetic CPU probe result",
         }
 
-    seed = context.job.config.seed if context.job.config.seed is not None else int(params.get("seed", 7))
+    seed = (
+        context.job.config.seed
+        if context.job.config.seed is not None
+        else int(params.get("seed", 7))
+    )
     random.seed(seed)
     torch.manual_seed(seed)
 
@@ -147,9 +168,13 @@ def probe_toy_training_batch_size(
 
         optimizer_name = str(params["optimizer"]).lower()
         if optimizer_name == "adam":
-            optimizer = torch.optim.Adam(model.parameters(), lr=float(params["learning_rate"]))
+            optimizer = torch.optim.Adam(
+                model.parameters(), lr=float(params["learning_rate"])
+            )
         else:
-            optimizer = torch.optim.SGD(model.parameters(), lr=float(params["learning_rate"]))
+            optimizer = torch.optim.SGD(
+                model.parameters(), lr=float(params["learning_rate"])
+            )
         criterion = nn.CrossEntropyLoss()
 
         input_dim = int(baseline.get("input_dim", params["input_dim"]))
@@ -172,17 +197,29 @@ def probe_toy_training_batch_size(
                     float(torch.cuda.memory_allocated(device)) / (1024 * 1024)
                 )
         torch.cuda.synchronize(device)
-        elapsed_ms = ((time.perf_counter() - start_time) * 1000.0) if start_time is not None and measured_steps > 0 else None
+        elapsed_ms = (
+            ((time.perf_counter() - start_time) * 1000.0)
+            if start_time is not None and measured_steps > 0
+            else None
+        )
         return {
             "fits": True,
-            "peak_vram_mb": int(torch.cuda.max_memory_allocated(device) / (1024 * 1024)),
+            "peak_vram_mb": int(
+                torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+            ),
             "avg_vram_mb": (
                 sum(measured_vram_mb) / len(measured_vram_mb)
                 if measured_vram_mb
                 else None
             ),
-            "memory_total_mb": int(torch.cuda.get_device_properties(device).total_memory / (1024 * 1024)),
-            "avg_step_time_ms": (elapsed_ms / measured_steps) if elapsed_ms is not None and measured_steps > 0 else None,
+            "memory_total_mb": int(
+                torch.cuda.get_device_properties(device).total_memory / (1024 * 1024)
+            ),
+            "avg_step_time_ms": (
+                (elapsed_ms / measured_steps)
+                if elapsed_ms is not None and measured_steps > 0
+                else None
+            ),
             "message": "cuda probe completed",
         }
     except RuntimeError as exc:
@@ -190,9 +227,13 @@ def probe_toy_training_batch_size(
             raise
         return {
             "fits": False,
-            "peak_vram_mb": int(torch.cuda.max_memory_allocated(device) / (1024 * 1024)),
+            "peak_vram_mb": int(
+                torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+            ),
             "avg_vram_mb": float(torch.cuda.memory_allocated(device)) / (1024 * 1024),
-            "memory_total_mb": int(torch.cuda.get_device_properties(device).total_memory / (1024 * 1024)),
+            "memory_total_mb": int(
+                torch.cuda.get_device_properties(device).total_memory / (1024 * 1024)
+            ),
             "message": str(exc),
         }
     finally:
@@ -220,11 +261,17 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
     }
     params.update(context.job.config.runner_kwargs)
 
-    seed = context.job.config.seed if context.job.config.seed is not None else int(params.get("seed", 7))
+    seed = (
+        context.job.config.seed
+        if context.job.config.seed is not None
+        else int(params.get("seed", 7))
+    )
     random.seed(seed)
     torch.manual_seed(seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     baseline = context.load_baseline_object()
     model = ToyMLP(
         int(baseline.get("input_dim", params["input_dim"])),
@@ -235,13 +282,19 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
 
     optimizer_name = str(params["optimizer"]).lower()
     if optimizer_name == "adam":
-        optimizer = torch.optim.Adam(model.parameters(), lr=float(params["learning_rate"]))
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=float(params["learning_rate"])
+        )
     else:
-        optimizer = torch.optim.SGD(model.parameters(), lr=float(params["learning_rate"]))
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=float(params["learning_rate"])
+        )
 
     scheduler = None
     if params.get("scheduler_gamma") is not None:
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=float(params["scheduler_gamma"]))
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=1, gamma=float(params["scheduler_gamma"])
+        )
 
     criterion = nn.CrossEntropyLoss()
     batches = _build_batches(
@@ -252,7 +305,9 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
         dataset_seed=int(params["dataset_seed"]),
         device=device,
     )
-    total_epochs = int(context.job.max_epochs or context.job.config.max_epochs or params["epochs"])
+    total_epochs = int(
+        context.job.max_epochs or context.job.config.max_epochs or params["epochs"]
+    )
     max_steps = context.job.max_steps or context.job.config.max_steps
     backend_name = str(context.job.metadata.get("placement_backend") or "exclusive")
     run_started_at = time.perf_counter()
@@ -260,7 +315,8 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
     runtime_profile = context.get_runtime_profile(backend_name=backend_name)
     estimated_total_runtime_seconds = (
         float(runtime_profile.estimated_total_runtime_seconds)
-        if runtime_profile is not None and runtime_profile.estimated_total_runtime_seconds is not None
+        if runtime_profile is not None
+        and runtime_profile.estimated_total_runtime_seconds is not None
         else None
     )
     profile_ready = runtime_profile is not None
@@ -282,11 +338,15 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
         global_step = int(state.get("global_step", 0))
         _restore_rng_state(state.get("rng_state"))
 
-    def build_checkpoint_state(epoch: int, step_in_epoch: int, global_step_value: int) -> dict[str, Any]:
+    def build_checkpoint_state(
+        epoch: int, step_in_epoch: int, global_step_value: int
+    ) -> dict[str, Any]:
         return {
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
-            "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+            "scheduler_state": (
+                scheduler.state_dict() if scheduler is not None else None
+            ),
             "epoch": epoch,
             "step_in_epoch": step_in_epoch,
             "global_step": global_step_value,
@@ -300,7 +360,9 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
         global_step=global_step,
         metrics={},
         message="before training",
-        state_factory=lambda: build_checkpoint_state(start_epoch, start_step_in_epoch, global_step),
+        state_factory=lambda: build_checkpoint_state(
+            start_epoch, start_step_in_epoch, global_step
+        ),
     )
 
     last_loss = 0.0
@@ -328,13 +390,21 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
                 time.sleep(float(params["sleep_per_step"]))
 
             runtime_updates: dict[str, float | int] = {}
-            if not profile_ready and max_steps is not None and int(max_steps) < max(1, steps_per_epoch):
+            if (
+                not profile_ready
+                and max_steps is not None
+                and int(max_steps) < max(1, steps_per_epoch)
+            ):
                 measured_steps = max(1, len(first_epoch_step_durations_ms))
                 avg_step_time_ms = sum(first_epoch_step_durations_ms) / measured_steps
-                estimated_total_runtime_seconds = estimate_total_runtime_from_step_window(
-                    startup_seconds=max(0.0, epoch_started_at - run_started_at),
-                    avg_step_time_ms=avg_step_time_ms,
-                    total_steps=planned_total_steps(context.job, steps_per_epoch=steps_per_epoch),
+                estimated_total_runtime_seconds = (
+                    estimate_total_runtime_from_step_window(
+                        startup_seconds=max(0.0, epoch_started_at - run_started_at),
+                        avg_step_time_ms=avg_step_time_ms,
+                        total_steps=planned_total_steps(
+                            context.job, steps_per_epoch=steps_per_epoch
+                        ),
+                    )
                 )
                 context.upsert_runtime_profile(
                     backend_name=backend_name,
@@ -361,32 +431,59 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
             if profile_ready and estimated_total_runtime_seconds is not None:
                 runtime_updates = {
                     "steps_per_epoch": steps_per_epoch,
-                    "avg_step_time_ms": sum(first_epoch_step_durations_ms) / max(1, len(first_epoch_step_durations_ms)),
+                    "avg_step_time_ms": sum(first_epoch_step_durations_ms)
+                    / max(1, len(first_epoch_step_durations_ms)),
                     "estimated_total_runtime_seconds": estimated_total_runtime_seconds,
-                    "remaining_runtime_seconds": max(0.0, estimated_total_runtime_seconds - (time.perf_counter() - run_started_at)),
+                    "remaining_runtime_seconds": max(
+                        0.0,
+                        estimated_total_runtime_seconds
+                        - (time.perf_counter() - run_started_at),
+                    ),
                 }
             context.control_hook.safe_point(
                 SafePointType.STEP,
                 epoch=epoch,
                 global_step=global_step,
                 metrics={"loss": last_loss},
-                state_factory=lambda epoch=epoch, step_in_epoch=step_in_epoch + 1, global_step=global_step: build_checkpoint_state(epoch, step_in_epoch, global_step),
-                steps_per_epoch=int(runtime_updates["steps_per_epoch"]) if runtime_updates else None,
-                avg_step_time_ms=float(runtime_updates["avg_step_time_ms"]) if runtime_updates else None,
-                estimated_total_runtime_seconds=float(runtime_updates["estimated_total_runtime_seconds"]) if runtime_updates else None,
-                remaining_runtime_seconds=float(runtime_updates["remaining_runtime_seconds"]) if runtime_updates else None,
+                state_factory=lambda epoch=epoch, step_in_epoch=step_in_epoch + 1, global_step=global_step: build_checkpoint_state(
+                    epoch, step_in_epoch, global_step
+                ),
+                steps_per_epoch=(
+                    int(runtime_updates["steps_per_epoch"]) if runtime_updates else None
+                ),
+                avg_step_time_ms=(
+                    float(runtime_updates["avg_step_time_ms"])
+                    if runtime_updates
+                    else None
+                ),
+                estimated_total_runtime_seconds=(
+                    float(runtime_updates["estimated_total_runtime_seconds"])
+                    if runtime_updates
+                    else None
+                ),
+                remaining_runtime_seconds=(
+                    float(runtime_updates["remaining_runtime_seconds"])
+                    if runtime_updates
+                    else None
+                ),
             )
 
         epoch_elapsed_s = time.perf_counter() - epoch_started_at
         epoch_durations.append(epoch_elapsed_s)
         if not profile_ready and epoch == start_epoch and global_step > 0:
             startup_seconds = max(0.0, epoch_started_at - run_started_at)
-            avg_step_time_ms = sum(first_epoch_step_durations_ms) / max(1, len(first_epoch_step_durations_ms))
+            avg_step_time_ms = sum(first_epoch_step_durations_ms) / max(
+                1, len(first_epoch_step_durations_ms)
+            )
             if max_steps is not None:
-                estimated_total_runtime_seconds = estimate_total_runtime_from_step_window(
-                    startup_seconds=startup_seconds,
-                    avg_step_time_ms=avg_step_time_ms,
-                    total_steps=planned_total_steps(context.job, steps_per_epoch=steps_per_epoch),
+                estimated_total_runtime_seconds = (
+                    estimate_total_runtime_from_step_window(
+                        startup_seconds=startup_seconds,
+                        avg_step_time_ms=avg_step_time_ms,
+                        total_steps=planned_total_steps(
+                            context.job, steps_per_epoch=steps_per_epoch
+                        ),
+                    )
                 )
                 strategy = "step_window"
                 confidence = 0.75
@@ -426,20 +523,43 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
         if profile_ready and estimated_total_runtime_seconds is not None:
             epoch_runtime_updates = {
                 "steps_per_epoch": steps_per_epoch,
-                "avg_step_time_ms": sum(first_epoch_step_durations_ms) / max(1, len(first_epoch_step_durations_ms)),
+                "avg_step_time_ms": sum(first_epoch_step_durations_ms)
+                / max(1, len(first_epoch_step_durations_ms)),
                 "estimated_total_runtime_seconds": estimated_total_runtime_seconds,
-                "remaining_runtime_seconds": max(0.0, estimated_total_runtime_seconds - (time.perf_counter() - run_started_at)),
+                "remaining_runtime_seconds": max(
+                    0.0,
+                    estimated_total_runtime_seconds
+                    - (time.perf_counter() - run_started_at),
+                ),
             }
         context.control_hook.safe_point(
             SafePointType.EPOCH,
             epoch=epoch + 1,
             global_step=global_step,
             metrics={"loss": last_loss},
-            state_factory=lambda epoch=epoch + 1, global_step=global_step: build_checkpoint_state(epoch, 0, global_step),
-            steps_per_epoch=int(epoch_runtime_updates["steps_per_epoch"]) if epoch_runtime_updates else None,
-            avg_step_time_ms=float(epoch_runtime_updates["avg_step_time_ms"]) if epoch_runtime_updates else None,
-            estimated_total_runtime_seconds=float(epoch_runtime_updates["estimated_total_runtime_seconds"]) if epoch_runtime_updates else None,
-            remaining_runtime_seconds=float(epoch_runtime_updates["remaining_runtime_seconds"]) if epoch_runtime_updates else None,
+            state_factory=lambda epoch=epoch + 1, global_step=global_step: build_checkpoint_state(
+                epoch, 0, global_step
+            ),
+            steps_per_epoch=(
+                int(epoch_runtime_updates["steps_per_epoch"])
+                if epoch_runtime_updates
+                else None
+            ),
+            avg_step_time_ms=(
+                float(epoch_runtime_updates["avg_step_time_ms"])
+                if epoch_runtime_updates
+                else None
+            ),
+            estimated_total_runtime_seconds=(
+                float(epoch_runtime_updates["estimated_total_runtime_seconds"])
+                if epoch_runtime_updates
+                else None
+            ),
+            remaining_runtime_seconds=(
+                float(epoch_runtime_updates["remaining_runtime_seconds"])
+                if epoch_runtime_updates
+                else None
+            ),
         )
         start_step_in_epoch = 0
         if max_steps is not None and global_step >= int(max_steps):
@@ -451,6 +571,20 @@ def run_toy_training_job(context: RunnerContext) -> dict[str, Any]:
         global_step=global_step,
         metrics={"loss": last_loss},
         message="final checkpoint",
-        state_factory=lambda: build_checkpoint_state(min(total_epochs, total_epochs), 0, global_step),
+        state_factory=lambda: build_checkpoint_state(
+            min(total_epochs, total_epochs), 0, global_step
+        ),
     )
-    return {"final_loss": last_loss, "global_step": global_step, "device": str(device)}
+    return {
+        "final_loss": last_loss,
+        "global_step": global_step,
+        "device": str(device),
+        "peak_vram_mb": (
+            int(torch.cuda.max_memory_allocated(device) / (1024 * 1024))
+            if device.type == "cuda"
+            else None
+        ),
+        "cuda_device_name": (
+            torch.cuda.get_device_name(device) if device.type == "cuda" else None
+        ),
+    }

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import subprocess
 import uuid
 
 from ..execution.backend_registry import BackendRegistry
 from ..execution.backends import ExecutionBackend
 from ..execution.control import ControlPlane
 from ..execution.executor import SubprocessExecutor, WorkerProcessHandle
+from ..execution.process_utils import terminate_process_tree
 from ..domain import JobStatus, PlacementDecision, TrainingJob
 from ..config import (
     SchedulerSettings,
@@ -65,18 +65,28 @@ class WorkerSupervisor:
         self.store = store or StateStore(settings)
         self.control_plane = ControlPlane(settings)
         self.executor = SubprocessExecutor(settings)
-        self.backend_registry = BackendRegistry(settings, self.executor, backends=backends)
+        self.backend_registry = BackendRegistry(
+            settings, self.executor, backends=backends
+        )
         self._groups: dict[str, PlacementGroupHandle] = {}
 
     def _concurrency_enabled(self) -> bool:
         if self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE:
             return True
-        return self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK and self.settings.gpu_scheduler.concurrent_groups_enabled
+        return (
+            self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK
+            and self.settings.gpu_scheduler.concurrent_groups_enabled
+        )
 
     def _overlap_allowed_for_backend(self, backend_name: str) -> bool:
         if self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE:
-            return backend_name != "exclusive" and backend_name in self.settings.gpu_scheduler.backend_priority
-        return backend_name in set(self.settings.gpu_scheduler.concurrent_backend_allowlist)
+            return (
+                backend_name != "exclusive"
+                and backend_name in self.settings.gpu_scheduler.backend_priority
+            )
+        return backend_name in set(
+            self.settings.gpu_scheduler.concurrent_backend_allowlist
+        )
 
     def available_backends(self) -> dict[str, bool]:
         return self.backend_registry.availability()
@@ -109,19 +119,31 @@ class WorkerSupervisor:
     def _worker_is_alive(self, worker: ManagedWorker) -> bool:
         if worker.handle.monitor_via_store:
             job = self.store.get_job(worker.job_id)
-            return bool(job is not None and job.status in {JobStatus.RUNNING, JobStatus.PAUSING})
+            return bool(
+                job is not None and job.status in {JobStatus.RUNNING, JobStatus.PAUSING}
+            )
         return worker.handle.process.poll() is None
 
     def active_job_ids(self) -> list[str]:
         job_ids: list[str] = []
         for group in self._groups.values():
-            job_ids.extend([job_id for job_id, worker in group.workers.items() if self._worker_is_alive(worker)])
+            job_ids.extend(
+                [
+                    job_id
+                    for job_id, worker in group.workers.items()
+                    if self._worker_is_alive(worker)
+                ]
+            )
         return job_ids
 
     def active_job_ids_by_group(self) -> dict[str, list[str]]:
         payload: dict[str, list[str]] = {}
         for group_id, group in self._groups.items():
-            payload[group_id] = [job_id for job_id, worker in group.workers.items() if self._worker_is_alive(worker)]
+            payload[group_id] = [
+                job_id
+                for job_id, worker in group.workers.items()
+                if self._worker_is_alive(worker)
+            ]
         return payload
 
     def active_job_id(self) -> str | None:
@@ -267,7 +289,9 @@ class WorkerSupervisor:
                 role = "primary" if index == 0 else "secondary"
             else:
                 role = f"slot-{index}"
-            workers[handle.job_id] = ManagedWorker(job_id=handle.job_id, handle=handle, role=role)
+            workers[handle.job_id] = ManagedWorker(
+                job_id=handle.job_id, handle=handle, role=role
+            )
         self._groups[group_id] = PlacementGroupHandle(
             group_id=group_id,
             mode=mode,
@@ -339,21 +363,22 @@ class WorkerSupervisor:
                 if process.pid in seen_processes or process.poll() is not None:
                     continue
                 seen_processes.add(process.pid)
-                process.terminate()
-                try:
-                    process.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+                terminate_process_tree(process, timeout=2.0)
         self._groups = {}
 
     def _refresh_group_shape(self, group_id: str) -> None:
         group = self._groups.get(group_id)
         if group is None:
             return
-        alive_workers = {job_id: worker for job_id, worker in group.workers.items() if self._worker_is_alive(worker)}
+        alive_workers = {
+            job_id: worker
+            for job_id, worker in group.workers.items()
+            if self._worker_is_alive(worker)
+        }
         group.workers = alive_workers
-        group.fallback_order = [job_id for job_id in group.fallback_order if job_id in alive_workers]
+        group.fallback_order = [
+            job_id for job_id in group.fallback_order if job_id in alive_workers
+        ]
         if not alive_workers:
             self._groups.pop(group_id, None)
             return

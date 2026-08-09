@@ -15,17 +15,12 @@ import time
 
 import humanize
 
+from engine.script_introspection import analyze_training_batch_contract
+
 from ..execution.runner_protocol import RunnerContext
 from ..scheduler.telemetry import GpuTelemetrySample, NvidiaSmiTelemetrySampler
 from ..domain import BatchProbeTrialResult, BatchResolution
 
-_BATCH_SIZE_NAMES = {
-    "batch_size",
-    "train_batch_size",
-    "eval_batch_size",
-    "per_device_train_batch_size",
-    "per_device_eval_batch_size",
-}
 _BATCH_OVERRIDE_VAR = "_MLEVOLVE_BATCH_SIZE_OVERRIDE"
 _EPOCH_COUNT_NAMES = {
     "epochs",
@@ -49,7 +44,9 @@ def load_raw_file(path: str) -> bytes:
     return Path(path).read_bytes()
 
 
-def _parse_exception(stderr_text: str, working_dir: Path, script_path: Path) -> tuple[str, dict[str, Any], list[tuple[str, int, str, str]]]:
+def _parse_exception(
+    stderr_text: str, working_dir: Path, script_path: Path
+) -> tuple[str, dict[str, Any], list[tuple[str, int, str, str]]]:
     exc_type = "RuntimeError"
     exc_info: dict[str, Any] = {}
     exc_stack: list[tuple[str, int, str, str]] = []
@@ -95,14 +92,21 @@ def _parse_exception(stderr_text: str, working_dir: Path, script_path: Path) -> 
                 func_start = line.find("in ") + 3
                 func_name = line[func_start:].strip()
             filename_short = filename.replace(str(script_path), script_path.name)
-            filename_short = os.path.basename(filename_short.replace(str(working_dir), ""))
+            filename_short = os.path.basename(
+                filename_short.replace(str(working_dir), "")
+            )
             exc_stack.append((filename_short, int(line_num_str), func_name, ""))
         except Exception:
             continue
 
     for line in reversed(stderr_lines):
         line = line.strip()
-        if line and not line.startswith("File") and not line.startswith("Traceback") and ":" in line:
+        if (
+            line
+            and not line.startswith("File")
+            and not line.startswith("Traceback")
+            and ":" in line
+        ):
             exc_info["message"] = line.split(":", 1)[1].strip()
             break
 
@@ -119,8 +123,14 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 def _override_batch_expr(original_value: ast.expr) -> ast.expr:
     override_name = ast.Name(id=_BATCH_OVERRIDE_VAR, ctx=ast.Load())
     return ast.IfExp(
-        test=ast.Compare(left=override_name, ops=[ast.IsNot()], comparators=[ast.Constant(value=None)]),
-        body=ast.Call(func=ast.Name(id="int", ctx=ast.Load()), args=[override_name], keywords=[]),
+        test=ast.Compare(
+            left=override_name,
+            ops=[ast.IsNot()],
+            comparators=[ast.Constant(value=None)],
+        ),
+        body=ast.Call(
+            func=ast.Name(id="int", ctx=ast.Load()), args=[override_name], keywords=[]
+        ),
         orelse=original_value,
     )
 
@@ -133,13 +143,21 @@ def _override_epoch_expr(original_value: ast.expr) -> ast.expr:
             op=ast.And(),
             values=[
                 probe_mode,
-                ast.Compare(left=override_name, ops=[ast.IsNot()], comparators=[ast.Constant(value=None)]),
+                ast.Compare(
+                    left=override_name,
+                    ops=[ast.IsNot()],
+                    comparators=[ast.Constant(value=None)],
+                ),
             ],
         ),
         body=ast.Call(
             func=ast.Name(id="min", ctx=ast.Load()),
             args=[
-                ast.Call(func=ast.Name(id="int", ctx=ast.Load()), args=[override_name], keywords=[]),
+                ast.Call(
+                    func=ast.Name(id="int", ctx=ast.Load()),
+                    args=[override_name],
+                    keywords=[],
+                ),
                 original_value,
             ],
             keywords=[],
@@ -149,17 +167,18 @@ def _override_epoch_expr(original_value: ast.expr) -> ast.expr:
 
 
 class _BatchOverrideTransformer(ast.NodeTransformer):
-    def __init__(self) -> None:
+    """Apply probe overrides only where static analysis proves training use."""
+
+    def __init__(self, training_sites: dict[tuple[int, int], str]) -> None:
+        self.training_sites = training_sites
         self.modified = False
+        self.had_batch_rewrite = False
 
     def visit_Assign(self, node: ast.Assign) -> ast.Assign:
         node = self.generic_visit(node)
         if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             target_name = node.targets[0].id
-            if target_name in _BATCH_SIZE_NAMES:
-                node.value = _override_batch_expr(node.value)
-                self.modified = True
-            elif target_name in _EPOCH_COUNT_NAMES:
+            if target_name in _EPOCH_COUNT_NAMES:
                 node.value = _override_epoch_expr(node.value)
                 self.modified = True
         return node
@@ -168,23 +187,30 @@ class _BatchOverrideTransformer(ast.NodeTransformer):
         node = self.generic_visit(node)
         if isinstance(node.target, ast.Name) and node.value is not None:
             target_name = node.target.id
-            if target_name in _BATCH_SIZE_NAMES:
-                node.value = _override_batch_expr(node.value)
-                self.modified = True
-            elif target_name in _EPOCH_COUNT_NAMES:
+            if target_name in _EPOCH_COUNT_NAMES:
                 node.value = _override_epoch_expr(node.value)
                 self.modified = True
         return node
 
     def visit_Call(self, node: ast.Call) -> ast.Call:
         node = self.generic_visit(node)
-        modified = False
-        for keyword in node.keywords:
-            if keyword.arg in _BATCH_SIZE_NAMES and keyword.value is not None:
-                keyword.value = _override_batch_expr(keyword.value)
-                modified = True
-        if modified:
-            self.modified = True
+        argument = self.training_sites.get((node.lineno, node.col_offset))
+        if argument is None:
+            return node
+        kind, _, name_or_index = argument.partition(":")
+        if kind == "keyword":
+            for keyword in node.keywords:
+                if keyword.arg == name_or_index and keyword.value is not None:
+                    keyword.value = _override_batch_expr(keyword.value)
+                    self.modified = True
+                    self.had_batch_rewrite = True
+                    break
+        elif kind == "positional" and name_or_index.isdigit():
+            index = int(name_or_index)
+            if index < len(node.args):
+                node.args[index] = _override_batch_expr(node.args[index])
+                self.modified = True
+                self.had_batch_rewrite = True
         return node
 
     def visit_For(self, node: ast.For) -> ast.For:
@@ -202,14 +228,20 @@ class _BatchOverrideTransformer(ast.NodeTransformer):
         return node
 
 
-def _materialize_instrumented_script(script_path: Path, working_dir: Path) -> InstrumentedScript:
+def _materialize_instrumented_script(
+    script_path: Path, working_dir: Path
+) -> InstrumentedScript:
     source = script_path.read_text(encoding="utf-8")
     try:
         module = ast.parse(source, filename=str(script_path))
     except SyntaxError:
         return InstrumentedScript(path=script_path, had_batch_rewrite=False)
 
-    transformer = _BatchOverrideTransformer()
+    contract = analyze_training_batch_contract(source)
+    training_sites = {
+        (site.lineno, site.col_offset): site.argument for site in contract.train_sites
+    }
+    transformer = _BatchOverrideTransformer(training_sites)
     module = transformer.visit(module)
     ast.fix_missing_locations(module)
     if not transformer.modified:
@@ -246,7 +278,10 @@ def _materialize_instrumented_script(script_path: Path, working_dir: Path) -> In
     instrumented_dir.mkdir(parents=True, exist_ok=True)
     instrumented_path = instrumented_dir / f"{script_path.stem}_instrumented.py"
     instrumented_path.write_text(ast.unparse(module), encoding="utf-8")
-    return InstrumentedScript(path=instrumented_path, had_batch_rewrite=True)
+    return InstrumentedScript(
+        path=instrumented_path,
+        had_batch_rewrite=transformer.had_batch_rewrite,
+    )
 
 
 def _base_script_env(
@@ -264,7 +299,9 @@ def _base_script_env(
     if probe_max_epochs is not None:
         env["MLEVOLVE_PROBE_MAX_EPOCHS"] = str(max(1, int(probe_max_epochs)))
     if probe_max_train_batches is not None:
-        env["MLEVOLVE_PROBE_MAX_TRAIN_BATCHES"] = str(max(1, int(probe_max_train_batches)))
+        env["MLEVOLVE_PROBE_MAX_TRAIN_BATCHES"] = str(
+            max(1, int(probe_max_train_batches))
+        )
     return env
 
 
@@ -299,7 +336,9 @@ def _run_probe_subprocess(
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     sampler = NvidiaSmiTelemetrySampler(device_index)
 
-    with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open("w", encoding="utf-8") as stderr_handle:
+    with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open(
+        "w", encoding="utf-8"
+    ) as stderr_handle:
         proc = subprocess.Popen(
             [python_executable, str(script_path)],
             cwd=str(working_dir),
@@ -335,8 +374,12 @@ def _run_probe_subprocess(
                 proc.wait(timeout=2.0)
             fits = True
 
-    stdout_text = stdout_path.read_text(encoding="utf-8") if stdout_path.exists() else ""
-    stderr_text = stderr_path.read_text(encoding="utf-8") if stderr_path.exists() else ""
+    stdout_text = (
+        stdout_path.read_text(encoding="utf-8") if stdout_path.exists() else ""
+    )
+    stderr_text = (
+        stderr_path.read_text(encoding="utf-8") if stderr_path.exists() else ""
+    )
     return fits, samples, stdout_text, stderr_text
 
 
@@ -362,7 +405,9 @@ def probe_mlevolve_script_job(
             message="no recognizable batch-size knob found; probe skipped with original script",
         )
 
-    timeout_seconds = int(kwargs.get("probe_timeout_seconds", max(20, warmup_steps + measure_steps)))
+    timeout_seconds = int(
+        kwargs.get("probe_timeout_seconds", max(20, warmup_steps + measure_steps))
+    )
     poll_interval_seconds = float(kwargs.get("probe_poll_interval_seconds", 0.5))
     probe_max_epochs = max(1, int(kwargs.get("probe_max_epochs", 1)))
     probe_max_train_batches = max(1, int(kwargs.get("probe_max_train_batches", 3)))
@@ -396,7 +441,8 @@ def probe_mlevolve_script_job(
         avg_vram_mb=avg_vram_mb,
         memory_total_mb=memory_total_mb,
         avg_step_time_ms=elapsed_ms / max(1, len(samples)) if samples else None,
-        message=failure_reason or ("probe window completed" if fits else stderr_text.strip()[:400]),
+        message=failure_reason
+        or ("probe window completed" if fits else stderr_text.strip()[:400]),
     )
 
 
@@ -411,7 +457,9 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
 
     instrumented = _materialize_instrumented_script(script_path, working_dir)
     executable_script = instrumented.path
-    batch_size_override = _resolved_batch_size(context) if instrumented.had_batch_rewrite else None
+    batch_size_override = (
+        _resolved_batch_size(context) if instrumented.had_batch_rewrite else None
+    )
 
     start_time = time.time()
     proc = subprocess.Popen(
@@ -434,7 +482,9 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
         stdout, stderr = proc.communicate(timeout=timeout)
         exec_time = time.time() - start_time
         if proc.returncode != 0:
-            exc_type, exc_info, exc_stack = _parse_exception(stderr, working_dir, executable_script)
+            exc_type, exc_info, exc_stack = _parse_exception(
+                stderr, working_dir, executable_script
+            )
     except subprocess.TimeoutExpired:
         try:
             proc.send_signal(signal.SIGINT)
@@ -456,9 +506,13 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
         output.append("\n")
 
     if exc_type == "TimeoutError":
-        output.append(f"Execution time: TimeoutError: Execution exceeded the time limit of {humanize.naturaldelta(timeout)}")
+        output.append(
+            f"Execution time: TimeoutError: Execution exceeded the time limit of {humanize.naturaldelta(timeout)}"
+        )
     else:
-        output.append(f"Execution time: {humanize.naturaldelta(exec_time)} seconds (time limit is {humanize.naturaldelta(timeout)}).")
+        output.append(
+            f"Execution time: {humanize.naturaldelta(exec_time)} seconds (time limit is {humanize.naturaldelta(timeout)})."
+        )
 
     result = {
         "term_out": output,

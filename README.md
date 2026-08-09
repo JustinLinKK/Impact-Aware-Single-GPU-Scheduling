@@ -57,8 +57,8 @@ python -m localml_scheduler.cli report
 Run the demo:
 
 ```bash
-python -m localml_scheduler.examples.demo_submit_jobs
-python -m localml_scheduler.examples.demo_mlevolve_bridge
+python -m localml_scheduler.examples.demos submit
+python -m localml_scheduler.examples.demos bridge
 ```
 
 ## MCP Graph/Vector Surface
