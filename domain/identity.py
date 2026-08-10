@@ -6,14 +6,14 @@ from hashlib import sha1
 from typing import Any
 import json
 
-from .jobs import normalize_batch_probe_search_mode, normalize_runtime_probe_strategy
+from .jobs import normalize_runtime_probe_strategy
 
 
-def build_batch_probe_key(model_key: str, device_type: str, shape_signature: str, *, search_mode: str | None = None) -> str:
+def build_batch_probe_key(model_key: str, device_type: str, shape_signature: str) -> str:
     payload = {
         "device_type": device_type,
         "model_key": model_key,
-        "search_mode": normalize_batch_probe_search_mode(search_mode),
+        "probe_policy": "time_aware_five_options",
         "shape_signature": shape_signature,
     }
     return sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()

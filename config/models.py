@@ -12,11 +12,6 @@ import warnings
 
 import yaml
 
-SCHEDULER_MODE_SERIAL_BASIC = "serial_basic"
-SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED = "serial_batch_optimized"
-SCHEDULER_MODE_PARALLEL_DEFAULT = "parallel_default"
-SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED = "parallel_batch_optimized"
-SCHEDULER_MODE_PARALLEL_AUTO_PACK = "parallel_auto_pack"
 SCHEDULER_MODE_PARALLEL_TIME_AWARE = "parallel_time_aware"
 PREDICTION_MODE_BRANCH_PROFILE = "branch_profile"
 PREDICTION_MODE_ML_PREDICTOR = "ml_predictor"
@@ -33,18 +28,17 @@ def normalize_prediction_mode(value: str | None) -> str:
 
 def normalize_scheduler_mode(value: str | None) -> str:
     normalized = (
-        str(value or SCHEDULER_MODE_PARALLEL_DEFAULT).strip().lower().replace("-", "_")
+        str(value or SCHEDULER_MODE_PARALLEL_TIME_AWARE)
+        .strip()
+        .lower()
+        .replace("-", "_")
     )
-    allowed = {
-        SCHEDULER_MODE_SERIAL_BASIC,
-        SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED,
-        SCHEDULER_MODE_PARALLEL_DEFAULT,
-        SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
-        SCHEDULER_MODE_PARALLEL_AUTO_PACK,
-        SCHEDULER_MODE_PARALLEL_TIME_AWARE,
-    }
-    if normalized not in allowed:
-        raise ValueError(f"Unsupported scheduler mode: {value}")
+    if normalized != SCHEDULER_MODE_PARALLEL_TIME_AWARE:
+        raise ValueError(
+            f"Unsupported scheduler mode: {value}. "
+            "The production scheduler only supports parallel_time_aware; "
+            "VRAM-fill and fixed-width placement modes were removed."
+        )
     return normalized
 
 
@@ -70,10 +64,8 @@ class GpuProfilingSettings:
 
 @dataclass(slots=True)
 class GpuMemorySettings:
-    # ``safe_vram_budget_gib`` is a legacy compatibility input. New
-    # time-aware configurations should use a detected/configured device size
-    # and ``predicted_budget_fraction``.
-    safe_vram_budget_gib: float | None = 28.0
+    """Memory safety gates for time-aware admission, never placement scores."""
+
     gpu_vram_gib: float | None = None
     predicted_budget_fraction: float = 0.85
     live_admission_stop_fraction: float = 0.90
@@ -81,8 +73,6 @@ class GpuMemorySettings:
     admission_average_window_seconds: float = 10.0
 
     def __post_init__(self) -> None:
-        if self.safe_vram_budget_gib is not None and self.safe_vram_budget_gib <= 0:
-            raise ValueError("safe_vram_budget_gib must be positive")
         if self.gpu_vram_gib is not None and self.gpu_vram_gib <= 0:
             raise ValueError("gpu_vram_gib must be positive")
         if not 0 < self.predicted_budget_fraction <= 1:
@@ -101,11 +91,18 @@ class GpuMemorySettings:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "GpuMemorySettings":
-        return cls(**dict(payload or {}))
+        raw = dict(payload or {})
+        removed = sorted({"safe_vram_budget_gib", "vram_budget_fraction"} & raw.keys())
+        if removed:
+            raise ValueError(
+                "Removed legacy gpu_scheduler.memory settings: "
+                + ", ".join(removed)
+                + ". Use gpu_vram_gib and predicted_budget_fraction; VRAM is an admission constraint only."
+            )
+        return cls(**raw)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "safe_vram_budget_gib": self.safe_vram_budget_gib,
             "gpu_vram_gib": self.gpu_vram_gib,
             "predicted_budget_fraction": self.predicted_budget_fraction,
             "live_admission_stop_fraction": self.live_admission_stop_fraction,
@@ -368,36 +365,6 @@ class EarlyStoppingSettings:
 
 
 @dataclass(slots=True)
-class GpuThresholdSettings:
-    # Retained for legacy reports. Colocation admission uses colocation.min_gain.
-    pack_reject_max_slowdown: float = 1.30
-    latency_sensitive_max_slowdown: float = 1.15
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "GpuThresholdSettings":
-        raw = dict(payload or {})
-        removed_sm_controls = sorted(
-            {"pack_prefer_sm_active_lt", "pack_reject_sm_active_ge"}.intersection(raw)
-        )
-        if removed_sm_controls:
-            raise ValueError(
-                "gpu_scheduler.thresholds no longer supports SM scheduling controls: "
-                + ", ".join(removed_sm_controls)
-            )
-        if "min_aggregate_gain" in raw:
-            raise ValueError(
-                "gpu_scheduler.thresholds no longer supports throughput scheduling control: min_aggregate_gain"
-            )
-        return cls(**raw)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "pack_reject_max_slowdown": self.pack_reject_max_slowdown,
-            "latency_sensitive_max_slowdown": self.latency_sensitive_max_slowdown,
-        }
-
-
-@dataclass(slots=True)
 class GpuTelemetrySettings:
     device_poll_ms: int = 500
     pair_recheck_every_steps: int = 20
@@ -474,64 +441,6 @@ class StreamSettings:
             "enabled": self.enabled,
             "host_poll_interval_seconds": self.host_poll_interval_seconds,
             "host_join_timeout_seconds": self.host_join_timeout_seconds,
-        }
-
-
-@dataclass(slots=True)
-class AutoPackSettings:
-    target_vram_fraction: float = 0.97
-    runtime_skew_guardrail_ratio: float = 2.0
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "AutoPackSettings":
-        raw = dict(payload or {})
-        removed_sm_controls = sorted(
-            {"target_metric", "target_sm_fraction"}.intersection(raw)
-        )
-        if removed_sm_controls:
-            raise ValueError(
-                "gpu_scheduler.auto_pack is always VRAM-only and no longer supports target selection controls: "
-                + ", ".join(removed_sm_controls)
-            )
-        return cls(**raw)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "target_vram_fraction": self.target_vram_fraction,
-            "runtime_skew_guardrail_ratio": self.runtime_skew_guardrail_ratio,
-        }
-
-
-@dataclass(slots=True)
-class ParallelOptimizerSettings:
-    batch_search_mode: str = "binary"
-    target_vram_fraction: float = 0.97
-    max_probe_jobs: int = 3
-    binary_range_up: int = 32
-    binary_range_down: int = 1
-    power_of_two_range_up: int = 5
-    power_of_two_range_down: int = 1
-
-    def __post_init__(self) -> None:
-        self.batch_search_mode = self.batch_search_mode or "binary"
-        self.binary_range_up = max(0, int(self.binary_range_up))
-        self.binary_range_down = max(0, int(self.binary_range_down))
-        self.power_of_two_range_up = max(0, int(self.power_of_two_range_up))
-        self.power_of_two_range_down = max(0, int(self.power_of_two_range_down))
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "ParallelOptimizerSettings":
-        return cls(**(payload or {}))
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "batch_search_mode": self.batch_search_mode,
-            "target_vram_fraction": self.target_vram_fraction,
-            "max_probe_jobs": self.max_probe_jobs,
-            "binary_range_up": self.binary_range_up,
-            "binary_range_down": self.binary_range_down,
-            "power_of_two_range_up": self.power_of_two_range_up,
-            "power_of_two_range_down": self.power_of_two_range_down,
         }
 
 
@@ -770,10 +679,6 @@ class SchedulerSubmissionDefaults:
     )
     batch_probe_enabled: bool = True
     batch_probe_model_key: str | None = None
-    batch_probe_probe_timeout_seconds: int = 45
-    batch_probe_poll_interval_seconds: float = 0.5
-    batch_probe_max_multiplier: int = 32
-    batch_probe_search_mode: str = "binary"
     runtime_probe_enabled: bool = True
     runtime_probe_target: str | None = None
     runtime_probe_model_key: str | None = None
@@ -781,14 +686,27 @@ class SchedulerSubmissionDefaults:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "SchedulerSubmissionDefaults":
-        instance = cls(**(payload or {}))
+        raw = dict(payload or {})
+        removed = sorted(
+            {
+                "batch_probe_probe_timeout_seconds",
+                "batch_probe_poll_interval_seconds",
+                "batch_probe_max_multiplier",
+                "batch_probe_search_mode",
+            }
+            & raw.keys()
+        )
+        if removed:
+            raise ValueError(
+                "Removed legacy submission-default settings: " + ", ".join(removed)
+            )
+        instance = cls(**raw)
         if instance.backend_allowlist is None:
             instance.backend_allowlist = ["mps", "cuda_process"]
         else:
             instance.backend_allowlist = [
                 str(item) for item in instance.backend_allowlist
             ]
-        instance.batch_probe_search_mode = instance.batch_probe_search_mode or "binary"
         instance.runtime_probe_strategy = (
             str(instance.runtime_probe_strategy or "epoch_1")
             .strip()
@@ -809,10 +727,6 @@ class SchedulerSubmissionDefaults:
             "backend_allowlist": list(self.backend_allowlist),
             "batch_probe_enabled": self.batch_probe_enabled,
             "batch_probe_model_key": self.batch_probe_model_key,
-            "batch_probe_probe_timeout_seconds": self.batch_probe_probe_timeout_seconds,
-            "batch_probe_poll_interval_seconds": self.batch_probe_poll_interval_seconds,
-            "batch_probe_max_multiplier": self.batch_probe_max_multiplier,
-            "batch_probe_search_mode": self.batch_probe_search_mode,
             "runtime_probe_enabled": self.runtime_probe_enabled,
             "runtime_probe_target": self.runtime_probe_target,
             "runtime_probe_model_key": self.runtime_probe_model_key,
@@ -822,40 +736,30 @@ class SchedulerSubmissionDefaults:
 
 @dataclass(slots=True)
 class GpuSchedulerSettings:
+    """The single production policy: incremental, slowdown-verified placement.
+
+    The scheduler starts one anchor, considers one newcomer at a time, and
+    keeps an addition only when measured/predicted drain-time gain passes
+    ``colocation.min_gain``. VRAM is solely a hard admission constraint.
+    """
+
     enabled: bool = True
-    mode: str = SCHEDULER_MODE_PARALLEL_DEFAULT
+    mode: str = SCHEDULER_MODE_PARALLEL_TIME_AWARE
     backend_priority: list[str] = field(
         default_factory=lambda: ["mps", "stream", "cuda_process", "exclusive"]
     )
-    max_packed_jobs_per_gpu: int = 2
     parallel_job_cap: int | None = None
     priority_window_size: int = 8
     oldest_window_size: int = 4
     starvation_timeout_seconds: float = 1800.0
-    beam_width: int = 64
-    exact_search_max_jobs: int = 3
-    allow_three_way_packing: bool = False
-    candidate_window_size: int = 8
     device_index: int = 0
     fallback_cooldown_seconds: int = 900
-    concurrent_groups_enabled: bool = False
-    concurrent_backend_allowlist: list[str] = field(
-        default_factory=lambda: ["mps", "stream"]
-    )
     batch_probe_enabled: bool = True
     batch_probe_target_memory_fraction: float = 0.97
-    batch_probe_min_batch_size: int = 1
-    batch_probe_max_search_rounds: int = 12
     batch_probe_max_batch_size: int | None = None
-    batch_probe_search_mode: str = "binary"
     profiling: GpuProfilingSettings = field(default_factory=GpuProfilingSettings)
     memory: GpuMemorySettings = field(default_factory=GpuMemorySettings)
-    thresholds: GpuThresholdSettings = field(default_factory=GpuThresholdSettings)
     telemetry: GpuTelemetrySettings = field(default_factory=GpuTelemetrySettings)
-    auto_pack: AutoPackSettings = field(default_factory=AutoPackSettings)
-    parallel_optimizer: ParallelOptimizerSettings = field(
-        default_factory=ParallelOptimizerSettings
-    )
     objective: TimeObjectiveSettings = field(default_factory=TimeObjectiveSettings)
     batch_options: BatchOptionSettings = field(default_factory=BatchOptionSettings)
     colocation: ColocationSettings = field(default_factory=ColocationSettings)
@@ -875,12 +779,6 @@ class GpuSchedulerSettings:
             self.backend_priority = ["mps", "stream", "cuda_process", "exclusive"]
         else:
             self.backend_priority = [str(item) for item in self.backend_priority]
-        if self.concurrent_backend_allowlist is None:
-            self.concurrent_backend_allowlist = ["mps", "stream"]
-        else:
-            self.concurrent_backend_allowlist = [
-                str(item) for item in self.concurrent_backend_allowlist
-            ]
         if self.parallel_job_cap is not None:
             self.parallel_job_cap = max(1, int(self.parallel_job_cap))
         self.priority_window_size = max(1, int(self.priority_window_size))
@@ -888,8 +786,6 @@ class GpuSchedulerSettings:
         self.starvation_timeout_seconds = max(
             0.0, float(self.starvation_timeout_seconds)
         )
-        self.beam_width = max(1, int(self.beam_width))
-        self.exact_search_max_jobs = max(1, int(self.exact_search_max_jobs))
         if self.profiling is None:
             self.profiling = GpuProfilingSettings()
         if isinstance(self.profiling, dict):
@@ -898,24 +794,10 @@ class GpuSchedulerSettings:
             self.memory = GpuMemorySettings()
         if isinstance(self.memory, dict):
             self.memory = GpuMemorySettings.from_dict(self.memory)
-        if self.thresholds is None:
-            self.thresholds = GpuThresholdSettings()
-        if isinstance(self.thresholds, dict):
-            self.thresholds = GpuThresholdSettings.from_dict(self.thresholds)
         if self.telemetry is None:
             self.telemetry = GpuTelemetrySettings()
         if isinstance(self.telemetry, dict):
             self.telemetry = GpuTelemetrySettings.from_dict(self.telemetry)
-        if self.auto_pack is None:
-            self.auto_pack = AutoPackSettings()
-        if isinstance(self.auto_pack, dict):
-            self.auto_pack = AutoPackSettings.from_dict(self.auto_pack)
-        if self.parallel_optimizer is None:
-            self.parallel_optimizer = ParallelOptimizerSettings()
-        if isinstance(self.parallel_optimizer, dict):
-            self.parallel_optimizer = ParallelOptimizerSettings.from_dict(
-                self.parallel_optimizer
-            )
         if self.objective is None:
             self.objective = TimeObjectiveSettings()
         if isinstance(self.objective, dict):
@@ -934,11 +816,7 @@ class GpuSchedulerSettings:
             self.exclusive_probe = ExclusiveProbeSettings.from_dict(
                 self.exclusive_probe
             )
-        if (
-            self.mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE
-            and self.memory.predicted_budget_fraction
-            > self.memory.live_admission_stop_fraction
-        ):
+        if self.memory.predicted_budget_fraction > self.memory.live_admission_stop_fraction:
             warnings.warn(
                 "predicted_budget_fraction exceeds live_admission_stop_fraction; a newly admitted pack may close admission immediately",
                 UserWarning,
@@ -966,8 +844,29 @@ class GpuSchedulerSettings:
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "GpuSchedulerSettings":
         raw = dict(payload or {})
-        if "parallel_job_cap" not in raw and "max_packed_jobs_per_gpu" in raw:
-            raw["parallel_job_cap"] = raw["max_packed_jobs_per_gpu"]
+        legacy_keys = {
+            "adaptive",
+            "allow_three_way_packing",
+            "auto_pack",
+            "beam_width",
+            "candidate_window_size",
+            "concurrent_backend_allowlist",
+            "concurrent_groups_enabled",
+            "exact_search_max_jobs",
+            "max_packed_jobs_per_gpu",
+            "parallel_optimizer",
+            "thresholds",
+            "batch_probe_min_batch_size",
+            "batch_probe_max_search_rounds",
+            "batch_probe_search_mode",
+        }
+        removed = sorted(legacy_keys & raw.keys())
+        if removed:
+            raise ValueError(
+                "Removed legacy gpu_scheduler settings: "
+                + ", ".join(removed)
+                + ". Configure parallel_time_aware with parallel_job_cap, colocation, objective, batch_options, and memory safety gates."
+            )
         return cls(**raw)
 
     def to_dict(self) -> dict[str, Any]:
@@ -975,31 +874,18 @@ class GpuSchedulerSettings:
             "enabled": self.enabled,
             "mode": self.mode,
             "backend_priority": list(self.backend_priority),
-            "max_packed_jobs_per_gpu": self.max_packed_jobs_per_gpu,
             "parallel_job_cap": self.parallel_job_cap,
             "priority_window_size": self.priority_window_size,
             "oldest_window_size": self.oldest_window_size,
             "starvation_timeout_seconds": self.starvation_timeout_seconds,
-            "beam_width": self.beam_width,
-            "exact_search_max_jobs": self.exact_search_max_jobs,
-            "allow_three_way_packing": self.allow_three_way_packing,
-            "candidate_window_size": self.candidate_window_size,
             "device_index": self.device_index,
             "fallback_cooldown_seconds": self.fallback_cooldown_seconds,
-            "concurrent_groups_enabled": self.concurrent_groups_enabled,
-            "concurrent_backend_allowlist": list(self.concurrent_backend_allowlist),
             "batch_probe_enabled": self.batch_probe_enabled,
             "batch_probe_target_memory_fraction": self.batch_probe_target_memory_fraction,
-            "batch_probe_min_batch_size": self.batch_probe_min_batch_size,
-            "batch_probe_max_search_rounds": self.batch_probe_max_search_rounds,
             "batch_probe_max_batch_size": self.batch_probe_max_batch_size,
-            "batch_probe_search_mode": self.batch_probe_search_mode,
             "profiling": self.profiling.to_dict(),
             "memory": self.memory.to_dict(),
-            "thresholds": self.thresholds.to_dict(),
             "telemetry": self.telemetry.to_dict(),
-            "auto_pack": self.auto_pack.to_dict(),
-            "parallel_optimizer": self.parallel_optimizer.to_dict(),
             "objective": self.objective.to_dict(),
             "batch_options": self.batch_options.to_dict(),
             "colocation": self.colocation.to_dict(),

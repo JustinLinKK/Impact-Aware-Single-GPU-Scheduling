@@ -1,4 +1,8 @@
-"""Pure-ish planning engine for GPU placement decisions."""
+"""Incremental time-aware GPU placement planning.
+
+VRAM is a feasibility constraint in this module. It is never an objective to
+maximize; placement value comes exclusively from projected/measured drain time.
+"""
 
 from __future__ import annotations
 
@@ -6,23 +10,14 @@ from datetime import datetime, timezone
 from typing import Iterable
 
 from ..domain import SchedulingClass, TrainingJob, parse_timestamp
-from ..config import (
-    SCHEDULER_MODE_PARALLEL_AUTO_PACK,
-    SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
-    SCHEDULER_MODE_SERIAL_BASIC,
-    SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED,
-    SCHEDULER_MODE_PARALLEL_TIME_AWARE,
-    SchedulerSettings,
-)
+from ..config import SchedulerSettings
 from .candidate_generator import CandidateGenerator
 from .compatibility import CompatibilityEvaluator
-from .objective import ObjectiveScorer
 from .planning_repository import PlanningRepository
-from .planner_types import DispatchPlan, EvaluatedGroup
+from .planner_types import DispatchPlan
 from .policies import SchedulingPolicy
 from .queue import RunnableJobQueue
 from .resource_estimator import ResourceEstimator
-from .runtime_guardrail import RuntimeGuardrail
 from .time_objective import TimeAwareObjectiveScorer
 
 
@@ -40,15 +35,7 @@ class PlacementPlanner:
         self.policy = policy
         self.estimator = ResourceEstimator(settings, repository)
         self.compatibility = CompatibilityEvaluator(repository)
-        self.runtime_guardrail = RuntimeGuardrail(settings, repository)
-        self.candidate_generator = CandidateGenerator(settings, self.estimator, self.compatibility)
-        self.objective = ObjectiveScorer(
-            settings,
-            self.estimator,
-            self.compatibility,
-            self.candidate_generator,
-            self.runtime_guardrail,
-        )
+        self.candidate_generator = CandidateGenerator(settings, self.estimator)
         self.time_objective = TimeAwareObjectiveScorer(
             settings,
             self.estimator,
@@ -66,7 +53,7 @@ class PlacementPlanner:
         return self.estimator.shape_signature(job)
 
     def _candidate_batch_sizes(self, job: TrainingJob) -> list[int]:
-        return self.candidate_generator.candidate_batch_sizes(job, scheduler_mode=self.settings.gpu_scheduler.mode)
+        return self.candidate_generator.candidate_batch_sizes(job)
 
     def _effective_priority(self, job: TrainingJob, *, now: datetime) -> int:
         if not self.settings.enable_priority_aging or self.settings.aging_interval_seconds <= 0:
@@ -116,10 +103,7 @@ class PlacementPlanner:
 
     def _fastest_time_option(self, job: TrainingJob, backend_name: str):
         try:
-            batch_sizes = self.candidate_generator.candidate_batch_sizes(
-                job,
-                scheduler_mode=SCHEDULER_MODE_PARALLEL_TIME_AWARE,
-            )
+            batch_sizes = self.candidate_generator.candidate_batch_sizes(job)
         except ValueError:
             return None
         options = [
@@ -129,7 +113,7 @@ class PlacementPlanner:
         ]
         return min(
             options,
-            key=lambda option: (option.remaining_runtime_seconds, option.avg_vram_mb, option.batch_size),
+            key=lambda option: (option.remaining_runtime_seconds, option.batch_size),
             default=None,
         )
 
@@ -325,27 +309,7 @@ class PlacementPlanner:
         ordered = RunnableJobQueue(policy=self.policy, jobs=materialized_jobs).ordered()
         if not ordered:
             return None
-        if self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE:
-            return self._choose_time_aware_plan(
-                materialized_jobs,
-                backend_available=backend_available,
-                active_vram_mb=active_vram_mb,
-                active_jobs=list(active_jobs),
-                admission_open=admission_open,
-                exclusive_drain_requested=exclusive_drain_requested,
-                packing_admission_stalled=packing_admission_stalled,
-                trial_pending=trial_pending,
-                now=now or datetime.now(timezone.utc),
-            )
         primary = ordered[0]
-        if len(ordered) == 1:
-            return DispatchPlan(
-                mode="exclusive",
-                backend_name="exclusive",
-                job_ids=(primary.job_id,),
-                reason="single runnable job",
-            )
-
         if not self.settings.gpu_scheduler.enabled:
             return DispatchPlan(
                 mode="exclusive",
@@ -353,96 +317,14 @@ class PlacementPlanner:
                 job_ids=(primary.job_id,),
                 reason="gpu scheduler disabled",
             )
-
-        scheduler_mode = self.settings.gpu_scheduler.mode
-        if scheduler_mode in {
-            SCHEDULER_MODE_SERIAL_BASIC,
-            SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED,
-        }:
-            return DispatchPlan(
-                mode="exclusive",
-                backend_name="exclusive",
-                job_ids=(primary.job_id,),
-                reason=f"{scheduler_mode} selected",
-            )
-
-        best_group: EvaluatedGroup | None = None
-        packed_backend_unavailable = False
-        missing_memory_estimate = False
-        incompatible_group = False
-        for group in self.candidate_generator.candidate_groups(ordered, scheduler_mode=scheduler_mode):
-            configured_backends = [
-                backend_name
-                for backend_name in self.settings.gpu_scheduler.backend_priority
-                if backend_name != "exclusive" and all(self.compatibility.pack_eligible(job, backend_name=backend_name) for job in group)
-            ]
-            if configured_backends and not any(backend_available.get(backend_name, False) for backend_name in configured_backends):
-                packed_backend_unavailable = True
-                continue
-            available_backends = self.candidate_generator.backend_candidates(
-                group,
-                backend_available=backend_available,
-                scheduler_mode=scheduler_mode,
-            )
-            if not available_backends:
-                continue
-            viable_backends = [
-                backend_name
-                for backend_name in available_backends
-                if backend_name == "exclusive" or all(self.estimator.has_memory_estimate(job, backend_name) for job in group)
-            ]
-            if not viable_backends:
-                missing_memory_estimate = True
-                continue
-
-            for backend_name in viable_backends:
-                if scheduler_mode == SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED:
-                    candidate = self.objective.evaluate_optimized_group(group, backend_name)
-                elif scheduler_mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK:
-                    candidate = self.objective.evaluate_auto_pack_group(
-                        group,
-                        backend_name,
-                        active_vram_mb=active_vram_mb,
-                    )
-                else:
-                    candidate = self.objective.evaluate_fixed_group(group, backend_name)
-                if candidate is None:
-                    incompatible_group = True
-                    continue
-                if best_group is None or candidate.objective_score > best_group.objective_score:
-                    best_group = candidate
-
-        if best_group is None:
-            reason = "no compatible packed group"
-            if packed_backend_unavailable:
-                reason = "packed backend unavailable"
-            elif missing_memory_estimate:
-                reason = "solo profile or VRAM estimate unavailable"
-            elif incompatible_group:
-                reason = "no compatible packed group"
-            return DispatchPlan(
-                mode="exclusive",
-                backend_name="exclusive",
-                job_ids=(primary.job_id,),
-                reason=reason,
-            )
-
-        if len(best_group.jobs) == 1:
-            return DispatchPlan(
-                mode="exclusive",
-                backend_name=best_group.backend_name,
-                job_ids=(best_group.jobs[0].job_id,),
-                reason=best_group.reason,
-                batch_overrides=best_group.batch_overrides,
-                fallback_order=best_group.fallback_order,
-            )
-
-        placement_mode = "packed_pair" if len(best_group.jobs) == 2 else "packed_group"
-        return DispatchPlan(
-            mode=placement_mode,
-            backend_name=best_group.backend_name,
-            job_ids=tuple(job.job_id for job in best_group.jobs),
-            reason=best_group.reason,
-            batch_overrides=best_group.batch_overrides,
-            fallback_order=best_group.fallback_order,
+        return self._choose_time_aware_plan(
+            materialized_jobs,
+            backend_available=backend_available,
+            active_vram_mb=active_vram_mb,
+            active_jobs=list(active_jobs),
+            admission_open=admission_open,
+            exclusive_drain_requested=exclusive_drain_requested,
+            packing_admission_stalled=packing_admission_stalled,
+            trial_pending=trial_pending,
+            now=now or datetime.now(timezone.utc),
         )

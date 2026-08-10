@@ -65,7 +65,7 @@ class AverageVramTest(unittest.TestCase):
                 build_group_signature(["left", "right"]),
                 hardware_key,
                 "cuda_process",
-                "parallel_batch_optimized",
+                "parallel_time_aware",
                 {"left": 2, "right": 2},
                 avg_vram_mb=505.5,
             )
@@ -92,7 +92,7 @@ class AverageVramTest(unittest.TestCase):
                     group_signature=combination.group_signature,
                     hardware_key=hardware_key,
                     backend_name="cuda_process",
-                    scheduler_mode="parallel_batch_optimized",
+                    scheduler_mode="parallel_time_aware",
                 ).avg_vram_mb,
                 505.5,
             )

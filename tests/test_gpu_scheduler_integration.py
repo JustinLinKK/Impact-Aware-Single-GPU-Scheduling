@@ -1,23 +1,30 @@
 from __future__ import annotations
 
 from pathlib import Path
-import shutil
 import tempfile
 import time
 import unittest
 
 from localml_scheduler.adapters.mlevolve import build_mlevolve_job
 from localml_scheduler.client import SchedulerClient
-from localml_scheduler.execution.backends import CudaProcessBackend, ExclusiveBackend, MPSBackend
+from localml_scheduler.config import SchedulerSettings
+from localml_scheduler.domain import (
+    BatchSizeObservation,
+    CheckpointPolicy,
+    JobStatus,
+    ResourceRequirements,
+    RuntimeProfile,
+    TrainingJob,
+    build_batch_probe_shape_signature,
+    build_batch_size_observation_key,
+)
+from localml_scheduler.execution.backends import CudaProcessBackend, ExclusiveBackend
 from localml_scheduler.execution.executor import SubprocessExecutor
 from localml_scheduler.examples.toy_pytorch_runner import create_toy_baseline_checkpoint
-from localml_scheduler.execution.runner_protocol import RunnerContext
-from localml_scheduler.domain import CheckpointPolicy, JobStatus, ResourceRequirements, SoloProfile
 from localml_scheduler.scheduler.supervisor import WorkerSupervisor
-from localml_scheduler.config import SchedulerSettings
 
 
-def wait_for(predicate, timeout: float = 30.0, interval: float = 0.1) -> None:
+def wait_for(predicate, timeout: float = 30.0, interval: float = 0.05) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if predicate():
@@ -26,367 +33,163 @@ def wait_for(predicate, timeout: float = 30.0, interval: float = 0.1) -> None:
     raise TimeoutError("condition not met in time")
 
 
-def run_failing_job(context: RunnerContext) -> dict[str, object]:
-    raise RuntimeError(f"forced failure for {context.job.job_id}")
-
-
-def _build_supervisor(settings: SchedulerSettings, *, mps_available: bool) -> WorkerSupervisor:
+def _supervisor(settings: SchedulerSettings, *, include_cuda_process: bool) -> WorkerSupervisor:
     executor = SubprocessExecutor(settings)
-    mps_binary = shutil.which("true") if mps_available else None
-    backends = {
-        "exclusive": ExclusiveBackend(settings, executor),
-        "mps": MPSBackend(settings, executor, mps_binary=mps_binary),
-    }
+    backends = {"exclusive": ExclusiveBackend(settings, executor)}
+    if include_cuda_process:
+        backends["cuda_process"] = CudaProcessBackend(settings, executor)
     return WorkerSupervisor(settings, backends=backends)
 
 
-def _build_cuda_process_supervisor(settings: SchedulerSettings) -> WorkerSupervisor:
-    executor = SubprocessExecutor(settings)
-    backends = {
-        "exclusive": ExclusiveBackend(settings, executor),
-        "cuda_process": CudaProcessBackend(settings, executor),
-    }
-    return WorkerSupervisor(settings, backends=backends)
-
-
-def _seed_solo_profile(api: SchedulerClient, job, *, avg_gpu_utilization: float = 0.2, peak_vram_mb: int = 512) -> None:
-    api.upsert_solo_profile(
-        SoloProfile(
-            signature=job.packing.signature,
-            family=job.packing.family,
-            peak_vram_mb=peak_vram_mb,
-            avg_gpu_utilization=avg_gpu_utilization,
-            avg_memory_utilization=0.2,
-            sample_count=3,
-            last_job_id=job.job_id,
-            metadata={"seeded": True},
-        )
+def _job(baseline: str, *, learning_rate: float, max_steps: int = 20) -> TrainingJob:
+    return build_mlevolve_job(
+        workflow_id="wf-time-aware",
+        baseline_model_id=f"baseline-{learning_rate}",
+        baseline_model_path=baseline,
+        runner_target="localml_scheduler.examples.toy_pytorch_runner:run_toy_training_job",
+        runner_kwargs={
+            "sleep_per_step": 0.02,
+            "learning_rate": learning_rate,
+            "batch_size": 8,
+        },
+        priority=5,
+        task_type="toy_classification",
+        resource_requirements=ResourceRequirements(
+            requires_gpu=False,
+            estimated_avg_vram_mb=512,
+            estimated_ram_mb=512,
+        ),
+        checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, save_every_epoch=True),
+        packing_family="toy-mlp",
+        packing_eligible=True,
+        packing_backend_allowlist=["cuda_process"],
+        max_steps=max_steps,
+        max_epochs=2,
     )
 
 
+def _seed_time_options(api: SchedulerClient, job: TrainingJob) -> None:
+    hardware_key = api.store.hardware_key()
+    shape_signature = build_batch_probe_shape_signature(job)
+    signature = job.packing.signature or job.job_id
+    for backend in ("exclusive", "cuda_process"):
+        for batch_size in (2, 4, 8, 16, 32):
+            api.store.upsert_batch_size_observation(
+                BatchSizeObservation(
+                    observation_key=build_batch_size_observation_key(
+                        job.baseline_model_id,
+                        shape_signature,
+                        hardware_key,
+                        backend,
+                        batch_size,
+                    ),
+                    model_key=job.baseline_model_id,
+                    shape_signature=shape_signature,
+                    hardware_key=hardware_key,
+                    backend_name=backend,
+                    batch_param_name="batch_size",
+                    batch_size=batch_size,
+                    avg_vram_mb=256 + batch_size,
+                    peak_vram_mb=320 + batch_size,
+                    metadata={"estimate_source": "integration_fixture"},
+                )
+            )
+            api.store.upsert_runtime_profile(
+                RuntimeProfile.create(
+                    signature=signature,
+                    hardware_key=hardware_key,
+                    backend_name=backend,
+                    resolved_batch_size=batch_size,
+                    strategy="epoch_1",
+                    epoch_1_seconds=0.5 + (1.0 / batch_size),
+                    estimated_total_runtime_seconds=1.2,
+                    confidence=0.9,
+                    observations=1,
+                    source="integration_fixture",
+                )
+            )
+
+
 class GpuSchedulerIntegrationTest(unittest.TestCase):
-    def _build_job(self, baseline: str, *, learning_rate: float, max_steps: int = 12, priority: int = 5, runner_target: str = "localml_scheduler.examples.toy_pytorch_runner:run_toy_training_job"):
-        return build_mlevolve_job(
-            workflow_id="wf-1",
-            baseline_model_id=f"baseline-{learning_rate}",
-            baseline_model_path=baseline,
-            runner_target=runner_target,
-            runner_kwargs={"sleep_per_step": 0.02, "learning_rate": learning_rate, "batch_size": 8},
-            priority=priority,
-            task_type="toy_classification",
-            resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=512, estimated_ram_mb=512),
-            checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, save_every_epoch=True),
-            packing_family="toy-mlp",
-            packing_eligible=True,
-            max_steps=max_steps,
-            max_epochs=2,
-        )
-
-    def test_packed_pair_dispatches_when_fake_mps_is_available(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            runtime_root = Path(tmpdir)
-            settings = SchedulerSettings(runtime_root=runtime_root, scheduler_poll_interval_seconds=0.05)
-            api = SchedulerClient(settings)
-            supervisor = _build_supervisor(settings, mps_available=True)
-            service = api.create_service(supervisor=supervisor).start(background=True)
-            try:
-                baseline = create_toy_baseline_checkpoint(runtime_root / "baselines" / "packed.pt", seed=90)
-                first = self._build_job(baseline, learning_rate=0.01, priority=7)
-                second = self._build_job(baseline, learning_rate=0.02, priority=6)
-                _seed_solo_profile(api, first)
-                _seed_solo_profile(api, second)
-
-                api.submit(first)
-                api.submit(second)
-
-                wait_for(
-                    lambda: api.inspect(first.job_id).status.is_terminal
-                    and api.inspect(second.job_id).status.is_terminal
-                    and api.get_pair_profile(first.packing.signature, second.packing.signature) is not None,
-                    timeout=30.0,
-                )
-                first_state = api.inspect(first.job_id)
-                second_state = api.inspect(second.job_id)
-                self.assertEqual(first_state.metadata["placement_mode"], "packed_pair")
-                self.assertEqual(second_state.metadata["placement_mode"], "packed_pair")
-                self.assertEqual(api.report()["packed_dispatches"], 1)
-                pair_profile = api.get_pair_profile(first.packing.signature, second.packing.signature)
-                self.assertIsNotNone(pair_profile)
-                self.assertTrue(pair_profile.compatible)
-            finally:
-                service.stop()
-
-    def test_cuda_process_backend_dispatches_packed_pair_when_mps_is_disabled(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            runtime_root = Path(tmpdir)
-            settings = SchedulerSettings(
-                runtime_root=runtime_root,
-                scheduler_poll_interval_seconds=0.05,
-                gpu_scheduler={"backend_priority": ["cuda_process", "exclusive"]},
-            )
-            api = SchedulerClient(settings)
-            supervisor = _build_cuda_process_supervisor(settings)
-            service = api.create_service(supervisor=supervisor).start(background=True)
-            try:
-                baseline = create_toy_baseline_checkpoint(runtime_root / "baselines" / "cuda-process-pair.pt", seed=89)
-                first = self._build_job(baseline, learning_rate=0.011, priority=7)
-                second = self._build_job(baseline, learning_rate=0.012, priority=6)
-                _seed_solo_profile(api, first)
-                _seed_solo_profile(api, second)
-
-                api.submit(first)
-                api.submit(second)
-
-                wait_for(
-                    lambda: api.inspect(first.job_id).status.is_terminal and api.inspect(second.job_id).status.is_terminal,
-                    timeout=30.0,
-                )
-                self.assertEqual(api.inspect(first.job_id).metadata["placement_mode"], "packed_pair")
-                self.assertEqual(api.inspect(second.job_id).metadata["placement_mode"], "packed_pair")
-                self.assertEqual(api.inspect(first.job_id).metadata["placement_backend"], "cuda_process")
-                self.assertEqual(api.inspect(second.job_id).metadata["placement_backend"], "cuda_process")
-                self.assertEqual(api.report()["packed_dispatches"], 1)
-            finally:
-                service.stop()
-
-    def test_parallel_cuda_process_prefetch_records_cache_hits_for_shared_baseline(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            runtime_root = Path(tmpdir)
-            settings = SchedulerSettings(
-                runtime_root=runtime_root,
-                scheduler_poll_interval_seconds=0.05,
-                baseline_cache={"warm_queue_top_k": 0, "entry_capacity": 8},
-                gpu_scheduler={"backend_priority": ["cuda_process", "exclusive"]},
-            )
-            api = SchedulerClient(settings)
-            supervisor = _build_cuda_process_supervisor(settings)
-            service = api.create_service(supervisor=supervisor).start(background=True)
-            try:
-                baseline = create_toy_baseline_checkpoint(runtime_root / "baselines" / "shared-prefetch.pt", seed=77)
-                first = build_mlevolve_job(
-                    workflow_id="wf-1",
-                    baseline_model_id="shared-prefetch-baseline",
-                    baseline_model_path=baseline,
-                    runner_target="localml_scheduler.examples.toy_pytorch_runner:run_toy_training_job",
-                    runner_kwargs={"sleep_per_step": 0.02, "learning_rate": 0.041, "batch_size": 8},
-                    priority=7,
-                    task_type="toy_classification",
-                    resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=512, estimated_ram_mb=512),
-                    checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, save_every_epoch=True),
-                    packing_family="toy-mlp",
-                    packing_eligible=True,
-                    max_steps=12,
-                    max_epochs=2,
-                )
-                second = build_mlevolve_job(
-                    workflow_id="wf-1",
-                    baseline_model_id="shared-prefetch-baseline",
-                    baseline_model_path=baseline,
-                    runner_target="localml_scheduler.examples.toy_pytorch_runner:run_toy_training_job",
-                    runner_kwargs={"sleep_per_step": 0.02, "learning_rate": 0.042, "batch_size": 8},
-                    priority=6,
-                    task_type="toy_classification",
-                    resource_requirements=ResourceRequirements(requires_gpu=False, estimated_vram_mb=512, estimated_ram_mb=512),
-                    checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, save_every_epoch=True),
-                    packing_family="toy-mlp",
-                    packing_eligible=True,
-                    max_steps=12,
-                    max_epochs=2,
-                )
-                _seed_solo_profile(api, first)
-                _seed_solo_profile(api, second)
-
-                api.submit(first)
-                api.submit(second)
-
-                wait_for(
-                    lambda: api.inspect(first.job_id).status.is_terminal and api.inspect(second.job_id).status.is_terminal,
-                    timeout=30.0,
-                )
-
-                first_state = api.inspect(first.job_id)
-                second_state = api.inspect(second.job_id)
-                self.assertEqual(first_state.metadata["placement_mode"], "packed_pair")
-                self.assertEqual(second_state.metadata["placement_mode"], "packed_pair")
-
-                cache_payload = api.cache_stats()
-                stats = cache_payload.get("stats") or cache_payload.get("result") or {}
-                self.assertEqual(stats["entries"], 1)
-                self.assertGreaterEqual(stats["hits"], 2)
-
-                cache_loaded_events = api.store.list_events(event_type="cache_loaded")
-                cache_hit_events = api.store.list_events(event_type="cache_hit")
-                cache_touch_events = api.store.list_events(event_type="cache_touched")
-                self.assertEqual(len(cache_loaded_events), 1)
-                self.assertGreaterEqual(len(cache_hit_events), 2)
-                self.assertGreaterEqual(len(cache_touch_events), 1)
-            finally:
-                service.stop()
-
-    def test_cuda_process_backend_dispatches_three_way_group(self) -> None:
+    def test_profiled_job_starts_as_time_aware_stack_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir)
             settings = SchedulerSettings(
                 runtime_root=runtime_root,
                 scheduler_poll_interval_seconds=0.05,
                 gpu_scheduler={
+                    "mode": "parallel_time_aware",
                     "backend_priority": ["cuda_process", "exclusive"],
-                    "max_packed_jobs_per_gpu": 3,
-                    "allow_three_way_packing": True,
                 },
+                graph_db={"enabled": False},
+                hardware_feature_db={"enabled": False},
             )
             api = SchedulerClient(settings)
-            supervisor = _build_cuda_process_supervisor(settings)
-            service = api.create_service(supervisor=supervisor).start(background=True)
+            service = api.create_service(
+                supervisor=_supervisor(settings, include_cuda_process=True)
+            ).start(background=True)
             try:
-                baseline = create_toy_baseline_checkpoint(runtime_root / "baselines" / "cuda-process-group.pt", seed=88)
-                jobs = [
-                    self._build_job(baseline, learning_rate=0.021, priority=9),
-                    self._build_job(baseline, learning_rate=0.022, priority=8),
-                    self._build_job(baseline, learning_rate=0.023, priority=7),
-                ]
-                for job in jobs:
-                    _seed_solo_profile(api, job, peak_vram_mb=256)
-                    api.submit(job)
+                baseline = create_toy_baseline_checkpoint(
+                    runtime_root / "baselines" / "anchor.pt",
+                    seed=89,
+                )
+                job = _job(baseline, learning_rate=0.011)
+                _seed_time_options(api, job)
 
-                wait_for(lambda: all(api.inspect(job.job_id).status.is_terminal for job in jobs), timeout=30.0)
-                self.assertTrue(all(api.inspect(job.job_id).metadata["placement_mode"] == "packed_group" for job in jobs))
-                self.assertTrue(all(api.inspect(job.job_id).metadata["placement_backend"] == "cuda_process" for job in jobs))
-                self.assertEqual(api.report()["packed_dispatches"], 1)
+                api.submit(job)
+                wait_for(lambda: api.inspect(job.job_id).status == JobStatus.RUNNING)
+
+                running = api.inspect(job.job_id)
+                self.assertEqual(running.metadata["placement_mode"], "stack_anchor")
+                self.assertEqual(running.metadata["placement_backend"], "cuda_process")
+                self.assertEqual(
+                    running.metadata["placement_objective_version"],
+                    "time_v6_verified_piecewise_drain",
+                )
+                wait_for(lambda: api.inspect(job.job_id).status.is_terminal)
+                self.assertEqual(api.inspect(job.job_id).status, JobStatus.COMPLETED)
             finally:
                 service.stop()
 
-    def test_cuda_process_failure_records_fallback_and_keeps_peer_alive(self) -> None:
+    def test_exclusive_only_backend_drains_jobs_one_at_a_time(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir)
             settings = SchedulerSettings(
                 runtime_root=runtime_root,
                 scheduler_poll_interval_seconds=0.05,
-                gpu_scheduler={"backend_priority": ["cuda_process", "exclusive"]},
+                gpu_scheduler={
+                    "mode": "parallel_time_aware",
+                    "backend_priority": ["exclusive"],
+                },
+                graph_db={"enabled": False},
+                hardware_feature_db={"enabled": False},
             )
             api = SchedulerClient(settings)
-            supervisor = _build_cuda_process_supervisor(settings)
-            service = api.create_service(supervisor=supervisor).start(background=True)
+            service = api.create_service(
+                supervisor=_supervisor(settings, include_cuda_process=False)
+            ).start(background=True)
             try:
-                baseline = create_toy_baseline_checkpoint(runtime_root / "baselines" / "cuda-process-failure.pt", seed=87)
-                primary = self._build_job(baseline, learning_rate=0.031, priority=9, max_steps=30)
-                failing = self._build_job(
-                    baseline,
-                    learning_rate=0.032,
-                    priority=8,
-                    max_steps=5,
-                    runner_target="localml_scheduler.tests.test_gpu_scheduler_integration:run_failing_job",
+                baseline = create_toy_baseline_checkpoint(
+                    runtime_root / "baselines" / "exclusive.pt",
+                    seed=90,
                 )
-                _seed_solo_profile(api, primary)
-                _seed_solo_profile(api, failing)
-
-                api.submit(primary)
-                api.submit(failing)
-
-                wait_for(
-                    lambda: api.inspect(primary.job_id).status.is_terminal and api.inspect(failing.job_id).status.is_terminal,
-                    timeout=30.0,
-                )
-                self.assertEqual(api.inspect(primary.job_id).status, JobStatus.COMPLETED)
-                self.assertEqual(api.inspect(failing.job_id).status, JobStatus.FAILED)
-                self.assertEqual(api.report()["packed_fallbacks"], 1)
-                self.assertEqual(api.inspect(primary.job_id).metadata["placement_backend"], "cuda_process")
-                self.assertEqual(api.inspect(failing.job_id).metadata["placement_backend"], "cuda_process")
-            finally:
-                service.stop()
-
-    def test_jobs_fall_back_to_exclusive_when_mps_is_unavailable(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            runtime_root = Path(tmpdir)
-            settings = SchedulerSettings(runtime_root=runtime_root, scheduler_poll_interval_seconds=0.05)
-            api = SchedulerClient(settings)
-            supervisor = _build_supervisor(settings, mps_available=False)
-            service = api.create_service(supervisor=supervisor).start(background=True)
-            try:
-                baseline = create_toy_baseline_checkpoint(runtime_root / "baselines" / "exclusive.pt", seed=91)
-                first = self._build_job(baseline, learning_rate=0.03, priority=7, max_steps=20)
-                second = self._build_job(baseline, learning_rate=0.04, priority=6, max_steps=20)
-                _seed_solo_profile(api, first)
-                _seed_solo_profile(api, second)
-
+                first = _job(baseline, learning_rate=0.021, max_steps=30)
+                second = _job(baseline, learning_rate=0.022, max_steps=10)
                 api.submit(first)
                 api.submit(second)
 
                 wait_for(lambda: api.inspect(first.job_id).status == JobStatus.RUNNING)
-                time.sleep(0.3)
-                self.assertIn(api.inspect(second.job_id).status, {JobStatus.PENDING, JobStatus.READY})
-
-                wait_for(lambda: api.inspect(first.job_id).status.is_terminal and api.inspect(second.job_id).status.is_terminal, timeout=30.0)
+                self.assertIn(
+                    api.inspect(second.job_id).status,
+                    {JobStatus.PENDING, JobStatus.READY},
+                )
+                wait_for(
+                    lambda: api.inspect(first.job_id).status.is_terminal
+                    and api.inspect(second.job_id).status.is_terminal
+                )
                 self.assertEqual(api.inspect(first.job_id).metadata["placement_mode"], "exclusive")
                 self.assertEqual(api.inspect(second.job_id).metadata["placement_mode"], "exclusive")
                 self.assertEqual(api.report()["packed_dispatches"], 0)
-            finally:
-                service.stop()
-
-    def test_secondary_failure_marks_pair_incompatible_and_keeps_primary_alive(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            runtime_root = Path(tmpdir)
-            settings = SchedulerSettings(runtime_root=runtime_root, scheduler_poll_interval_seconds=0.05)
-            api = SchedulerClient(settings)
-            supervisor = _build_supervisor(settings, mps_available=True)
-            service = api.create_service(supervisor=supervisor).start(background=True)
-            try:
-                baseline = create_toy_baseline_checkpoint(runtime_root / "baselines" / "failure.pt", seed=92)
-                primary = self._build_job(baseline, learning_rate=0.05, priority=9, max_steps=30)
-                failing = self._build_job(
-                    baseline,
-                    learning_rate=0.06,
-                    priority=8,
-                    max_steps=5,
-                    runner_target="localml_scheduler.tests.test_gpu_scheduler_integration:run_failing_job",
-                )
-                _seed_solo_profile(api, primary)
-                _seed_solo_profile(api, failing)
-
-                api.submit(primary)
-                api.submit(failing)
-
-                wait_for(
-                    lambda: api.inspect(primary.job_id).status.is_terminal
-                    and api.inspect(failing.job_id).status.is_terminal
-                    and api.get_pair_profile(primary.packing.signature, failing.packing.signature) is not None,
-                    timeout=30.0,
-                )
-                self.assertEqual(api.inspect(primary.job_id).status, JobStatus.COMPLETED)
-                self.assertEqual(api.inspect(failing.job_id).status, JobStatus.FAILED)
-                pair_profile = api.get_pair_profile(primary.packing.signature, failing.packing.signature)
-                self.assertIsNotNone(pair_profile)
-                self.assertFalse(pair_profile.compatible)
-                self.assertEqual(api.report()["packed_fallbacks"], 1)
-            finally:
-                service.stop()
-
-    def test_manual_pause_and_cancel_work_per_job_in_packed_group(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            runtime_root = Path(tmpdir)
-            settings = SchedulerSettings(runtime_root=runtime_root, scheduler_poll_interval_seconds=0.05)
-            api = SchedulerClient(settings)
-            supervisor = _build_supervisor(settings, mps_available=True)
-            service = api.create_service(supervisor=supervisor).start(background=True)
-            try:
-                baseline = create_toy_baseline_checkpoint(runtime_root / "baselines" / "control.pt", seed=93)
-                primary = self._build_job(baseline, learning_rate=0.07, priority=9, max_steps=80)
-                secondary = self._build_job(baseline, learning_rate=0.08, priority=8, max_steps=80)
-                _seed_solo_profile(api, primary)
-                _seed_solo_profile(api, secondary)
-
-                api.submit(primary)
-                api.submit(secondary)
-
-                wait_for(lambda: api.inspect(primary.job_id).status == JobStatus.RUNNING and api.inspect(secondary.job_id).status == JobStatus.RUNNING)
-                api.pause(secondary.job_id)
-                wait_for(lambda: api.inspect(secondary.job_id).status == JobStatus.PAUSED, timeout=20.0)
-
-                primary_after_pause = api.inspect(primary.job_id).status
-                self.assertIn(primary_after_pause, {JobStatus.RUNNING, JobStatus.COMPLETED})
-                if primary_after_pause == JobStatus.RUNNING:
-                    api.cancel(primary.job_id)
-                    wait_for(lambda: api.inspect(primary.job_id).status == JobStatus.CANCELLED, timeout=20.0)
             finally:
                 service.stop()
 

@@ -21,13 +21,15 @@ def wait_for(predicate, timeout: float = 20.0, interval: float = 0.1) -> None:
 
 
 class PauseResumeIntegrationTest(unittest.TestCase):
-    def test_preemption_and_auto_resume(self) -> None:
+    def test_time_aware_scheduler_does_not_preempt_the_running_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir)
             settings = SchedulerSettings(
                 runtime_root=runtime_root,
                 scheduler_poll_interval_seconds=0.05,
                 baseline_cache={"warm_queue_top_k": 2},
+                graph_db={"enabled": False},
+                hardware_feature_db={"enabled": False},
             )
             api = SchedulerClient(settings)
             service = api.create_service().start(background=True)
@@ -61,9 +63,15 @@ class PauseResumeIntegrationTest(unittest.TestCase):
                     )
                 )
 
+                time.sleep(0.2)
+                self.assertEqual(api.inspect(low.job_id).status.value, "RUNNING")
+                self.assertIn(
+                    api.inspect(high.job_id).status.value,
+                    {"PENDING", "READY"},
+                )
                 wait_for(lambda: api.inspect(high.job_id).status.is_terminal and api.inspect(low.job_id).status.is_terminal, timeout=30.0)
                 pause_events = api.store.list_events(job_id=low.job_id, event_type="job_paused")
-                self.assertTrue(pause_events, "expected low-priority job to pause at least once")
+                self.assertEqual(pause_events, [])
                 self.assertEqual(api.inspect(low.job_id).status.value, "COMPLETED")
                 self.assertEqual(api.inspect(high.job_id).status.value, "COMPLETED")
             finally:

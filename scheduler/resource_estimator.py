@@ -11,9 +11,8 @@ from ..domain import (
     TrainingJob,
     build_batch_probe_key,
     build_batch_probe_shape_signature,
-    normalize_batch_probe_search_mode,
 )
-from ..config import SCHEDULER_MODE_PARALLEL_TIME_AWARE, SchedulerSettings
+from ..config import SchedulerSettings
 from ..config import PREDICTION_MODE_ML_PREDICTOR
 from ..prediction import JobPredictionError, MLVramPredictor
 from .planning_repository import PlanningRepository
@@ -41,16 +40,13 @@ class ResourceEstimator:
         )
 
     def safe_budget_mb(self) -> float:
+        """Return the hard prediction budget used only to admit/reject work."""
         memory = self.settings.gpu_scheduler.memory
-        if self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE:
-            total_mb = (
-                float(memory.gpu_vram_gib) * 1024.0 if memory.gpu_vram_gib is not None else float(self.repository.hardware_profile().total_vram_mb or 0.0)
-            )
-            if total_mb > 0:
-                return total_mb * float(memory.predicted_budget_fraction)
-        if memory.safe_vram_budget_gib is not None:
-            return float(memory.safe_vram_budget_gib) * 1024.0
-        total_mb = float(self.repository.hardware_profile().total_vram_mb or 0.0)
+        total_mb = (
+            float(memory.gpu_vram_gib) * 1024.0
+            if memory.gpu_vram_gib is not None
+            else float(self.repository.hardware_profile().total_vram_mb or 0.0)
+        )
         return total_mb * float(memory.predicted_budget_fraction)
 
     def resolved_batch_size(self, job: TrainingJob) -> int:
@@ -286,21 +282,6 @@ class ResourceEstimator:
                 pass
         return None, "missing", None
 
-    @staticmethod
-    def pareto_prune(options: list[BatchOptionEstimate]) -> list[BatchOptionEstimate]:
-        retained: list[BatchOptionEstimate] = []
-        for option in options:
-            dominated = any(
-                other.batch_size != option.batch_size
-                and other.avg_vram_mb <= option.avg_vram_mb
-                and other.remaining_runtime_seconds <= option.remaining_runtime_seconds
-                and (other.avg_vram_mb < option.avg_vram_mb or other.remaining_runtime_seconds < option.remaining_runtime_seconds)
-                for other in options
-            )
-            if not dominated:
-                retained.append(option)
-        return sorted(retained, key=lambda item: item.batch_size)
-
     def solo_profile(self, job: TrainingJob) -> SoloProfile | None:
         if not job.packing.signature:
             return None
@@ -345,12 +326,10 @@ class ResourceEstimator:
             return float(nearest.avg_vram_mb) * (float(batch_size) / float(max(1, nearest.batch_size)))
 
         device_type = hardware.gpu_name
-        search_mode = normalize_batch_probe_search_mode(job.batch_probe.search_mode or self.settings.gpu_scheduler.batch_probe_search_mode)
         probe_key = build_batch_probe_key(
             self.model_key(job),
             device_type,
             self.shape_signature(job),
-            search_mode=search_mode,
         )
         batch_profile = self.repository.get_batch_probe_profile(probe_key)
         if batch_profile and batch_profile.avg_vram_mb is not None:
@@ -391,12 +370,10 @@ class ResourceEstimator:
             return float(nearest.peak_vram_mb) * (float(batch_size) / float(max(1, nearest.batch_size)))
 
         device_type = hardware.gpu_name
-        search_mode = normalize_batch_probe_search_mode(job.batch_probe.search_mode or self.settings.gpu_scheduler.batch_probe_search_mode)
         probe_key = build_batch_probe_key(
             self.model_key(job),
             device_type,
             self.shape_signature(job),
-            search_mode=search_mode,
         )
         batch_profile = self.repository.get_batch_probe_profile(probe_key)
         if batch_profile and batch_profile.peak_vram_mb is not None:

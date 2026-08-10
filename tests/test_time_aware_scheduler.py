@@ -189,18 +189,14 @@ def test_five_batch_options_use_immutable_requested_batch_and_clip() -> None:
         assert planner._candidate_batch_sizes(capped) == [1, 2, 4, 6]
 
 
-def test_time_aware_configuration_validates_and_migrates_legacy_cap() -> None:
+def test_time_aware_configuration_is_the_only_supported_policy() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
-        migrated = SchedulerSettings(
-            runtime_root=tmpdir,
-            gpu_scheduler={"mode": "parallel_time_aware", "max_packed_jobs_per_gpu": 3},
-        )
-        assert migrated.gpu_scheduler.parallel_job_cap == 3
         restored = SchedulerSettings(
             runtime_root=tmpdir,
-            gpu_scheduler=migrated.gpu_scheduler.to_dict(),
+            gpu_scheduler={"mode": "parallel_time_aware", "parallel_job_cap": 3},
             early_stopping={"mode": "min", "patience_epochs": 2},
         )
+        assert restored.gpu_scheduler.parallel_job_cap == 3
         assert restored.gpu_scheduler.objective.objective_version == "time_v6_verified_piecewise_drain"
         assert restored.gpu_scheduler.colocation.min_gain == 1.0
         assert restored.gpu_scheduler.colocation.trial_epochs == 2
@@ -236,10 +232,14 @@ def test_time_aware_configuration_validates_and_migrates_legacy_cap() -> None:
         assert piecewise_objective.gpu_scheduler.objective.objective_version == "time_v6_verified_piecewise_drain"
         assert restored.early_stopping.mode == "min"
         serialized_gpu = restored.gpu_scheduler.to_dict()
-        assert "pack_prefer_sm_active_lt" not in serialized_gpu["thresholds"]
-        assert "pack_reject_sm_active_ge" not in serialized_gpu["thresholds"]
-        assert "target_metric" not in serialized_gpu["auto_pack"]
-        assert "target_sm_fraction" not in serialized_gpu["auto_pack"]
+        assert serialized_gpu["mode"] == "parallel_time_aware"
+        for removed_key in (
+            "max_packed_jobs_per_gpu",
+            "thresholds",
+            "auto_pack",
+            "parallel_optimizer",
+        ):
+            assert removed_key not in serialized_gpu
         with pytest.raises(ValueError, match="timeout_max_seconds must be at least"):
             _settings(
                 tmpdir,
@@ -250,18 +250,26 @@ def test_time_aware_configuration_validates_and_migrates_legacy_cap() -> None:
             )
         with pytest.raises(ValueError, match="min_bad_trials must be at least 1"):
             _settings(tmpdir, colocation={"profile_rejection_min_bad_trials": 0})
-        for removed_key in ("pack_prefer_sm_active_lt", "pack_reject_sm_active_ge"):
-            with pytest.raises(ValueError, match="no longer supports SM scheduling controls"):
+        for legacy_mode in (
+            "serial_basic",
+            "serial_batch_optimized",
+            "parallel_default",
+            "parallel_batch_optimized",
+            "parallel_auto_pack",
+        ):
+            with pytest.raises(ValueError, match="only supports parallel_time_aware"):
                 SchedulerSettings(
                     runtime_root=tmpdir,
-                    gpu_scheduler={"thresholds": {removed_key: 0.9}},
+                    gpu_scheduler={"mode": legacy_mode},
                 )
-        for removed_key, value in (("target_metric", "vram"), ("target_sm_fraction", 0.9)):
-            with pytest.raises(ValueError, match="always VRAM-only"):
-                SchedulerSettings(
-                    runtime_root=tmpdir,
-                    gpu_scheduler={"auto_pack": {removed_key: value}},
-                )
+        for removed_key, value in (
+            ("max_packed_jobs_per_gpu", 3),
+            ("thresholds", {}),
+            ("auto_pack", {}),
+            ("parallel_optimizer", {}),
+        ):
+            with pytest.raises(ValueError, match="Removed legacy gpu_scheduler settings"):
+                SchedulerSettings(runtime_root=tmpdir, gpu_scheduler={removed_key: value})
         with pytest.raises(ValueError, match="no longer supports throughput scheduling controls"):
             SchedulerSettings(
                 runtime_root=tmpdir,
@@ -270,34 +278,14 @@ def test_time_aware_configuration_validates_and_migrates_legacy_cap() -> None:
                     "objective": {"makespan_weight": 0.8, "flow_time_weight": 0.4},
                 },
             )
-        with pytest.raises(ValueError, match="no longer supports throughput scheduling control"):
-            SchedulerSettings(
-                runtime_root=tmpdir,
-                gpu_scheduler={
-                    "mode": "parallel_time_aware",
-                    "thresholds": {"min_aggregate_gain": 1.1},
-                },
-            )
 
 
-@pytest.mark.parametrize(
-    "scheduler_mode",
-    [
-        "parallel_default",
-        "parallel_batch_optimized",
-        "parallel_auto_pack",
-        "parallel_time_aware",
-    ],
-)
-def test_parallel_placement_is_invariant_to_sm_utilization(scheduler_mode: str) -> None:
+def test_time_aware_placement_is_invariant_to_sm_utilization() -> None:
     def plan_for_utilization(avg_gpu_utilization: float) -> tuple[object, ...]:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = _settings(
                 tmpdir,
-                mode=scheduler_mode,
-                max_packed_jobs_per_gpu=2,
                 parallel_job_cap=2,
-                auto_pack={"target_vram_fraction": 0.97},
             )
             store = SQLiteStateStore(settings)
             planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
@@ -322,55 +310,12 @@ def test_parallel_placement_is_invariant_to_sm_utilization(scheduler_mode: str) 
                 backend_available={"cuda_process": True, "exclusive": True},
             )
             assert plan is not None
-            assert plan.mode == ("stack_anchor" if scheduler_mode == "parallel_time_aware" else "packed_pair")
+            assert plan.mode == "stack_anchor"
             return plan.mode, plan.backend_name, plan.job_ids, plan.batch_overrides
 
     baseline = plan_for_utilization(0.0)
     assert plan_for_utilization(0.9) == baseline
     assert plan_for_utilization(1.0) == baseline
-
-
-def test_auto_pack_uses_active_and_candidate_vram_only() -> None:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        settings = _settings(
-            tmpdir,
-            mode="parallel_auto_pack",
-            auto_pack={"target_vram_fraction": 0.10},
-        )
-        store = SQLiteStateStore(settings)
-        planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
-        jobs = [_job("auto-left", "auto-left-sig"), _job("auto-right", "auto-right-sig")]
-        for job in jobs:
-            job.runtime_probe.enabled = True
-            _seed_options(store, planner, job)
-            store.upsert_solo_profile(
-                SoloProfile(
-                    signature=job.packing.signature or job.job_id,
-                    family=job.packing.family,
-                    avg_vram_mb=404.0,
-                    avg_gpu_utilization=1.0,
-                    sample_count=1,
-                )
-            )
-        target_vram_mb = planner.estimator.safe_budget_mb() * settings.gpu_scheduler.auto_pack.target_vram_fraction
-        candidate_vram_mb = sum(
-            planner.estimator.estimate_avg_vram_mb(job, 4, "cuda_process") for job in jobs
-        )
-        exact_active_vram_mb = target_vram_mb - candidate_vram_mb
-
-        accepted = planner.objective.evaluate_auto_pack_group(
-            jobs,
-            "cuda_process",
-            active_vram_mb=exact_active_vram_mb,
-        )
-        rejected = planner.objective.evaluate_auto_pack_group(
-            jobs,
-            "cuda_process",
-            active_vram_mb=exact_active_vram_mb + 1e-6,
-        )
-
-        assert accepted is not None
-        assert rejected is None
 
 
 def test_time_score_starts_one_anchor_and_ignores_legacy_pair_slowdown() -> None:
@@ -576,47 +521,6 @@ def test_stale_cached_fill_objective_cannot_influence_time_score() -> None:
         assert plan.objective_version == "time_v6_verified_piecewise_drain"
         assert plan.mode == "stack_anchor"
         assert plan.batch_overrides == {"left": 1}
-
-
-def test_batch_optimized_ignores_slowdown_and_legacy_cached_objective() -> None:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        settings = _settings(tmpdir, mode="parallel_batch_optimized")
-        store = SQLiteStateStore(settings)
-        planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
-        left = _job("optimized-left", "optimized-left-sig")
-        right = _job("optimized-right", "optimized-right-sig")
-        for job in (left, right):
-            _seed_options(store, planner, job)
-        store.upsert_pair_profile(
-            PairProfile.create(
-                "optimized-left-sig",
-                "optimized-right-sig",
-                backend_name="cuda_process",
-                hardware_key=store.hardware_key(),
-                slowdown_ratio=9.0,
-                observations=1,
-            )
-        )
-        store.upsert_combination_profile(
-            CombinationProfile.create(
-                build_group_signature(["optimized-left-sig", "optimized-right-sig"]),
-                store.hardware_key(),
-                "cuda_process",
-                "parallel_batch_optimized",
-                {"optimized-left": 1, "optimized-right": 1},
-                avg_vram_mb=802.0,
-                objective_score=9999.0,
-                resolved_optimal=True,
-            )
-        )
-        plan = planner.choose_plan(
-            [left, right],
-            backend_available={"cuda_process": True, "exclusive": True},
-        )
-        assert plan is not None
-        assert plan.mode == "packed_pair"
-        expected_batch = max(planner._candidate_batch_sizes(left))
-        assert plan.batch_overrides == {"optimized-left": expected_batch, "optimized-right": expected_batch}
 
 
 def test_early_stop_hook_persists_state_and_completes_successfully() -> None:
@@ -936,7 +840,7 @@ def test_batch_resolution_remains_immutable_across_dispatch_and_resume_round_tri
     assert restored.status == JobStatus.PAUSED
 
 
-def test_batch_estimates_are_batch_specific_sourced_and_pareto_pruned() -> None:
+def test_batch_estimates_are_batch_specific_and_sourced() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         settings = _settings(tmpdir)
         store = SQLiteStateStore(settings)
@@ -947,13 +851,6 @@ def test_batch_estimates_are_batch_specific_sourced_and_pareto_pruned() -> None:
         assert [option.batch_size for option in options] == [1, 4, 16]
         assert [option.avg_vram_mb for option in options] == [401.0, 404.0, 416.0]
         assert all(option.source == "branch_profile" for option in options)
-
-        synthetic = [
-            BatchOptionEstimate("estimate", 1, 100.0, 10.0, 1, 10.0, "probe", 0.9, "v1"),
-            BatchOptionEstimate("estimate", 2, 120.0, 12.0, 1, 12.0, "probe", 0.9, "v1"),
-            BatchOptionEstimate("estimate", 4, 90.0, 15.0, 1, 15.0, "probe", 0.9, "v1"),
-        ]
-        assert [option.batch_size for option in planner.estimator.pareto_prune(synthetic)] == [1, 4]
 
 
 class _FailingBatchPredictor:
@@ -1038,6 +935,45 @@ def test_memory_budget_accepts_equality_and_rejects_any_excess() -> None:
         }
         assert planner.choose_plan([waiting], active_vram_mb=exact_active_memory, **kwargs) is not None
         assert planner.choose_plan([waiting], active_vram_mb=exact_active_memory + 1e-6, **kwargs) is None
+
+
+def test_memory_does_not_break_ties_between_equally_fast_feasible_options() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir)
+        store = SQLiteStateStore(settings)
+        planner = PlacementPlanner(
+            settings,
+            store,
+            PriorityFifoPolicy(enable_priority_aging=False),
+        )
+        job = _job("memory-tie", "memory-tie-sig")
+        _seed_options(store, planner, job)
+        shape_signature = planner.estimator.shape_signature(job)
+        for batch_size, avg_vram_mb in ((1, 7_000.0), (2, 100.0)):
+            store.upsert_batch_size_observation(
+                BatchSizeObservation(
+                    observation_key=build_batch_size_observation_key(
+                        job.baseline_model_id,
+                        shape_signature,
+                        store.hardware_key(),
+                        "exclusive",
+                        batch_size,
+                    ),
+                    model_key=job.baseline_model_id,
+                    shape_signature=shape_signature,
+                    hardware_key=store.hardware_key(),
+                    backend_name="exclusive",
+                    batch_param_name="batch_size",
+                    batch_size=batch_size,
+                    avg_vram_mb=avg_vram_mb,
+                    metadata={"estimate_source": "test"},
+                )
+            )
+
+        selected = planner._fastest_time_option(job, "exclusive")
+
+        assert selected is not None
+        assert selected.batch_size == 1
 
 
 @pytest.mark.parametrize(
@@ -2413,8 +2349,6 @@ def test_planning_latency_is_bounded_at_maximum_default_window() -> None:
             parallel_job_cap=4,
             priority_window_size=8,
             oldest_window_size=4,
-            beam_width=32,
-            exact_search_max_jobs=3,
         )
         store = SQLiteStateStore(settings)
         planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
@@ -2445,7 +2379,7 @@ def test_real_worker_validation_runner_early_stops_successfully() -> None:
         settings = SchedulerSettings(
             runtime_root=Path(tmpdir),
             scheduler_poll_interval_seconds=0.05,
-            gpu_scheduler={"mode": "serial_basic", "backend_priority": ["exclusive"]},
+            gpu_scheduler={"mode": "parallel_time_aware", "backend_priority": ["exclusive"]},
             early_stopping={
                 "enabled": True,
                 "metric_name": "accuracy",

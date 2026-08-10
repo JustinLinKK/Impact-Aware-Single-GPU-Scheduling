@@ -63,11 +63,16 @@ class SchedulerKnowledgeBase:
         settings = self._settings()
         gpu_scheduler = getattr(settings, "gpu_scheduler", None)
         memory = getattr(gpu_scheduler, "memory", None)
-        budget_gib = getattr(memory, "safe_vram_budget_gib", None)
-        if budget_gib is None:
+        profile = self._current_hardware_profile()
+        total_mb = (
+            float(memory.gpu_vram_gib) * 1024.0
+            if memory is not None and getattr(memory, "gpu_vram_gib", None) is not None
+            else float(getattr(profile, "total_vram_mb", 0.0) or 0.0)
+        )
+        if total_mb <= 0 or memory is None:
             return None
         try:
-            return int(float(budget_gib) * 1024.0)
+            return int(total_mb * float(memory.predicted_budget_fraction))
         except (TypeError, ValueError):
             return None
 
@@ -708,14 +713,12 @@ class SchedulerKnowledgeBase:
         if gpu_scheduler is None:
             return {}
         memory = getattr(gpu_scheduler, "memory", None)
-        thresholds = getattr(gpu_scheduler, "thresholds", None)
         submission_defaults = getattr(gpu_scheduler, "submission_defaults", None)
         return {
             "safe_vram_budget_mb": self._safe_vram_budget_mb(),
+            "vram_role": "admission_constraint_only",
+            "placement_objective": "verified_piecewise_drain_time_gain",
             "memory": memory.to_dict() if hasattr(memory, "to_dict") else {},
-            "thresholds": (
-                thresholds.to_dict() if hasattr(thresholds, "to_dict") else {}
-            ),
             "backend_priority": list(
                 getattr(gpu_scheduler, "backend_priority", []) or []
             ),
@@ -741,18 +744,9 @@ class SchedulerKnowledgeBase:
         return {
             "enabled_backends": enabled_backends,
             "priority": list(getattr(gpu_scheduler, "backend_priority", []) or []),
-            "concurrent_groups_enabled": bool(
-                getattr(gpu_scheduler, "concurrent_groups_enabled", False)
-            ),
-            "concurrent_backend_allowlist": list(
-                getattr(gpu_scheduler, "concurrent_backend_allowlist", []) or []
-            ),
-            "max_packed_jobs_per_gpu": getattr(
-                gpu_scheduler, "max_packed_jobs_per_gpu", None
-            ),
-            "allow_three_way_packing": bool(
-                getattr(gpu_scheduler, "allow_three_way_packing", False)
-            ),
+            "placement_mode": getattr(gpu_scheduler, "mode", None),
+            "parallel_job_cap": getattr(gpu_scheduler, "parallel_job_cap", None),
+            "incremental_admission": True,
         }
 
     def _scheduler_guidance(self) -> dict[str, Any]:

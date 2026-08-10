@@ -10,10 +10,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..config import (
-    SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED,
-    SCHEDULER_MODE_PARALLEL_TIME_AWARE,
-)
 from ..domain import (
     CombinationProfile,
     JobStatus,
@@ -266,13 +262,6 @@ class RunTrackingMixin:
             job.status != JobStatus.FAILED for job in materialized_jobs
         )
         objective_score = run.objective_breakdown.get("score")
-        if (
-            objective_score is None
-            and self.settings.gpu_scheduler.mode != SCHEDULER_MODE_PARALLEL_TIME_AWARE
-        ):
-            objective_score = (summary.avg_vram_mb or 0) / max(
-                1.0, self.planner.estimator.safe_budget_mb()
-            )
         numeric_objective_score = (
             float(objective_score)
             if isinstance(objective_score, (int, float))
@@ -296,10 +285,7 @@ class RunTrackingMixin:
                 avg_memory_utilization=summary.avg_memory_utilization,
                 avg_step_time_ms=None,
                 objective_score=numeric_objective_score,
-                resolved_optimal=(
-                    self.settings.gpu_scheduler.mode
-                    == SCHEDULER_MODE_PARALLEL_BATCH_OPTIMIZED
-                ),
+                resolved_optimal=False,
                 last_failure_reason=run.fallback_reason,
                 fallback_order=run.fallback_order,
                 metadata={

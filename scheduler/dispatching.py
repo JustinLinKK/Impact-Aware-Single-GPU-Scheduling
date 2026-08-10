@@ -10,10 +10,6 @@ from __future__ import annotations
 
 import time
 
-from ..config import (
-    SCHEDULER_MODE_PARALLEL_AUTO_PACK,
-    SCHEDULER_MODE_PARALLEL_TIME_AWARE,
-)
 from ..domain import (
     BatchResolution,
     JobStatus,
@@ -76,43 +72,8 @@ class DispatchMixin:
         return updated_job
 
     def _maybe_preempt(self) -> None:
-        """Pause exclusive work when policy admits a higher-priority job."""
-        if self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE:
-            # Time-aware scheduling uses drain boundaries; exclusive probes and
-            # newly urgent work do not preempt active training.
-            return
-        if len(self._active_runs) != 1:
-            return
-        active_run = next(iter(self._active_runs.values()))
-        if active_run.mode != "exclusive":
-            return
-        active_job_id = active_run.job_ids[0] if active_run.job_ids else None
-        if active_job_id is None:
-            return
-        active_job = self.store.get_job(active_job_id)
-        candidate_job = self._next_job()
-        if active_job is None or candidate_job is None:
-            return
-        if candidate_job.job_id == active_job.job_id:
-            return
-        if active_job.status != JobStatus.RUNNING:
-            return
-        if not self.policy.should_preempt(active_job, candidate_job):
-            return
-        reason = f"preempted by higher-priority job {candidate_job.job_id}"
-        if self.supervisor.request_pause(active_job.job_id, reason=reason, hold=False):
-            self.store.set_job_status(
-                active_job.job_id, JobStatus.PAUSING, reason=reason, hold=False
-            )
-            self.event_logger.emit(
-                "pause_requested",
-                job_id=active_job.job_id,
-                payload={
-                    "reason": reason,
-                    "preempting_job_id": candidate_job.job_id,
-                    "hold": False,
-                },
-            )
+        """Time-aware placement is non-preemptive and changes at drain boundaries."""
+        return
 
     def _preload_job_baseline(self, job: TrainingJob) -> None:
         """Best-effort preload the model needed by an imminent dispatch."""
@@ -502,11 +463,7 @@ class DispatchMixin:
         verified decision. Otherwise the planner chooses from the live queue;
         concurrent modes may repeat the loop to build a packed stack.
         """
-        scheduler_mode = self.settings.gpu_scheduler.mode
-        concurrent_mode = scheduler_mode in {
-            SCHEDULER_MODE_PARALLEL_AUTO_PACK,
-            SCHEDULER_MODE_PARALLEL_TIME_AWARE,
-        }
+        concurrent_mode = bool(self.settings.gpu_scheduler.enabled)
         if not concurrent_mode and self._active_runs:
             return
 
@@ -535,10 +492,7 @@ class DispatchMixin:
                 if replay_plan.backend_name == "exclusive":
                     return
                 continue
-            if (
-                scheduler_mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE
-                and self.settings.gpu_scheduler.exclusive_probe.enabled
-            ):
+            if self.settings.gpu_scheduler.exclusive_probe.enabled:
                 probes = [
                     job
                     for job in runnable

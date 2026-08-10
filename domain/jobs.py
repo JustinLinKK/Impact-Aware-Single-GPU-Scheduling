@@ -48,19 +48,8 @@ class CommandType(str, Enum):
     PRELOAD = "PRELOAD"
 
 
-BATCH_PROBE_SEARCH_MODE_BINARY = "binary"
-BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO = "power_of_two"
 RUNTIME_PROBE_STRATEGY_EPOCH_1 = "epoch_1"
 RUNTIME_PROBE_STRATEGY_STEP_WINDOW = "step_window"
-
-
-def normalize_batch_probe_search_mode(value: str | None) -> str:
-    normalized = str(value or BATCH_PROBE_SEARCH_MODE_BINARY).strip().lower().replace("-", "_")
-    if normalized in {"binary", "default"}:
-        return BATCH_PROBE_SEARCH_MODE_BINARY
-    if normalized in {"power_of_two", "powers_of_two", "pow2", "2^n", "2n"}:
-        return BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO
-    raise ValueError(f"Unsupported batch probe search mode: {value}")
 
 
 def normalize_runtime_probe_strategy(value: str | None) -> str:
@@ -157,14 +146,15 @@ class BatchProbeSpec:
     probe_target: str | None = None
     batch_param_name: str = "batch_size"
     model_key: str | None = None
-    search_mode: str | None = None
     shape_hints: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "BatchProbeSpec":
         payload = dict(payload or {})
-        if payload.get("search_mode") is not None:
-            payload["search_mode"] = normalize_batch_probe_search_mode(payload.get("search_mode"))
+        if "search_mode" in payload:
+            raise ValueError(
+                "batch_probe.search_mode was removed; time-aware exclusive probes always measure the configured five batch options"
+            )
         return cls(**payload)
 
     def to_dict(self) -> dict[str, Any]:

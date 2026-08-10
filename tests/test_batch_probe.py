@@ -1,77 +1,43 @@
 from __future__ import annotations
 
-from pathlib import Path
-import shutil
 import tempfile
-import time
 import unittest
 
-from localml_scheduler.adapters.mlevolve import build_mlevolve_job
-from localml_scheduler.client import SchedulerClient
 from localml_scheduler.checkpointing.manager import CheckpointManager
-from localml_scheduler.execution.backends import ExclusiveBackend, MPSBackend
-from localml_scheduler.execution.control import ControlPlane, TrainingControlHook
-from localml_scheduler.execution.executor import SubprocessExecutor
-from localml_scheduler.execution.runner_protocol import RunnerContext
-from localml_scheduler.examples.toy_pytorch_runner import create_toy_baseline_checkpoint
-from localml_scheduler.observability.events import EventLogger
-from localml_scheduler.profiling.batch_probe import (
-    BatchProbeKeyInfo,
-    _run_probe_controller,
-    run_batch_probe_preflight,
-)
+from localml_scheduler.config import SchedulerSettings
 from localml_scheduler.domain import (
-    BATCH_PROBE_SEARCH_MODE_BINARY,
-    BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
     BatchProbeProfile,
     BatchProbeSpec,
     BatchProbeTrialResult,
-    CheckpointPolicy,
     ResourceRequirements,
-    SafePointType,
     SchedulingClass,
-    SoloProfile,
     TrainingJob,
     build_batch_probe_shape_signature,
 )
-from localml_scheduler.scheduler.supervisor import WorkerSupervisor
-from localml_scheduler.config import (
-    SCHEDULER_MODE_PARALLEL_TIME_AWARE,
-    SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED,
-    SchedulerSettings,
-)
+from localml_scheduler.execution.control import ControlPlane, TrainingControlHook
+from localml_scheduler.execution.runner_protocol import RunnerContext
+from localml_scheduler.observability.events import EventLogger
+from localml_scheduler.profiling.batch_probe import run_batch_probe_preflight
 from localml_scheduler.storage.sqlite_store import SQLiteStateStore
 
 
-def wait_for(predicate, timeout: float = 30.0, interval: float = 0.1) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if predicate():
-            return
-        time.sleep(interval)
-    raise TimeoutError("condition not met in time")
-
-
-def fake_limit_probe(context: RunnerContext, batch_size: int, warmup_steps: int, measure_steps: int) -> BatchProbeTrialResult:
+def fake_limit_probe(
+    context: RunnerContext,
+    batch_size: int,
+    warmup_steps: int,
+    measure_steps: int,
+) -> BatchProbeTrialResult:
     threshold = int(context.job.metadata.get("probe_threshold", 5))
     peak_vram_mb = 128 + (batch_size * 64)
-    if batch_size > threshold:
-        return BatchProbeTrialResult(
-            fits=False,
-            peak_vram_mb=peak_vram_mb,
-            memory_total_mb=1024,
-            avg_step_time_ms=2.0,
-            message=f"batch size {batch_size} is above threshold {threshold}",
-        )
     return BatchProbeTrialResult(
-        fits=True,
+        fits=batch_size <= threshold,
         peak_vram_mb=peak_vram_mb,
         avg_vram_mb=peak_vram_mb * 0.8,
-        memory_total_mb=1024,
+        memory_total_mb=2048,
         avg_step_time_ms=1.0 + float(batch_size),
         steps_per_epoch=10,
         seconds_per_epoch=(1.0 + float(batch_size)) / 100.0,
-        message=f"batch size {batch_size} fits",
+        message=f"batch size {batch_size} {'fits' if batch_size <= threshold else 'does not fit'}",
     )
 
 
@@ -82,59 +48,31 @@ def _build_context(settings: SchedulerSettings, job: TrainingJob) -> RunnerConte
     checkpoint_manager = CheckpointManager(settings, store, event_logger)
     control_plane = ControlPlane(settings)
     control_plane.initialize_job(job.job_id)
-    control_hook = TrainingControlHook(job, control_plane, checkpoint_manager, store, event_logger)
     return RunnerContext(
         job=job,
         settings=settings,
         store=store,
         event_logger=event_logger,
-        control_hook=control_hook,
+        control_hook=TrainingControlHook(
+            job,
+            control_plane,
+            checkpoint_manager,
+            store,
+            event_logger,
+        ),
         checkpoint_manager=checkpoint_manager,
         cache_client=None,
     )
 
 
-def _build_supervisor(settings: SchedulerSettings, *, mps_available: bool) -> WorkerSupervisor:
-    executor = SubprocessExecutor(settings)
-    mps_binary = shutil.which("true") if mps_available else None
-    backends = {
-        "exclusive": ExclusiveBackend(settings, executor),
-        "mps": MPSBackend(settings, executor, mps_binary=mps_binary),
-    }
-    return WorkerSupervisor(settings, backends=backends)
-
-
-def _batch_probe_settings(runtime_root: str | Path) -> SchedulerSettings:
-    return SchedulerSettings(
-        runtime_root=runtime_root,
-        scheduler_poll_interval_seconds=0.05,
-        gpu_scheduler={"mode": SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED},
-    )
-
-
-def _seed_solo_profile(api: SchedulerClient, job: TrainingJob) -> None:
-    api.upsert_solo_profile(
-        SoloProfile(
-            signature=job.packing.signature,
-            family=job.packing.family,
-            peak_vram_mb=512,
-            avg_gpu_utilization=0.2,
-            avg_memory_utilization=0.2,
-            sample_count=3,
-            last_job_id=job.job_id,
-            metadata={"seeded": True},
-        )
-    )
-
-
-class BatchProbeUnitTest(unittest.TestCase):
-    def test_time_aware_exclusive_probe_persists_five_batch_measurements(self) -> None:
+class TimeAwareBatchProbeTest(unittest.TestCase):
+    def test_exclusive_probe_persists_the_five_time_aware_options(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerSettings(
                 runtime_root=tmpdir,
                 gpu_scheduler={
-                    "mode": SCHEDULER_MODE_PARALLEL_TIME_AWARE,
-                    "memory": {"gpu_vram_gib": 1, "predicted_budget_fraction": 0.85},
+                    "mode": "parallel_time_aware",
+                    "memory": {"gpu_vram_gib": 2, "predicted_budget_fraction": 0.85},
                 },
             )
             job = TrainingJob.create(
@@ -151,7 +89,9 @@ class BatchProbeUnitTest(unittest.TestCase):
                 resource_requirements=ResourceRequirements(requires_gpu=True),
             )
             context = _build_context(settings, job)
+
             resolved = run_batch_probe_preflight(context)
+
             self.assertEqual(resolved.requested_batch_size, 4)
             observations = context.store.list_batch_size_observations(
                 model_key="baseline-five",
@@ -159,437 +99,74 @@ class BatchProbeUnitTest(unittest.TestCase):
                 hardware_key=context.store.hardware_key(),
                 backend_name="exclusive",
             )
-            self.assertEqual(sorted(item.batch_size for item in observations), [1, 2, 4, 8, 16])
+            self.assertEqual(
+                sorted(item.batch_size for item in observations),
+                [1, 2, 4, 8, 16],
+            )
             self.assertTrue(all(item.metadata.get("seconds_per_epoch") for item in observations))
 
-    def test_shape_signature_ignores_batch_size_but_changes_with_shape(self) -> None:
-        job_a = TrainingJob.create(
-            "pkg.runner:train",
-            "baseline-a",
-            "/tmp/a.pt",
-            task_type="classification",
-            runner_kwargs={
-                "batch_size": 4,
-                "precision": "bf16",
-                "sequence_length": 128,
-            },
-            batch_probe=BatchProbeSpec(enabled=True, probe_target="pkg.runner:probe"),
-        )
-        job_b = TrainingJob.create(
-            "pkg.runner:train",
-            "baseline-a",
-            "/tmp/a.pt",
-            task_type="classification",
-            runner_kwargs={
-                "batch_size": 8,
-                "precision": "bf16",
-                "sequence_length": 128,
-            },
-            batch_probe=BatchProbeSpec(enabled=True, probe_target="pkg.runner:probe"),
-        )
-        job_c = TrainingJob.create(
-            "pkg.runner:train",
-            "baseline-a",
-            "/tmp/a.pt",
-            task_type="classification",
-            runner_kwargs={
-                "batch_size": 8,
-                "precision": "bf16",
-                "sequence_length": 256,
-            },
-            batch_probe=BatchProbeSpec(enabled=True, probe_target="pkg.runner:probe"),
-        )
-        self.assertEqual(
-            build_batch_probe_shape_signature(job_a),
-            build_batch_probe_shape_signature(job_b),
-        )
-        self.assertNotEqual(
-            build_batch_probe_shape_signature(job_a),
-            build_batch_probe_shape_signature(job_c),
-        )
-
-    def test_batch_probe_store_round_trip(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = SQLiteStateStore(SchedulerSettings(runtime_root=tmpdir))
-            profile = BatchProbeProfile(
-                probe_key="probe-1",
-                model_key="baseline-a",
-                device_type="RTX-test",
-                shape_signature="shape-1",
-                batch_param_name="batch_size",
-                resolved_batch_size=6,
-                peak_vram_mb=1536,
-                memory_total_mb=2048,
-                target_budget_mb=1986,
-                metadata={"source": "test"},
-            )
-            store.upsert_batch_probe_profile(profile)
-
-            restored = store.get_batch_probe_profile("probe-1")
-            self.assertIsNotNone(restored)
-            self.assertEqual(restored.resolved_batch_size, 6)
-            self.assertEqual(len(store.list_batch_probe_profiles()), 1)
-
-    def test_probe_controller_selects_largest_safe_batch_size(self) -> None:
+    def test_normal_jobs_never_run_the_exclusive_probe(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = SchedulerSettings(runtime_root=tmpdir)
             job = TrainingJob.create(
                 "pkg.runner:train",
-                "baseline-a",
-                "/tmp/a.pt",
-                task_type="classification",
-                runner_kwargs={"batch_size": 3},
+                "normal",
+                "/tmp/normal.pt",
+                runner_kwargs={"batch_size": 4},
                 batch_probe=BatchProbeSpec(
                     enabled=True,
                     probe_target="localml_scheduler.tests.test_batch_probe:fake_limit_probe",
                 ),
-                metadata={"placement_backend": "exclusive", "probe_threshold": 5},
-                resource_requirements=ResourceRequirements(requires_gpu=True),
-                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
+                metadata={"placement_backend": "exclusive"},
             )
             context = _build_context(settings, job)
-            profile = _run_probe_controller(
-                context,
-                key_info=BatchProbeKeyInfo(
-                    probe_key="probe-1",
-                    model_key="baseline-a",
-                    device_type="cuda-unavailable",
-                    shape_signature="shape-1",
-                    search_mode=BATCH_PROBE_SEARCH_MODE_BINARY,
-                ),
-            )
-            self.assertEqual(profile.resolved_batch_size, 5)
-            self.assertEqual(profile.batch_param_name, "batch_size")
-            self.assertGreater(profile.target_budget_mb, 0)
 
-    def test_probe_controller_power_of_two_mode_limits_candidates(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = SchedulerSettings(runtime_root=tmpdir)
-            job = TrainingJob.create(
+            self.assertIs(run_batch_probe_preflight(context), context.job)
+            self.assertEqual(context.store.list_batch_size_observations(), [])
+
+    def test_shape_signature_ignores_batch_size_but_tracks_shape(self) -> None:
+        def job(batch_size: int, sequence_length: int) -> TrainingJob:
+            return TrainingJob.create(
                 "pkg.runner:train",
                 "baseline-a",
                 "/tmp/a.pt",
-                task_type="classification",
-                runner_kwargs={"batch_size": 3},
-                batch_probe=BatchProbeSpec(
-                    enabled=True,
-                    probe_target="localml_scheduler.tests.test_batch_probe:fake_limit_probe",
-                    search_mode=BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
-                ),
-                metadata={"placement_backend": "exclusive", "probe_threshold": 5},
-                resource_requirements=ResourceRequirements(requires_gpu=True),
-                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
-            )
-            context = _build_context(settings, job)
-            profile = _run_probe_controller(
-                context,
-                key_info=BatchProbeKeyInfo(
-                    probe_key="probe-pow2",
-                    model_key="baseline-a",
-                    device_type="cuda-unavailable",
-                    shape_signature="shape-1",
-                    search_mode=BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
-                ),
-            )
-            self.assertEqual(profile.resolved_batch_size, 4)
-            self.assertEqual(profile.metadata["search_mode"], BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO)
-            trial_sizes = [event["payload"]["batch_size"] for event in context.store.list_events(job_id=job.job_id, event_type="batch_probe_trial")]
-            self.assertEqual(trial_sizes, [2, 4, 8])
-
-    def test_probe_controller_warns_when_capped_before_vram_saturation(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = SchedulerSettings(runtime_root=tmpdir)
-            job = TrainingJob.create(
-                "pkg.runner:train",
-                "baseline-a",
-                "/tmp/a.pt",
-                task_type="classification",
-                runner_kwargs={"batch_size": 3, "probe_max_batch_size": 6},
-                batch_probe=BatchProbeSpec(
-                    enabled=True,
-                    probe_target="localml_scheduler.tests.test_batch_probe:fake_limit_probe",
-                ),
-                metadata={"placement_backend": "exclusive", "probe_threshold": 100},
-                resource_requirements=ResourceRequirements(requires_gpu=True),
-                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
-            )
-            context = _build_context(settings, job)
-            profile = _run_probe_controller(
-                context,
-                key_info=BatchProbeKeyInfo(
-                    probe_key="probe-capped",
-                    model_key="baseline-a",
-                    device_type="cuda-unavailable",
-                    shape_signature="shape-1",
-                    search_mode=BATCH_PROBE_SEARCH_MODE_BINARY,
-                ),
-            )
-            self.assertEqual(profile.resolved_batch_size, 6)
-            self.assertEqual(profile.metadata["warning_reason"], "max_batch_size_cap")
-            self.assertIn("before VRAM saturation", profile.metadata["warning_message"])
-
-
-class BatchProbeIntegrationTest(unittest.TestCase):
-    def _build_probe_job(
-        self,
-        baseline: str,
-        *,
-        batch_size: int,
-        learning_rate: float = 0.01,
-        max_steps: int = 4,
-        epochs: int = 1,
-        sleep_per_step: float = 0.0,
-        shape_hints: dict[str, int] | None = None,
-        probe_max_batch_size: int | None = 6,
-        packing_eligible: bool = False,
-        priority: int = 5,
-    ) -> TrainingJob:
-        runner_kwargs = {
-            "batch_size": batch_size,
-            "learning_rate": learning_rate,
-            "epochs": epochs,
-            "num_samples": 64,
-            "sleep_per_step": sleep_per_step,
-            "probe_memory_total_mb": 2048,
-            "probe_base_memory_mb": 256,
-            "probe_memory_per_sample_mb": 256,
-        }
-        if probe_max_batch_size is not None:
-            runner_kwargs["probe_max_batch_size"] = probe_max_batch_size
-        return build_mlevolve_job(
-            workflow_id="wf-probe",
-            baseline_model_id="toy-baseline",
-            baseline_model_path=baseline,
-            runner_target="localml_scheduler.examples.toy_pytorch_runner:run_toy_training_job",
-            runner_kwargs=runner_kwargs,
-            priority=priority,
-            task_type="toy_classification",
-            checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, save_every_epoch=True),
-            batch_probe=BatchProbeSpec(
-                enabled=True,
-                probe_target="localml_scheduler.examples.toy_pytorch_runner:probe_toy_training_batch_size",
-                shape_hints=shape_hints or {},
-            ),
-            resource_requirements=ResourceRequirements(requires_gpu=True, estimated_vram_mb=1024, estimated_ram_mb=512),
-            packing_family="toy-mlp",
-            packing_eligible=packing_eligible,
-            max_steps=max_steps,
-            max_epochs=1,
-        )
-
-    def test_first_job_probes_and_second_job_reuses_cache(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = _batch_probe_settings(Path(tmpdir))
-            api = SchedulerClient(settings)
-            service = api.create_service(supervisor=_build_supervisor(settings, mps_available=False)).start(background=True)
-            try:
-                baseline = create_toy_baseline_checkpoint(Path(tmpdir) / "baselines" / "probe.pt", seed=100)
-                first = self._build_probe_job(baseline, batch_size=3)
-                second = self._build_probe_job(baseline, batch_size=1)
-
-                api.submit(first)
-                wait_for(lambda: api.inspect(first.job_id).status.is_terminal, timeout=30.0)
-                first_state = api.inspect(first.job_id)
-                self.assertEqual(first_state.config.runner_kwargs["batch_size"], 6)
-                self.assertEqual(first_state.metadata["batch_probe_source"], "probe")
-                self.assertEqual(len(api.store.list_batch_probe_profiles()), 1)
-
-                api.submit(second)
-                wait_for(lambda: api.inspect(second.job_id).status.is_terminal, timeout=30.0)
-                second_state = api.inspect(second.job_id)
-                self.assertEqual(second_state.config.runner_kwargs["batch_size"], 6)
-                self.assertEqual(second_state.metadata["batch_probe_source"], "cache")
-                self.assertEqual(
-                    len(api.store.list_events(job_id=second.job_id, event_type="batch_probe_cache_hit")),
-                    1,
-                )
-            finally:
-                service.stop()
-
-    def test_shape_change_creates_a_new_probe_profile(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = _batch_probe_settings(Path(tmpdir))
-            api = SchedulerClient(settings)
-            service = api.create_service(supervisor=_build_supervisor(settings, mps_available=False)).start(background=True)
-            try:
-                baseline = create_toy_baseline_checkpoint(Path(tmpdir) / "baselines" / "shape.pt", seed=101)
-                first = self._build_probe_job(baseline, batch_size=3, shape_hints={"tokens": 128})
-                second = self._build_probe_job(baseline, batch_size=3, shape_hints={"tokens": 256})
-
-                api.submit(first)
-                wait_for(lambda: api.inspect(first.job_id).status.is_terminal, timeout=30.0)
-                api.submit(second)
-                wait_for(lambda: api.inspect(second.job_id).status.is_terminal, timeout=30.0)
-
-                self.assertEqual(len(api.store.list_batch_probe_profiles()), 2)
-                self.assertEqual(len(api.store.list_events(event_type="batch_probe_cache_miss")), 2)
-            finally:
-                service.stop()
-
-    def test_power_of_two_mode_uses_separate_cache_key(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = _batch_probe_settings(Path(tmpdir))
-            binary_job = TrainingJob.create(
-                "pkg.runner:train",
-                "baseline-a",
-                "/tmp/a.pt",
-                task_type="classification",
-                runner_kwargs={"batch_size": 3, "probe_max_batch_size": 6},
-                batch_probe=BatchProbeSpec(
-                    enabled=True,
-                    probe_target="localml_scheduler.tests.test_batch_probe:fake_limit_probe",
-                    search_mode=BATCH_PROBE_SEARCH_MODE_BINARY,
-                ),
-                metadata={"placement_backend": "exclusive", "probe_threshold": 5},
-                resource_requirements=ResourceRequirements(requires_gpu=True),
-                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
-            )
-            power_of_two_job = TrainingJob.create(
-                "pkg.runner:train",
-                "baseline-a",
-                "/tmp/a.pt",
-                task_type="classification",
-                runner_kwargs={"batch_size": 3, "probe_max_batch_size": 6},
-                batch_probe=BatchProbeSpec(
-                    enabled=True,
-                    probe_target="localml_scheduler.tests.test_batch_probe:fake_limit_probe",
-                    search_mode=BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
-                ),
-                metadata={"placement_backend": "exclusive", "probe_threshold": 5},
-                resource_requirements=ResourceRequirements(requires_gpu=True),
-                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
-            )
-
-            binary_context = _build_context(settings, binary_job)
-            binary_resolved = run_batch_probe_preflight(binary_context)
-            self.assertEqual(binary_resolved.config.runner_kwargs["batch_size"], 5)
-            self.assertEqual(binary_resolved.metadata["batch_probe_source"], "probe")
-
-            power_of_two_context = _build_context(settings, power_of_two_job)
-            power_of_two_resolved = run_batch_probe_preflight(power_of_two_context)
-            self.assertEqual(power_of_two_resolved.config.runner_kwargs["batch_size"], 4)
-            self.assertEqual(power_of_two_resolved.metadata["batch_probe_source"], "probe")
-            self.assertEqual(len(power_of_two_context.store.list_batch_probe_profiles()), 2)
-            cache_hit_events = power_of_two_context.store.list_events(
-                job_id=power_of_two_job.job_id,
-                event_type="batch_probe_cache_hit",
-            )
-            self.assertEqual(cache_hit_events, [])
-
-    def test_scheduler_level_power_of_two_mode_applies_when_job_mode_is_unspecified(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = SchedulerSettings(
-                runtime_root=Path(tmpdir),
-                scheduler_poll_interval_seconds=0.05,
-                gpu_scheduler={
-                    "mode": SCHEDULER_MODE_SERIAL_BATCH_OPTIMIZED,
-                    "batch_probe_search_mode": BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
+                runner_kwargs={
+                    "batch_size": batch_size,
+                    "precision": "bf16",
+                    "sequence_length": sequence_length,
                 },
             )
-            job = TrainingJob.create(
-                "pkg.runner:train",
-                "baseline-a",
-                "/tmp/a.pt",
-                task_type="classification",
-                runner_kwargs={"batch_size": 3, "probe_max_batch_size": 6},
-                batch_probe=BatchProbeSpec(
-                    enabled=True,
-                    probe_target="localml_scheduler.tests.test_batch_probe:fake_limit_probe",
-                ),
-                metadata={"placement_backend": "exclusive", "probe_threshold": 5},
-                resource_requirements=ResourceRequirements(requires_gpu=True),
-                checkpoint_policy=CheckpointPolicy(save_every_n_steps=1, pause_mode=SafePointType.STEP),
+
+        self.assertEqual(
+            build_batch_probe_shape_signature(job(4, 128)),
+            build_batch_probe_shape_signature(job(8, 128)),
+        )
+        self.assertNotEqual(
+            build_batch_probe_shape_signature(job(4, 128)),
+            build_batch_probe_shape_signature(job(4, 256)),
+        )
+
+    def test_profile_store_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SQLiteStateStore(SchedulerSettings(runtime_root=tmpdir))
+            store.upsert_batch_probe_profile(
+                BatchProbeProfile(
+                    probe_key="probe-1",
+                    model_key="baseline-a",
+                    device_type="RTX-test",
+                    shape_signature="shape-1",
+                    batch_param_name="batch_size",
+                    resolved_batch_size=4,
+                    metadata={"source": "exclusive_five_option_probe"},
+                )
             )
+            restored = store.get_batch_probe_profile("probe-1")
+            self.assertIsNotNone(restored)
+            self.assertEqual(restored.resolved_batch_size, 4)
 
-            context = _build_context(settings, job)
-            resolved = run_batch_probe_preflight(context)
-            self.assertEqual(resolved.config.runner_kwargs["batch_size"], 4)
-            self.assertEqual(resolved.metadata["batch_probe_source"], "probe")
-            selected_events = context.store.list_events(job_id=job.job_id, event_type="batch_probe_selected")
-            self.assertEqual(
-                selected_events[0]["payload"]["search_mode"],
-                BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
-            )
-
-    def test_resume_does_not_reprobe_once_batch_size_is_persisted(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = _batch_probe_settings(Path(tmpdir))
-            api = SchedulerClient(settings)
-            service = api.create_service(supervisor=_build_supervisor(settings, mps_available=False)).start(background=True)
-            try:
-                baseline = create_toy_baseline_checkpoint(Path(tmpdir) / "baselines" / "resume.pt", seed=102)
-                job = self._build_probe_job(baseline, batch_size=3, max_steps=80, epochs=8, sleep_per_step=0.02)
-                api.submit(job)
-
-                wait_for(
-                    lambda: api.inspect(job.job_id).status.name == "RUNNING",
-                    timeout=30.0,
-                )
-                api.pause(job.job_id)
-                wait_for(
-                    lambda: api.inspect(job.job_id).status.name == "PAUSED",
-                    timeout=30.0,
-                )
-                api.resume(job.job_id)
-                wait_for(lambda: api.inspect(job.job_id).status.is_terminal, timeout=30.0)
-
-                self.assertEqual(
-                    len(api.store.list_events(job_id=job.job_id, event_type="batch_probe_started")),
-                    1,
-                )
-            finally:
-                service.stop()
-
-    def test_mps_packed_jobs_skip_batch_probe(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = SchedulerSettings(runtime_root=Path(tmpdir), scheduler_poll_interval_seconds=0.05)
-            api = SchedulerClient(settings)
-            service = api.create_service(supervisor=_build_supervisor(settings, mps_available=True)).start(background=True)
-            try:
-                baseline = create_toy_baseline_checkpoint(Path(tmpdir) / "baselines" / "mps.pt", seed=103)
-                first = self._build_probe_job(baseline, batch_size=3, packing_eligible=True, priority=8)
-                second = self._build_probe_job(
-                    baseline,
-                    batch_size=4,
-                    learning_rate=0.02,
-                    packing_eligible=True,
-                    priority=7,
-                )
-                _seed_solo_profile(api, first)
-                _seed_solo_profile(api, second)
-
-                api.submit(first)
-                api.submit(second)
-                wait_for(
-                    lambda: api.inspect(first.job_id).status.is_terminal and api.inspect(second.job_id).status.is_terminal,
-                    timeout=30.0,
-                )
-
-                self.assertEqual(api.inspect(first.job_id).metadata["placement_mode"], "packed_pair")
-                self.assertEqual(api.inspect(second.job_id).metadata["placement_mode"], "packed_pair")
-                self.assertEqual(api.store.list_batch_probe_profiles(), [])
-                self.assertEqual(len(api.store.list_events(event_type="batch_probe_started")), 0)
-            finally:
-                service.stop()
-
-    def test_probe_failure_marks_job_failed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = _batch_probe_settings(Path(tmpdir))
-            api = SchedulerClient(settings)
-            service = api.create_service(supervisor=_build_supervisor(settings, mps_available=False)).start(background=True)
-            try:
-                baseline = create_toy_baseline_checkpoint(Path(tmpdir) / "baselines" / "fail.pt", seed=104)
-                job = self._build_probe_job(baseline, batch_size=1, probe_max_batch_size=0)
-                api.submit(job)
-                wait_for(lambda: api.inspect(job.job_id).status.is_terminal, timeout=30.0)
-
-                final = api.inspect(job.job_id)
-                self.assertEqual(final.status.name, "FAILED")
-                self.assertIn("feasible batch size", final.status_reason or "")
-            finally:
-                service.stop()
+    def test_legacy_search_mode_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "search_mode was removed"):
+            BatchProbeSpec.from_dict({"enabled": True, "search_mode": "power_of_two"})
 
 
 if __name__ == "__main__":

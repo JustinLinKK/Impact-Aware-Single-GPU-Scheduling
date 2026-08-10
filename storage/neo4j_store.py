@@ -433,7 +433,7 @@ class Neo4jStateStore:
             "packing_max_slowdown_ratio": job.packing.max_slowdown_ratio,
             "batch_probe_enabled": job.batch_probe.enabled,
             "batch_probe_model_key": job.batch_probe.model_key,
-            "batch_probe_search_mode": job.batch_probe.search_mode,
+            "batch_probe_policy": "time_aware_five_options",
             "runtime_probe_enabled": job.runtime_probe.enabled,
             "runtime_probe_strategy": job.runtime_probe.strategy,
             "max_steps": job.max_steps,

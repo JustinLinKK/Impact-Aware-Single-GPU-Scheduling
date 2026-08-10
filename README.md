@@ -4,9 +4,9 @@
 
 - a single-GPU scheduler with priority queueing, safe-point pause/resume, persistence, and restart recovery
 - a RAM-backed baseline-model cache with optional LRU entry-capacity and RAM-percent limits that keeps immutable CPU-side baselines warm and serves isolated copies to worker subprocesses
-- time-aware GPU packing that chooses ready jobs, batch sizes, and concurrent backends from predicted completion time, average VRAM, and compatibility evidence
-- optional Linux hybrid overlap across `mps` and `stream` backend groups on one GPU when concurrent groups are enabled
-- optional exclusive-path batch-size probing with SQLite-backed reuse for repeated model/device/shape combinations
+- time-aware GPU packing that chooses ready jobs, batch sizes, and concurrent backends from predicted completion time and compatibility evidence, with average VRAM used only as a safety gate
+- Linux overlap on a configured non-exclusive backend, admitted incrementally by the time-aware policy
+- reserved exclusive five-option calibration that persists timing and VRAM measurements for time-aware planning
 - one-epoch runtime profiling that makes new job families pack-eligible after the first exclusive calibration run
 - optional hardware-selected PerfSeer student prediction, with CPU-only
   TorchScript inference and per-job branch-profile fallback
@@ -17,7 +17,8 @@ It is intentionally packaged as a root-level module so it can be used by MLEvolv
 
 - `schemas.py`: serializable job, checkpoint policy, progress, and cache schemas
 - `scheduler/`: policy, queue, service loop, recovery, and worker supervision
-- `scheduler/gpu_scheduler.py`: GPU placement planning based on VRAM headroom, compatibility history, runtime skew, and optional auto-pack targets
+- `scheduler/placement_planner.py`: shortest-anchor, one-newcomer-at-a-time placement planning
+- `scheduler/time_objective.py`: verified sequential-versus-packed drain-time scoring
 - `scheduler/telemetry.py`: lightweight `nvidia-smi` device telemetry for solo and packed runs
 - `execution/`: subprocess launcher, file-based control plane, worker entrypoint, and runner context
 - `execution/backends.py`: exclusive and MPS-backed launch backends
@@ -25,7 +26,7 @@ It is intentionally packaged as a root-level module so it can be used by MLEvolv
 - `model_cache/`: in-memory LRU baseline cache plus a local socket server for worker access
 - `storage/`: SQLite-backed jobs, commands, checkpoints, cache metadata, and event history
 - `observability/`: JSONL events, log files, and aggregate reports
-- `profiling/`: exclusive-path batch probe controller plus runtime profile helpers
+- `profiling/`: exclusive five-option measurement plus runtime profile helpers
 - `prediction/`: scheduler integration for isolated source conversion and the
   PerfSeer submodule's CPU runtime
 - `examples/`: toy PyTorch training runner and a demo script
@@ -112,7 +113,11 @@ The target receives a `RunnerContext` object with:
 - `load_baseline_object()`: fetch a fresh baseline object from the RAM cache, or fall back to disk if needed
 - `load_resume_checkpoint()`: access the latest successful checkpoint
 
-Structured runners can also expose an optional batch probe hook in `module:function` form. When `batch_probe.enabled: true` is set on a GPU job running through the exclusive backend, the worker can probe candidate batch sizes before training, persist the selected result in SQLite, and reuse it for later matching jobs.
+Structured runners can expose a batch probe hook in `module:function` form. A
+job reserved with `scheduling_class: exclusive_probe` measures the five batch
+options configured by `batch_options`, persists timing/VRAM evidence in SQLite,
+and then releases the idle boundary. Normal jobs never run the removed
+VRAM-saturation search controller.
 
 Structured runners can also opt into runtime probing with `runtime_probe.enabled: true`. The default `epoch_1` strategy treats the first exclusive epoch as calibration, persists a runtime profile keyed by workload signature, hardware, backend, and resolved batch size, and then uses that estimate to reject badly skewed packed groups. Jobs without reliable epoch semantics can use `runtime_probe.strategy: "step_window"` instead.
 
@@ -144,19 +149,20 @@ When this block is absent, the scheduler tries the job source with
 propagation run in a timed subprocess with GPU visibility disabled. An
 unsupported source, timeout, or invalid result falls back only that job.
 
-All placement modes use average used GPU VRAM in MiB (`avg_vram_mb`) for
-packing. In `parallel_time_aware`, device-level memory is averaged over a time
-window: sustained use at the stop threshold closes only new packed admission,
-and active work continues normally. Admission reopens after a complete window
-below the resume threshold. GPU/SM utilization is not a placement input for
-any scheduler mode; it is retained only as telemetry and profile evidence.
+There is one production placement mode: `parallel_time_aware`. Its objective is
+verified drain-time gain, never GPU-memory utilization. Predicted average used
+VRAM in MiB (`avg_vram_mb`) is only a hard admission constraint. Device-level
+memory is averaged over a time window: sustained use at the stop threshold
+closes only new packed admission, and active work continues normally. Admission
+reopens after a complete window below the resume threshold. GPU/SM utilization
+is retained only as telemetry and profile evidence.
 
 ## Time-aware scheduling
 
 `parallel_time_aware` starts the shortest predicted solo job as an anchor and
 then admits one candidate at a time, shortest remaining runtime first. A
 starving job overrides that ordering. Each addition must pass scheduling class,
-parallel cap, backend and pair compatibility, live-admission, fixed-batch, and
+parallel cap, backend and pair compatibility, live-admission, batch-option, and
 predicted average-VRAM checks before any concurrent work begins.
 
 The final admission check is a live trial requiring two fresh epochs from every
@@ -308,8 +314,9 @@ oracle remains intentionally limited to small, non-preemptive drain-boundary
 fixtures.
 
 The real-GPU benchmark performs a hardware-specific five-option calibration,
-then runs serial FIFO, the previous fill-based policy, and time-aware packing
-at least twice from isolated runtime directories. It records means, sample
+then runs a one-job-cap time-aware control and normal time-aware placement at
+least twice from isolated runtime directories. Historical fill-policy
+comparisons exist only in the deterministic simulator. The replay records means, sample
 variance, standard deviation, raw runs, hardware identity, makespan, and flow
 metrics. A matched exclusive solo control replays each time-aware selected
 batch so measured slowdown is not confounded by batch-size changes:
@@ -337,13 +344,12 @@ The normal pause flow is:
 
 ## Packed Execution Notes
 
-- `parallel_default` and `parallel_batch_optimized` keep the legacy fixed-width packed-group behavior and still fall back to exclusive execution when compatibility or memory evidence is missing
-- `parallel_auto_pack` ignores `max_packed_jobs_per_gpu` and keeps admitting work until predicted VRAM is close to `auto_pack.target_vram_fraction`
-- `parallel_time_aware` uses `parallel_job_cap` (`null` means unlimited); if absent, an explicitly supplied legacy `max_packed_jobs_per_gpu` is mapped to it
-- `safe_vram_budget_gib` remains a compatibility input for older modes; time-aware mode uses detected/configured total VRAM times `predicted_budget_fraction`
+- `parallel_time_aware` is the only accepted mode; removed fixed-width and VRAM-fill mode names fail configuration validation
+- `parallel_job_cap` is optional (`null` means incremental admission has no fixed-width cap)
+- the memory ceiling is detected/configured total VRAM times `predicted_budget_fraction`; it can reject an addition but cannot improve its score
 - the packed path is opt-in per job via `packing.eligible: true` and a stable `packing.signature`
 - backend compatibility is tracked per backend, so an MPS failure does not automatically poison a stream pairing
-- Linux deployments can enable `concurrent_groups_enabled: true` with `concurrent_backend_allowlist: ["mps", "stream"]` to overlap an MPS group and a stream group on the same GPU
+- concurrent additions must remain on the active non-exclusive backend
 - raw MLEvolve snippet execution remains conservative by default; without an explicit runtime-probe hook they stay exclusive-only for runtime-aware packing
 
 ## Limitations In V1

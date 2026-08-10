@@ -80,12 +80,14 @@ class MLStressTest(unittest.TestCase):
                     },
                 },
                 gpu_scheduler={
-                    "mode": "parallel_auto_pack",
+                    "mode": "parallel_time_aware",
                     "backend_priority": ["cuda_process", "exclusive"],
-                    "candidate_window_size": 4,
-                    "max_packed_jobs_per_gpu": 4,
-                    "allow_three_way_packing": True,
-                    "memory": {"safe_vram_budget_gib": 28.0},
+                    "parallel_job_cap": 4,
+                    "priority_window_size": 4,
+                    "memory": {
+                        "gpu_vram_gib": 28.0,
+                        "predicted_budget_fraction": 0.85,
+                    },
                 },
             )
             api = SchedulerClient(settings)
@@ -139,21 +141,22 @@ class MLStressTest(unittest.TestCase):
                     },
                 )
                 jobs.append(job)
-                api.upsert_runtime_profile(
-                    RuntimeProfile.create(
-                        signature=job.packing.signature or job.job_id,
-                        hardware_key=api.store.hardware_key(),
-                        backend_name="cuda_process",
-                        resolved_batch_size=2,
-                        strategy="epoch_1",
-                        epoch_1_seconds=0.1,
-                        avg_step_time_ms=25.0,
-                        estimated_total_runtime_seconds=0.1,
-                        confidence=1.0,
-                        observations=1,
-                        source="fixture",
+                for backend_name in ("exclusive", "cuda_process"):
+                    api.upsert_runtime_profile(
+                        RuntimeProfile.create(
+                            signature=job.packing.signature or job.job_id,
+                            hardware_key=api.store.hardware_key(),
+                            backend_name=backend_name,
+                            resolved_batch_size=2,
+                            strategy="epoch_1",
+                            epoch_1_seconds=0.1,
+                            avg_step_time_ms=25.0,
+                            estimated_total_runtime_seconds=0.1,
+                            confidence=1.0,
+                            observations=1,
+                            source="fixture",
+                        )
                     )
-                )
                 api.submit(job)
 
             cuda_before = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0

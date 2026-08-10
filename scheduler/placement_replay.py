@@ -12,7 +12,6 @@ from __future__ import annotations
 from math import isfinite
 from statistics import fmean, median
 
-from ..config import SCHEDULER_MODE_PARALLEL_TIME_AWARE
 from ..domain import BatchResolution, TrainingJob, WorkloadIdentity
 from .planner_types import DispatchPlan
 from .queue import RunnableJobQueue
@@ -544,8 +543,7 @@ class PlacementReplayMixin:
         reference = template.slot_profiles[slot_index]
         try:
             supported_batches = self.planner.candidate_generator.candidate_batch_sizes(
-                candidate,
-                scheduler_mode=SCHEDULER_MODE_PARALLEL_TIME_AWARE,
+                candidate
             )
         except ValueError:
             supported_batches = []

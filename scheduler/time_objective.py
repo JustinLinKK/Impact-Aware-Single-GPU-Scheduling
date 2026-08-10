@@ -564,19 +564,33 @@ class TimeAwareObjectiveScorer:
             active_sources[job.job_id] = source
 
         try:
-            batch_sizes = self.candidates.candidate_batch_sizes(
-                candidate,
-                scheduler_mode=self.settings.gpu_scheduler.mode,
-            )
+            batch_sizes = self.candidates.candidate_batch_sizes(candidate)
         except ValueError:
             return None
-        options = self.estimator.pareto_prune(
-            self.estimator.estimate_batch_options(candidate, backend_name, batch_sizes)
-        )
+        feasible_options = [
+            option
+            for option in self.estimator.estimate_batch_options(
+                candidate,
+                backend_name,
+                batch_sizes,
+            )
+            if active_vram_mb + option.avg_vram_mb
+            <= self.estimator.safe_budget_mb() + 1e-9
+        ]
+        # Batch selection is time-only after memory admission. Evaluating a
+        # slower option merely because it uses less memory would reintroduce a
+        # fill/footprint objective through the back door.
+        options = [
+            min(
+                feasible_options,
+                key=lambda option: (
+                    option.remaining_runtime_seconds,
+                    option.batch_size,
+                ),
+            )
+        ] if feasible_options else []
         evaluations: list[tuple[tuple[object, ...], EvaluatedGroup]] = []
         for option in options:
-            if active_vram_mb + option.avg_vram_mb > self.estimator.safe_budget_mb() + 1e-9:
-                continue
             solo_options = self.estimator.estimate_batch_options(candidate, "exclusive", [option.batch_size])
             if not solo_options:
                 continue
@@ -690,7 +704,10 @@ class TimeAwareObjectiveScorer:
                 estimated_vram_mb=option.avg_vram_mb,
                 objective_score=float(predicted_gain if predicted_gain is not None else 1.0),
                 batch_overrides={candidate.job_id: option.batch_size},
-                fallback_order=self.candidates.fallback_order([candidate], {candidate.job_id: option.batch_size}, backend_name),
+                fallback_order=self.candidates.fallback_order(
+                    [candidate],
+                    backend_name,
+                ),
                 reason=("known colocation gain is below threshold" if rejected else "two-epoch colocation trial"),
                 batch_estimates={candidate.job_id: option},
                 score_breakdown=breakdown,
@@ -702,7 +719,6 @@ class TimeAwareObjectiveScorer:
                 0 if predicted_gain is not None else 1,
                 -(predicted_gain or 0.0),
                 option.remaining_runtime_seconds,
-                option.avg_vram_mb,
                 option.batch_size,
             )
             evaluations.append((key, evaluated))
@@ -711,7 +727,6 @@ class TimeAwareObjectiveScorer:
     def tie_key(self, group: EvaluatedGroup) -> tuple[object, ...]:
         return (
             -group.objective_score,
-            group.estimated_vram_mb,
             tuple(sorted(group.batch_overrides.items())),
             group.backend_name,
         )

@@ -24,8 +24,6 @@ from .identity import (
     normalize_colocation_members,
 )
 from .jobs import (
-    BATCH_PROBE_SEARCH_MODE_BINARY,
-    BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO,
     RUNTIME_PROBE_STRATEGY_EPOCH_1,
     RUNTIME_PROBE_STRATEGY_STEP_WINDOW,
     BatchProbeSpec,
@@ -43,7 +41,6 @@ from .jobs import (
     SchedulingClass,
     TrainingJob,
     WorkloadIdentity,
-    normalize_batch_probe_search_mode,
     normalize_runtime_probe_strategy,
 )
 from .profiles import (
@@ -66,8 +63,6 @@ from .progress import JobProgress, PlacementAssignment, ProgressSnapshot
 
 __all__ = [
     "_to_primitive",
-    "BATCH_PROBE_SEARCH_MODE_BINARY",
-    "BATCH_PROBE_SEARCH_MODE_POWER_OF_TWO",
     "BatchProbeProfile",
     "BatchProbeSpec",
     "BatchProbeTrialResult",
@@ -115,7 +110,6 @@ __all__ = [
     "decode_batch_vector",
     "encode_batch_vector",
     "import_string",
-    "normalize_batch_probe_search_mode",
     "normalize_group_signatures",
     "normalize_colocation_members",
     "normalize_runtime_probe_strategy",

@@ -11,11 +11,7 @@ from ..execution.control import ControlPlane
 from ..execution.executor import SubprocessExecutor, WorkerProcessHandle
 from ..execution.process_utils import terminate_process_tree
 from ..domain import JobStatus, PlacementDecision, TrainingJob
-from ..config import (
-    SchedulerSettings,
-    SCHEDULER_MODE_PARALLEL_AUTO_PACK,
-    SCHEDULER_MODE_PARALLEL_TIME_AWARE,
-)
+from ..config import SchedulerSettings
 from ..storage.state_store import StateStore
 
 
@@ -71,21 +67,13 @@ class WorkerSupervisor:
         self._groups: dict[str, PlacementGroupHandle] = {}
 
     def _concurrency_enabled(self) -> bool:
-        if self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE:
-            return True
-        return (
-            self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_AUTO_PACK
-            and self.settings.gpu_scheduler.concurrent_groups_enabled
-        )
+        return bool(self.settings.gpu_scheduler.enabled)
 
     def _overlap_allowed_for_backend(self, backend_name: str) -> bool:
-        if self.settings.gpu_scheduler.mode == SCHEDULER_MODE_PARALLEL_TIME_AWARE:
-            return (
-                backend_name != "exclusive"
-                and backend_name in self.settings.gpu_scheduler.backend_priority
-            )
-        return backend_name in set(
-            self.settings.gpu_scheduler.concurrent_backend_allowlist
+        return (
+            self.settings.gpu_scheduler.enabled
+            and backend_name != "exclusive"
+            and backend_name in self.settings.gpu_scheduler.backend_priority
         )
 
     def available_backends(self) -> dict[str, bool]:

@@ -88,26 +88,20 @@ def test_replay_time_aware_settings_use_fractional_budget_and_new_cap(tmp_path) 
     settings = build_settings(
         mode="parallel_time_aware",
         backend="cuda_process",
-        batch_search="power_of_two",
-        max_packed_jobs_per_gpu=3,
-        vram_budget_gib=22,
+        parallel_job_cap=3,
+        gpu_vram_gib=22,
         runtime_root=tmp_path,
         cache_warm_top_k=0,
         cache_warm_policy="top_k",
         cache_entry_capacity=0,
         cache_max_ram_percent=0.0,
         cache_memory_budget_gib=0.0,
-        binary_range_up=16,
-        binary_range_down=8,
-        power_of_two_range_up=2,
-        power_of_two_range_down=2,
-        target_vram_fraction=0.97,
         predicted_budget_fraction=0.84,
     )
     assert settings.gpu_scheduler.parallel_job_cap == 3
     assert settings.gpu_scheduler.memory.predicted_budget_fraction == pytest.approx(0.84)
     assert settings.gpu_scheduler.memory.live_admission_stop_fraction == pytest.approx(0.90)
-    assert settings.gpu_scheduler.thresholds.pack_reject_max_slowdown == pytest.approx(1.30)
+    assert settings.gpu_scheduler.colocation.min_gain == pytest.approx(1.0)
 
 
 def test_replay_metrics_use_release_flow_and_wait_times() -> None:
