@@ -35,3 +35,8 @@ class BackendRegistry:
     def availability(self) -> dict[str, bool]:
         return {name: backend.available() for name, backend in self._backends.items()}
 
+    def shutdown(self) -> None:
+        for backend in self._backends.values():
+            shutdown = getattr(backend, "shutdown", None)
+            if callable(shutdown):
+                shutdown()

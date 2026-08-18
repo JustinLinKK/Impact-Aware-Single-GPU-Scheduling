@@ -348,10 +348,16 @@ class SchedulerService(
         job = self.store.get_job(job_id)
         if job is None or job.status.is_terminal:
             return
-        if job.status != JobStatus.READY:
+        # Submission and scheduling run on different threads.  A newly saved
+        # PENDING job can be dispatched between command polling and this
+        # handler; never demote that RUNNING job back to READY when its queued
+        # SUBMIT command is observed on the next tick.
+        if job.status == JobStatus.PENDING:
             self.store.set_job_status(
                 job_id, JobStatus.READY, reason="job accepted by scheduler", hold=False
             )
+        elif job.status != JobStatus.READY:
+            return
         self.event_logger.emit(
             "job_ready", job_id=job_id, payload={"priority": job.priority}
         )

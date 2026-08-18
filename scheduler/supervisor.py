@@ -108,7 +108,9 @@ class WorkerSupervisor:
         if worker.handle.monitor_via_store:
             job = self.store.get_job(worker.job_id)
             return bool(
-                job is not None and job.status in {JobStatus.RUNNING, JobStatus.PAUSING}
+                worker.handle.process.poll() is None
+                and job is not None
+                and job.status in {JobStatus.RUNNING, JobStatus.PAUSING}
             )
         return worker.handle.process.poll() is None
 
@@ -297,20 +299,33 @@ class WorkerSupervisor:
             for job_id, worker in list(group.workers.items()):
                 if worker.handle.monitor_via_store:
                     job = self.store.get_job(job_id)
-                    if job is None or job.status not in {
+                    if job is not None and job.status in {
                         JobStatus.COMPLETED,
                         JobStatus.FAILED,
                         JobStatus.CANCELLED,
                         JobStatus.PAUSED,
                     }:
+                        snapshots.append(
+                            WorkerSnapshot(
+                                job_id=job_id,
+                                group_id=group_id,
+                                alive=False,
+                                returncode=worker.handle.process.poll(),
+                                reported_by="store",
+                            )
+                        )
+                        del group.workers[job_id]
+                        continue
+                    returncode = worker.handle.process.poll()
+                    if returncode is None:
                         continue
                     snapshots.append(
                         WorkerSnapshot(
                             job_id=job_id,
                             group_id=group_id,
                             alive=False,
-                            returncode=worker.handle.process.poll(),
-                            reported_by="store",
+                            returncode=returncode,
+                            reported_by="process",
                         )
                     )
                     del group.workers[job_id]
@@ -344,6 +359,7 @@ class WorkerSupervisor:
         return True
 
     def shutdown(self) -> None:
+        self.backend_registry.shutdown()
         seen_processes: set[int] = set()
         for group in self._groups.values():
             for worker in group.workers.values():
