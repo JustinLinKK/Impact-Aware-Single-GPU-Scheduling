@@ -5,6 +5,7 @@ from __future__ import annotations
 from hashlib import sha1
 from typing import Any
 import json
+import re
 
 from ..client import SchedulerClient
 from ..domain import (
@@ -142,6 +143,186 @@ def build_mlevolve_job(
         max_steps=max_steps,
         max_epochs=max_epochs,
         metadata=job_metadata,
+    )
+
+
+def build_startpoint_profile_key(
+    *, task_id: str, model_key: str, modality: str, shape_hints: dict[str, Any] | None = None
+) -> str:
+    payload = {
+        "modality": modality,
+        "model_key": model_key,
+        "shape_hints": shape_hints or {},
+        "task_id": task_id,
+    }
+    digest = sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return f"mlevolve-startpoint:{digest[:24]}"
+
+
+def build_startpoint_shape_signature(
+    *, task_id: str, model_key: str, modality: str, shape_hints: dict[str, Any] | None = None
+) -> str:
+    payload = {
+        "kind": "mlevolve_startpoint_shape",
+        "modality": modality,
+        "model_key": model_key,
+        "shape_hints": shape_hints or {},
+        "task_id": task_id,
+    }
+    digest = sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return f"mlevolve-startpoint-shape:{digest[:24]}"
+
+
+def normalize_model_family(value: str | None) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9_.:/-]+", "-", str(value or "").strip().lower())
+    normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
+    return normalized or "unknown-family"
+
+
+def build_model_family_profile_key(*, task_id: str, model_family: str) -> str:
+    """Return a logical family key retained for agent journal compatibility.
+
+    The time-aware scheduler derives its actual probe key from model, hardware,
+    and shape identity; callers must not use this logical key to bypass that
+    native identity.
+    """
+    payload = {
+        "kind": "mlevolve_model_family",
+        "model_family": normalize_model_family(model_family),
+        "task_id": str(task_id or "mlevolve"),
+    }
+    digest = sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return f"mlevolve-family:{digest[:24]}"
+
+
+def build_model_family_shape_signature(
+    *, task_id: str, model_family: str, shape_hints: dict[str, Any] | None = None
+) -> str:
+    payload = {
+        "kind": "mlevolve_model_family_shape",
+        "model_family": normalize_model_family(model_family),
+        "shape_hints": shape_hints or {},
+        "task_id": str(task_id or "mlevolve"),
+    }
+    digest = sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return f"mlevolve-family-shape:{digest[:24]}"
+
+
+def build_model_family_probe_job(
+    *,
+    workflow_id: str,
+    task_id: str,
+    model_family: str,
+    script_path: str,
+    working_dir: str,
+    shape_hints: dict[str, Any] | None = None,
+    priority: int = 100,
+    probe_timeout_seconds: int = 45,
+    probe_poll_interval_seconds: float = 0.5,
+    start_batch_size: int | None = None,
+    probe_max_batch_size: int | None = None,
+) -> TrainingJob:
+    """Build a native time-aware probe job for a generated model family."""
+    normalized_family = normalize_model_family(model_family)
+    hints = dict(shape_hints or {})
+    hints.setdefault("model_family", normalized_family)
+    logical_profile_key = build_model_family_profile_key(
+        task_id=task_id,
+        model_family=normalized_family,
+    )
+    runner_kwargs = {
+        "script_path": script_path,
+        "working_dir": working_dir,
+        "probe_timeout_seconds": int(probe_timeout_seconds),
+        "probe_poll_interval_seconds": float(probe_poll_interval_seconds),
+        "probe_max_epochs": 1,
+        "probe_max_train_batches": 3,
+        "batch_size": int(start_batch_size or hints.get("start_batch_size") or 1),
+        "probe_max_batch_size": int(probe_max_batch_size or hints.get("probe_max_batch_size") or 256),
+    }
+    return build_mlevolve_job(
+        workflow_id=workflow_id,
+        baseline_model_id=f"mlevolve-model-family:{normalized_family}",
+        baseline_model_path=str(script_path),
+        runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_model_family_probe_job",
+        runner_kwargs=runner_kwargs,
+        priority=priority,
+        task_type="mlevolve_model_family_probe",
+        loader_target="localml_scheduler.adapters.mlevolve_runner:load_raw_file",
+        batch_probe=BatchProbeSpec(
+            enabled=True,
+            probe_target="localml_scheduler.adapters.mlevolve_runner:probe_mlevolve_script_job",
+            batch_param_name="batch_size",
+            model_key=normalized_family,
+            shape_hints=hints,
+        ),
+        resource_requirements=ResourceRequirements(requires_gpu=True),
+        packing_family="mlevolve_model_family_probe",
+        packing_signature=logical_profile_key,
+        packing_eligible=False,
+        packing_backend_allowlist=["exclusive"],
+        runtime_probe=RuntimeProbeSpec(enabled=False),
+        metadata={
+            "kind": "mlevolve_model_family_probe",
+            "task_id": str(task_id or "mlevolve"),
+            "model_family": normalized_family,
+            "logical_profile_key": logical_profile_key,
+            "exclusive_probe": True,
+        },
+    )
+
+
+def build_startpoint_probe_job(
+    *, workflow_id: str, startpoint: dict[str, Any], priority: int = 100
+) -> TrainingJob:
+    """Build a native time-aware probe job for one cold-start model."""
+    task_id = str(startpoint.get("task_id") or workflow_id or "mlevolve")
+    model_key = str(startpoint.get("model_key") or startpoint.get("display_name") or "startpoint")
+    modality = str(startpoint.get("modality") or "generic")
+    shape_hints = dict(startpoint.get("shape_hints") or {})
+    logical_profile_key = str(
+        startpoint.get("profile_key")
+        or build_startpoint_profile_key(
+            task_id=task_id,
+            model_key=model_key,
+            modality=modality,
+            shape_hints=shape_hints,
+        )
+    )
+    runner_kwargs = {
+        "batch_size": int(shape_hints.get("start_batch_size") or 1),
+        "probe_max_batch_size": int(shape_hints.get("probe_max_batch_size") or 256),
+    }
+    return build_mlevolve_job(
+        workflow_id=workflow_id,
+        baseline_model_id=f"mlevolve-startpoint:{model_key}",
+        baseline_model_path=f"synthetic://{model_key}",
+        runner_target="localml_scheduler.adapters.startpoint_probe:run_startpoint_probe_job",
+        runner_kwargs=runner_kwargs,
+        priority=priority,
+        task_type="mlevolve_startpoint_probe",
+        batch_probe=BatchProbeSpec(
+            enabled=True,
+            probe_target="localml_scheduler.adapters.startpoint_probe:probe_startpoint_batch_size",
+            batch_param_name="batch_size",
+            model_key=model_key,
+            shape_hints=shape_hints,
+        ),
+        resource_requirements=ResourceRequirements(requires_gpu=True),
+        packing_family="mlevolve_startpoint_probe",
+        packing_signature=logical_profile_key,
+        packing_eligible=False,
+        packing_backend_allowlist=["exclusive"],
+        runtime_probe=RuntimeProbeSpec(enabled=False),
+        metadata={
+            "kind": "mlevolve_startpoint_probe",
+            "task_id": task_id,
+            "startpoint_model_key": model_key,
+            "startpoint_display_name": startpoint.get("display_name"),
+            "startpoint_rank": startpoint.get("rank"),
+            "startpoint_modality": modality,
+            "logical_profile_key": logical_profile_key,
+        },
     )
 
 

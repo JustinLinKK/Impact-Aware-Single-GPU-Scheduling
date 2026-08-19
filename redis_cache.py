@@ -24,6 +24,7 @@ class RedisCacheSettings:
     max_entries: int | None = 4096
     socket_timeout_seconds: float = 0.2
     cache_graph_queries: bool = True
+    cache_vector_queries: bool = True
 
     def __post_init__(self) -> None:
         self.enabled = bool(self.enabled)
@@ -36,6 +37,7 @@ class RedisCacheSettings:
             self.max_entries = max(0, int(self.max_entries))
         self.socket_timeout_seconds = max(0.0, float(self.socket_timeout_seconds))
         self.cache_graph_queries = bool(self.cache_graph_queries)
+        self.cache_vector_queries = bool(self.cache_vector_queries)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "RedisCacheSettings":
@@ -58,6 +60,7 @@ class RedisCacheSettings:
             "max_entries": self.max_entries,
             "socket_timeout_seconds": self.socket_timeout_seconds,
             "cache_graph_queries": self.cache_graph_queries,
+            "cache_vector_queries": self.cache_vector_queries,
         }
 
 

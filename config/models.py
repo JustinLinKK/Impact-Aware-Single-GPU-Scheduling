@@ -12,6 +12,8 @@ import warnings
 
 import yaml
 
+from ..redis_cache import RedisCacheSettings
+
 SCHEDULER_MODE_PARALLEL_TIME_AWARE = "parallel_time_aware"
 PREDICTION_MODE_BRANCH_PROFILE = "branch_profile"
 PREDICTION_MODE_ML_PREDICTOR = "ml_predictor"
@@ -577,6 +579,40 @@ class GraphDBSettings:
 
 
 @dataclass(slots=True)
+class HardwareKnowledgeGraphSettings:
+    """Connection settings for hardware facts, isolated from profile evidence."""
+
+    enabled: bool = True
+    provider: str = "neo4j"
+    uri: str = "bolt://127.0.0.1:7688"
+    username: str = "neo4j"
+    password_env: str = "HARDWARE_KNOWLEDGE_NEO4J_PASSWORD"
+    database: str = "neo4j"
+
+    def __post_init__(self) -> None:
+        self.enabled = bool(self.enabled)
+        self.provider = str(self.provider or "neo4j").strip().lower().replace("-", "_")
+        self.uri = str(self.uri or "").strip()
+        self.username = str(self.username or "").strip()
+        self.password_env = str(self.password_env or "").strip()
+        self.database = str(self.database or "").strip()
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "HardwareKnowledgeGraphSettings":
+        return cls(**(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "provider": self.provider,
+            "uri": self.uri,
+            "username": self.username,
+            "password_env": self.password_env,
+            "database": self.database,
+        }
+
+
+@dataclass(slots=True)
 class HardwareFeatureDBSettings:
     enabled: bool = True
     provider: str = "qdrant"
@@ -757,6 +793,8 @@ class GpuSchedulerSettings:
     batch_probe_enabled: bool = True
     batch_probe_target_memory_fraction: float = 0.97
     batch_probe_max_batch_size: int | None = None
+    startpoint_probe_enabled: bool = False
+    startpoint_probe_max_models: int | None = None
     profiling: GpuProfilingSettings = field(default_factory=GpuProfilingSettings)
     memory: GpuMemorySettings = field(default_factory=GpuMemorySettings)
     telemetry: GpuTelemetrySettings = field(default_factory=GpuTelemetrySettings)
@@ -781,6 +819,8 @@ class GpuSchedulerSettings:
             self.backend_priority = [str(item) for item in self.backend_priority]
         if self.parallel_job_cap is not None:
             self.parallel_job_cap = max(1, int(self.parallel_job_cap))
+        if self.startpoint_probe_max_models is not None:
+            self.startpoint_probe_max_models = max(0, int(self.startpoint_probe_max_models))
         self.priority_window_size = max(1, int(self.priority_window_size))
         self.oldest_window_size = max(1, int(self.oldest_window_size))
         self.starvation_timeout_seconds = max(
@@ -883,6 +923,8 @@ class GpuSchedulerSettings:
             "batch_probe_enabled": self.batch_probe_enabled,
             "batch_probe_target_memory_fraction": self.batch_probe_target_memory_fraction,
             "batch_probe_max_batch_size": self.batch_probe_max_batch_size,
+            "startpoint_probe_enabled": self.startpoint_probe_enabled,
+            "startpoint_probe_max_models": self.startpoint_probe_max_models,
             "profiling": self.profiling.to_dict(),
             "memory": self.memory.to_dict(),
             "telemetry": self.telemetry.to_dict(),
@@ -912,6 +954,9 @@ class SchedulerConfig:
     cache_server_host: str = "127.0.0.1"
     cache_server_port: int = 8765
     cache_socket_name: str = "cache_server.sock"
+    redis_cache: RedisCacheSettings | dict[str, Any] = field(
+        default_factory=RedisCacheSettings
+    )
     auto_resume_recoverable: bool = False
     gpu_scheduler: GpuSchedulerSettings = field(default_factory=GpuSchedulerSettings)
     early_stopping: EarlyStoppingSettings | dict[str, Any] = field(
@@ -921,6 +966,9 @@ class SchedulerConfig:
         default_factory=PredictionSettings
     )
     graph_db: GraphDBSettings | dict[str, Any] = field(default_factory=GraphDBSettings)
+    hardware_knowledge_graph: HardwareKnowledgeGraphSettings | dict[str, Any] = field(
+        default_factory=HardwareKnowledgeGraphSettings
+    )
     hardware_feature_db: HardwareFeatureDBSettings | dict[str, Any] = field(
         default_factory=HardwareFeatureDBSettings
     )
@@ -954,10 +1002,20 @@ class SchedulerConfig:
             self.baseline_cache = BaselineCacheSettings()
         if isinstance(self.baseline_cache, dict):
             self.baseline_cache = BaselineCacheSettings.from_dict(self.baseline_cache)
+        if self.redis_cache is None:
+            self.redis_cache = RedisCacheSettings()
+        if isinstance(self.redis_cache, dict):
+            self.redis_cache = RedisCacheSettings.from_dict(self.redis_cache)
         if self.graph_db is None:
             self.graph_db = GraphDBSettings()
         if isinstance(self.graph_db, dict):
             self.graph_db = GraphDBSettings.from_dict(self.graph_db)
+        if self.hardware_knowledge_graph is None:
+            self.hardware_knowledge_graph = HardwareKnowledgeGraphSettings()
+        if isinstance(self.hardware_knowledge_graph, dict):
+            self.hardware_knowledge_graph = HardwareKnowledgeGraphSettings.from_dict(
+                self.hardware_knowledge_graph
+            )
         if self.hardware_feature_db is None:
             self.hardware_feature_db = HardwareFeatureDBSettings()
         if isinstance(self.hardware_feature_db, dict):
@@ -1048,6 +1106,7 @@ class SchedulerConfig:
         assert isinstance(self.early_stopping, EarlyStoppingSettings)
         assert isinstance(self.prediction, PredictionSettings)
         assert isinstance(self.graph_db, GraphDBSettings)
+        assert isinstance(self.hardware_knowledge_graph, HardwareKnowledgeGraphSettings)
         assert isinstance(self.hardware_feature_db, HardwareFeatureDBSettings)
         assert isinstance(self.log_db, LogDBSettings)
         return {
@@ -1062,11 +1121,13 @@ class SchedulerConfig:
             "cache_server_host": self.cache_server_host,
             "cache_server_port": self.cache_server_port,
             "cache_socket_name": self.cache_socket_name,
+            "redis_cache": self.redis_cache.to_dict(),
             "auto_resume_recoverable": self.auto_resume_recoverable,
             "gpu_scheduler": self.gpu_scheduler.to_dict(),
             "early_stopping": self.early_stopping.to_dict(),
             "prediction": self.prediction.to_dict(),
             "graph_db": self.graph_db.to_dict(),
+            "hardware_knowledge_graph": self.hardware_knowledge_graph.to_dict(),
             "hardware_feature_db": self.hardware_feature_db.to_dict(),
             "log_db": self.log_db.to_dict(),
             "python_executable": self.python_executable,

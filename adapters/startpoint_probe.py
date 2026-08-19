@@ -101,6 +101,6 @@ def run_startpoint_probe_job(context: RunnerContext) -> dict[str, Any]:
     return {
         "kind": "mlevolve_startpoint_probe",
         "model_key": context.job.batch_probe.model_key,
-        "profile_key": context.job.batch_probe.profile_key,
+        "logical_profile_key": context.job.metadata.get("logical_profile_key"),
         "resolved_batch_size": context.job.metadata.get("resolved_batch_size"),
     }
