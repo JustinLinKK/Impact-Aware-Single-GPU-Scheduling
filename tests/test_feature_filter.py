@@ -148,7 +148,8 @@ def test_training_parameters_feature_key_mapping_is_merged_and_source_free():
     assert "bf16" in training_keys
     assert "fp8_rowwise_scaling" not in training_keys
     assert {"muon_optimizer", "gram_newton_schulz_symmetric_gemm"} <= training_keys
-    assert {"soap_optimizer", "ademamix_optimizer", "fp8_rowwise_scaling"} <= training_not_recommended
+    assert {"soap_optimizer", "ademamix_optimizer"} <= training_not_recommended
+    assert "fp8_rowwise_scaling" not in training_not_recommended
     assert any("gradient accumulation" in item.lower() for item in training["recommended_patterns"])
     assert not any("nvfp4" in item.lower() or "mxfp8" in item.lower() for item in training["recommended_patterns"])
     assert any("fp4" in item.lower() or "mxfp8" in item.lower() for item in training["avoid_patterns"])

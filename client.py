@@ -778,6 +778,7 @@ class SchedulerClient:
         stages: list[str],
         limit: int,
         stage_scope: str | None = None,
+        precision_mode: str = "normal",
     ) -> dict[str, Any]:
         if not hardware_name:
             return {
@@ -811,8 +812,16 @@ class SchedulerClient:
         reason = "hardware not found"
         per_stage_limit = max(1, int(limit))
         for stage in stages:
-            node_payload = query_hardware_node(hardware_name, stage)
-            feature_payload = query_hardware_features(hardware_name, stage)
+            node_payload = query_hardware_node(
+                hardware_name,
+                stage,
+                precision_mode=precision_mode,
+            )
+            feature_payload = query_hardware_features(
+                hardware_name,
+                stage,
+                precision_mode=precision_mode,
+            )
             node_payload, feature_payload = SchedulerClient._filter_static_stage_payloads(
                 stage=stage,
                 scope=stage_scope,
@@ -865,6 +874,7 @@ class SchedulerClient:
         *,
         pipeline_stage: str | list[str] | tuple[str, ...] | None = None,
         limit: int = 8,
+        precision_mode: str = "normal",
     ) -> dict[str, Any]:
         """Return hardware facts filtered to the ML pipeline stage contract.
 
@@ -890,6 +900,7 @@ class SchedulerClient:
             stages=stages,
             limit=limit,
             stage_scope=stage_scope,
+            precision_mode=precision_mode,
         )
         result["hardware_context"] = hardware_context
         result["requested_hardware_id"] = hardware_id
@@ -1089,6 +1100,22 @@ class SchedulerClient:
     def get_optimization_context(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
         graph_context = self.get_profile_evidence(candidate=candidate, limit=limit)
         code_context = self.get_code_optimization_context(candidate=candidate, graph_context=graph_context, limit=limit)
+        stages = self._hardware_stages_for_candidate(candidate)
+        try:
+            stage_hardware_features = self.get_stage_hardware_features(
+                "current",
+                pipeline_stage=stages,
+                limit=limit,
+                precision_mode=str(candidate.get("precision_optimization_mode") or "normal"),
+            )
+        except Exception as exc:
+            stage_hardware_features = {
+                "found": False,
+                "stages": [],
+                "features": [],
+                "feature_count": 0,
+                "reason": str(exc),
+            }
         recommendations: list[str] = []
         risks: list[str] = list(graph_context.get("risk_flags") or [])
         batch_recommendation = graph_context.get("batch_size_recommendation") or {}
@@ -1118,6 +1145,7 @@ class SchedulerClient:
             "hardware_context": graph_context.get("hardware_context"),
             "graph_evidence": graph_context.get("graph_evidence") or {"exact_profiles": [], "similar_profiles": [], "packed_profiles": []},
             "derived_diagnosis": graph_context.get("derived_diagnosis") or {"profile_symptoms": [], "optimization_targets": []},
+            "stage_hardware_features": stage_hardware_features,
             "vector_evidence": vector_evidence,
             "recommendations": recommendations[: max(1, int(limit))],
             "risk_flags": risks,

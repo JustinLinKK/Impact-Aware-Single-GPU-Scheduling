@@ -7,6 +7,12 @@ import re
 from pathlib import Path
 from typing import Any
 
+from utils.precision_policy import (
+    PrecisionPolicy,
+    precision_feature_visibility,
+    resolve_precision_policy,
+)
+
 # ---------------------------------------------------------------------------
 # Pipeline stage keyword definitions
 # ---------------------------------------------------------------------------
@@ -84,6 +90,7 @@ def query_hardware_node(
     agent_stage: str | None = None,
     *,
     graph_path: str | Path | None = None,
+    precision_mode: str = "normal",
 ) -> dict[str, Any]:
     """Query a hardware node by GPU name, filtered by pipeline stage.
 
@@ -105,8 +112,25 @@ def query_hardware_node(
     props = node.get("properties", node)
     raw_cap = _first_list_entry(props.get("compute_capabilities"))
     stage = _normalize_stage(agent_stage)
+    precision_policy = resolve_precision_policy(
+        props,
+        mode=precision_mode,
+        datatypes=props.get("datatypes"),
+    )
+    recommended_patterns = list(props.get("recommended_patterns", []))
+    if stage in {"datatype_precision", "tuning"}:
+        recommended_patterns = [
+            pattern
+            for pattern in recommended_patterns
+            if _precision_pattern_allowed(pattern, precision_policy)
+        ]
 
-    feature_index = _stage_feature_key_index(graph, edges, stage)
+    feature_index = _stage_feature_key_index(
+        graph,
+        edges,
+        stage,
+        precision_policy=precision_policy if stage in {"datatype_precision", "tuning"} else None,
+    )
 
     return _compact_dict({
         "found": True,
@@ -119,8 +143,9 @@ def query_hardware_node(
         "sm_count": _as_int(props.get("sm_count")),
         "compute_capability": raw_cap,
         "stage_filter": stage,
+        "precision_policy": precision_policy.to_dict() if stage in {"datatype_precision", "tuning"} else None,
         **feature_index,
-        "recommended_patterns": props.get("recommended_patterns", []),
+        "recommended_patterns": recommended_patterns,
         "avoid_patterns": props.get("avoid_patterns", []),
         "feature_query": {
             "tool": "query_hardware_features",
@@ -169,6 +194,7 @@ def query_hardware_features(
     agent_stage: str | None = None,
     *,
     graph_path: str | Path | None = None,
+    precision_mode: str = "normal",
 ) -> dict[str, Any]:
     """List all Feature node details for a hardware, optionally filtered by stage.
 
@@ -196,6 +222,12 @@ def query_hardware_features(
 
     stage = _normalize_stage(agent_stage)
     stage_specs = _stage_specs(stage)
+    node_props = node.get("properties", {})
+    precision_policy = resolve_precision_policy(
+        node_props,
+        mode=precision_mode,
+        datatypes=node_props.get("datatypes"),
+    )
 
     features: list[dict[str, Any]] = []
     for edge in edges:
@@ -210,6 +242,11 @@ def query_hardware_features(
             continue
 
         edge_props = edge.get("properties", {})
+        visibility = None
+        if category == "precision" and stage in {"datatype_precision", "tuning"}:
+            visibility = precision_feature_visibility(feature_id, precision_policy)
+            if visibility == "hidden":
+                continue
         features.append(_compact_dict({
             "feature_id": feature_id,
             "name": _feature_name(feat_props),
@@ -221,15 +258,23 @@ def query_hardware_features(
             "recommended_patterns": feat_props.get("recommended_patterns", []),
             "avoid_patterns": feat_props.get("avoid_patterns", []),
             "support_level": edge_props.get("support_level"),
-            "recommended": edge_props.get("recommended"),
+            "recommended": (
+                visibility == "recommendation"
+                if visibility is not None
+                else edge_props.get("recommended")
+            ),
+            "prompt_visibility": visibility,
             "verified": edge_props.get("verified"),
             "performance_impact": edge_props.get("performance_impact"),
-            "min_compute_capability": edge_props.get("min_compute_capability"),
+            "min_compute_capability": edge_props.get("min_compute_capability") or feat_props.get("min_compute_capability"),
+            "native_tensor_core_evidence": edge_props.get("native_tensor_core_evidence") or feat_props.get("native_tensor_core_evidence"),
+            "training_backend": edge_props.get("training_backend") or feat_props.get("training_backend"),
+            "optimization_modes": edge_props.get("optimization_modes") or feat_props.get("optimization_modes", []),
             "recommendation_scope": (
                 edge_props.get("recommendation_scope")
                 or feat_props.get("default_recommendation_scope")
             ),
-            "limitations": edge_props.get("limitations") or feat_props.get("limitations"),
+            "limitations": edge_props.get("limitations") or feat_props.get("model_shape_limitations") or feat_props.get("limitations"),
             "notes": _merge_text_values(feat_props.get("notes"), edge_props.get("notes")),
         }))
 
@@ -286,6 +331,8 @@ def _stage_feature_key_index(
     graph: dict[str, Any],
     edges: list[dict[str, Any]],
     stage: str | None,
+    *,
+    precision_policy: PrecisionPolicy | None = None,
 ) -> dict[str, Any]:
     feat_nodes = {
         n["id"]: n.get("properties", {})
@@ -308,15 +355,25 @@ def _stage_feature_key_index(
         if stage_specs and not _feature_matches_stage(category, feature_id, stage_specs):
             continue
         edge_props = edge.get("properties") or {}
+        visibility = (
+            precision_feature_visibility(feature_id, precision_policy)
+            if precision_policy is not None and category == "precision"
+            else None
+        )
+        if visibility == "hidden":
+            continue
         description = _feature_short_description(feature_id, feat_props)
         _append_unique_feature_pair(all_keys, feature_id, description)
-        if edge_props.get("recommended") is False:
+        if visibility == "integer_indicator" or (
+            visibility is None and edge_props.get("recommended") is False
+        ):
             _append_unique_feature_pair(not_recommended_keys, feature_id, description)
-        elif edge_props.get("recommended") is True:
+        elif visibility == "recommendation" or edge_props.get("recommended") is True:
             _append_unique_feature_pair(recommended_keys, feature_id, description)
         support_level = str(edge_props.get("support_level") or "").lower()
         if (
-            edge_props.get("recommended") is False
+            visibility in {"integer_indicator", "permitted"}
+            or (visibility is None and edge_props.get("recommended") is False)
             or support_level in {"experimental", "limited"}
             or bool(edge_props.get("limitations"))
             or bool(edge_props.get("notes"))
@@ -340,6 +397,18 @@ def _merge_text_values(*values: Any) -> str:
         if text and text not in merged:
             merged.append(text)
     return "; ".join(merged)
+
+
+def _precision_pattern_allowed(pattern: str, policy: PrecisionPolicy) -> bool:
+    text = str(pattern or "").lower().replace("-", "_")
+    requirements = {
+        "mxfp8": "mxfp8_te",
+        "nvfp4": "nvfp4_te",
+        "fp8": "fp8_te",
+    }
+    if "fp6" in text or ("fp4" in text and "nvfp4" not in text):
+        return False
+    return all(token not in text or policy.allows(required) for token, required in requirements.items())
 
 
 def _feature_short_description(feature_id: str, feat_props: dict[str, Any]) -> str:

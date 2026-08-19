@@ -35,8 +35,8 @@ records:
   - schema_version: hardware_feature_record_v1
     record_id: nvidia.blackwell.tensor_cores.precision_policy
     title: Blackwell Tensor Core precision policy
-    summary_text: Blackwell Tensor Cores can accelerate low-precision AI math, but generated training code should use framework-supported AMP, bf16, or fp16 paths first and guard experimental precision choices.
-    detail_text: For MLEvolve training code, prefer torch.amp autocast with bf16 or fp16 when the toolkit, model, and loss path are compatible. Keep GradScaler optional because bf16 generally does not require scaling, while fp16 often benefits from it. Treat FP4 and TensorRT-oriented low-precision paths as specialized acceleration features that require explicit framework support and validation.
+    summary_text: Blackwell normal mode permits TF32, BF16 AMP, and FP16 AMP; aggressive mode additionally permits explicit Transformer Engine FP8, MXFP8, and NVFP4 training recipes without recommending them automatically.
+    detail_text: Use torch.amp TF32, BF16, or FP16 paths in normal mode. Aggressive mode may test FP8, MXFP8BlockScaling, or NVFP4BlockScaling only when Transformer Engine, the model modules, tensor shapes, and packages are compatible and a BF16 or FP16 fallback remains available. Generic FP4 and MXFP4 are not NVFP4 training evidence.
     vendor: nvidia
     architectures: [blackwell]
     accelerator_names: [rtx_5090, geforce_rtx_5090]
@@ -44,26 +44,59 @@ records:
     toolkits: [cuda]
     frameworks: [pytorch]
     workload_types: [vision_training, transformer_training, inference]
-    features: [tensor_cores, amp, bf16, fp16, fp4]
+    features: [tensor_cores, amp, tf32, bf16, fp16, fp8, mxfp8, nvfp4]
     recommended_patterns:
-      - Use torch.amp.autocast with an explicit dtype selected from hardware and framework context.
+      - In normal mode, use TF32 or torch.amp autocast with BF16 or FP16 selected from hardware and framework context.
       - Use GradScaler for fp16 training and make it optional for bf16 training.
       - Keep a full-precision fallback path for numerically fragile losses or metrics.
+      - In aggressive mode, treat FP8, MXFP8, and NVFP4 as opt-in experiments that require an explicit compatible Transformer Engine recipe and end-to-end measurement.
     avoid_patterns:
       - Do not blindly enable every low-precision mode at once.
-      - Do not use inference-only FP4 paths in training code unless the stack explicitly supports that workflow.
+      - Do not treat generic FP4, MXFP4, inference quantization, or the text fp4 as NVFP4 training.
     source_refs:
-      - title: NVIDIA TensorRT FP4 on Blackwell GeForce RTX 50 Series
-        url: https://developer.nvidia.com/blog/?p=99256
-        source_type: vendor_technical_blog
-        retrieved_or_verified_date: "2026-05-15"
-      - title: NVIDIA CUDA GPU Compute Capability
-        url: https://developer.nvidia.com/cuda-gpus
-        source_type: vendor_reference
-        retrieved_or_verified_date: "2026-05-15"
-    confidence: 0.82
-    last_verified: "2026-05-15"
-    tags: [precision, tensor_cores, amp, bf16, fp16, fp4]
+      - title: NVIDIA Transformer Engine MXFP8 training
+        url: https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/features/low_precision_training/mxfp8/mxfp8.html
+        source_type: vendor_documentation
+        retrieved_or_verified_date: "2026-08-19"
+      - title: NVIDIA Transformer Engine NVFP4 training
+        url: https://docs.nvidia.com/deeplearning/transformer-engine-releases/release-2.14/user-guide/features/low_precision_training/nvfp4/nvfp4.html
+        source_type: vendor_documentation
+        retrieved_or_verified_date: "2026-08-19"
+    confidence: 0.94
+    last_verified: "2026-08-19"
+    tags: [precision, tensor_cores, normal_mode, aggressive_mode, amp, tf32, bf16, fp16, fp8, mxfp8, nvfp4]
+
+  - schema_version: hardware_feature_record_v1
+    record_id: nvidia.ada_hopper.fp8.training_policy
+    title: Ada and Hopper FP8 training policy
+    summary_text: Ada SM 8.9 and Hopper SM 9.0 have native FP8 Tensor Cores, and MLEvolve exposes FP8 training only in aggressive mode through a validated Transformer Engine E4M3 or HYBRID recipe.
+    detail_text: FP8 is hardware-native on Ada and later, including Ada rather than only Hopper. It still requires compatible Transformer Engine modules, supported tensor shapes, an installed software stack, and end-to-end accuracy and speed validation. E4M3 can be used by a documented recipe; E5M2 is only the backward-gradient component of the HYBRID recipe and is not an independent training policy. Keep BF16 or FP16 as the fallback.
+    vendor: nvidia
+    architectures: [ada_lovelace, hopper]
+    accelerator_names: [geforce_rtx_4090, l40s, h100, h200]
+    compute_capabilities: ["8.9", "9.0"]
+    toolkits: [cuda, transformer_engine]
+    frameworks: [pytorch]
+    workload_types: [transformer_training, generative_ai]
+    features: [tensor_cores, fp8, fp8_e4m3, fp8_hybrid]
+    recommended_patterns:
+      - In aggressive mode, use an explicit Transformer Engine E4M3 or HYBRID forward/backward recipe and benchmark it against BF16 or FP16.
+      - Keep a BF16 or FP16 fallback when model modules, tensor shapes, packages, speed, or accuracy do not validate.
+    avoid_patterns:
+      - Do not enable FP8 in normal mode.
+      - Do not select pure E5M2 as the end-to-end training policy.
+    source_refs:
+      - title: NVIDIA Ada GPU architecture tuning guide
+        url: https://docs.nvidia.com/cuda/archive/12.9.2/ada-tuning-guide/index.html
+        source_type: vendor_documentation
+        retrieved_or_verified_date: "2026-08-19"
+      - title: NVIDIA Transformer Engine FP8 current scaling
+        url: https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/features/low_precision_training/fp8_current_scaling/fp8_current_scaling.html
+        source_type: vendor_documentation
+        retrieved_or_verified_date: "2026-08-19"
+    confidence: 0.94
+    last_verified: "2026-08-19"
+    tags: [ada_lovelace, hopper, fp8, e4m3, hybrid, transformer_engine, aggressive_mode]
 
   - schema_version: hardware_feature_record_v1
     record_id: generic.cuda.dataloader.h2d_throughput
