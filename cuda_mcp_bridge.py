@@ -153,11 +153,21 @@ def facts_from_knowledge_base(client: Any, *, signature: str | None = None) -> H
     elif isinstance(cap, (list, tuple)) and len(cap) == 2:
         facts.compute_capability = (int(cap[0]), int(cap[1]))
 
+    # Mirror ResourceEstimator.safe_budget_mb (resource_estimator.py:43-50):
+    # in parallel_time_aware mode the budget is gpu_vram_gib scaled by
+    # predicted_budget_fraction, and safe_vram_budget_gib is only the fallback.
+    # Quoting the fallback would understate the ceiling by ~2 GB and push the
+    # agent to shrink batches further than the scheduler requires.
     limits = (ctx.get("scheduler_limits") or {}) if isinstance(ctx, dict) else {}
-    for key in ("safe_budget_mb", "predicted_budget_mb", "gpu_vram_budget_mb"):
-        if limits.get(key):
-            facts.budget_vram_mb = float(limits[key])
-            break
+    memory = limits.get("memory") or {}
+    gpu_vram_gib = memory.get("gpu_vram_gib")
+    fraction = memory.get("predicted_budget_fraction")
+    if gpu_vram_gib and fraction:
+        facts.budget_vram_mb = float(gpu_vram_gib) * 1024.0 * float(fraction)
+    elif limits.get("safe_vram_budget_mb"):
+        facts.budget_vram_mb = float(limits["safe_vram_budget_mb"])
+    elif memory.get("safe_vram_budget_gib"):
+        facts.budget_vram_mb = float(memory["safe_vram_budget_gib"]) * 1024.0
 
     try:
         profiles = list(client.store.list_solo_profiles())
