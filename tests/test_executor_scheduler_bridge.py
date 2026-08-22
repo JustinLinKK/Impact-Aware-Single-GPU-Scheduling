@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 from engine.executor import Interpreter
+from engine.preflight import candidate_code_hash
 from localml_scheduler.domain import BatchProbeProfile, JobStatus, TrainingJob
 from localml_scheduler.config import SchedulerSettings
 
@@ -116,6 +117,30 @@ class _FakeSchedulerClient:
 
 
 class InterpreterSchedulerBridgeTest(unittest.TestCase):
+    def test_preflight_rejected_node_never_reaches_scheduler(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "workdir"
+            workdir.mkdir(parents=True, exist_ok=True)
+            fake_api = _FakeSchedulerClient(SchedulerSettings(runtime_root=Path(tmpdir) / "runtime"))
+            interpreter = Interpreter(working_dir=workdir, timeout=10, max_parallel_run=1)
+            interpreter.attach_scheduler(
+                fake_api,
+                SimpleNamespace(wait_timeout_seconds=5, wait_poll_interval_seconds=0.01),
+            )
+            code = "print('must not run')\n"
+            result = interpreter._run_scheduler_job(
+                code=code,
+                id="node-rejected",
+                working_dir=str(workdir),
+                node_context=SimpleNamespace(
+                    preflight_admitted=False,
+                    preflight_code_hash=None,
+                ),
+            )
+
+            self.assertEqual(result.exc_type, "PreflightRejected")
+            self.assertEqual(fake_api.submitted_jobs, [])
+
     def test_scheduler_submission_uses_scheduler_defaults_and_preload_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir) / "runtime"
@@ -149,14 +174,30 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             (workdir / "shared-start.ckpt").write_bytes(b"checkpoint")
             interpreter.attach_scheduler(fake_api, bridge_cfg)
 
+            code = (
+                "from torch.utils.data import DataLoader\n"
+                "BATCH_SIZE = 4\n"
+                "train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)\n"
+            )
             result = interpreter._run_scheduler_job(
-                code=(
-                    "from torch.utils.data import DataLoader\n"
-                    "BATCH_SIZE = 4\n"
-                    "train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)\n"
-                ),
+                code=code,
                 id="node-1",
                 working_dir=str(workdir),
+                node_context=SimpleNamespace(
+                    model_family=None,
+                    branch_id=None,
+                    parent=None,
+                    active_profile_key=None,
+                    preflight_status="INCONCLUSIVE",
+                    preflight_mode="full_cpu",
+                    preflight_code_hash=candidate_code_hash(code),
+                    preflight_diagnostic_codes=["GPU003"],
+                    preflight_report_path="/tmp/report.json",
+                    preflight_summary_path="/tmp/summary.json",
+                    preflight_repair_count=1,
+                    preflight_gpu_check_required=True,
+                    preflight_admitted=True,
+                ),
             )
 
             self.assertIsNone(result.exc_type)
@@ -176,6 +217,10 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertEqual(submitted.config.runner_kwargs["probe_timeout_seconds"], 45)
             self.assertEqual(submitted.config.runner_kwargs["probe_poll_interval_seconds"], 0.5)
             self.assertEqual(submitted.metadata["batch_probe_policy"], "time_aware_five_options")
+            self.assertEqual(submitted.metadata["preflight_status"], "INCONCLUSIVE")
+            self.assertEqual(submitted.metadata["preflight_diagnostic_codes"], ["GPU003"])
+            self.assertTrue(submitted.metadata["gpu_check_required"])
+            self.assertEqual(submitted.metadata["preflight_repair_count"], 1)
             self.assertTrue(submitted.baseline_model_id.startswith("mlevolve-script-"))
             self.assertIsNotNone(submitted.preload_source)
             self.assertEqual(submitted.preload_source.model_id, "shared-startpoint")
