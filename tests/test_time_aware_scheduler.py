@@ -865,6 +865,36 @@ def test_batch_estimates_are_batch_specific_and_sourced() -> None:
         assert all(option.source == "branch_profile" for option in options)
 
 
+def test_remaining_runtime_uses_batch_profile_epoch_time_without_runtime_profile() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir)
+        store = SQLiteStateStore(settings)
+        planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
+        job = _job("batch-runtime", "batch-runtime-sig")
+        job.max_epochs = 4
+        store.upsert_batch_size_observation(
+            BatchSizeObservation(
+                observation_key=build_batch_size_observation_key(
+                    job.baseline_model_id,
+                    planner.estimator.shape_signature(job),
+                    store.hardware_key(),
+                    "exclusive",
+                    4,
+                ),
+                model_key=job.baseline_model_id,
+                shape_signature=planner.estimator.shape_signature(job),
+                hardware_key=store.hardware_key(),
+                backend_name="exclusive",
+                batch_param_name="batch_size",
+                batch_size=4,
+                avg_vram_mb=512.0,
+                metadata={"seconds_per_epoch": 12.0},
+            )
+        )
+
+        assert planner.predicted_remaining_runtime_seconds(job, backend_name="cuda_process") == 48.0
+
+
 class _FailingBatchPredictor:
     last_sources: dict[str, str] = {}
     last_errors: dict[str, str] = {}

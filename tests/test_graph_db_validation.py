@@ -14,6 +14,7 @@ from localml_scheduler.config import SchedulerConfig
 from localml_scheduler.domain import (
     BatchProbeProfile,
     BatchProbeSpec,
+    BatchSizeObservation,
     PackingSpec,
     RuntimeProfile,
     SoloProfile,
@@ -969,6 +970,47 @@ class GraphDatabaseValidationTest(unittest.TestCase):
             self.assertFalse(context["batch_size_recommendation"]["found"])
             self.assertIn(
                 "no_matching_profiles_for_current_hardware", context["risk_flags"]
+            )
+
+    def test_get_job_design_context_derives_runtime_from_batch_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            api = _sqlite_client_with_test_hardware(tmpdir)
+            api.upsert_batch_size_observation(
+                BatchSizeObservation(
+                    observation_key="observation-resnet50-bs32",
+                    model_key="resnet50",
+                    shape_signature="shape-resnet50",
+                    hardware_key=_test_hardware_profile().hardware_key,
+                    backend_name="exclusive",
+                    batch_param_name="batch_size",
+                    batch_size=32,
+                    peak_vram_mb=8192,
+                    avg_vram_mb=7000.0,
+                    metadata={"seconds_per_epoch": 12.0},
+                )
+            )
+
+            context = api.get_job_design_context(
+                candidate={
+                    "model_key": "resnet50",
+                    "proposed_batch_size": 32,
+                    "proposed_epochs": 4,
+                    "requires_gpu": True,
+                },
+                limit=5,
+            )
+
+            self.assertTrue(context["runtime_estimate"]["found"])
+            self.assertEqual(
+                context["runtime_estimate"]["estimated_total_runtime_seconds"],
+                48.0,
+            )
+            self.assertTrue(
+                any(
+                    entry["kind"] == "batch_size_observation"
+                    and entry["data"]["estimated_total_runtime_seconds"] == 48.0
+                    for entry in context["matched_profiles"]
+                )
             )
 
     def test_get_job_design_context_supports_model_key_only(self) -> None:

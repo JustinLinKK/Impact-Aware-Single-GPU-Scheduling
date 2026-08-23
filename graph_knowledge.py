@@ -413,6 +413,12 @@ class SchedulerKnowledgeBase:
                 f"Batch probe for model {payload.get('model_key')} on {payload.get('device_type')}"
                 f" resolved batch size {payload.get('resolved_batch_size')}."
             )
+        if kind == "batch_size_observation":
+            return (
+                f"Batch observation for model {payload.get('model_key')} on backend "
+                f"{payload.get('backend_name')} at batch size {payload.get('batch_size')}: "
+                f"estimated total runtime {payload.get('estimated_total_runtime_seconds')} seconds."
+            )
         if kind == "solo_profile":
             return (
                 f"Solo profile for {payload.get('signature')} on hardware {payload.get('hardware_key')}"
@@ -513,6 +519,7 @@ class SchedulerKnowledgeBase:
         # forcing callers to understand every profile type.
         kind_weight = {
             "runtime_profile": 40,
+            "batch_size_observation": 35,
             "batch_probe_profile": 30,
             "solo_profile": 20,
             "run_profile": 10,
@@ -537,6 +544,8 @@ class SchedulerKnowledgeBase:
             return f"runtime_profile:{payload.get('profile_key')}"
         if kind == "batch_probe_profile":
             return f"batch_probe_profile:{payload.get('probe_key')}"
+        if kind == "batch_size_observation":
+            return f"batch_size_observation:{payload.get('observation_key')}"
         if kind == "solo_profile":
             return (
                 f"solo_profile:{payload.get('hardware_key')}:{payload.get('signature')}"
@@ -568,6 +577,55 @@ class SchedulerKnowledgeBase:
         rows.append(
             (self._evidence_score(kind, match_reason, backend_name, candidate), entry)
         )
+
+    @staticmethod
+    def _observation_seconds_per_epoch(observation: Any) -> float | None:
+        metadata = getattr(observation, "metadata", {}) or {}
+        value = metadata.get("seconds_per_epoch")
+        if value is None:
+            step_time = getattr(observation, "avg_step_time_ms", None)
+            steps = metadata.get("steps_per_epoch")
+            if step_time is not None and steps is not None:
+                value = float(step_time) * float(steps) / 1000.0
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            return None
+        return seconds if seconds > 0.0 else None
+
+    def _batch_observation_payload(
+        self, observation: Any, candidate: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        seconds_per_epoch = self._observation_seconds_per_epoch(observation)
+        if seconds_per_epoch is None:
+            return None
+        payload = observation.to_dict()
+        payload["seconds_per_epoch"] = seconds_per_epoch
+        try:
+            epochs = int(candidate["proposed_epochs"])
+        except (KeyError, TypeError, ValueError):
+            epochs = None
+        if epochs is not None and epochs > 0:
+            payload["estimated_total_runtime_seconds"] = seconds_per_epoch * epochs
+        return payload
+
+    def _batch_observations_for_candidate(
+        self, candidate: dict[str, Any]
+    ) -> list[tuple[str, Any, dict[str, Any]]]:
+        current_key = self._current_hardware_key()
+        rows: list[tuple[str, Any, dict[str, Any]]] = []
+        for observation in self.store.list_batch_size_observations(
+            hardware_key=current_key or None
+        ):
+            match_reason = self._batch_probe_match_reason(
+                observation.model_key, candidate
+            )
+            if not match_reason:
+                continue
+            payload = self._batch_observation_payload(observation, candidate)
+            if payload is not None:
+                rows.append((match_reason, observation, payload))
+        return rows
 
     def _normalized_job_design_candidate(
         self, candidate: dict[str, Any] | None
@@ -604,7 +662,40 @@ class SchedulerKnowledgeBase:
     ) -> dict[str, Any]:
         runtime_matches = self._current_runtime_profiles_for_candidate(candidate)
         if not runtime_matches:
-            return {"found": False, "reason": "insufficient evidence"}
+            observations = self._batch_observations_for_candidate(candidate)
+            if not observations:
+                return {"found": False, "reason": "insufficient evidence"}
+            proposed_batch_size = candidate.get("proposed_batch_size")
+            backend_preference = candidate.get("backend_preference")
+
+            def observation_key(item: tuple[str, Any, dict[str, Any]]) -> tuple[int, int, int, str]:
+                _reason, observation, _payload = item
+                exact_batch = int(
+                    proposed_batch_size is not None
+                    and int(observation.batch_size) == int(proposed_batch_size)
+                )
+                preferred_backend = int(
+                    backend_preference is not None
+                    and observation.backend_name == backend_preference
+                )
+                exclusive_fallback = int(observation.backend_name == "exclusive")
+                return (exact_batch, preferred_backend, exclusive_fallback, observation.observation_key)
+
+            match_reason, observation, payload = max(observations, key=observation_key)
+            return {
+                "found": True,
+                "profile": payload,
+                "source": "batch_size_observation",
+                "match_reason": match_reason,
+                "matched_exact_batch_size": bool(
+                    proposed_batch_size is not None
+                    and int(observation.batch_size) == int(proposed_batch_size)
+                ),
+                "seconds_per_epoch": payload["seconds_per_epoch"],
+                "estimated_total_runtime_seconds": payload.get(
+                    "estimated_total_runtime_seconds"
+                ),
+            }
         proposed_batch_size = candidate.get("proposed_batch_size")
         exact: list[tuple[str, Any]] = []
         if proposed_batch_size is not None:
@@ -675,6 +766,15 @@ class SchedulerKnowledgeBase:
                 payload=profile.to_dict(),
                 match_reason=match_reason,
                 candidate=candidate,
+            )
+        for match_reason, observation, payload in self._batch_observations_for_candidate(candidate):
+            self._append_evidence(
+                rows,
+                kind="batch_size_observation",
+                payload=payload,
+                match_reason=match_reason,
+                candidate=candidate,
+                backend_name=observation.backend_name,
             )
         for profile in self.store.list_solo_profiles(hardware_key=current_key or None):
             match_reason = self._solo_match_reason(

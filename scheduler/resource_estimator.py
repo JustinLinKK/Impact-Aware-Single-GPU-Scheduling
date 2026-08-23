@@ -70,9 +70,24 @@ class ResourceEstimator:
             except (TypeError, ValueError):
                 pass
         profile = runtime_profile_for_job(self.repository, job, backend_name=backend_name)
-        if profile is None or profile.estimated_total_runtime_seconds is None:
+        if profile is not None and profile.estimated_total_runtime_seconds is not None:
+            return max(0.0, float(profile.estimated_total_runtime_seconds))
+        total_epochs = job.max_epochs or job.config.max_epochs
+        try:
+            remaining_epochs = max(
+                0,
+                int(total_epochs) - int(job.metadata.get("last_completed_epoch", 0)),
+            )
+        except (TypeError, ValueError):
             return None
-        return max(0.0, float(profile.estimated_total_runtime_seconds))
+        seconds_per_epoch, _source, _confidence = self._seconds_per_epoch(
+            job,
+            self.resolved_batch_size(job),
+            backend_name,
+        )
+        if seconds_per_epoch is None:
+            return None
+        return float(seconds_per_epoch) * remaining_epochs
 
     def estimate_batch_options(self, job: TrainingJob, backend_name: str, batch_sizes: list[int]) -> list[BatchOptionEstimate]:
         """Return batch-indexed memory and epoch-time estimates in one bundle."""
