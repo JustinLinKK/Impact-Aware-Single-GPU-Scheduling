@@ -8,6 +8,13 @@ from mcp.server.fastmcp import FastMCP
 
 from .client import SchedulerClient
 from .config import SchedulerConfig
+from .cuda_mcp_bridge import (
+    CUDA_MCP_ENDPOINT,
+    build_query,
+    facts_from_knowledge_base,
+    to_records,
+    topic_for_error,
+)
 
 
 def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
@@ -214,6 +221,78 @@ def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
             outcome_metrics=outcome_metrics or {},
             notes=notes,
         )
+
+    @server.tool()
+    def get_cuda_docs_query(error_text: str, signature: str | None = None) -> dict[str, Any]:
+        """Turn a training failure into a hardware-constrained CUDA docs query.
+
+        Put the returned `query` to the nvidia-cuda-docs MCP server, then pass
+        its answer back to ingest_cuda_docs_answer so the knowledge is kept.
+
+        Returns applicable=False for failures CUDA documentation cannot fix,
+        such as syntax errors and missing packages. Those dominate the observed
+        failure mix, so querying for them would only add noise.
+        """
+        topic = topic_for_error(error_text)
+        if topic is None:
+            return {
+                "applicable": False,
+                "reason": "failure is not CUDA-related; CUDA docs will not help",
+                "endpoint": CUDA_MCP_ENDPOINT,
+            }
+        facts = facts_from_knowledge_base(client, signature=signature)
+        return {
+            "applicable": True,
+            "topic": topic,
+            "query": build_query(topic, facts),
+            "endpoint": CUDA_MCP_ENDPOINT,
+            "hardware": {
+                "gpu_name": facts.gpu_name,
+                "compute_capability": facts.capability_str,
+                "total_vram_mb": facts.total_vram_mb,
+                "budget_vram_mb": facts.budget_vram_mb,
+                "measured_peak_vram_mb": facts.measured_peak_vram_mb,
+                "measured_samples": facts.measured_samples,
+            },
+            "excluded_techniques": facts.excluded_techniques(),
+        }
+
+    @server.tool()
+    def ingest_cuda_docs_answer(
+        topic: str,
+        answer: str,
+        verified_date: str,
+        signature: str | None = None,
+        source_refs: list[dict[str, Any]] | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Store a CUDA docs answer in HWKD, gated on this card's capability.
+
+        Guidance the installed GPU cannot execute is dropped here rather than at
+        read time, so the store stays honest for every later query. Pass
+        source_refs through from the documentation answer so a reader can check
+        the claim.
+        """
+        facts = facts_from_knowledge_base(client, signature=signature)
+        records = to_records(
+            topic=topic,
+            answer=answer,
+            facts=facts,
+            source_refs=source_refs,
+            verified_date=verified_date,
+        )
+        if not records:
+            return {"ingested": 0, "reason": "answer contained no actionable patterns"}
+        result = client._code_store().ingest_records(records, dry_run=dry_run)
+        return {
+            "ingested": len(records),
+            "dry_run": dry_run,
+            "recipe_ids": [r.get("recipe_id") for r in records],
+            "kept_recommended": len(records[0].get("recommended_patterns", [])),
+            "kept_avoid": len(records[0].get("avoid_patterns", [])),
+            "excluded_techniques": facts.excluded_techniques(),
+            "store_result": result,
+        }
 
     return server
 
