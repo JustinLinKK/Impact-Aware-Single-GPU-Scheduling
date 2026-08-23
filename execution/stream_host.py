@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import socket
 import threading
+import time
 from typing import Any
 
 import torch
@@ -54,6 +55,7 @@ def _run_job_in_thread(
     stream: Any | None = None,
     ready_event: threading.Event | None = None,
     host_pid: int | None = None,
+    start_delay_seconds: float = 0.0,
 ) -> None:
     """Run one structured job and publish its stream identity before training."""
 
@@ -104,6 +106,9 @@ def _run_job_in_thread(
         )
         if ready_event is not None:
             ready_event.set()
+
+        if start_delay_seconds > 0:
+            time.sleep(float(start_delay_seconds))
 
         runner = resolve_runner(context)
         if stream is not None and torch.cuda.is_available():
@@ -212,6 +217,18 @@ class StreamHostServer:
         ready: list[tuple[str, threading.Event]] = []
         stream_ids: dict[str, int | str | None] = {}
         for job_id in job_ids:
+            job = self.store.get_job(job_id)
+            try:
+                start_delay_seconds = max(
+                    0.0,
+                    float(
+                        job.metadata.get("placement_start_delay_seconds", 0.0)
+                        if job is not None
+                        else 0.0
+                    ),
+                )
+            except (TypeError, ValueError):
+                start_delay_seconds = 0.0
             stream = (
                 torch.cuda.Stream(device=self.settings.gpu_scheduler.device_index)
                 if torch.cuda.is_available()
@@ -234,6 +251,7 @@ class StreamHostServer:
                     "stream": stream,
                     "ready_event": ready_event,
                     "host_pid": os.getpid(),
+                    "start_delay_seconds": start_delay_seconds,
                 },
                 name=f"cuda-stream-job-{job_id}",
                 daemon=False,

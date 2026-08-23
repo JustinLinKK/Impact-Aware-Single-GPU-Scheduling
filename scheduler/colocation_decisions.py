@@ -240,15 +240,28 @@ class ColocationDecisionMixin:
             },
             packed_epoch_sources=packed_sources,
         )
+        trial_wall_seconds = 0.0
+        started_at = self._parsed_timestamp(trial.started_at)
+        if started_at is not None:
+            trial_wall_seconds = max(
+                0.0, (datetime.now(timezone.utc) - started_at).total_seconds()
+            )
+        charged_trial_seconds = (
+            trial_wall_seconds + trial.setup_cost_seconds
+            if trial.scheduler_decision_mode == "backend_awared"
+            else 0.0
+        )
         if result is None:
             gain = 0.0
             sequential = None
             packed = None
             reason = "colocation trial lacked complete timing evidence"
         else:
-            gain = result.gain
+            gain = result.sequential_drain_seconds / max(
+                1e-9, result.packed_drain_seconds + charged_trial_seconds
+            )
             sequential = result.sequential_drain_seconds
-            packed = result.packed_drain_seconds
+            packed = result.packed_drain_seconds + charged_trial_seconds
             reason = (
                 "colocation gain accepted"
                 if gain + 1e-9 >= self.settings.gpu_scheduler.colocation.min_gain
@@ -260,6 +273,12 @@ class ColocationDecisionMixin:
             "gain_threshold": self.settings.gpu_scheduler.colocation.min_gain,
             "sequential_drain_seconds": sequential,
             "packed_drain_seconds": packed,
+            "measured_packed_drain_seconds_before_trial_charge": (
+                result.packed_drain_seconds if result is not None else None
+            ),
+            "trial_wall_seconds": trial_wall_seconds,
+            "setup_cost_seconds": trial.setup_cost_seconds,
+            "charged_trial_seconds": charged_trial_seconds,
             "sequential_drain_phases": (
                 [phase.to_dict() for phase in result.sequential_phases]
                 if result is not None
@@ -288,11 +307,11 @@ class ColocationDecisionMixin:
             packed_rates,
             trial,
             sources=packed_sources,
-            gain=result.gain if result is not None else None,
+            gain=gain if result is not None else None,
             decision=(
                 "accepted"
                 if result is not None
-                and result.gain + 1e-9
+                and gain + 1e-9
                 >= self.settings.gpu_scheduler.colocation.min_gain
                 else "rejected" if result is not None else None
             ),

@@ -52,6 +52,9 @@ class ColocationTrialState:
     pretrial_epoch_seconds: dict[str, float] = field(default_factory=dict)
     member_start_epochs: dict[str, int] = field(default_factory=dict)
     evidence_deadline_at: str = ""
+    scheduler_decision_mode: str = "baseline"
+    estimated_trial_cost_seconds: float = 0.0
+    setup_cost_seconds: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         """Serialize ColocationTrialState for durable scheduler state."""
@@ -68,6 +71,9 @@ class ColocationTrialState:
             "pretrial_epoch_seconds": dict(self.pretrial_epoch_seconds),
             "member_start_epochs": dict(self.member_start_epochs),
             "evidence_deadline_at": self.evidence_deadline_at,
+            "scheduler_decision_mode": self.scheduler_decision_mode,
+            "estimated_trial_cost_seconds": self.estimated_trial_cost_seconds,
+            "setup_cost_seconds": self.setup_cost_seconds,
         }
 
     @classmethod
@@ -96,6 +102,13 @@ class ColocationTrialState:
                 for key, value in dict(payload.get("member_start_epochs", {})).items()
             },
             evidence_deadline_at=str(payload.get("evidence_deadline_at") or ""),
+            scheduler_decision_mode=str(
+                payload.get("scheduler_decision_mode") or "baseline"
+            ),
+            estimated_trial_cost_seconds=float(
+                payload.get("estimated_trial_cost_seconds") or 0.0
+            ),
+            setup_cost_seconds=float(payload.get("setup_cost_seconds") or 0.0),
         )
 
 

@@ -101,16 +101,37 @@ def build_runtime_profile_key(
 
 
 def normalize_colocation_members(members: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for member in members:
+        item: dict[str, Any] = {
+            "signature": str(member["signature"]),
+            "batch_size": int(member["batch_size"]),
+            "backend_name": str(member["backend_name"]),
+        }
+        backend_config = member.get("backend_config")
+        if isinstance(backend_config, dict) and backend_config:
+            # A JSON round trip rejects unserializable runtime objects and
+            # produces a stable topology/configuration identity.
+            item["backend_config"] = json.loads(
+                json.dumps(
+                    backend_config,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        normalized.append(item)
     return sorted(
-        (
-            {
-                "signature": str(member["signature"]),
-                "batch_size": int(member["batch_size"]),
-                "backend_name": str(member["backend_name"]),
-            }
-            for member in members
+        normalized,
+        key=lambda member: (
+            member["signature"],
+            member["batch_size"],
+            member["backend_name"],
+            json.dumps(
+                member.get("backend_config", {}),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
         ),
-        key=lambda member: (member["signature"], member["batch_size"], member["backend_name"]),
     )
 
 

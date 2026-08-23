@@ -18,6 +18,7 @@ class DispatchPlan:
     fallback_order: list[str] = field(default_factory=list)
     objective_breakdown: dict[str, object] = field(default_factory=dict)
     trial_metadata: dict[str, object] = field(default_factory=dict)
+    backend_config: dict[str, object] = field(default_factory=dict)
     mandatory_anchor_job_id: str | None = None
     objective_version: str | None = None
 

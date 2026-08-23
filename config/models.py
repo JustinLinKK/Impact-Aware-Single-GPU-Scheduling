@@ -15,6 +15,8 @@ import yaml
 from ..redis_cache import RedisCacheSettings
 
 SCHEDULER_MODE_PARALLEL_TIME_AWARE = "parallel_time_aware"
+SCHEDULER_DECISION_MODE_BASELINE = "baseline"
+SCHEDULER_DECISION_MODE_BACKEND_AWARED = "backend_awared"
 PREDICTION_MODE_BRANCH_PROFILE = "branch_profile"
 PREDICTION_MODE_ML_PREDICTOR = "ml_predictor"
 
@@ -40,6 +42,26 @@ def normalize_scheduler_mode(value: str | None) -> str:
             f"Unsupported scheduler mode: {value}. "
             "The production scheduler only supports parallel_time_aware; "
             "VRAM-fill and fixed-width placement modes were removed."
+        )
+    return normalized
+
+
+def normalize_scheduler_decision_mode(value: str | None) -> str:
+    normalized = (
+        str(value or SCHEDULER_DECISION_MODE_BASELINE)
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+    if normalized == "backend_aware":
+        normalized = SCHEDULER_DECISION_MODE_BACKEND_AWARED
+    if normalized not in {
+        SCHEDULER_DECISION_MODE_BASELINE,
+        SCHEDULER_DECISION_MODE_BACKEND_AWARED,
+    }:
+        raise ValueError(
+            f"Unsupported scheduler_decision_mode: {value}. "
+            "Expected baseline or backend_awared."
         )
     return normalized
 
@@ -178,6 +200,155 @@ class BatchOptionSettings:
         return {
             "exponent_offsets": list(self.exponent_offsets),
             "require_power_of_two_original": self.require_power_of_two_original,
+        }
+
+
+@dataclass(slots=True)
+class SourceAnalysisSettings:
+    cache_enabled: bool = True
+    max_source_bytes: int = 2_000_000
+    max_unknown_operator_fraction_for_high_confidence: float = 0.05
+    max_unknown_operator_fraction_for_medium_confidence: float = 0.25
+    peak_tflops_by_dtype: dict[str, float] = field(default_factory=dict)
+    memory_bandwidth_gbps: float | None = None
+
+    def __post_init__(self) -> None:
+        self.max_source_bytes = max(1, int(self.max_source_bytes))
+        self.max_unknown_operator_fraction_for_high_confidence = float(
+            self.max_unknown_operator_fraction_for_high_confidence
+        )
+        self.max_unknown_operator_fraction_for_medium_confidence = float(
+            self.max_unknown_operator_fraction_for_medium_confidence
+        )
+        if not (
+            0
+            <= self.max_unknown_operator_fraction_for_high_confidence
+            <= self.max_unknown_operator_fraction_for_medium_confidence
+            <= 1
+        ):
+            raise ValueError(
+                "source_analysis unknown-operator thresholds must satisfy 0 <= high <= medium <= 1"
+            )
+        self.peak_tflops_by_dtype = {
+            str(key).lower(): float(value)
+            for key, value in dict(self.peak_tflops_by_dtype or {}).items()
+            if float(value) > 0
+        }
+        if self.memory_bandwidth_gbps is not None:
+            self.memory_bandwidth_gbps = float(self.memory_bandwidth_gbps)
+            if self.memory_bandwidth_gbps <= 0:
+                raise ValueError("source_analysis.memory_bandwidth_gbps must be positive")
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "SourceAnalysisSettings":
+        return cls(**dict(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "cache_enabled": self.cache_enabled,
+            "max_source_bytes": self.max_source_bytes,
+            "max_unknown_operator_fraction_for_high_confidence": self.max_unknown_operator_fraction_for_high_confidence,
+            "max_unknown_operator_fraction_for_medium_confidence": self.max_unknown_operator_fraction_for_medium_confidence,
+            "peak_tflops_by_dtype": dict(self.peak_tflops_by_dtype),
+            "memory_bandwidth_gbps": self.memory_bandwidth_gbps,
+        }
+
+
+@dataclass(slots=True)
+class SourceTrialRankingSettings:
+    schema_version: int = 1
+    policy: str = "pareto"
+    ready_window_size: int = 10
+    max_group_size: int = 2
+    amortization_factor: float = 3.0
+    estimated_setup_seconds: float = 0.0
+    require_live_trial_for_unknown: bool = True
+    source_analysis: SourceAnalysisSettings = field(default_factory=SourceAnalysisSettings)
+    mode_overhead_mb: dict[str, float] = field(
+        default_factory=lambda: {
+            "cuda_process": 512.0,
+            "mps": 384.0,
+            "mps_process": 384.0,
+            "stream": 256.0,
+            "cuda_stream": 256.0,
+            "mps_stream": 512.0,
+        }
+    )
+    mps_allocation_templates: list[list[int]] = field(
+        default_factory=lambda: [[50, 50], [60, 40], [40, 60]]
+    )
+    stream_offset_templates_in_steps: list[float] = field(
+        default_factory=lambda: [0.0, 0.25, 0.5]
+    )
+
+    def __post_init__(self) -> None:
+        self.schema_version = int(self.schema_version)
+        if self.schema_version != 1:
+            raise ValueError("source_trial_ranking.schema_version must be 1")
+        self.policy = str(self.policy or "pareto").strip().lower()
+        if self.policy != "pareto":
+            raise ValueError("source_trial_ranking.policy must be pareto")
+        self.ready_window_size = max(2, int(self.ready_window_size))
+        self.max_group_size = int(self.max_group_size)
+        if self.max_group_size != 2:
+            raise ValueError(
+                "source_trial_ranking.max_group_size currently supports only 2"
+            )
+        self.amortization_factor = float(self.amortization_factor)
+        self.estimated_setup_seconds = float(self.estimated_setup_seconds)
+        if self.amortization_factor < 0:
+            raise ValueError("source_trial_ranking.amortization_factor must be non-negative")
+        if self.estimated_setup_seconds < 0:
+            raise ValueError("source_trial_ranking.estimated_setup_seconds must be non-negative")
+        if self.source_analysis is None:
+            self.source_analysis = SourceAnalysisSettings()
+        if isinstance(self.source_analysis, dict):
+            self.source_analysis = SourceAnalysisSettings.from_dict(self.source_analysis)
+        self.mode_overhead_mb = {
+            str(key): float(value) for key, value in dict(self.mode_overhead_mb).items()
+        }
+        if any(value < 0 for value in self.mode_overhead_mb.values()):
+            raise ValueError("source_trial_ranking.mode_overhead_mb values must be non-negative")
+        self.mps_allocation_templates = [
+            [int(value) for value in template]
+            for template in self.mps_allocation_templates
+        ]
+        if not self.mps_allocation_templates or any(
+            len(template) != 2
+            or any(value < 1 or value > 100 for value in template)
+            or sum(template) > 100
+            for template in self.mps_allocation_templates
+        ):
+            raise ValueError(
+                "source_trial_ranking.mps_allocation_templates must contain valid two-client percentages"
+            )
+        self.stream_offset_templates_in_steps = [
+            float(value) for value in self.stream_offset_templates_in_steps
+        ]
+        if not self.stream_offset_templates_in_steps or any(
+            value < 0 for value in self.stream_offset_templates_in_steps
+        ):
+            raise ValueError(
+                "source_trial_ranking.stream_offset_templates_in_steps must be non-negative"
+            )
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "SourceTrialRankingSettings":
+        return cls(**dict(payload or {}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "policy": self.policy,
+            "ready_window_size": self.ready_window_size,
+            "max_group_size": self.max_group_size,
+            "amortization_factor": self.amortization_factor,
+            "estimated_setup_seconds": self.estimated_setup_seconds,
+            "require_live_trial_for_unknown": self.require_live_trial_for_unknown,
+            "source_analysis": self.source_analysis.to_dict(),
+            "mode_overhead_mb": dict(self.mode_overhead_mb),
+            "mps_allocation_templates": [list(value) for value in self.mps_allocation_templates],
+            "stream_offset_templates_in_steps": list(self.stream_offset_templates_in_steps),
         }
 
 
@@ -781,6 +952,7 @@ class GpuSchedulerSettings:
 
     enabled: bool = True
     mode: str = SCHEDULER_MODE_PARALLEL_TIME_AWARE
+    scheduler_decision_mode: str = SCHEDULER_DECISION_MODE_BASELINE
     backend_priority: list[str] = field(
         default_factory=lambda: ["mps", "stream", "cuda_process", "exclusive"]
     )
@@ -800,6 +972,9 @@ class GpuSchedulerSettings:
     telemetry: GpuTelemetrySettings = field(default_factory=GpuTelemetrySettings)
     objective: TimeObjectiveSettings = field(default_factory=TimeObjectiveSettings)
     batch_options: BatchOptionSettings = field(default_factory=BatchOptionSettings)
+    source_trial_ranking: SourceTrialRankingSettings = field(
+        default_factory=SourceTrialRankingSettings
+    )
     colocation: ColocationSettings = field(default_factory=ColocationSettings)
     exclusive_probe: ExclusiveProbeSettings = field(
         default_factory=ExclusiveProbeSettings
@@ -813,6 +988,9 @@ class GpuSchedulerSettings:
 
     def __post_init__(self) -> None:
         self.mode = normalize_scheduler_mode(self.mode)
+        self.scheduler_decision_mode = normalize_scheduler_decision_mode(
+            self.scheduler_decision_mode
+        )
         if self.backend_priority is None:
             self.backend_priority = ["mps", "stream", "cuda_process", "exclusive"]
         else:
@@ -846,6 +1024,12 @@ class GpuSchedulerSettings:
             self.batch_options = BatchOptionSettings()
         if isinstance(self.batch_options, dict):
             self.batch_options = BatchOptionSettings.from_dict(self.batch_options)
+        if self.source_trial_ranking is None:
+            self.source_trial_ranking = SourceTrialRankingSettings()
+        if isinstance(self.source_trial_ranking, dict):
+            self.source_trial_ranking = SourceTrialRankingSettings.from_dict(
+                self.source_trial_ranking
+            )
         if self.colocation is None:
             self.colocation = ColocationSettings()
         if isinstance(self.colocation, dict):
@@ -913,6 +1097,7 @@ class GpuSchedulerSettings:
         return {
             "enabled": self.enabled,
             "mode": self.mode,
+            "scheduler_decision_mode": self.scheduler_decision_mode,
             "backend_priority": list(self.backend_priority),
             "parallel_job_cap": self.parallel_job_cap,
             "priority_window_size": self.priority_window_size,
@@ -930,6 +1115,7 @@ class GpuSchedulerSettings:
             "telemetry": self.telemetry.to_dict(),
             "objective": self.objective.to_dict(),
             "batch_options": self.batch_options.to_dict(),
+            "source_trial_ranking": self.source_trial_ranking.to_dict(),
             "colocation": self.colocation.to_dict(),
             "exclusive_probe": self.exclusive_probe.to_dict(),
             "submission_defaults": self.submission_defaults.to_dict(),

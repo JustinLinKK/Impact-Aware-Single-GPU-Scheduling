@@ -325,12 +325,28 @@ class TimeAwareObjectiveScorer:
         return True
 
     @staticmethod
-    def member_descriptor(job: TrainingJob, *, backend_name: str, batch_size: int) -> dict[str, object]:
-        return {
-            "signature": job.packing.signature or job.job_id,
+    def member_descriptor(
+        job: TrainingJob,
+        *,
+        backend_name: str,
+        batch_size: int,
+        backend_config: Mapping[str, object] | None = None,
+        execution_signature: str | None = None,
+    ) -> dict[str, object]:
+        descriptor: dict[str, object] = {
+            "signature": (
+                execution_signature
+                or job.metadata.get("placement_source_fingerprint_signature")
+                or job.packing.signature
+                or job.job_id
+            ),
             "batch_size": int(batch_size),
             "backend_name": str(backend_name),
         }
+        config = backend_config or job.metadata.get("placement_backend_config")
+        if isinstance(config, Mapping) and config:
+            descriptor["backend_config"] = dict(config)
+        return descriptor
 
     @staticmethod
     def _profile_epoch_seconds(profile: object, descriptor: dict[str, object]) -> float | None:
@@ -550,6 +566,8 @@ class TimeAwareObjectiveScorer:
         active_jobs: list[TrainingJob],
         active_vram_mb: float,
         mandatory_anchor: TrainingJob | None,
+        backend_config: Mapping[str, object] | None = None,
+        execution_signature_for: Callable[[TrainingJob, int], str] | None = None,
     ) -> EvaluatedGroup | None:
         if not active_jobs or not self.compatibility.compatible_group([*active_jobs, candidate], backend_name=backend_name):
             return None
@@ -600,6 +618,20 @@ class TimeAwareObjectiveScorer:
                     job,
                     backend_name=str(job.metadata.get("placement_backend") or backend_name),
                     batch_size=BatchResolution.resolved_batch_size(job),
+                    backend_config=(
+                        job.metadata.get("placement_backend_config")
+                        if isinstance(
+                            job.metadata.get("placement_backend_config"), Mapping
+                        )
+                        else backend_config
+                    ),
+                    execution_signature=(
+                        execution_signature_for(
+                            job, BatchResolution.resolved_batch_size(job)
+                        )
+                        if execution_signature_for is not None
+                        else None
+                    ),
                 )
                 for job in active_jobs
             ]
@@ -607,6 +639,12 @@ class TimeAwareObjectiveScorer:
                 candidate,
                 backend_name=backend_name,
                 batch_size=option.batch_size,
+                backend_config=backend_config,
+                execution_signature=(
+                    execution_signature_for(candidate, option.batch_size)
+                    if execution_signature_for is not None
+                    else None
+                ),
             )
             descriptors.append(candidate_descriptor)
             profile_key = build_colocation_profile_key(self.estimator.repository.hardware_key(), descriptors)
@@ -697,6 +735,7 @@ class TimeAwareObjectiveScorer:
                 "requires_live_trial": not rejected and self.settings.gpu_scheduler.colocation.live_trial_enabled,
                 "preexisting_job_ids": [job.job_id for job in active_jobs],
                 "objective_version": self.settings.gpu_scheduler.objective.objective_version,
+                "backend_config": dict(backend_config or {}),
             }
             evaluated = EvaluatedGroup(
                 jobs=[candidate],

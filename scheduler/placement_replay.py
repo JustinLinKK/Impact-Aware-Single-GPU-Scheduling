@@ -30,13 +30,21 @@ class PlacementReplayMixin:
         job: TrainingJob, fallback_backend: str
     ) -> dict[str, object]:
         """Build the stable member description used in placement profiles."""
-        return {
-            "signature": job.packing.signature or job.job_id,
+        descriptor: dict[str, object] = {
+            "signature": (
+                job.metadata.get("placement_source_fingerprint_signature")
+                or job.packing.signature
+                or job.job_id
+            ),
             "batch_size": BatchResolution.resolved_batch_size(job),
             "backend_name": str(
                 job.metadata.get("placement_backend") or fallback_backend
             ),
         }
+        backend_config = job.metadata.get("placement_backend_config")
+        if isinstance(backend_config, dict) and backend_config:
+            descriptor["backend_config"] = dict(backend_config)
+        return descriptor
 
     def _workload_identity(self, job: TrainingJob) -> WorkloadIdentity:
         """Derive a replay-safe identity from explicit and inferred metadata."""

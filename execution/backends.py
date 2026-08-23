@@ -147,7 +147,15 @@ class MPSBackend:
             "OMP_NUM_THREADS": str(mps_settings.default_omp_num_threads),
             "MKL_NUM_THREADS": str(mps_settings.default_mkl_num_threads),
         }
-        if len(jobs) == 1:
+        selected_config = jobs[0].metadata.get("placement_backend_config") if jobs else None
+        configured_percentages = (
+            selected_config.get("allocation_percentages")
+            if isinstance(selected_config, dict)
+            else None
+        )
+        if isinstance(configured_percentages, list) and len(configured_percentages) == len(jobs):
+            percentages = [int(value) for value in configured_percentages]
+        elif len(jobs) == 1:
             percentages = [100]
         elif len(jobs) == 2:
             percentages = [

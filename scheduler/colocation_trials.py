@@ -117,6 +117,9 @@ class ColocationTrialMixin:
                 trial.candidate_solo_epoch_seconds,
                 pretrial,
             ),
+            scheduler_decision_mode=trial.scheduler_decision_mode,
+            estimated_trial_cost_seconds=trial.estimated_trial_cost_seconds,
+            setup_cost_seconds=trial.setup_cost_seconds,
         )
         self._colocation_trial = restarted
         self.store.update_job(
@@ -192,6 +195,20 @@ class ColocationTrialMixin:
                 started_at,
                 candidate_solo_epoch_seconds,
                 pretrial_epoch_seconds,
+            ),
+            scheduler_decision_mode=str(
+                plan.objective_breakdown.get("scheduler_decision_mode")
+                or "baseline"
+            ),
+            estimated_trial_cost_seconds=float(
+                plan.objective_breakdown.get("estimated_trial_cost_seconds")
+                or 0.0
+            ),
+            setup_cost_seconds=float(
+                self.settings.gpu_scheduler.source_trial_ranking.estimated_setup_seconds
+                if plan.objective_breakdown.get("scheduler_decision_mode")
+                == "backend_awared"
+                else 0.0
             ),
         )
         self._colocation_trial = trial

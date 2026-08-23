@@ -12,6 +12,7 @@ import math
 import statistics
 from typing import Callable, Iterable
 
+from .pareto import pareto_fronts
 from .time_objective import EpochRateSet, project_piecewise_drain
 
 
@@ -33,6 +34,11 @@ class TraceJob:
     backend_allowlist: tuple[str, ...] = ("cuda_process",)
     validation_metrics: tuple[float | None, ...] = ()
     planned_epochs: int | None = None
+    compute_pressure_proxy: float = 0.0
+    memory_pressure_proxy: float = 0.0
+    large_operation_fraction: float = 0.0
+    synchronization_pressure: float = 0.0
+    analysis_uncertainty: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +72,7 @@ class TracePack:
     @property
     def actual_memory_mb(self) -> float:
         return sum(option.actual_memory_mb if option.actual_memory_mb is not None else option.memory_mb for option in self.options)
+
 
 @dataclass(frozen=True, slots=True)
 class TraceMetrics:
@@ -350,7 +357,50 @@ def simulate_policy(
     return trace_metrics(problem, policy, completion, first_dispatch, dispatches=dispatches)
 
 
-def simulate_recursive_time_aware(problem: TraceProblem) -> TraceMetrics:
+def _trace_backend_risks(
+    problem: TraceProblem,
+    member_ids: tuple[str, ...],
+    *,
+    backend_name: str,
+) -> dict[str, float]:
+    jobs = {job.job_id: job for job in problem.jobs}
+    members = [jobs[job_id] for job_id in member_ids]
+    compute = [max(0.0, job.compute_pressure_proxy) for job in members]
+    memory = [max(0.0, job.memory_pressure_proxy) for job in members]
+    large = [max(0.0, job.large_operation_fraction) for job in members]
+    uncertainty = max((job.analysis_uncertainty for job in members), default=1.0)
+
+    def pairwise(values: list[float]) -> float:
+        return sum(left * right for left, right in combinations(values, 2))
+
+    if backend_name in {"mps", "mps_process"}:
+        return {
+            "compute_excess": max(0.0, sum(compute) - 1.0),
+            "bandwidth_excess": max(0.0, sum(memory) - 1.0),
+            "same_resource_conflict": pairwise(compute) + pairwise(memory),
+            "large_operation_conflict": pairwise(large),
+            "analysis_uncertainty": uncertainty,
+        }
+    if backend_name in {"stream", "cuda_stream"}:
+        return {
+            "sync_conflict": sum(job.synchronization_pressure for job in members),
+            "compute_excess": max(0.0, sum(compute) - 1.0),
+            "bandwidth_excess": max(0.0, sum(memory) - 1.0),
+            "large_operation_conflict": pairwise(large),
+            "analysis_uncertainty": uncertainty,
+        }
+    pressure = [max(left, right) for left, right in zip(compute, memory, strict=True)]
+    return {
+        "continuous_gpu_conflict": pairwise(pressure),
+        "large_operation_conflict": pairwise(large),
+        "synchronization_pressure": sum(job.synchronization_pressure for job in members),
+        "analysis_uncertainty": uncertainty,
+    }
+
+
+def simulate_recursive_time_aware(
+    problem: TraceProblem, *, backend_aware: bool = False
+) -> TraceMetrics:
     """Simulate incremental packing with useful two-epoch admission trials."""
 
     jobs = {job.job_id: job for job in problem.jobs}
@@ -375,6 +425,7 @@ def simulate_recursive_time_aware(problem: TraceProblem) -> TraceMetrics:
     }
     stalled_members: set[str] | None = None
     active_backend = "exclusive"
+    preferred_candidate_id: str | None = None
     now = min((job.release_seconds for job in problem.jobs), default=0.0)
     epsilon = 1e-9
 
@@ -415,6 +466,20 @@ def simulate_recursive_time_aware(problem: TraceProblem) -> TraceMetrics:
             if backend_name != "exclusive" and availability.get(backend_name, False):
                 return backend_name
         return None
+
+    def amortizable_pair(left_id: str, right_id: str) -> bool:
+        left_seconds = remaining_epochs[left_id] * solo_epoch_seconds(left_id, predicted=True)
+        right_seconds = remaining_epochs[right_id] * solo_epoch_seconds(right_id, predicted=True)
+        optimistic_gain = min(left_seconds, right_seconds)
+        trial_cost = (
+            3.0
+            * problem.colocation_trial_epochs
+            * max(
+                solo_epoch_seconds(left_id, predicted=True),
+                solo_epoch_seconds(right_id, predicted=True),
+            )
+        )
+        return optimistic_gain + epsilon >= trial_cost
 
     def record_segment(member_ids: list[str], duration: float, rates: dict[str, float]) -> None:
         if duration <= epsilon or not member_ids:
@@ -462,7 +527,7 @@ def simulate_recursive_time_aware(problem: TraceProblem) -> TraceMetrics:
         return duration, finished, rates
 
     def start_anchor() -> bool:
-        nonlocal active, active_backend
+        nonlocal active, active_backend, preferred_candidate_id
         ready = [
             job_id
             for job_id, job in jobs.items()
@@ -477,6 +542,60 @@ def simulate_recursive_time_aware(problem: TraceProblem) -> TraceMetrics:
         eligible = starving or ready
         for job_id in eligible:
             selected_options[job_id] = fastest_option(job_id) or jobs[job_id].options[0]
+        if backend_aware and len(eligible) >= 2:
+            pairs: list[tuple[str, str]] = []
+            for left_id, right_id in combinations(sorted(eligible), 2):
+                if overlap_backend([left_id, right_id]) is None:
+                    continue
+                if not problem.pair_compatible(jobs[left_id], jobs[right_id]):
+                    continue
+                if not amortizable_pair(left_id, right_id):
+                    continue
+                if (
+                    selected_options[left_id].memory_mb
+                    + selected_options[right_id].memory_mb
+                    > problem.memory_budget_mb + epsilon
+                ):
+                    continue
+                pairs.append((left_id, right_id))
+            if pairs:
+                fronts = pareto_fronts(
+                    pairs,
+                    lambda pair: _trace_backend_risks(
+                        problem,
+                        pair,
+                        backend_name=overlap_backend(list(pair)) or "cuda_process",
+                    ),
+                    stable_key=lambda pair: "::".join(pair),
+                )
+                selected_pair = min(
+                    pairs,
+                    key=lambda pair: (
+                        fronts["::".join(pair)],
+                        -min(
+                            remaining_epochs[job_id]
+                            * solo_epoch_seconds(job_id, predicted=True)
+                            for job_id in pair
+                        ),
+                        max(jobs[job_id].analysis_uncertainty for job_id in pair),
+                        pair,
+                    ),
+                )
+                anchor = min(
+                    selected_pair,
+                    key=lambda job_id: (
+                        remaining_epochs[job_id]
+                        * solo_epoch_seconds(job_id, predicted=True),
+                        job_id,
+                    ),
+                )
+                preferred_candidate_id = next(
+                    job_id for job_id in selected_pair if job_id != anchor
+                )
+                active = [anchor]
+                first_dispatch.setdefault(anchor, now)
+                active_backend = overlap_backend(list(selected_pair)) or "exclusive"
+                return True
         anchor = min(
             eligible,
             key=lambda job_id: (
@@ -510,6 +629,38 @@ def simulate_recursive_time_aware(problem: TraceProblem) -> TraceMetrics:
                 option = fastest_option(job_id)
                 if option is not None:
                     selected_options[job_id] = option
+        if backend_aware:
+            eligible_candidates = [
+                job_id
+                for job_id in ready
+                if job_id in selected_options
+                and len(active) == 1
+                and amortizable_pair(active[0], job_id)
+            ]
+            if preferred_candidate_id in eligible_candidates:
+                eligible_candidates.remove(preferred_candidate_id)
+                eligible_candidates.insert(0, preferred_candidate_id)
+                return eligible_candidates
+            fronts = pareto_fronts(
+                eligible_candidates,
+                lambda job_id: _trace_backend_risks(
+                    problem,
+                    tuple([*active, job_id]),
+                    backend_name=active_backend,
+                ),
+                stable_key=lambda job_id: job_id,
+            )
+            return sorted(
+                eligible_candidates,
+                key=lambda job_id: (
+                    fronts[job_id],
+                    remaining_epochs[job_id]
+                    * solo_epoch_seconds(job_id, predicted=True),
+                    -jobs[job_id].priority,
+                    jobs[job_id].release_seconds,
+                    job_id,
+                ),
+            )
         return sorted(
             (job_id for job_id in ready if job_id in selected_options),
             key=lambda job_id: (
@@ -538,7 +689,9 @@ def simulate_recursive_time_aware(problem: TraceProblem) -> TraceMetrics:
         return overlap_backend([*active, candidate_id]) == active_backend
 
     def run_trial(candidate_id: str) -> str:
-        nonlocal active, stalled_members
+        nonlocal active, stalled_members, preferred_candidate_id
+        preferred_candidate_id = None
+        trial_started_at = now
         preexisting = list(active)
         pretrial_rates = {job_id: packed_epoch_seconds(job_id, preexisting) for job_id in preexisting}
         active.append(candidate_id)
@@ -625,11 +778,9 @@ def simulate_recursive_time_aware(problem: TraceProblem) -> TraceMetrics:
                 active_projection.total_seconds
                 + remaining_epochs[candidate_id] * solo_epoch_seconds(candidate_id, predicted=True)
             )
-            gain = (
-                sequential / packed_projection.total_seconds
-                if packed_projection.total_seconds > epsilon
-                else float("inf")
-            )
+            charged_trial_seconds = now - trial_started_at if backend_aware else 0.0
+            charged_packed = packed_projection.total_seconds + charged_trial_seconds
+            gain = sequential / charged_packed if charged_packed > epsilon else float("inf")
         if gain + epsilon >= problem.colocation_min_gain:
             return "accepted"
         active = [job_id for job_id in active if job_id != candidate_id]
@@ -676,7 +827,7 @@ def simulate_recursive_time_aware(problem: TraceProblem) -> TraceMetrics:
 
     return trace_metrics(
         problem,
-        "parallel_time_aware",
+        "backend_awared" if backend_aware else "parallel_time_aware",
         completion,
         first_dispatch,
         dispatches=dispatches,
@@ -829,8 +980,60 @@ def compare_policies(problem: TraceProblem) -> list[TraceMetrics]:
         serial,
         simulate_policy(problem, "legacy_vram_fill", _fill_choice),
         simulate_recursive_time_aware(problem),
+        simulate_recursive_time_aware(problem, backend_aware=True),
         oracle(problem, serial_baseline=serial),
     ]
+
+
+def backend_aware_benchmark_fixture() -> TraceProblem:
+    options = (TraceBatchOption(4, 2_000, 60.0),)
+    jobs = (
+        TraceJob(
+            "compute-a",
+            0,
+            0,
+            options,
+            backend_allowlist=("mps",),
+            planned_epochs=20,
+            compute_pressure_proxy=0.8,
+            memory_pressure_proxy=0.1,
+            large_operation_fraction=0.6,
+        ),
+        TraceJob(
+            "compute-b",
+            0,
+            0,
+            (TraceBatchOption(4, 2_000, 50.0),),
+            backend_allowlist=("mps",),
+            planned_epochs=20,
+            compute_pressure_proxy=0.8,
+            memory_pressure_proxy=0.1,
+            large_operation_fraction=0.6,
+        ),
+        TraceJob(
+            "memory",
+            0,
+            0,
+            (TraceBatchOption(4, 2_000, 70.0),),
+            backend_allowlist=("mps",),
+            planned_epochs=20,
+            compute_pressure_proxy=0.1,
+            memory_pressure_proxy=0.8,
+            large_operation_fraction=0.1,
+        ),
+    )
+    return TraceProblem(
+        jobs=jobs,
+        memory_budget_mb=6_500,
+        parallel_cap=2,
+        initial_backend_availability={"exclusive": True, "mps": True},
+        slowdown_by_pair={
+            ("compute-a", "compute-b"): 3.0,
+            ("compute-a", "memory"): 1.05,
+            ("compute-b", "memory"): 1.05,
+        },
+        colocation_trial_epochs=2,
+    )
 
 
 def benchmark_fixture() -> TraceProblem:

@@ -10,7 +10,8 @@ from datetime import datetime, timezone
 from typing import Iterable
 
 from ..domain import SchedulingClass, TrainingJob, parse_timestamp
-from ..config import SchedulerSettings
+from ..config import SCHEDULER_DECISION_MODE_BACKEND_AWARED, SchedulerSettings
+from .backend_aware_planner import BackendAwarePlacementPlanner
 from .candidate_generator import CandidateGenerator
 from .compatibility import CompatibilityEvaluator
 from .planning_repository import PlanningRepository
@@ -41,6 +42,14 @@ class PlacementPlanner:
             self.estimator,
             self.compatibility,
             self.candidate_generator,
+        )
+        self.backend_aware = BackendAwarePlacementPlanner(
+            settings,
+            repository,
+            self.estimator,
+            self.candidate_generator,
+            self.compatibility,
+            self.time_objective,
         )
 
     def predicted_remaining_runtime_seconds(self, job: TrainingJob, *, backend_name: str) -> float | None:
@@ -161,10 +170,25 @@ class PlacementPlanner:
         if remaining_slots is not None and remaining_slots <= 0:
             return None
         normal_window = [job for job in window if job.scheduling_class == SchedulingClass.NORMAL]
+        backend_aware_window = list(normal_window)
         if mandatory is not None:
             normal_window = [mandatory]
 
         if not active_jobs:
+            if (
+                self.settings.gpu_scheduler.scheduler_decision_mode
+                == SCHEDULER_DECISION_MODE_BACKEND_AWARED
+            ):
+                pair_plan = self.backend_aware.choose_empty(
+                    backend_aware_window,
+                    mandatory=mandatory,
+                    backend_available=backend_available,
+                    effective_priority=lambda job: self._effective_priority(
+                        job, now=now
+                    ),
+                )
+                if pair_plan is not None:
+                    return pair_plan
             anchor_candidates: list[tuple[tuple[object, ...], TrainingJob, str, object]] = []
             allow_stack_anchor = cap != 1
             for job in normal_window:
@@ -240,6 +264,20 @@ class PlacementPlanner:
             and backend_available.get(backend_name, False)
             and (not active_backends or backend_name in active_backends)
         ]
+        if (
+            self.settings.gpu_scheduler.scheduler_decision_mode
+            == SCHEDULER_DECISION_MODE_BACKEND_AWARED
+        ):
+            return self.backend_aware.choose_active(
+                normal_window,
+                active_jobs=active_jobs,
+                active_vram_mb=active_vram_mb,
+                mandatory=mandatory,
+                backend_candidates=backend_candidates,
+                effective_priority=lambda job: self._effective_priority(
+                    job, now=now
+                ),
+            )
         ordered_candidates: list[tuple[tuple[object, ...], TrainingJob]] = []
         for job in normal_window:
             solo_remaining = self._predicted_solo_remaining(job)

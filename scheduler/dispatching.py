@@ -153,6 +153,32 @@ class DispatchMixin:
                 )
                 for job in selected_jobs
             ]
+        if plan.backend_config or plan.trial_metadata.get(
+            "start_delay_seconds_by_job"
+        ):
+            delay_by_job = dict(
+                plan.trial_metadata.get("start_delay_seconds_by_job") or {}
+            )
+            source_signatures = dict(
+                plan.trial_metadata.get("source_fingerprint_signatures") or {}
+            )
+            configured_jobs: list[TrainingJob] = []
+            for job in selected_jobs:
+                updated = job.copy(
+                    metadata={
+                        **job.metadata,
+                        "placement_backend_config": dict(plan.backend_config),
+                        "placement_start_delay_seconds": float(
+                            delay_by_job.get(job.job_id, 0.0)
+                        ),
+                        "placement_source_fingerprint_signature": source_signatures.get(
+                            job.job_id
+                        ),
+                    }
+                )
+                self.store.save_job(updated)
+                configured_jobs.append(updated)
+            selected_jobs = configured_jobs
         replayed = bool(plan.objective_breakdown.get("placement_replay"))
         if replayed:
             replay_slot = int(plan.objective_breakdown.get("placement_replay_slot", 0))
@@ -176,9 +202,17 @@ class DispatchMixin:
         for job in selected_jobs:
             self._preload_job_baseline(job)
 
+        candidate_job_id = str(
+            plan.trial_metadata.get("candidate_job_id")
+            or (selected_jobs[0].job_id if selected_jobs else "")
+        )
+        candidate_job = next(
+            (job for job in selected_jobs if job.job_id == candidate_job_id),
+            selected_jobs[0] if selected_jobs else None,
+        )
         prepared_trial = (
-            self._prepare_colocation_trial(plan, selected_jobs[0])
-            if selected_jobs
+            self._prepare_colocation_trial(plan, candidate_job)
+            if candidate_job is not None
             else None
         )
 
@@ -376,6 +410,7 @@ class DispatchMixin:
                     "placement_objective_version": plan.objective_version,
                     "placement_objective_breakdown": plan.objective_breakdown,
                     "placement_trial_metadata": plan.trial_metadata,
+                    "placement_backend_config": dict(plan.backend_config),
                     "placement_mandatory_anchor_job_id": plan.mandatory_anchor_job_id,
                     **self._prediction_metadata(job.job_id),
                 },

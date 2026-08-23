@@ -165,6 +165,33 @@ starving job overrides that ordering. Each addition must pass scheduling class,
 parallel cap, backend and pair compatibility, live-admission, batch-option, and
 predicted average-VRAM checks before any concurrent work begins.
 
+`gpu_scheduler.scheduler_decision_mode` selects the trial ordering layer:
+
+- `baseline` (the default) preserves the shortest-anchor and shortest-newcomer
+  behavior described above.
+- `backend_awared` jointly enumerates pairs at an empty-GPU boundary and ranks
+  empty-GPU pairs or active-group newcomers with deterministic Pareto fronts.
+  The risk vectors are derived from a CPU-only AST fingerprint and differ for
+  MPS, CUDA streams, and ordinary CUDA processes. Static analysis only orders
+  candidates; unknown placements still require the same measured live trial.
+
+Backend-aware mode applies backend compatibility, batch/accuracy, conservative
+VRAM overhead, known-bad exact-profile, and optimistic trial-amortization gates
+before ranking. Exact profile identity includes hardware/runtime identity,
+source/graph signature, dtype, batch vector, backend, and backend configuration;
+epoch count and submission time are excluded. MPS pair templates are limited to
+50/50, 60/40, and 40/60, and stream offsets to 0, quarter-step, and half-step.
+Nonzero stream offsets are rejected when step time is unavailable.
+
+The analyzer never imports submitted modules or initializes CUDA. It recognizes
+common linear/GEMM, convolution, attention, normalization, activation,
+reduction, embedding, pooling, layout/transfer, recurrent, and optimizer calls,
+plus synchronization, blocking/nonblocking transfers, DataLoader workers,
+checkpoint/evaluation calls, CPU augmentation, dynamic control flow, and
+custom/fused-operation markers. Dynamic dispatch, runtime-generated modules,
+opaque extensions, missing shapes, and unsupported custom operators degrade to
+low confidence and baseline tie-breaking; they do not block every candidate.
+
 The final admission check is a live trial requiring two fresh epochs from every
 member. These are ordinary training epochs: progress and checkpoints are retained
 whether the candidate is accepted or paused. If the newcomer reaches epoch two

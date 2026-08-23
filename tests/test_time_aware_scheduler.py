@@ -67,6 +67,7 @@ from localml_scheduler.scheduler.trace_simulator import (
     TraceMemorySample,
     TraceProblem,
     _time_aware_choice,
+    backend_aware_benchmark_fixture,
     benchmark_fixture,
     compare_policies,
     feasible_packs,
@@ -593,6 +594,7 @@ def test_early_stop_hook_persists_state_and_completes_successfully() -> None:
 def test_trace_replay_compares_serial_fill_time_aware_and_oracle() -> None:
     results = {item.policy: item for item in compare_policies(benchmark_fixture())}
     assert set(results) == {
+        "backend_awared",
         "serial_fifo",
         "legacy_vram_fill",
         "parallel_time_aware",
@@ -601,10 +603,20 @@ def test_trace_replay_compares_serial_fill_time_aware_and_oracle() -> None:
     assert results["parallel_time_aware"].makespan_seconds < results["legacy_vram_fill"].makespan_seconds
     assert results["parallel_time_aware"].mean_flow_seconds < results["serial_fifo"].mean_flow_seconds
     assert results["parallel_time_aware"].starvation_count == 0
+    assert results["backend_awared"].hard_constraint_violations == 0
     report = markdown_table(results.values())
     assert "Total flow (s)" in report
     assert "Median flow (s)" in report
     assert "Actual over-budget packs" in report
+
+
+def test_backend_aware_trace_ranking_reduces_trials_and_makespan() -> None:
+    problem = backend_aware_benchmark_fixture()
+    baseline = simulate_recursive_time_aware(problem)
+    aware = simulate_recursive_time_aware(problem, backend_aware=True)
+    assert aware.makespan_seconds < baseline.makespan_seconds
+    assert aware.slowdown_rejections < baseline.slowdown_rejections
+    assert aware.hard_constraint_violations == 0
 
 
 class _DrainSupervisor:
