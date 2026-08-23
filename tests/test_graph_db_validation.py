@@ -1167,6 +1167,8 @@ class GraphDatabaseValidationTest(unittest.TestCase):
                 "get_hardware_feature_context",
                 "get_hardware_optimization_context",
                 "record_tuning_outcome",
+                "get_cuda_docs_query",
+                "ingest_cuda_docs_answer",
             },
         )
 
