@@ -8,6 +8,12 @@ from typing import Any
 import json
 import re
 
+from ..backend_mode import (
+    is_retired_backend,
+    normalize_backend_allowlist,
+    normalize_runtime_backend,
+    stream_removal_message,
+)
 from .common import parse_timestamp, stable_job_id, to_primitive, utc_now
 
 
@@ -123,6 +129,9 @@ class PackingSpec:
     max_slowdown_ratio: float | None = None
     backend_allowlist: list[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self.backend_allowlist = normalize_backend_allowlist(self.backend_allowlist)
+
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "PackingSpec":
         payload = dict(payload or {})
@@ -137,7 +146,10 @@ class PackingSpec:
     def allows_backend(self, backend_name: str) -> bool:
         if not self.backend_allowlist:
             return True
-        return backend_name in self.backend_allowlist
+        return (
+            normalize_runtime_backend(backend_name, warn_legacy=False)
+            in self.backend_allowlist
+        )
 
 
 @dataclass(slots=True)
@@ -441,8 +453,46 @@ class TrainingJob:
         return job
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "TrainingJob":
+    def from_dict(
+        cls,
+        payload: dict[str, Any],
+        *,
+        historical_read: bool = False,
+    ) -> "TrainingJob":
         payload = dict(payload)
+        raw_packing = dict(payload.get("packing") or {})
+        metadata = dict(payload.get("metadata") or {})
+        backend_values = [
+            *(raw_packing.get("backend_allowlist") or []),
+            metadata.get("placement_backend"),
+            metadata.get("effective_backend"),
+        ]
+        retired_backends = sorted(
+            {
+                str(value)
+                for value in backend_values
+                if value and is_retired_backend(value)
+            }
+        )
+        if retired_backends:
+            if not historical_read:
+                raise ValueError(stream_removal_message())
+            raw_packing["eligible"] = False
+            raw_packing["backend_allowlist"] = []
+            payload["packing"] = raw_packing
+            metadata.update(
+                {
+                    "historical_backend_identifiers": retired_backends,
+                    "retired_backend_record": True,
+                    "selectable": False,
+                }
+            )
+            payload["metadata"] = metadata
+            payload["hold"] = True
+            payload["status_reason"] = (
+                payload.get("status_reason")
+                or "historical job uses a retired backend and is non-selectable"
+            )
         payload["status"] = JobStatus(payload.get("status", JobStatus.PENDING.value))
         payload["scheduling_class"] = SchedulingClass(payload.get("scheduling_class", SchedulingClass.NORMAL.value))
         payload["config"] = JobConfig.from_dict(payload["config"])

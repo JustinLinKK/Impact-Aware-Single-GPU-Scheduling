@@ -19,7 +19,7 @@ packing:
   signature: "toy_classification:example"
   family: "toy-mlp"
   max_slowdown_ratio: 1.25
-  backend_allowlist: ["mps", "cuda_process"]
+  backend_allowlist: ["mps_process"]
 batch_probe:
   enabled: true
   probe_target: "localml_scheduler.examples.toy_pytorch_runner:probe_toy_training_batch_size"

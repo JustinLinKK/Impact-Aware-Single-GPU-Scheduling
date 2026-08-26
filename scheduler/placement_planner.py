@@ -192,14 +192,16 @@ class PlacementPlanner:
             anchor_candidates: list[tuple[tuple[object, ...], TrainingJob, str, object]] = []
             allow_stack_anchor = cap != 1
             for job in normal_window:
-                backends = [
-                    backend_name
-                    for backend_name in self.settings.gpu_scheduler.backend_priority
+                packing_backend = self.settings.gpu_scheduler.packing_backend
+                backends = (
+                    [packing_backend]
                     if allow_stack_anchor
-                    and backend_name != "exclusive"
-                    and backend_available.get(backend_name, False)
-                    and self.compatibility.pack_eligible(job, backend_name=backend_name)
-                ]
+                    and backend_available.get(packing_backend, False)
+                    and self.compatibility.pack_eligible(
+                        job, backend_name=packing_backend
+                    )
+                    else []
+                )
                 for backend_name in backends:
                     option = self._fastest_time_option(job, backend_name)
                     solo_remaining = self._predicted_solo_remaining(job)
@@ -257,13 +259,13 @@ class PlacementPlanner:
         }
         if "exclusive" in active_backends or len(active_backends) > 1:
             return None
-        backend_candidates = [
-            backend_name
-            for backend_name in self.settings.gpu_scheduler.backend_priority
-            if backend_name != "exclusive"
-            and backend_available.get(backend_name, False)
-            and (not active_backends or backend_name in active_backends)
-        ]
+        packing_backend = self.settings.gpu_scheduler.packing_backend
+        backend_candidates = (
+            [packing_backend]
+            if backend_available.get(packing_backend, False)
+            and (not active_backends or packing_backend in active_backends)
+            else []
+        )
         if (
             self.settings.gpu_scheduler.scheduler_decision_mode
             == SCHEDULER_DECISION_MODE_BACKEND_AWARED

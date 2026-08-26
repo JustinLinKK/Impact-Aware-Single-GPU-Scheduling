@@ -117,7 +117,9 @@ def query_hardware_node(
         mode=precision_mode,
         datatypes=props.get("datatypes"),
     )
-    recommended_patterns = list(props.get("recommended_patterns", []))
+    recommended_patterns = _filter_patterns_by_stage(
+        _as_str_list(props.get("recommended_patterns")), stage
+    )
     if stage in {"datatype_precision", "tuning"}:
         recommended_patterns = [
             pattern
@@ -146,7 +148,9 @@ def query_hardware_node(
         "precision_policy": precision_policy.to_dict() if stage in {"datatype_precision", "tuning"} else None,
         **feature_index,
         "recommended_patterns": recommended_patterns,
-        "avoid_patterns": props.get("avoid_patterns", []),
+        "avoid_patterns": _filter_patterns_by_stage(
+            _as_str_list(props.get("avoid_patterns")), stage
+        ),
         "feature_query": {
             "tool": "query_hardware_features",
             "hardware_name": _as_str(props.get("name")) or hardware_name,
@@ -175,7 +179,7 @@ _COMPOSITE_STAGE_SPECS: dict[str, tuple[tuple[str, set[str], set[str]], ...]] = 
         ("datatype", _STAGE_CATEGORIES["datatype"], _STAGE_FEATURE_IDS.get("datatype", set())),
         (
             "model",
-            {"compute_capability", "interconnect", "tensor_core"},
+            {"compute_capability", "interconnect", "parallelism", "tensor_core"},
             _STAGE_FEATURE_IDS.get("model", set()),
         ),
     ),
@@ -304,6 +308,30 @@ def _normalize_stage(agent_stage: str | None) -> str | None:
     if not stage or stage == "all":
         return None
     return _STAGE_ALIASES.get(stage, stage)
+
+
+def _filter_patterns_by_stage(
+    patterns: list[str], stage: str | None
+) -> list[str]:
+    if not stage:
+        return patterns
+    component_stages = {
+        "model_design": ("datatype", "model"),
+        "datatype_precision": ("tuning",),
+        "training_evaluation": ("optimizer", "tuning"),
+    }.get(stage, (stage,))
+    keywords = [
+        keyword
+        for component in component_stages
+        for keyword in _STAGE_KEYWORDS.get(component, [])
+    ]
+    if not keywords:
+        return []
+    return [
+        pattern
+        for pattern in patterns
+        if any(keyword in _strip_urls(pattern).lower() for keyword in keywords)
+    ]
 
 
 def _stage_specs(stage: str | None) -> tuple[tuple[str, set[str], set[str]], ...]:

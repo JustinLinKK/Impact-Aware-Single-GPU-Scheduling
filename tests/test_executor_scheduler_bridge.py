@@ -309,7 +309,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
                 gpu_scheduler={
                     "submission_defaults": {
                         "packing_eligible": True,
-                        "backend_allowlist": ["stream"],
+                        "backend_allowlist": ["cuda_process"],
                     }
                 },
             )
@@ -326,9 +326,9 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertIsNone(result.exc_type)
             submitted = fake_api.submitted_jobs[0]
             self.assertTrue(submitted.packing.eligible)
-            self.assertEqual(submitted.packing.backend_allowlist, ["stream"])
+            self.assertEqual(submitted.packing.backend_allowlist, ["cuda_process"])
 
-    def test_scheduler_bridge_leaves_empty_raw_allowlist_unrestricted(self) -> None:
+    def test_scheduler_bridge_resolves_empty_allowlist_to_configured_backend(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir) / "runtime"
             workdir = Path(tmpdir) / "workdir"
@@ -355,7 +355,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertIsNone(result.exc_type)
             submitted = fake_api.submitted_jobs[0]
             self.assertTrue(submitted.packing.eligible)
-            self.assertEqual(submitted.packing.backend_allowlist, [])
+            self.assertEqual(submitted.packing.backend_allowlist, ["mps_process"])
             self.assertIsNone(submitted.preload_source)
 
     def test_run_many_submits_round_before_collecting_results(self) -> None:

@@ -118,7 +118,7 @@ class SQLiteStateStore:
         if not row:
             return None
         payload = json.loads(row["payload_json"])
-        return TrainingJob.from_dict(payload)
+        return TrainingJob.from_dict(payload, historical_read=True)
 
     def list_jobs(self, statuses: Iterable[JobStatus | str] | None = None) -> list[TrainingJob]:
         query = "SELECT payload_json FROM jobs"
@@ -131,7 +131,12 @@ class SQLiteStateStore:
         query += " ORDER BY priority DESC, queue_sequence ASC"
         with self._connect() as connection:
             rows = connection.execute(query, params).fetchall()
-        return [TrainingJob.from_dict(json.loads(row["payload_json"])) for row in rows]
+        return [
+            TrainingJob.from_dict(
+                json.loads(row["payload_json"]), historical_read=True
+            )
+            for row in rows
+        ]
 
     def runnable_jobs(self) -> list[TrainingJob]:
         jobs = self.list_jobs(

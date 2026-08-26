@@ -128,6 +128,7 @@ class TraceMetrics:
 class TraceProblem:
     jobs: tuple[TraceJob, ...]
     memory_budget_mb: float
+    packing_backend: str = "cuda_process"
     parallel_cap: int | None = None
     default_slowdown: float = 1.0
     slowdown_by_pair: dict[tuple[str, str], float] | None = None
@@ -237,9 +238,10 @@ def _backend_for_members(problem: TraceProblem, members: tuple[TraceJob, ...], n
     common = set(members[0].backend_allowlist)
     for member in members[1:]:
         common.intersection_update(member.backend_allowlist)
-    for backend_name in sorted(common):
-        if backend_name != "exclusive" and availability.get(backend_name, False):
-            return backend_name
+    if problem.packing_backend in common and availability.get(
+        problem.packing_backend, False
+    ):
+        return problem.packing_backend
     return None
 
 
@@ -373,19 +375,11 @@ def _trace_backend_risks(
     def pairwise(values: list[float]) -> float:
         return sum(left * right for left, right in combinations(values, 2))
 
-    if backend_name in {"mps", "mps_process"}:
+    if backend_name == "mps_process":
         return {
             "compute_excess": max(0.0, sum(compute) - 1.0),
             "bandwidth_excess": max(0.0, sum(memory) - 1.0),
             "same_resource_conflict": pairwise(compute) + pairwise(memory),
-            "large_operation_conflict": pairwise(large),
-            "analysis_uncertainty": uncertainty,
-        }
-    if backend_name in {"stream", "cuda_stream"}:
-        return {
-            "sync_conflict": sum(job.synchronization_pressure for job in members),
-            "compute_excess": max(0.0, sum(compute) - 1.0),
-            "bandwidth_excess": max(0.0, sum(memory) - 1.0),
             "large_operation_conflict": pairwise(large),
             "analysis_uncertainty": uncertainty,
         }
@@ -462,9 +456,10 @@ def simulate_recursive_time_aware(
         for job_id in member_ids:
             allowed = set(jobs[job_id].backend_allowlist)
             common = allowed if common is None else common.intersection(allowed)
-        for backend_name in sorted(common or ()):
-            if backend_name != "exclusive" and availability.get(backend_name, False):
-                return backend_name
+        if problem.packing_backend in (common or ()) and availability.get(
+            problem.packing_backend, False
+        ):
+            return problem.packing_backend
         return None
 
     def amortizable_pair(left_id: str, right_id: str) -> bool:
@@ -993,7 +988,7 @@ def backend_aware_benchmark_fixture() -> TraceProblem:
             0,
             0,
             options,
-            backend_allowlist=("mps",),
+            backend_allowlist=("mps_process",),
             planned_epochs=20,
             compute_pressure_proxy=0.8,
             memory_pressure_proxy=0.1,
@@ -1004,7 +999,7 @@ def backend_aware_benchmark_fixture() -> TraceProblem:
             0,
             0,
             (TraceBatchOption(4, 2_000, 50.0),),
-            backend_allowlist=("mps",),
+            backend_allowlist=("mps_process",),
             planned_epochs=20,
             compute_pressure_proxy=0.8,
             memory_pressure_proxy=0.1,
@@ -1015,7 +1010,7 @@ def backend_aware_benchmark_fixture() -> TraceProblem:
             0,
             0,
             (TraceBatchOption(4, 2_000, 70.0),),
-            backend_allowlist=("mps",),
+            backend_allowlist=("mps_process",),
             planned_epochs=20,
             compute_pressure_proxy=0.1,
             memory_pressure_proxy=0.8,
@@ -1025,8 +1020,9 @@ def backend_aware_benchmark_fixture() -> TraceProblem:
     return TraceProblem(
         jobs=jobs,
         memory_budget_mb=6_500,
+        packing_backend="mps_process",
         parallel_cap=2,
-        initial_backend_availability={"exclusive": True, "mps": True},
+        initial_backend_availability={"exclusive": True, "mps_process": True},
         slowdown_by_pair={
             ("compute-a", "compute-b"): 3.0,
             ("compute-a", "memory"): 1.05,

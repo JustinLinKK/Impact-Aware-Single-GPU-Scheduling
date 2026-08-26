@@ -26,6 +26,7 @@ from localml_scheduler.scheduler.placement_planner import PlacementPlanner
 from localml_scheduler.scheduler.policies import PriorityFifoPolicy
 from localml_scheduler.scheduler.source_fingerprint import StaticJobAnalyzer
 from localml_scheduler.scheduler.trial_candidate import BackendTrialConfig
+from localml_scheduler.scheduler.trial_priority import TrialPriorityPlanner
 from localml_scheduler.storage.sqlite_store import SQLiteStateStore
 
 
@@ -41,7 +42,7 @@ def _settings(
         hardware_feature_db={"enabled": False},
         gpu_scheduler={
             "scheduler_decision_mode": decision_mode,
-            "backend_priority": ["cuda_process", "exclusive"],
+            "packing_backend": "cuda_process",
             "memory": {
                 "gpu_vram_gib": 10,
                 "predicted_budget_fraction": 0.85,
@@ -248,10 +249,10 @@ def test_mps_policy_prefers_compute_memory_complement() -> None:
     policy = BackendCompatibilityPolicy()
     config = BackendTrialConfig(allocation_percentages=(50, 50))
     complement = policy.evaluate(
-        (compute, memory), backend_name="mps", backend_config=config
+        (compute, memory), backend_name="mps_process", backend_config=config
     )
     conflict = policy.evaluate(
-        (compute, compute), backend_name="mps", backend_config=config
+        (compute, compute), backend_name="mps_process", backend_config=config
     )
     assert "MPS_COMPUTE_MEMORY_COMPLEMENT" in complement.reason_codes
     assert (
@@ -265,13 +266,13 @@ def test_backend_config_is_exact_cache_identity_and_mps_launch_input() -> None:
         {
             "signature": "left",
             "batch_size": 4,
-            "backend_name": "mps",
+            "backend_name": "mps_process",
             "backend_config": {"allocation_percentages": [50, 50]},
         },
         {
             "signature": "right",
             "batch_size": 8,
-            "backend_name": "mps",
+            "backend_name": "mps_process",
             "backend_config": {"allocation_percentages": [50, 50]},
         },
     ]
@@ -300,24 +301,32 @@ def test_backend_config_is_exact_cache_identity_and_mps_launch_input() -> None:
     ]
 
 
-def test_nonzero_stream_offset_requires_known_step_time() -> None:
+def test_active_mps_allocations_are_immutable_and_templates_are_not_reenumerated() -> None:
+    planner = TrialPriorityPlanner()
+    configs = planner.backend_configs(
+        "mps_process",
+        mps_templates=[[50, 50], [70, 30]],
+        active_config={"allocation_percentages": [60, 40]},
+    )
+    assert [config.to_dict() for config in configs] == [
+        {"allocation_percentages": [60, 40]}
+    ]
+
+
+@pytest.mark.parametrize(
+    "retired", ["stream", "cuda_stream", "mps_stream", "stream_mps"]
+)
+def test_retired_backend_cannot_enter_compatibility_policy(retired: str) -> None:
     job = TrainingJob.create(
-        "pkg:run",
-        "model",
-        "/tmp/model.py",
-        runner_kwargs={
-            "architecture_source": "x = torch.matmul(a, b)",
-            "batch_size": 1,
-        },
-        max_epochs=1,
+        "pkg:run", "model", "/tmp/model.py", runner_kwargs={"batch_size": 1}
     )
     fingerprint = StaticJobAnalyzer().analyze(job, 1)
-    assessment = BackendCompatibilityPolicy().evaluate(
-        (fingerprint, fingerprint),
-        backend_name="stream",
-        backend_config=BackendTrialConfig(stream_offset_steps=0.25),
-    )
-    assert assessment.hard_rejection_reasons == ("STREAM_OFFSET_REQUIRES_STEP_TIME",)
+    with pytest.raises(ValueError, match="retired"):
+        BackendCompatibilityPolicy().evaluate(
+            (fingerprint, fingerprint),
+            backend_name=retired,
+            backend_config=BackendTrialConfig(),
+        )
 
 
 def test_backend_aware_mode_jointly_selects_pair_and_baseline_does_not() -> None:

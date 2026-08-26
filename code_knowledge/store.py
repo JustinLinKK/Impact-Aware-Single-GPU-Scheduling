@@ -7,16 +7,25 @@ from pathlib import Path
 from typing import Any
 import hashlib
 import os
+from datetime import datetime, timezone
 
 import numpy as np
 
 from localml_scheduler.hardware_features.records import load_seed_records
+from localml_scheduler.backend_mode import (
+    BACKEND_NEUTRAL,
+    RETIRED_BACKEND_MODES,
+    RUNNER_CONTRACT_SUBPROCESS_V1,
+    normalize_runtime_backend,
+)
 
 from .records import (
     API_SYMBOL_SCHEMA_VERSION,
+    BACKEND_GUIDANCE_SCHEMA_VERSION,
     CODE_DOC_SCHEMA_VERSION,
     OPTIMIZATION_RECIPE_SCHEMA_VERSION,
     convert_hardware_feature_records,
+    load_backend_guidance_seed_records,
     load_code_knowledge_records,
     record_to_search_text,
     validate_code_knowledge_record,
@@ -30,6 +39,8 @@ _SCHEMA_BY_RECORD_TYPE = {
     "docs": CODE_DOC_SCHEMA_VERSION,
     "recipes": OPTIMIZATION_RECIPE_SCHEMA_VERSION,
     "api_symbols": API_SYMBOL_SCHEMA_VERSION,
+    "backend_guidance_rules": BACKEND_GUIDANCE_SCHEMA_VERSION,
+    "backend_guidance": BACKEND_GUIDANCE_SCHEMA_VERSION,
 }
 
 
@@ -50,6 +61,16 @@ class CodeKnowledgeSearchResult:
             "summary_text": record.get("solution_summary") or record.get("usage_summary") or record.get("text"),
             "score": self.score,
             "framework": record.get("framework"),
+            "frameworks": list(record.get("frameworks") or []),
+            "framework_version": record.get("framework_version"),
+            "framework_versions": list(record.get("framework_versions") or []),
+            "toolkits": list(record.get("toolkits") or []),
+            "toolkit_versions": list(record.get("toolkit_versions") or []),
+            "driver_versions": list(record.get("driver_versions") or []),
+            "compute_capabilities": list(record.get("compute_capabilities") or []),
+            "accelerator_names": list(record.get("accelerator_names") or []),
+            "gpu_architectures": list(record.get("gpu_architectures") or []),
+            "backend_keys": list(record.get("backend_keys") or []),
             "technology_keys": list(record.get("technology_keys") or []),
             "hardware_feature_keys": list(record.get("hardware_feature_keys") or []),
             "model_families": list(record.get("model_families") or []),
@@ -65,6 +86,27 @@ class CodeKnowledgeSearchResult:
             "source_type": record.get("source_type"),
             "source_title": record.get("source_title"),
             "source_url": record.get("source_url"),
+            "source_version": record.get("source_version"),
+            "retrieved_or_verified_date": record.get("retrieved_or_verified_date"),
+            "backend_modes": list(record.get("backend_modes") or []),
+            "runner_contracts": list(record.get("runner_contracts") or []),
+            "pipeline_stages": list(record.get("pipeline_stages") or []),
+            "rule_type": record.get("rule_type"),
+            "owner": record.get("owner"),
+            "strength": record.get("strength"),
+            "transferability": record.get("transferability"),
+            "review_status": record.get("review_status"),
+            "hardware_constraints": dict(record.get("hardware_constraints") or {}),
+            "source_refs": list(record.get("source_refs") or []),
+            "last_verified": record.get("last_verified"),
+            "applicability": dict(record.get("applicability") or {}),
+            "support_status": record.get("support_status"),
+            "applicability_support": dict(record.get("applicability_support") or {}),
+            "cuda_docs_cache_key": record.get("cuda_docs_cache_key"),
+            "query_template_version": record.get("query_template_version"),
+            "remote_tool_schema_hash": record.get("remote_tool_schema_hash"),
+            "backend_config_hash": record.get("backend_config_hash"),
+            "verified_source": bool(record.get("verified_source", False)),
         }
 
 
@@ -95,6 +137,7 @@ class CodeKnowledgeStore:
             CODE_DOC_SCHEMA_VERSION: self.config.code_doc_collection_name,
             OPTIMIZATION_RECIPE_SCHEMA_VERSION: self.config.optimization_recipe_collection_name,
             API_SYMBOL_SCHEMA_VERSION: self.config.api_symbol_collection_name,
+            BACKEND_GUIDANCE_SCHEMA_VERSION: self.config.backend_guidance_collection_name,
         }
 
     def _qdrant_models(self) -> Any:
@@ -155,13 +198,13 @@ class CodeKnowledgeStore:
 
     def _record_types(self, record_types: list[str] | None = None) -> list[str]:
         if not record_types:
-            return [CODE_DOC_SCHEMA_VERSION, OPTIMIZATION_RECIPE_SCHEMA_VERSION, API_SYMBOL_SCHEMA_VERSION]
+            return [CODE_DOC_SCHEMA_VERSION, OPTIMIZATION_RECIPE_SCHEMA_VERSION, API_SYMBOL_SCHEMA_VERSION, BACKEND_GUIDANCE_SCHEMA_VERSION]
         schemas: list[str] = []
         for item in record_types:
             schema = _SCHEMA_BY_RECORD_TYPE.get(str(item))
             if schema and schema not in schemas:
                 schemas.append(schema)
-        return schemas or [CODE_DOC_SCHEMA_VERSION, OPTIMIZATION_RECIPE_SCHEMA_VERSION, API_SYMBOL_SCHEMA_VERSION]
+        return schemas or [CODE_DOC_SCHEMA_VERSION, OPTIMIZATION_RECIPE_SCHEMA_VERSION, API_SYMBOL_SCHEMA_VERSION, BACKEND_GUIDANCE_SCHEMA_VERSION]
 
     def ensure_collections(self, *, recreate: bool = False) -> dict[str, Any]:
         if not self.enabled:
@@ -225,10 +268,17 @@ class CodeKnowledgeStore:
         }
 
     def ingest_source(self, source: str | Path | None = None, *, recreate: bool = False, dry_run: bool = False) -> dict[str, Any]:
-        records = convert_hardware_feature_records(load_seed_records()) if source is None else load_code_knowledge_records(source)
+        records = (
+            [
+                *convert_hardware_feature_records(load_seed_records()),
+                *load_backend_guidance_seed_records(),
+            ]
+            if source is None
+            else load_code_knowledge_records(source)
+        )
         return self.ingest_records(records, recreate=recreate, dry_run=dry_run)
 
-    def _match_condition(self, key: str, value: str) -> Any:
+    def _match_condition(self, key: str, value: Any) -> Any:
         models = self._qdrant_models()
         return models.FieldCondition(key=key, match=models.MatchValue(value=value))
 
@@ -240,7 +290,21 @@ class CodeKnowledgeStore:
                 continue
             if isinstance(value, list):
                 if value:
-                    must.append(self._match_condition(key, str(value[0])))
+                    normalized = [str(item).strip() for item in value if str(item).strip()]
+                    if not normalized:
+                        continue
+                    models = self._qdrant_models()
+                    if hasattr(models, "MatchAny"):
+                        must.append(
+                            models.FieldCondition(
+                                key=key,
+                                match=models.MatchAny(any=normalized),
+                            )
+                        )
+                    else:
+                        must.append(self._match_condition(key, normalized[0]))
+            elif isinstance(value, bool):
+                must.append(self._match_condition(key, value))
             elif str(value).strip():
                 must.append(self._match_condition(key, str(value).strip()))
         if not must:
@@ -308,6 +372,20 @@ class CodeKnowledgeStore:
                 for point in points:
                     payload = self._payload_from_point(point)
                     payload.pop("search_text", None)
+                    if (
+                        payload.get("source_type") == "nvidia_cuda_docs"
+                        and not self._nvidia_cuda_payload_visible(payload, filters)
+                    ):
+                        continue
+                    if (
+                        schema == OPTIMIZATION_RECIPE_SCHEMA_VERSION
+                        and payload.get("source_type") == "nvidia_cuda_docs"
+                        and payload.get("review_status") != "reviewed"
+                    ):
+                        # Draft/retired hosted interpretations remain stored
+                        # for audit but are not published into general agent
+                        # retrieval.
+                        continue
                     results.append(
                         CodeKnowledgeSearchResult(
                             record=payload,
@@ -319,3 +397,218 @@ class CodeKnowledgeStore:
             return []
         results.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
         return results[: max(1, int(limit))]
+
+    @staticmethod
+    def _nvidia_cuda_payload_visible(
+        payload: dict[str, Any], filters: dict[str, Any]
+    ) -> bool:
+        """Require an exact cache key or complete applicability at read time."""
+
+        cache_key = str(filters.get("cuda_docs_cache_key") or "").strip()
+        if cache_key and cache_key == str(payload.get("cuda_docs_cache_key") or ""):
+            return bool(filters.get("verified_source"))
+        if filters.get("source_type") != "nvidia_cuda_docs" or filters.get(
+            "verified_source"
+        ) is not True:
+            return False
+        applicability = dict(payload.get("applicability") or {})
+        required = (
+            "gpu_architecture",
+            "compute_capability",
+            "driver_major_minor",
+            "cuda_major_minor",
+            "framework",
+            "framework_major_minor",
+            "backend_mode",
+            "backend_config_hash",
+            "runner_contract",
+        )
+        for key in required:
+            expected = str(filters.get(f"applicability.{key}") or "").strip()
+            if not expected or expected != str(applicability.get(key) or "").strip():
+                return False
+        max_age_days = (
+            90
+            if payload.get("record_type") == "optimization_recipe_chunks"
+            else 30
+        )
+        value = str(payload.get("retrieved_or_verified_date") or "")
+        try:
+            retrieved = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if retrieved.tzinfo is None:
+                retrieved = retrieved.replace(tzinfo=timezone.utc)
+            if (
+                datetime.now(timezone.utc) - retrieved
+            ).total_seconds() > max_age_days * 86400:
+                return False
+        except ValueError:
+            return False
+        return True
+
+    def get_cuda_doc_chunks(
+        self,
+        *,
+        cache_key: str,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Return only raw NVIDIA chunks for one exact applicability key."""
+
+        if not str(cache_key).strip():
+            return []
+        return self.search(
+            query=str(cache_key),
+            filters={
+                "cuda_docs_cache_key": str(cache_key),
+                "source_type": "nvidia_cuda_docs",
+                "verified_source": True,
+            },
+            record_types=["code_doc_chunks"],
+            limit=max(1, int(limit)),
+        )
+
+    @staticmethod
+    def _hardware_rule_exclusion(
+        record: dict[str, Any], hardware_context: dict[str, Any]
+    ) -> str | None:
+        constraints = dict(record.get("hardware_constraints") or {})
+        hardware = dict(hardware_context.get("hardware") or hardware_context or {})
+        required_vendor = str(constraints.get("vendor") or "").strip().lower()
+        actual_vendor = str(hardware.get("vendor") or "").strip().lower()
+        if required_vendor and actual_vendor and required_vendor != actual_vendor:
+            return f"hardware_vendor_mismatch:{actual_vendor}"
+        minimum = str(constraints.get("min_compute_capability") or "").strip()
+        actual = str(hardware.get("compute_capability") or "").strip()
+        if minimum and actual:
+            try:
+                if tuple(map(int, actual.split("."))) < tuple(map(int, minimum.split("."))):
+                    return f"compute_capability_below:{minimum}"
+            except ValueError:
+                return "compute_capability_unparseable"
+        return None
+
+    def get_backend_design_guidance(
+        self,
+        *,
+        effective_backend: str,
+        runner_contract: str = RUNNER_CONTRACT_SUBPROCESS_V1,
+        pipeline_stage: str = "model_design",
+        hardware_context: dict[str, Any] | None = None,
+        query: str | None = None,
+        limit: int = 32,
+    ) -> dict[str, Any]:
+        """Return deterministic exact-backend rules before optional vector ranking."""
+
+        backend = normalize_runtime_backend(effective_backend)
+        if runner_contract != RUNNER_CONTRACT_SUBPROCESS_V1:
+            raise ValueError(
+                f"Unsupported runner contract {runner_contract!r}; expected {RUNNER_CONTRACT_SUBPROCESS_V1}"
+            )
+        if pipeline_stage not in {
+            "model_design",
+            "datatype_precision",
+            "training_evaluation",
+        }:
+            raise ValueError(f"Unsupported backend-guidance pipeline stage: {pipeline_stage}")
+        records = load_backend_guidance_seed_records()
+        eligible: list[dict[str, Any]] = []
+        excluded: list[dict[str, str]] = []
+        for record in records:
+            rule_id = str(record.get("record_id") or record.get("rule_id") or "")
+            modes = set(record.get("backend_modes") or [])
+            reason: str | None = None
+            if modes.intersection(RETIRED_BACKEND_MODES):
+                reason = "retired_backend"
+            elif not record.get("active", True) or record.get("deprecated"):
+                reason = "inactive"
+            elif backend not in modes and BACKEND_NEUTRAL not in modes:
+                reason = f"backend_mismatch:{backend}"
+            elif runner_contract not in set(record.get("runner_contracts") or []):
+                reason = f"runner_contract_mismatch:{runner_contract}"
+            elif pipeline_stage not in set(record.get("pipeline_stages") or []):
+                reason = f"pipeline_stage_mismatch:{pipeline_stage}"
+            else:
+                reason = self._hardware_rule_exclusion(
+                    record, hardware_context or {}
+                )
+            if reason:
+                excluded.append({"rule_id": rule_id, "reason": reason})
+            else:
+                eligible.append(record)
+
+        vector_scores: dict[str, float] = {}
+        if self.enabled and query:
+            for match in self.search(
+                query=query,
+                filters={
+                    "backend_modes": [BACKEND_NEUTRAL, backend],
+                    "runner_contracts": runner_contract,
+                    "pipeline_stages": pipeline_stage,
+                },
+                record_types=["backend_guidance_rules"],
+                limit=max(1, int(limit)),
+            ):
+                vector_scores[str(match.get("record_id") or "")] = float(
+                    match.get("score") or 0.0
+                )
+
+        strength_order = {"hard": 0, "preferred": 1, "informational": 2}
+        eligible.sort(
+            key=lambda item: (
+                strength_order.get(str(item.get("strength")), 3),
+                -vector_scores.get(str(item.get("record_id") or ""), 0.0),
+                str(item.get("record_id") or ""),
+            )
+        )
+        selected = eligible[: max(1, int(limit))]
+        public_rules = [
+            CodeKnowledgeSearchResult(
+                record=record,
+                score=vector_scores.get(str(record.get("record_id") or ""), 1.0),
+                collection_name=self.config.backend_guidance_collection_name,
+            ).to_public_dict()
+            for record in selected
+        ]
+        hard_rules = [item for item in public_rules if item.get("strength") == "hard"]
+        preferred_rules = [
+            item for item in public_rules if item.get("strength") == "preferred"
+        ]
+        neutral_rules = [
+            item
+            for item in public_rules
+            if BACKEND_NEUTRAL in (item.get("backend_modes") or [])
+        ]
+        preferred_patterns = list(
+            dict.fromkeys(
+                pattern
+                for item in public_rules
+                for pattern in (item.get("recommended_patterns") or [])
+            )
+        )
+        avoid_patterns = list(
+            dict.fromkeys(
+                pattern
+                for item in public_rules
+                for pattern in (item.get("avoid_patterns") or [])
+            )
+        )
+        return {
+            "effective_backend": backend,
+            "runner_contract": runner_contract,
+            "pipeline_stage": pipeline_stage,
+            "hard_rules": hard_rules,
+            "preferred_rules": preferred_rules,
+            "backend_neutral_rules": neutral_rules,
+            "preferred_patterns": preferred_patterns,
+            "avoid_patterns": avoid_patterns,
+            "excluded_rules": excluded,
+            "selected_rule_ids": [item.get("record_id") for item in public_rules],
+            "evidence_refs": [
+                f"backend_guidance:{item.get('record_id')}" for item in public_rules
+            ],
+            "confidence": min(
+                (float(item.get("confidence") or 0.0) for item in public_rules),
+                default=0.0,
+            ),
+            "semantic_ranking_used": bool(vector_scores),
+            "knowledge_corpus_version": BACKEND_GUIDANCE_SCHEMA_VERSION,
+        }

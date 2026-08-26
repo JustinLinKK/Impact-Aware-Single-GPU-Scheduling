@@ -12,6 +12,7 @@ import time
 
 
 LOGGER = logging.getLogger(__name__)
+_DEFAULT_TTL = object()
 
 
 @dataclass(slots=True)
@@ -164,7 +165,19 @@ class RedisLRUCache:
         except Exception:
             return None
 
-    def set(self, namespace: str, payload: dict[str, Any], value: Any) -> None:
+    def set(
+        self,
+        namespace: str,
+        payload: dict[str, Any],
+        value: Any,
+        *,
+        ttl_seconds: int | None | object = _DEFAULT_TTL,
+    ) -> None:
+        """Write a value with an optional namespace-specific TTL.
+
+        Omitting ``ttl_seconds`` preserves the historic configured default;
+        passing ``None`` explicitly stores without expiry.
+        """
         client = self.client
         if client is None:
             return
@@ -174,14 +187,52 @@ class RedisLRUCache:
         key = self._payload_key(namespace, payload)
         try:
             encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
-            if self.settings.ttl_seconds is None:
+            ttl = (
+                self.settings.ttl_seconds
+                if ttl_seconds is _DEFAULT_TTL
+                else ttl_seconds
+            )
+            if ttl is None:
                 client.set(key, encoded)
             else:
-                client.set(key, encoded, ex=self.settings.ttl_seconds)
+                client.set(key, encoded, ex=max(1, int(ttl)))
             client.zadd(self._index_key(namespace), {key: time.time()})
             self._evict_over_capacity(client, namespace)
         except Exception:
             return
+
+    def acquire_lock(self, key: str, token: str, *, deadline_ms: int) -> bool | None:
+        """Best-effort distributed lock using Redis SET NX PX."""
+
+        client = self.client
+        if client is None:
+            return None
+        try:
+            return bool(
+                client.set(
+                    str(key),
+                    str(token),
+                    nx=True,
+                    px=max(1, int(deadline_ms)),
+                )
+            )
+        except Exception:
+            return None
+
+    def release_lock(self, key: str, token: str) -> bool:
+        """Compare-and-delete a lock so one caller cannot release another's."""
+
+        client = self.client
+        if client is None:
+            return False
+        script = (
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "return redis.call('del', KEYS[1]) else return 0 end"
+        )
+        try:
+            return bool(client.eval(script, 1, str(key), str(token)))
+        except Exception:
+            return False
 
     def invalidate_namespace(self, namespace: str) -> None:
         client = self.client

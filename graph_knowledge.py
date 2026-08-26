@@ -5,6 +5,13 @@ from __future__ import annotations
 from statistics import median
 from typing import Any
 
+from .backend_mode import (
+    RUNNER_CONTRACT_SUBPROCESS_V1,
+    active_backend_matches,
+    is_retired_backend,
+    normalize_packing_backend,
+    normalize_runtime_backend,
+)
 from .domain import RunProfile
 
 _JOB_DESIGN_CANDIDATE_KEYS = {
@@ -17,7 +24,8 @@ _JOB_DESIGN_CANDIDATE_KEYS = {
     "proposed_epochs",
     "requires_gpu",
     "script_signature",
-    "backend_preference",
+    "effective_backend",
+    "runner_contract",
     "uses_amp",
     "notes",
 }
@@ -136,6 +144,7 @@ class SchedulerKnowledgeBase:
             "toolkit_name": toolkit_name,
             "toolkit_version": toolkit_version,
             "torch_version": profile.torch_version,
+            "driver_version": profile.driver_version,
             "summary_text": "",
             "is_current": True,
             "source": "current_runtime",
@@ -150,6 +159,7 @@ class SchedulerKnowledgeBase:
                 "toolkit_name": toolkit_name,
                 "toolkit_version": toolkit_version,
                 "torch_version": profile.torch_version,
+                "driver_version": profile.driver_version,
             },
             "_stats": {},
         }
@@ -185,6 +195,9 @@ class SchedulerKnowledgeBase:
             "torch_version": payload.get("torch_version")
             or hardware.get("torch_version")
             or toolkit.get("torch_version"),
+            "driver_version": payload.get("driver_version")
+            or hardware.get("driver_version")
+            or toolkit.get("driver_version"),
             "summary_text": payload.get("summary_text")
             or hardware.get("summary_text")
             or "",
@@ -219,6 +232,7 @@ class SchedulerKnowledgeBase:
             "toolkit_name",
             "toolkit_version",
             "torch_version",
+            "driver_version",
             "summary_text",
             "source",
         ):
@@ -531,13 +545,7 @@ class SchedulerKnowledgeBase:
             "packing_family_exact": 10,
             "model_family_exact": 8,
         }.get(match_reason, 0)
-        backend_bonus = 0
-        if (
-            candidate.get("backend_preference")
-            and backend_name == candidate["backend_preference"]
-        ):
-            backend_bonus = 5
-        return kind_weight + match_weight + backend_bonus
+        return kind_weight + match_weight
 
     def _evidence_ref(self, kind: str, payload: dict[str, Any]) -> str:
         if kind == "runtime_profile":
@@ -573,6 +581,15 @@ class SchedulerKnowledgeBase:
             "summary_text": summary_text,
             "ref": self._evidence_ref(kind, payload),
             "data": payload,
+            "transferability": (
+                "exclusive_baseline"
+                if backend_name == "exclusive"
+                else (
+                    "exact_backend"
+                    if backend_name is not None
+                    else "backend_neutral"
+                )
+            ),
         }
         rows.append(
             (self._evidence_score(kind, match_reason, backend_name, candidate), entry)
@@ -617,6 +634,12 @@ class SchedulerKnowledgeBase:
         for observation in self.store.list_batch_size_observations(
             hardware_key=current_key or None
         ):
+            if not active_backend_matches(
+                observation.backend_name,
+                candidate.get("effective_backend"),
+                allow_exclusive_baseline=True,
+            ):
+                continue
             match_reason = self._batch_probe_match_reason(
                 observation.model_key, candidate
             )
@@ -643,6 +666,18 @@ class SchedulerKnowledgeBase:
                 normalized[key] = int(normalized[key])
             except (TypeError, ValueError):
                 normalized[key] = None
+        settings = self._settings()
+        gpu_scheduler = getattr(settings, "gpu_scheduler", None)
+        configured = getattr(gpu_scheduler, "packing_backend", None)
+        if configured:
+            normalized["effective_backend"] = normalize_packing_backend(
+                configured, warn_legacy=False
+            )
+        elif normalized.get("effective_backend"):
+            normalized["effective_backend"] = normalize_packing_backend(
+                normalized["effective_backend"], warn_legacy=False
+            )
+        normalized["runner_contract"] = RUNNER_CONTRACT_SUBPROCESS_V1
         return normalized
 
     def _current_runtime_profiles_for_candidate(
@@ -652,6 +687,12 @@ class SchedulerKnowledgeBase:
         profiles = self.store.list_runtime_profiles(hardware_key=current_key or None)
         rows: list[tuple[str, Any]] = []
         for profile in profiles:
+            if not active_backend_matches(
+                profile.backend_name,
+                candidate.get("effective_backend"),
+                allow_exclusive_baseline=True,
+            ):
+                continue
             match_reason = self._runtime_match_reason(profile.signature, candidate)
             if match_reason:
                 rows.append((match_reason, profile))
@@ -666,8 +707,6 @@ class SchedulerKnowledgeBase:
             if not observations:
                 return {"found": False, "reason": "insufficient evidence"}
             proposed_batch_size = candidate.get("proposed_batch_size")
-            backend_preference = candidate.get("backend_preference")
-
             def observation_key(item: tuple[str, Any, dict[str, Any]]) -> tuple[int, int, int, str]:
                 _reason, observation, _payload = item
                 exact_batch = int(
@@ -675,8 +714,10 @@ class SchedulerKnowledgeBase:
                     and int(observation.batch_size) == int(proposed_batch_size)
                 )
                 preferred_backend = int(
-                    backend_preference is not None
-                    and observation.backend_name == backend_preference
+                    active_backend_matches(
+                        observation.backend_name,
+                        candidate.get("effective_backend"),
+                    )
                 )
                 exclusive_fallback = int(observation.backend_name == "exclusive")
                 return (exact_batch, preferred_backend, exclusive_fallback, observation.observation_key)
@@ -743,6 +784,12 @@ class SchedulerKnowledgeBase:
         for profile in self.store.list_runtime_profiles(
             hardware_key=current_key or None
         ):
+            if not active_backend_matches(
+                profile.backend_name,
+                candidate.get("effective_backend"),
+                allow_exclusive_baseline=True,
+            ):
+                continue
             match_reason = self._runtime_match_reason(profile.signature, candidate)
             if not match_reason:
                 continue
@@ -793,6 +840,12 @@ class SchedulerKnowledgeBase:
             model_key=candidate.get("model_key"),
             signature=candidate.get("script_signature"),
         ):
+            if profile.backend_name and not active_backend_matches(
+                profile.backend_name,
+                candidate.get("effective_backend"),
+                allow_exclusive_baseline=True,
+            ):
+                continue
             match_reason = self._run_match_reason(profile, candidate)
             if not match_reason:
                 continue
@@ -819,9 +872,11 @@ class SchedulerKnowledgeBase:
             "vram_role": "admission_constraint_only",
             "placement_objective": "verified_piecewise_drain_time_gain",
             "memory": memory.to_dict() if hasattr(memory, "to_dict") else {},
-            "backend_priority": list(
-                getattr(gpu_scheduler, "backend_priority", []) or []
+            "packing_backend": getattr(gpu_scheduler, "packing_backend", None),
+            "exclusive_fallback_enabled": bool(
+                getattr(gpu_scheduler, "exclusive_fallback_enabled", True)
             ),
+            "runner_contract": RUNNER_CONTRACT_SUBPROCESS_V1,
             "submission_defaults": (
                 submission_defaults.to_dict()
                 if hasattr(submission_defaults, "to_dict")
@@ -836,14 +891,17 @@ class SchedulerKnowledgeBase:
             return {}
         enabled_backends = ["exclusive"]
         if getattr(getattr(gpu_scheduler, "mps", None), "enabled", False):
-            enabled_backends.append("mps")
+            enabled_backends.append("mps_process")
         if getattr(getattr(gpu_scheduler, "cuda_process", None), "enabled", False):
             enabled_backends.append("cuda_process")
-        if getattr(getattr(gpu_scheduler, "stream", None), "enabled", False):
-            enabled_backends.append("stream")
         return {
             "enabled_backends": enabled_backends,
-            "priority": list(getattr(gpu_scheduler, "backend_priority", []) or []),
+            "packing_backend": getattr(gpu_scheduler, "packing_backend", None),
+            "effective_backend": getattr(gpu_scheduler, "packing_backend", None),
+            "runner_contract": RUNNER_CONTRACT_SUBPROCESS_V1,
+            "exclusive_fallback_enabled": bool(
+                getattr(gpu_scheduler, "exclusive_fallback_enabled", True)
+            ),
             "placement_mode": getattr(gpu_scheduler, "mode", None),
             "parallel_job_cap": getattr(gpu_scheduler, "parallel_job_cap", None),
             "incremental_admission": True,
@@ -859,11 +917,13 @@ class SchedulerKnowledgeBase:
                 getattr(submission_defaults, "backend_allowlist", []) or []
             )
         if not recommended_allowlist and gpu_scheduler is not None:
-            recommended_allowlist = list(
-                getattr(gpu_scheduler, "backend_priority", []) or []
-            )
+            recommended_allowlist = [
+                str(getattr(gpu_scheduler, "packing_backend", ""))
+            ]
         return {
             "recommended_backend_allowlist": recommended_allowlist,
+            "effective_backend": getattr(gpu_scheduler, "packing_backend", None),
+            "runner_contract": RUNNER_CONTRACT_SUBPROCESS_V1,
             "batch_probe_enabled": bool(
                 getattr(submission_defaults, "batch_probe_enabled", False)
             ),
@@ -910,16 +970,6 @@ class SchedulerKnowledgeBase:
             "matched_exact_batch_size", False
         ):
             flags.append("runtime_estimate_reused_nearest_batch_size")
-        backend_preference = candidate.get("backend_preference")
-        recommended_allowlist = (
-            scheduler_guidance.get("recommended_backend_allowlist") or []
-        )
-        if (
-            backend_preference
-            and recommended_allowlist
-            and backend_preference not in recommended_allowlist
-        ):
-            flags.append("backend_preference_not_in_recommended_allowlist")
         return flags
 
     def _job_design_confidence(
@@ -1395,11 +1445,16 @@ class SchedulerKnowledgeBase:
         self, candidate: dict[str, Any], limit: int
     ) -> list[dict[str, Any]]:
         current_key = self._current_hardware_key()
+        effective_backend = candidate.get("effective_backend")
         rows: list[dict[str, Any]] = []
         if hasattr(self.store, "list_pair_profiles"):
             for profile in self.store.list_pair_profiles(
                 hardware_key=current_key or None
             ):
+                if not active_backend_matches(
+                    profile.backend_name, effective_backend
+                ):
+                    continue
                 left_model = (
                     self._model_key_for_signature(profile.left_signature)
                     or profile.left_signature
@@ -1444,6 +1499,10 @@ class SchedulerKnowledgeBase:
             for profile in self.store.list_combination_profiles(
                 hardware_key=current_key or None
             ):
+                if not active_backend_matches(
+                    profile.backend_name, effective_backend
+                ):
+                    continue
                 rows.append(
                     {
                         "kind": "packed_group_profile",
@@ -1456,6 +1515,64 @@ class SchedulerKnowledgeBase:
                     }
                 )
         return rows[: max(1, int(limit))]
+
+    def _excluded_backend_evidence(
+        self, candidate: dict[str, Any], limit: int
+    ) -> list[dict[str, Any]]:
+        effective = candidate.get("effective_backend")
+        current_key = self._current_hardware_key()
+        excluded: list[dict[str, Any]] = []
+
+        def add(kind: str, ref: str, backend_name: object) -> None:
+            backend = str(backend_name or "")
+            reason = (
+                "retired_backend"
+                if is_retired_backend(backend)
+                else (
+                    "ambiguous_legacy_mps_profile"
+                    if backend.strip().lower() == "mps"
+                    else f"backend_mismatch:{effective}"
+                )
+            )
+            excluded.append(
+                {
+                    "kind": kind,
+                    "ref": ref,
+                    "backend_name": backend,
+                    "reason": reason,
+                }
+            )
+
+        for profile in self.store.list_runtime_profiles(
+            hardware_key=current_key or None
+        ):
+            if not active_backend_matches(
+                profile.backend_name,
+                effective,
+                allow_exclusive_baseline=True,
+            ):
+                add("runtime_profile", f"runtime_profile:{profile.profile_key}", profile.backend_name)
+        if hasattr(self.store, "list_pair_profiles"):
+            for profile in self.store.list_pair_profiles(
+                hardware_key=current_key or None
+            ):
+                if not active_backend_matches(profile.backend_name, effective):
+                    add(
+                        "packed_pair_profile",
+                        f"packed_pair:{profile.pair_key}:{profile.hardware_key}",
+                        profile.backend_name,
+                    )
+        if hasattr(self.store, "list_combination_profiles"):
+            for profile in self.store.list_combination_profiles(
+                hardware_key=current_key or None
+            ):
+                if not active_backend_matches(profile.backend_name, effective):
+                    add(
+                        "packed_group_profile",
+                        f"packed_group:{profile.combination_key}",
+                        profile.backend_name,
+                    )
+        return excluded[: max(1, int(limit))]
 
     def _derive_diagnosis(
         self,
@@ -1544,17 +1661,23 @@ class SchedulerKnowledgeBase:
         packed_profiles = self._packed_profiles_for_candidate(
             self._normalized_job_design_candidate(candidate), limit=limit
         )
+        excluded_evidence = self._excluded_backend_evidence(
+            self._normalized_job_design_candidate(candidate), limit=limit
+        )
         evidence_refs = list(design_context.get("evidence_refs") or [])
         evidence_refs.extend(
             entry["ref"] for entry in packed_profiles if entry.get("ref")
         )
         return {
+            "effective_backend": design_context.get("effective_backend"),
+            "runner_contract": design_context.get("runner_contract"),
             "hardware_context": design_context.get("hardware_context"),
             "graph_evidence": {
                 "exact_profiles": exact_profiles,
                 "similar_profiles": similar_profiles,
                 "packed_profiles": packed_profiles,
             },
+            "excluded_evidence": excluded_evidence,
             "runtime_estimate": design_context.get("runtime_estimate"),
             "batch_size_recommendation": design_context.get(
                 "batch_size_recommendation"
@@ -1622,6 +1745,8 @@ class SchedulerKnowledgeBase:
             risk_flags=risk_flags,
         )
         return {
+            "effective_backend": normalized_candidate.get("effective_backend"),
+            "runner_contract": normalized_candidate.get("runner_contract"),
             "hardware_context": self.get_hardware_context(
                 "current", include_scheduler_limits=True
             ),

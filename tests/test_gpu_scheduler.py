@@ -55,7 +55,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                         "gpu_scheduler:",
                         '  mode: "parallel_time_aware"',
                         "  parallel_job_cap: 3",
-                        '  backend_priority: ["stream", "cuda_process", "exclusive"]',
+                        '  packing_backend: "cuda_process"',
                         "  memory:",
                         "    gpu_vram_gib: 16",
                         "    predicted_budget_fraction: 0.8",
@@ -96,13 +96,11 @@ class GpuSchedulerUnitTest(unittest.TestCase):
                 "submission_defaults": None,
                 "mps": None,
                 "cuda_process": None,
-                "stream": None,
             }
         )
         self.assertIsNotNone(settings.gpu_scheduler.submission_defaults)
         self.assertIsNotNone(settings.gpu_scheduler.mps)
         self.assertIsNotNone(settings.gpu_scheduler.cuda_process)
-        self.assertIsNotNone(settings.gpu_scheduler.stream)
 
     def test_packing_and_preload_specs_round_trip(self) -> None:
         job = TrainingJob.create(

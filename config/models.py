@@ -12,6 +12,12 @@ import warnings
 
 import yaml
 
+from ..backend_mode import (
+    PACKED_BACKEND_MODES,
+    normalize_backend_allowlist,
+    normalize_packing_backend,
+    warn_backend_deprecation,
+)
 from ..redis_cache import RedisCacheSettings
 
 SCHEDULER_MODE_PARALLEL_TIME_AWARE = "parallel_time_aware"
@@ -256,7 +262,7 @@ class SourceAnalysisSettings:
 
 @dataclass(slots=True)
 class SourceTrialRankingSettings:
-    schema_version: int = 1
+    schema_version: int = 2
     policy: str = "pareto"
     ready_window_size: int = 10
     max_group_size: int = 2
@@ -267,24 +273,18 @@ class SourceTrialRankingSettings:
     mode_overhead_mb: dict[str, float] = field(
         default_factory=lambda: {
             "cuda_process": 512.0,
-            "mps": 384.0,
             "mps_process": 384.0,
-            "stream": 256.0,
-            "cuda_stream": 256.0,
-            "mps_stream": 512.0,
         }
     )
     mps_allocation_templates: list[list[int]] = field(
         default_factory=lambda: [[50, 50], [60, 40], [40, 60]]
     )
-    stream_offset_templates_in_steps: list[float] = field(
-        default_factory=lambda: [0.0, 0.25, 0.5]
-    )
-
     def __post_init__(self) -> None:
         self.schema_version = int(self.schema_version)
-        if self.schema_version != 1:
-            raise ValueError("source_trial_ranking.schema_version must be 1")
+        if self.schema_version != 2:
+            raise ValueError(
+                "source_trial_ranking.schema_version must be 2; version 1 contains retired stream semantics"
+            )
         self.policy = str(self.policy or "pareto").strip().lower()
         if self.policy != "pareto":
             raise ValueError("source_trial_ranking.policy must be pareto")
@@ -307,6 +307,14 @@ class SourceTrialRankingSettings:
         self.mode_overhead_mb = {
             str(key): float(value) for key, value in dict(self.mode_overhead_mb).items()
         }
+        unsupported_overheads = sorted(
+            set(self.mode_overhead_mb).difference(PACKED_BACKEND_MODES)
+        )
+        if unsupported_overheads:
+            raise ValueError(
+                "source_trial_ranking.mode_overhead_mb contains unsupported backends: "
+                + ", ".join(unsupported_overheads)
+            )
         if any(value < 0 for value in self.mode_overhead_mb.values()):
             raise ValueError("source_trial_ranking.mode_overhead_mb values must be non-negative")
         self.mps_allocation_templates = [
@@ -322,19 +330,17 @@ class SourceTrialRankingSettings:
             raise ValueError(
                 "source_trial_ranking.mps_allocation_templates must contain valid two-client percentages"
             )
-        self.stream_offset_templates_in_steps = [
-            float(value) for value in self.stream_offset_templates_in_steps
-        ]
-        if not self.stream_offset_templates_in_steps or any(
-            value < 0 for value in self.stream_offset_templates_in_steps
-        ):
-            raise ValueError(
-                "source_trial_ranking.stream_offset_templates_in_steps must be non-negative"
-            )
-
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "SourceTrialRankingSettings":
-        return cls(**dict(payload or {}))
+        raw = dict(payload or {})
+        removed = sorted(
+            {"stream_offset_templates_in_steps", "stream_offsets"}.intersection(raw)
+        )
+        if removed:
+            raise ValueError(
+                "Removed CUDA-stream source-trial settings: " + ", ".join(removed)
+            )
+        return cls(**raw)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -348,7 +354,6 @@ class SourceTrialRankingSettings:
             "source_analysis": self.source_analysis.to_dict(),
             "mode_overhead_mb": dict(self.mode_overhead_mb),
             "mps_allocation_templates": [list(value) for value in self.mps_allocation_templates],
-            "stream_offset_templates_in_steps": list(self.stream_offset_templates_in_steps),
         }
 
 
@@ -600,24 +605,6 @@ class CudaProcessSettings:
 
 
 @dataclass(slots=True)
-class StreamSettings:
-    enabled: bool = False
-    host_poll_interval_seconds: float = 0.1
-    host_join_timeout_seconds: float = 3.0
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "StreamSettings":
-        return cls(**(payload or {}))
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "enabled": self.enabled,
-            "host_poll_interval_seconds": self.host_poll_interval_seconds,
-            "host_join_timeout_seconds": self.host_join_timeout_seconds,
-        }
-
-
-@dataclass(slots=True)
 class BaselineCacheSettings:
     warm_queue_policy: str = "top_k"
     warm_queue_top_k: int | None = 2
@@ -793,6 +780,7 @@ class HardwareFeatureDBSettings:
     code_doc_collection_name: str = "code_doc_chunks"
     optimization_recipe_collection_name: str = "optimization_recipe_chunks"
     api_symbol_collection_name: str = "api_symbol_chunks"
+    backend_guidance_collection_name: str = "backend_guidance_rules"
     embedding_model_type: str = "local"
     embedding_model_name: str = "BAAI/bge-base-en-v1.5"
     embedding_device: str = "cpu"
@@ -817,6 +805,9 @@ class HardwareFeatureDBSettings:
         self.api_symbol_collection_name = str(
             self.api_symbol_collection_name or "api_symbol_chunks"
         ).strip()
+        self.backend_guidance_collection_name = str(
+            self.backend_guidance_collection_name or "backend_guidance_rules"
+        ).strip()
         self.embedding_model_type = (
             str(self.embedding_model_type or "local").strip().lower()
         )
@@ -840,6 +831,7 @@ class HardwareFeatureDBSettings:
             "code_doc_collection_name": self.code_doc_collection_name,
             "optimization_recipe_collection_name": self.optimization_recipe_collection_name,
             "api_symbol_collection_name": self.api_symbol_collection_name,
+            "backend_guidance_collection_name": self.backend_guidance_collection_name,
             "embedding_model_type": self.embedding_model_type,
             "embedding_model_name": self.embedding_model_name,
             "embedding_device": self.embedding_device,
@@ -881,9 +873,7 @@ class SchedulerSubmissionDefaults:
     packing_eligible: bool = False
     packing_family: str = "mlevolve_script"
     packing_max_slowdown_ratio: float | None = None
-    backend_allowlist: list[str] = field(
-        default_factory=lambda: ["mps", "cuda_process"]
-    )
+    backend_allowlist: list[str] = field(default_factory=list)
     batch_probe_enabled: bool = True
     batch_probe_model_key: str | None = None
     runtime_probe_enabled: bool = True
@@ -908,12 +898,10 @@ class SchedulerSubmissionDefaults:
                 "Removed legacy submission-default settings: " + ", ".join(removed)
             )
         instance = cls(**raw)
-        if instance.backend_allowlist is None:
-            instance.backend_allowlist = ["mps", "cuda_process"]
-        else:
-            instance.backend_allowlist = [
-                str(item) for item in instance.backend_allowlist
-            ]
+        instance.backend_allowlist = normalize_backend_allowlist(
+            instance.backend_allowlist,
+            warn_legacy=True,
+        )
         instance.runtime_probe_strategy = (
             str(instance.runtime_probe_strategy or "epoch_1")
             .strip()
@@ -953,9 +941,12 @@ class GpuSchedulerSettings:
     enabled: bool = True
     mode: str = SCHEDULER_MODE_PARALLEL_TIME_AWARE
     scheduler_decision_mode: str = SCHEDULER_DECISION_MODE_BASELINE
-    backend_priority: list[str] = field(
-        default_factory=lambda: ["mps", "stream", "cuda_process", "exclusive"]
-    )
+    packing_backend: str = "mps_process"
+    exclusive_fallback_enabled: bool = True
+    mps_unavailable_policy: str = "exclusive"
+    # Read compatibility for one deprecation window. Internal code sees at most
+    # the authoritative packed backend plus the explicit exclusive fallback.
+    backend_priority: list[str] | None = None
     parallel_job_cap: int | None = None
     priority_window_size: int = 8
     oldest_window_size: int = 4
@@ -984,17 +975,39 @@ class GpuSchedulerSettings:
     )
     mps: MPSSettings = field(default_factory=MPSSettings)
     cuda_process: CudaProcessSettings = field(default_factory=CudaProcessSettings)
-    stream: StreamSettings = field(default_factory=StreamSettings)
 
     def __post_init__(self) -> None:
         self.mode = normalize_scheduler_mode(self.mode)
         self.scheduler_decision_mode = normalize_scheduler_decision_mode(
             self.scheduler_decision_mode
         )
+        self.packing_backend = normalize_packing_backend(self.packing_backend)
+        self.mps_unavailable_policy = (
+            str(self.mps_unavailable_policy or "exclusive")
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
+        if self.mps_unavailable_policy not in {"exclusive", "fail"}:
+            raise ValueError("mps_unavailable_policy must be 'exclusive' or 'fail'")
         if self.backend_priority is None:
-            self.backend_priority = ["mps", "stream", "cuda_process", "exclusive"]
+            self.backend_priority = [self.packing_backend]
+            if self.exclusive_fallback_enabled:
+                self.backend_priority.append("exclusive")
         else:
-            self.backend_priority = [str(item) for item in self.backend_priority]
+            legacy_priority = normalize_backend_allowlist(self.backend_priority)
+            packed = [item for item in legacy_priority if item != "exclusive"]
+            if len(packed) != 1:
+                raise ValueError(
+                    "gpu_scheduler.backend_priority is ambiguous. Configure exactly one "
+                    "packing_backend (cuda_process or mps_process) plus optional exclusive fallback."
+                )
+            if packed[0] != self.packing_backend:
+                raise ValueError(
+                    "gpu_scheduler.backend_priority conflicts with authoritative packing_backend: "
+                    f"{packed[0]} != {self.packing_backend}"
+                )
+            self.backend_priority = legacy_priority or [self.packing_backend]
         if self.parallel_job_cap is not None:
             self.parallel_job_cap = max(1, int(self.parallel_job_cap))
         if self.startpoint_probe_max_models is not None:
@@ -1052,6 +1065,8 @@ class GpuSchedulerSettings:
             self.submission_defaults = SchedulerSubmissionDefaults.from_dict(
                 self.submission_defaults
             )
+        if not self.submission_defaults.backend_allowlist:
+            self.submission_defaults.backend_allowlist = [self.packing_backend]
         if self.mps is None:
             self.mps = MPSSettings()
         if isinstance(self.mps, dict):
@@ -1060,14 +1075,14 @@ class GpuSchedulerSettings:
             self.cuda_process = CudaProcessSettings()
         if isinstance(self.cuda_process, dict):
             self.cuda_process = CudaProcessSettings.from_dict(self.cuda_process)
-        if self.stream is None:
-            self.stream = StreamSettings()
-        if isinstance(self.stream, dict):
-            self.stream = StreamSettings.from_dict(self.stream)
-
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "GpuSchedulerSettings":
         raw = dict(payload or {})
+        if "stream" in raw:
+            raise ValueError(
+                "gpu_scheduler.stream was removed. Independently generated subprocess jobs "
+                "cannot be controlled by a parent CUDA stream; choose packing_backend."
+            )
         legacy_keys = {
             "adaptive",
             "allow_three_way_packing",
@@ -1091,6 +1106,29 @@ class GpuSchedulerSettings:
                 + ", ".join(removed)
                 + ". Configure parallel_time_aware with parallel_job_cap, colocation, objective, batch_options, and memory safety gates."
             )
+        legacy_priority = raw.get("backend_priority")
+        if legacy_priority is not None:
+            normalized_priority = normalize_backend_allowlist(legacy_priority)
+            packed = [item for item in normalized_priority if item != "exclusive"]
+            if len(packed) != 1:
+                raise ValueError(
+                    "gpu_scheduler.backend_priority is ambiguous. Replace it with one "
+                    "packing_backend: cuda_process or mps_process."
+                )
+            if "packing_backend" in raw:
+                configured = normalize_packing_backend(raw["packing_backend"])
+                if configured != packed[0]:
+                    raise ValueError(
+                        "gpu_scheduler.backend_priority conflicts with packing_backend"
+                    )
+            else:
+                warn_backend_deprecation(
+                    "gpu_scheduler.backend_priority is deprecated; use packing_backend. "
+                    "The single packed backend was migrated.",
+                    stacklevel=2,
+                )
+                raw["packing_backend"] = packed[0]
+            raw["backend_priority"] = normalized_priority
         return cls(**raw)
 
     def to_dict(self) -> dict[str, Any]:
@@ -1098,7 +1136,9 @@ class GpuSchedulerSettings:
             "enabled": self.enabled,
             "mode": self.mode,
             "scheduler_decision_mode": self.scheduler_decision_mode,
-            "backend_priority": list(self.backend_priority),
+            "packing_backend": self.packing_backend,
+            "exclusive_fallback_enabled": self.exclusive_fallback_enabled,
+            "mps_unavailable_policy": self.mps_unavailable_policy,
             "parallel_job_cap": self.parallel_job_cap,
             "priority_window_size": self.priority_window_size,
             "oldest_window_size": self.oldest_window_size,
@@ -1121,7 +1161,6 @@ class GpuSchedulerSettings:
             "submission_defaults": self.submission_defaults.to_dict(),
             "mps": self.mps.to_dict(),
             "cuda_process": self.cuda_process.to_dict(),
-            "stream": self.stream.to_dict(),
         }
 
 

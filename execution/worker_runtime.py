@@ -1,4 +1,4 @@
-"""Shared worker-runtime helpers for subprocess and stream execution."""
+"""Shared worker-runtime helpers for independent subprocess execution."""
 
 from __future__ import annotations
 

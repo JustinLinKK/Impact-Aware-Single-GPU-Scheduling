@@ -81,7 +81,8 @@ from localml_scheduler.storage.sqlite_store import SQLiteStateStore
 def _settings(tmpdir: str, **gpu_overrides: object) -> SchedulerSettings:
     gpu = {
         "mode": "parallel_time_aware",
-        "backend_priority": ["cuda_process", "exclusive"],
+        "packing_backend": "cuda_process",
+        "exclusive_fallback_enabled": True,
         "parallel_job_cap": None,
         "memory": {
             "gpu_vram_gib": 10,
@@ -1373,7 +1374,7 @@ def test_colocation_profile_key_isolated_by_hardware_backend_batch_duplicates_an
     )
     assert key != build_colocation_profile_key(
         "gpu-a",
-        [{**base[0], "backend_name": "stream"}, base[1]],
+        [{**base[0], "backend_name": "mps_process"}, base[1]],
     )
     assert key != build_colocation_profile_key("gpu-a", base[:1])
     assert key != build_colocation_profile_key(
@@ -2421,7 +2422,12 @@ def test_real_worker_validation_runner_early_stops_successfully() -> None:
         settings = SchedulerSettings(
             runtime_root=Path(tmpdir),
             scheduler_poll_interval_seconds=0.05,
-            gpu_scheduler={"mode": "parallel_time_aware", "backend_priority": ["exclusive"]},
+            gpu_scheduler={
+                "mode": "parallel_time_aware",
+                "packing_backend": "cuda_process",
+                "exclusive_fallback_enabled": True,
+                "cuda_process": {"enabled": False},
+            },
             early_stopping={
                 "enabled": True,
                 "metric_name": "accuracy",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ..backend_mode import normalize_packing_backend
 from .backend_compatibility import BackendCompatibilityPolicy
 from .pareto import pareto_fronts
 from .trial_candidate import BackendTrialConfig, TrialCandidate
@@ -16,10 +17,9 @@ class TrialPriorityPlanner:
         backend_name: str,
         *,
         mps_templates: list[list[int]],
-        stream_offsets: list[float],
         active_config: dict[str, object] | None = None,
     ) -> tuple[BackendTrialConfig, ...]:
-        normalized = str(backend_name).lower().replace("-", "_")
+        normalized = normalize_packing_backend(backend_name, warn_legacy=False)
         if active_config:
             return (
                 BackendTrialConfig(
@@ -27,51 +27,14 @@ class TrialPriorityPlanner:
                         int(value)
                         for value in active_config.get("allocation_percentages", [])
                     ),
-                    stream_offset_steps=(
-                        float(active_config["stream_offset_steps"])
-                        if active_config.get("stream_offset_steps") is not None
-                        else None
-                    ),
-                    mps_clients=(
-                        int(active_config["mps_clients"])
-                        if active_config.get("mps_clients") is not None
-                        else None
-                    ),
-                    streams_per_client=(
-                        int(active_config["streams_per_client"])
-                        if active_config.get("streams_per_client") is not None
-                        else None
-                    ),
                 ),
             )
-        if normalized in {"mps", "mps_process"}:
+        if normalized == "mps_process":
             return tuple(
                 BackendTrialConfig(
                     allocation_percentages=tuple(template),
-                    mps_clients=2,
-                    streams_per_client=1,
                 )
                 for template in mps_templates
-            )
-        if normalized in {"stream", "cuda_stream"}:
-            return tuple(
-                BackendTrialConfig(
-                    stream_offset_steps=float(offset),
-                    mps_clients=1,
-                    streams_per_client=2,
-                )
-                for offset in stream_offsets
-            )
-        if normalized == "mps_stream":
-            return tuple(
-                BackendTrialConfig(
-                    allocation_percentages=tuple(template),
-                    stream_offset_steps=float(offset),
-                    mps_clients=2,
-                    streams_per_client=1,
-                )
-                for template in mps_templates
-                for offset in stream_offsets
             )
         return (BackendTrialConfig(),)
 

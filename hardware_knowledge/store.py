@@ -34,7 +34,11 @@ class HardwareKnowledgeGraphStore:
 
     def __init__(self, settings: Any, *, driver: Any | None = None):
         self.settings = settings
-        self.config = getattr(settings, "hardware_knowledge_graph", None) or getattr(settings, "graph_db", None)
+        self.config = (
+            getattr(settings, "hardware_knowledge_graph", None)
+            or getattr(settings, "graph_db", None)
+            or getattr(settings, "graph", None)
+        )
         self._driver = driver
 
     @property

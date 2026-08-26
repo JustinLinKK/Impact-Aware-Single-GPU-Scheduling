@@ -10,6 +10,13 @@ import uuid
 
 import yaml
 
+from .backend_mode import (
+    BACKEND_NEUTRAL,
+    RUNNER_CONTRACT_SUBPROCESS_V1,
+    is_retired_backend,
+    normalize_packing_backend,
+    stream_removal_message,
+)
 from .config import SchedulerConfig
 from .domain import (
     BatchProbeProfile,
@@ -202,16 +209,34 @@ class SchedulerClient:
             }
         return TrainingJob.from_dict(payload)
 
+    def _apply_backend_contract(self, job: TrainingJob) -> TrainingJob:
+        for key in ("placement_backend", "effective_backend"):
+            if is_retired_backend(job.metadata.get(key)):
+                raise ValueError(stream_removal_message())
+        existing_runner = job.metadata.get("runner_contract")
+        if existing_runner and existing_runner != RUNNER_CONTRACT_SUBPROCESS_V1:
+            raise ValueError(
+                f"Unsupported runner contract {existing_runner!r}; expected {RUNNER_CONTRACT_SUBPROCESS_V1}"
+            )
+        effective_backend = self.settings.gpu_scheduler.packing_backend
+        if job.packing.eligible and not job.packing.backend_allowlist:
+            job.packing.backend_allowlist = [effective_backend]
+        job.metadata["effective_backend"] = effective_backend
+        job.metadata["runner_contract"] = RUNNER_CONTRACT_SUBPROCESS_V1
+        return job
+
     def submit(self, request: SubmitJobRequest | JobSpec | TrainingJob) -> TrainingJob:
         if isinstance(request, TrainingJob):
-            return self.store.submit_job(request)
+            return self.store.submit_job(self._apply_backend_contract(request))
         if isinstance(request, JobSpec):
             request = SubmitJobRequest(spec=request)
         run = request.run or JobRun()
-        return self.store.submit_job(TrainingJob.from_parts(request.spec, run))
+        return self.store.submit_job(
+            self._apply_backend_contract(TrainingJob.from_parts(request.spec, run))
+        )
 
     def submit_many(self, requests: list[SubmitJobRequest | JobSpec | TrainingJob]) -> list[TrainingJob]:
-        """Submit a scheduler-visible round before callers start polling results."""
+        """Submit each ready job immediately; callers need not wait for a batch barrier."""
         return [self.submit(request) for request in requests]
 
     def submit_from_payload(self, payload: dict[str, Any]) -> TrainingJob:
@@ -273,6 +298,20 @@ class SchedulerClient:
         del query
         report: SchedulerReport = self.store.report()
         return report.to_dict()
+
+    def migrate_backend_modes(
+        self,
+        *,
+        dry_run: bool = True,
+        config_paths: list[str | Path] | None = None,
+    ) -> dict[str, Any]:
+        from .migrations import migrate_backend_mode_v2
+
+        return migrate_backend_mode_v2(
+            self.settings,
+            dry_run=dry_run,
+            config_paths=config_paths or [],
+        )
 
     def list_events(self, *, job_id: str | None = None, event_type: str | None = None) -> list[dict[str, Any]]:
         return self.store.list_events(job_id=job_id, event_type=event_type)
@@ -586,6 +625,9 @@ class SchedulerClient:
             "hardware_key": hardware.get("hardware_key"),
             "gpu_name": hardware.get("gpu_name"),
             "compute_capability": hardware.get("compute_capability"),
+            "effective_backend": self.settings.gpu_scheduler.packing_backend,
+            "runner_contract": RUNNER_CONTRACT_SUBPROCESS_V1,
+            "knowledge_corpus_version": "backend_guidance_rule_v1",
         }
 
     def _current_hardware_context_for_lookup(self, hardware_id: str) -> dict[str, Any]:
@@ -1016,6 +1058,34 @@ class SchedulerClient:
             limit=limit,
         )
 
+    def get_backend_design_guidance(
+        self,
+        *,
+        effective_backend: str | None = None,
+        runner_contract: str = RUNNER_CONTRACT_SUBPROCESS_V1,
+        pipeline_stage: str = "model_design",
+        hardware_key: str = "current",
+        query: str | None = None,
+        limit: int = 32,
+    ) -> dict[str, Any]:
+        configured = self.settings.gpu_scheduler.packing_backend
+        selected = normalize_packing_backend(effective_backend or configured)
+        if selected != configured:
+            raise ValueError(
+                "effective_backend must match authoritative gpu_scheduler.packing_backend"
+            )
+        hardware_context = self.get_hardware_context(
+            hardware_key, include_scheduler_limits=True
+        )
+        return self._code_store().get_backend_design_guidance(
+            effective_backend=selected,
+            runner_contract=runner_contract,
+            pipeline_stage=pipeline_stage,
+            hardware_context=hardware_context,
+            query=query,
+            limit=limit,
+        )
+
     def _vector_filters_from_context(
         self,
         candidate: dict[str, Any],
@@ -1024,8 +1094,29 @@ class SchedulerClient:
         hardware_context = graph_context.get("hardware_context") or {}
         hardware = hardware_context.get("hardware") or {}
         diagnosis = graph_context.get("derived_diagnosis") or {}
+        configured_backend = self.settings.gpu_scheduler.packing_backend
+        backend = normalize_packing_backend(
+            candidate.get("effective_backend") or configured_backend
+        )
+        if backend != configured_backend:
+            raise ValueError(
+                "candidate effective_backend must match authoritative gpu_scheduler.packing_backend"
+            )
+        runner_contract = str(
+            candidate.get("runner_contract") or RUNNER_CONTRACT_SUBPROCESS_V1
+        )
+        if runner_contract != RUNNER_CONTRACT_SUBPROCESS_V1:
+            raise ValueError(
+                f"Unsupported runner contract {runner_contract!r}; expected {RUNNER_CONTRACT_SUBPROCESS_V1}"
+            )
+        pipeline_stages = self._hardware_stages_for_candidate(candidate) or [
+            "model_design"
+        ]
         filters: dict[str, Any] = {
             "framework": str(candidate.get("framework") or "pytorch"),
+            "backend_modes": [BACKEND_NEUTRAL, backend],
+            "runner_contracts": runner_contract,
+            "pipeline_stages": pipeline_stages,
         }
         if candidate.get("model_family") or candidate.get("packing_family"):
             filters["model_families"] = candidate.get("model_family") or candidate.get("packing_family")
@@ -1071,13 +1162,44 @@ class SchedulerClient:
             limit=limit,
         )
         if not results and filters:
-            relaxed_filters = {"framework": filters.get("framework", "pytorch")}
+            relaxed_filters = {
+                key: filters[key]
+                for key in (
+                    "framework",
+                    "backend_modes",
+                    "runner_contracts",
+                    "pipeline_stages",
+                )
+                if key in filters
+            }
             results = self.search_code_knowledge(
                 query=query,
                 filters=relaxed_filters,
                 record_types=["optimization_recipe_chunks", "code_doc_chunks", "api_symbol_chunks"],
                 limit=limit,
             )
+        exact_cuda_filters = self._exact_cuda_docs_filters(
+            backend=str(filters.get("backend_modes", [self.settings.gpu_scheduler.packing_backend])[-1]),
+            runner_contract=str(filters.get("runner_contracts") or RUNNER_CONTRACT_SUBPROCESS_V1),
+            pipeline_stages=list(filters.get("pipeline_stages") or ["model_design"]),
+        )
+        if exact_cuda_filters:
+            exact_cuda = self._code_store().search(
+                query=query,
+                filters=exact_cuda_filters,
+                record_types=["optimization_recipe_chunks", "code_doc_chunks"],
+                limit=limit,
+            )
+            by_id = {
+                str(item.get("record_id") or ""): item
+                for item in [*results, *exact_cuda]
+                if item.get("record_id")
+            }
+            results = sorted(
+                by_id.values(),
+                key=lambda item: float(item.get("score") or 0.0),
+                reverse=True,
+            )[: max(1, int(limit))]
         recipes = [item for item in results if item.get("record_type") == "optimization_recipe_chunks"]
         docs = [item for item in results if item.get("record_type") == "code_doc_chunks"]
         api_symbols = [item for item in results if item.get("record_type") == "api_symbol_chunks"]
@@ -1096,6 +1218,65 @@ class SchedulerClient:
                 if item.get("record_id")
             ],
         }
+
+    def _exact_cuda_docs_filters(
+        self,
+        *,
+        backend: str,
+        runner_contract: str,
+        pipeline_stages: list[str],
+    ) -> dict[str, Any]:
+        """Build the complete read-time publication gate for NVIDIA records."""
+
+        if not bool(getattr(self._code_store(), "enabled", False)):
+            return {}
+        facts = getattr(self, "_cuda_docs_applicability_facts", None)
+        if facts is None:
+            try:
+                from .cuda_mcp_bridge import facts_from_knowledge_base
+
+                facts = facts_from_knowledge_base(self)
+            except Exception:
+                facts = False
+            self._cuda_docs_applicability_facts = facts
+        if not facts:
+            return {}
+        try:
+            from .cuda_docs.router import applicability_from_facts
+
+            applicability = applicability_from_facts(
+                facts,
+                backend_mode=backend,
+                runner_contract=runner_contract,
+                remote_tool_schema_hash="not_required_for_read",
+            )
+        except Exception:
+            return {}
+        values = applicability.to_dict()
+        required = (
+            "gpu_architecture",
+            "compute_capability",
+            "driver_major_minor",
+            "cuda_major_minor",
+            "framework",
+            "framework_major_minor",
+            "backend_mode",
+            "backend_config_hash",
+            "runner_contract",
+        )
+        if any(
+            not str(values.get(key) or "").strip()
+            or str(values.get(key)).strip().lower() == "unknown"
+            for key in required
+        ):
+            return {}
+        result: dict[str, Any] = {
+            "source_type": "nvidia_cuda_docs",
+            "verified_source": True,
+            "pipeline_stages": pipeline_stages,
+        }
+        result.update({f"applicability.{key}": values[key] for key in required})
+        return result
 
     def get_optimization_context(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
         graph_context = self.get_profile_evidence(candidate=candidate, limit=limit)
@@ -1154,7 +1335,7 @@ class SchedulerClient:
         }
 
     def plan_job_packet(self, *, candidates: list[dict[str, Any]], limit: int = 8) -> dict[str, Any]:
-        """Plan a round together so placement evidence is available before dispatch."""
+        """Compare currently ready candidates without imposing a dispatch barrier."""
         normalized_candidates = [dict(candidate or {}) for candidate in candidates]
         packet_id = f"packet-{uuid.uuid4().hex[:12]}"
         jobs: list[dict[str, Any]] = []
@@ -1216,7 +1397,7 @@ class SchedulerClient:
         recommendations: list[str] = []
         if normalized_candidates:
             recommendations.append(
-                "Submit this round as one scheduler packet so batch probing, placement, and packing decisions can see all runnable jobs before dispatch."
+                "Each candidate remains independently submit-ready; use packet evidence only to improve placement decisions for jobs that are ready now."
             )
         compatible_pairs = [
             item for item in compatibilities if (item.get("compatibility") or {}).get("compatible") is True
@@ -1243,12 +1424,28 @@ class SchedulerClient:
         workload_type: str | None = None,
         task_type: str | None = None,
         candidate_families: list[str] | None = None,
+        effective_backend: str | None = None,
+        runner_contract: str = RUNNER_CONTRACT_SUBPROCESS_V1,
         hardware_key: str = "current",
         limit: int = 8,
     ) -> dict[str, Any]:
         """Rank model-family choices using hardware feature/code knowledge before draft generation."""
         workload = workload_type or task_type or "mlevolve_training"
+        configured_backend = self.settings.gpu_scheduler.packing_backend
+        backend = normalize_packing_backend(effective_backend or configured_backend)
+        if backend != configured_backend:
+            raise ValueError(
+                "effective_backend must match authoritative gpu_scheduler.packing_backend"
+            )
         hardware_context = self.get_hardware_context(hardware_key, include_scheduler_limits=True)
+        backend_guidance = self.get_backend_design_guidance(
+            effective_backend=backend,
+            runner_contract=runner_contract,
+            pipeline_stage="model_design",
+            hardware_key=hardware_key,
+            query=f"{workload} pytorch model design memory batch operators",
+            limit=max(8, int(limit) * 2),
+        )
         try:
             stage_feature_context = self.get_stage_hardware_features(
                 hardware_key,
@@ -1286,7 +1483,14 @@ class SchedulerClient:
             try:
                 matches = self.search_code_knowledge(
                     query=query,
-                    filters={"framework": "pytorch", "workload_types": workload, "model_families": family},
+                    filters={
+                        "framework": "pytorch",
+                        "workload_types": workload,
+                        "model_families": family,
+                        "backend_modes": [BACKEND_NEUTRAL, backend],
+                        "runner_contracts": runner_contract,
+                        "pipeline_stages": "model_design",
+                    },
                     record_types=["optimization_recipe_chunks", "code_doc_chunks", "api_symbol_chunks"],
                     limit=max(1, min(4, int(limit))),
                 )
@@ -1339,14 +1543,25 @@ class SchedulerClient:
         ]
         return _sanitize_agent_response({
             "found": bool(options),
+            "effective_backend": backend,
+            "runner_contract": runner_contract,
+            "backend_guidance": backend_guidance,
             "hardware_context": hardware_context,
             "hardware_feature_index": feature_index,
             "workload_type": workload,
             "model_options": options[: max(1, int(limit))],
             "recommendations": recommendations,
             "risk_flags": sorted(set(risk_flags))[: max(1, int(limit))],
-            "evidence_refs": sorted(set(evidence_refs)),
-            "confidence": round(max([float(item.get("confidence") or 0.0) for item in options] or [0.0]), 3),
+            "evidence_refs": sorted(
+                set(evidence_refs).union(backend_guidance.get("evidence_refs") or [])
+            ),
+            "confidence": round(
+                max(
+                    [float(item.get("confidence") or 0.0) for item in options]
+                    + [float(backend_guidance.get("confidence") or 0.0)]
+                ),
+                3,
+            ),
         })
 
     def search_hardware_features(

@@ -159,7 +159,9 @@ class Neo4jStateStore:
                 "SELECT payload_json FROM jobs ORDER BY queue_sequence ASC"
             ).fetchall():
                 self.record_scheduler_job_evidence(
-                    TrainingJob.from_dict(json.loads(row["payload_json"]))
+                    TrainingJob.from_dict(
+                        json.loads(row["payload_json"]), historical_read=True
+                    )
                 )
             for row in connection.execute("SELECT * FROM solo_profiles").fetchall():
                 self.record_solo_profile_evidence(SoloProfile.from_row(dict(row)))
@@ -504,7 +506,9 @@ class Neo4jStateStore:
         )
         if not rows:
             return None
-        return TrainingJob.from_dict(json.loads(rows[0]["payload_json"]))
+        return TrainingJob.from_dict(
+            json.loads(rows[0]["payload_json"]), historical_read=True
+        )
 
     def list_jobs(
         self, statuses: Iterable[JobStatus | str] | None = None
@@ -533,7 +537,12 @@ class Neo4jStateStore:
                 """,
                 params,
             )
-        return [TrainingJob.from_dict(json.loads(row["payload_json"])) for row in rows]
+        return [
+            TrainingJob.from_dict(
+                json.loads(row["payload_json"]), historical_read=True
+            )
+            for row in rows
+        ]
 
     def runnable_jobs(self) -> list[TrainingJob]:
         jobs = self.list_jobs(

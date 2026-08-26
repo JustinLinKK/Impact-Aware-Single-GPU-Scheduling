@@ -64,9 +64,9 @@ class LiveGpuSchedulerFullFlowTest(unittest.TestCase):
                 scheduler_poll_interval_seconds=0.05,
                 gpu_scheduler={
                     "mode": "parallel_time_aware",
-                    "backend_priority": ["exclusive"],
+                    "packing_backend": "cuda_process",
+                    "exclusive_fallback_enabled": True,
                     "profiling": {"warmup_steps": 1, "solo_probe_steps": 1},
-                    "stream": {"enabled": False},
                     "cuda_process": {"enabled": False},
                     "mps": {"enabled": False},
                 },
@@ -214,9 +214,9 @@ class LiveGpuSchedulerFullFlowTest(unittest.TestCase):
                 scheduler_poll_interval_seconds=0.05,
                 gpu_scheduler={
                     "mode": "parallel_time_aware",
-                    "backend_priority": ["cuda_process", "exclusive"],
+                    "packing_backend": "cuda_process",
+                    "exclusive_fallback_enabled": True,
                     "parallel_job_cap": 3,
-                    "stream": {"enabled": False},
                     "mps": {"enabled": False},
                     "cuda_process": {"enabled": True},
                 },

@@ -72,12 +72,22 @@ class WorkerSupervisor:
     def _overlap_allowed_for_backend(self, backend_name: str) -> bool:
         return (
             self.settings.gpu_scheduler.enabled
-            and backend_name != "exclusive"
-            and backend_name in self.settings.gpu_scheduler.backend_priority
+            and backend_name == self.settings.gpu_scheduler.packing_backend
         )
 
     def available_backends(self) -> dict[str, bool]:
-        return self.backend_registry.availability()
+        availability = self.backend_registry.availability()
+        gpu = self.settings.gpu_scheduler
+        if (
+            gpu.packing_backend == "mps_process"
+            and not availability.get("mps_process", False)
+            and gpu.mps_unavailable_policy == "fail"
+        ):
+            raise RuntimeError(
+                "mps_process is configured but NVIDIA MPS is unavailable; "
+                "set mps_unavailable_policy=exclusive to permit the explicit solo fallback"
+            )
+        return availability
 
     def active_groups(self) -> dict[str, PlacementGroupHandle]:
         return dict(self._groups)

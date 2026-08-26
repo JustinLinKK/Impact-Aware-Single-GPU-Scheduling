@@ -1,0 +1,238 @@
+records:
+  - schema_version: backend_guidance_rule_v1
+    rule_id: shared.subprocess.task_quality_and_elasticity
+    title: Preserve task quality and expose elastic model dimensions
+    text: Preserve the task metric while making physical batch size, effective batch size, model dimensions, input shape, and host parallelism configurable.
+    backend_modes: [backend_neutral]
+    runner_contracts: [subprocess_job_v1]
+    pipeline_stages: [model_design, datatype_precision, training_evaluation]
+    rule_type: invariant
+    owner: job_code
+    strength: hard
+    transferability: backend_neutral
+    framework: pytorch
+    workload_types: []
+    hardware_constraints: {}
+    recommended_patterns:
+      - Separate physical batch size from effective batch size with correct gradient accumulation.
+      - Keep width, depth, input resolution or sequence length configurable when the architecture permits.
+      - Make DataLoader workers, pinned memory, prefetching, OMP threads, and MKL threads configurable.
+    avoid_patterns:
+      - Do not choose a weaker model solely because it may colocate more easily.
+    source_refs:
+      - title: MLEvolve subprocess backend ADR
+        path: docs/adr/0001-retire-cuda-stream-backend.md
+        source_type: architecture_decision
+    confidence: 1.0
+    last_verified: "2026-08-25"
+
+  - schema_version: backend_guidance_rule_v1
+    rule_id: shared.subprocess.isolated_artifacts_and_telemetry
+    title: Keep independent job artifacts isolated and report resolved resources
+    text: Every generated job is an independent subprocess and must use process-local outputs while reporting resolved batch, timing, memory, and failures.
+    backend_modes: [backend_neutral]
+    runner_contracts: [subprocess_job_v1]
+    pipeline_stages: [model_design, training_evaluation]
+    rule_type: safety
+    owner: runner
+    strength: hard
+    transferability: backend_neutral
+    framework: pytorch
+    workload_types: []
+    hardware_constraints: {}
+    recommended_patterns:
+      - Use node-specific checkpoints, logs, temporary files, seeds, and output directories.
+      - Emit machine-readable resolved batch size, epoch or step timing, peak memory, and failure information.
+    avoid_patterns:
+      - Do not hardcode GPU IDs or launch sibling training jobs.
+      - Do not assume another job starts at the same time.
+    source_refs:
+      - title: MLEvolve subprocess backend ADR
+        path: docs/adr/0001-retire-cuda-stream-backend.md
+        source_type: architecture_decision
+    confidence: 1.0
+    last_verified: "2026-08-25"
+
+  - schema_version: backend_guidance_rule_v1
+    rule_id: cuda_process.normal_process_throughput
+    title: Optimize ordinary independent CUDA process throughput
+    text: In cuda_process mode each job owns a CUDA context, so optimize normal process throughput and memory stability while leaving colocation benefit to measured scheduler trials.
+    backend_modes: [cuda_process]
+    runner_contracts: [subprocess_job_v1]
+    pipeline_stages: [model_design, datatype_precision, training_evaluation]
+    rule_type: recommendation
+    owner: job_code
+    strength: preferred
+    transferability: exact_backend
+    framework: pytorch
+    workload_types: []
+    hardware_constraints: {vendor: nvidia}
+    recommended_patterns:
+      - Prefer efficient supported fused or standard operators and reduce launch overhead within the scheduler memory budget.
+      - Use one main GPU-training process per submitted job.
+      - Keep CPU and DataLoader parallelism configurable to avoid host oversubscription.
+    avoid_patterns:
+      - Do not deliberately underutilize the model in hopes that another process fills the GPU.
+      - Do not create nested CUDA multiprocessing or extra GPU worker processes.
+      - Do not initialize CUDA before a multiprocessing boundary owned by the job.
+    source_refs:
+      - title: PyTorch multiprocessing best practices
+        url: https://docs.pytorch.org/docs/stable/notes/multiprocessing.html
+        source_type: framework_documentation
+    confidence: 0.95
+    last_verified: "2026-08-25"
+
+  - schema_version: backend_guidance_rule_v1
+    rule_id: cuda_process.no_mps_controls
+    title: Exclude MPS deployment controls from cuda_process jobs
+    text: cuda_process mode does not depend on the MPS service; generated job code must not configure it.
+    backend_modes: [cuda_process]
+    runner_contracts: [subprocess_job_v1]
+    pipeline_stages: [model_design, training_evaluation]
+    rule_type: safety
+    owner: scheduler
+    strength: hard
+    transferability: exact_backend
+    framework: pytorch
+    workload_types: []
+    hardware_constraints: {vendor: nvidia}
+    recommended_patterns: []
+    avoid_patterns:
+      - Do not start or stop MPS, set active-thread percentages, select client priority, or set MPS pipe and log variables.
+    source_refs:
+      - title: NVIDIA MPS deployment guidance
+        url: https://docs.nvidia.com/deploy/mps/when-to-use-mps.html
+        source_type: vendor_documentation
+    confidence: 1.0
+    last_verified: "2026-08-25"
+
+  - schema_version: backend_guidance_rule_v1
+    rule_id: mps_process.separate_process_semantics
+    title: Treat MPS clients as separate processes and address spaces
+    text: Every mps_process job remains an independent CUDA process and address space; MPS does not share model weights, PyTorch state, a CUDA context, or allocator state between jobs.
+    backend_modes: [mps_process]
+    runner_contracts: [subprocess_job_v1]
+    pipeline_stages: [model_design, datatype_precision, training_evaluation]
+    rule_type: invariant
+    owner: runner
+    strength: hard
+    transferability: exact_backend
+    framework: pytorch
+    workload_types: []
+    hardware_constraints: {vendor: nvidia, min_compute_capability: "7.0"}
+    recommended_patterns:
+      - Keep peak and reserved memory plus temporary workspaces conservative because clients share physical GPU memory.
+      - Favor batch elasticity and ordinary PyTorch, cuDNN, and cuBLAS operators with understood resource behavior.
+    avoid_patterns:
+      - Do not claim cross-job sharing of model state, weights, CUDA contexts, or allocators.
+      - Do not reshape models merely to make concurrent jobs structurally similar.
+    source_refs:
+      - title: NVIDIA MPS architecture
+        url: https://docs.nvidia.com/deploy/mps/architecture.html
+        source_type: vendor_documentation
+    confidence: 1.0
+    last_verified: "2026-08-25"
+
+  - schema_version: backend_guidance_rule_v1
+    rule_id: mps_process.scheduler_owned_controls
+    title: Keep MPS controls outside generated jobs
+    text: The scheduler owns the MPS daemon, active-thread allocations, priorities, memory limits, and device compute mode.
+    backend_modes: [mps_process]
+    runner_contracts: [subprocess_job_v1]
+    pipeline_stages: [model_design, datatype_precision, training_evaluation]
+    rule_type: safety
+    owner: scheduler
+    strength: hard
+    transferability: exact_backend
+    framework: pytorch
+    workload_types: []
+    hardware_constraints: {vendor: nvidia, min_compute_capability: "7.0"}
+    recommended_patterns: []
+    avoid_patterns:
+      - Do not start or stop MPS from generated model code.
+      - Do not set active-thread percentages, client priority, memory limits, pipe directories, log directories, or device compute mode.
+    source_refs:
+      - title: NVIDIA MPS deployment guidance
+        url: https://docs.nvidia.com/deploy/mps/when-to-use-mps.html
+        source_type: vendor_documentation
+    confidence: 1.0
+    last_verified: "2026-08-25"
+
+  - schema_version: backend_guidance_rule_v1
+    rule_id: mps_process.operator_and_sync_safety
+    title: Use MPS-safe operators and necessary synchronization only
+    text: Prefer supported operators with bounded resource behavior, avoid unsupported device-side launch patterns, and retain every correctness-required synchronization.
+    backend_modes: [mps_process]
+    runner_contracts: [subprocess_job_v1]
+    pipeline_stages: [model_design, training_evaluation]
+    rule_type: safety
+    owner: job_code
+    strength: preferred
+    transferability: exact_backend
+    framework: pytorch
+    workload_types: []
+    hardware_constraints: {vendor: nvidia, min_compute_capability: "7.0"}
+    recommended_patterns:
+      - Prefer event or tensor dependencies and normal framework ordering where sufficient.
+      - Validate custom long-running or resource-monopolizing kernels explicitly.
+    avoid_patterns:
+      - Avoid CUDA dynamic parallelism and operations unsupported by the deployed MPS and GPU generation.
+      - Avoid unnecessary device-wide synchronization in the training loop.
+      - Never remove correctness-required synchronization.
+    source_refs:
+      - title: NVIDIA MPS deployment guidance
+        url: https://docs.nvidia.com/deploy/mps/when-to-use-mps.html
+        source_type: vendor_documentation
+    confidence: 0.92
+    last_verified: "2026-08-25"
+
+  - schema_version: backend_guidance_rule_v1
+    rule_id: mps_process.allocations_are_limits
+    title: Treat MPS allocations as tested usage limits
+    text: MPS active-thread percentages are resource-usage limits rather than guaranteed reserved shares, so measured scheduler trials determine slowdown and makespan benefit.
+    backend_modes: [mps_process]
+    runner_contracts: [subprocess_job_v1]
+    pipeline_stages: [model_design, training_evaluation]
+    rule_type: heuristic
+    owner: scheduler
+    strength: informational
+    transferability: exact_backend
+    framework: pytorch
+    workload_types: []
+    hardware_constraints: {vendor: nvidia, min_compute_capability: "7.0"}
+    recommended_patterns:
+      - Keep operator and batch behavior stable across scheduler-tested active-thread allocations.
+    avoid_patterns:
+      - Do not promise a fixed slowdown or makespan improvement from an allocation percentage.
+    source_refs:
+      - title: NVIDIA MPS active thread percentage
+        url: https://docs.nvidia.com/deploy/mps/index.html#active-thread-percentage
+        source_type: vendor_documentation
+    confidence: 0.9
+    last_verified: "2026-08-25"
+
+  - schema_version: backend_guidance_rule_v1
+    rule_id: exclusive.repeatable_solo_baseline
+    title: Produce repeatable exclusive baselines
+    text: Exclusive probes and fallback runs optimize one-job throughput, memory stability, and repeatable measurement while retaining the same scheduler interface.
+    backend_modes: [exclusive]
+    runner_contracts: [subprocess_job_v1]
+    pipeline_stages: [model_design, datatype_precision, training_evaluation]
+    rule_type: recommendation
+    owner: job_code
+    strength: preferred
+    transferability: exclusive_baseline
+    framework: pytorch
+    workload_types: []
+    hardware_constraints: {}
+    recommended_patterns:
+      - Preserve configurable batch behavior so the same job remains portable to the configured packed mode.
+      - Report stable solo epoch time and peak memory as baseline evidence.
+    avoid_patterns:
+      - Do not inject packed-mode resource controls into an exclusive probe.
+    source_refs:
+      - title: MLEvolve subprocess backend ADR
+        path: docs/adr/0001-retire-cuda-stream-backend.md
+        source_type: architecture_decision
+    confidence: 1.0
+    last_verified: "2026-08-25"

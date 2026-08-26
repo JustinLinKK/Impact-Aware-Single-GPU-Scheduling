@@ -7,6 +7,7 @@ from hashlib import sha1
 import platform
 from typing import Any
 import json
+import subprocess
 
 import torch
 
@@ -20,6 +21,7 @@ class HardwareProfile:
     compute_capability: str | None
     cuda_runtime: str | None
     torch_version: str
+    driver_version: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -30,10 +32,11 @@ class HardwareProfile:
             "compute_capability": self.compute_capability,
             "cuda_runtime": self.cuda_runtime,
             "torch_version": self.torch_version,
+            "driver_version": self.driver_version,
         }
 
 
-def _hardware_key_payload(*, os_name: str, gpu_name: str, total_vram_mb: int | None, compute_capability: str | None, cuda_runtime: str | None, torch_version: str) -> dict[str, Any]:
+def _hardware_key_payload(*, os_name: str, gpu_name: str, total_vram_mb: int | None, compute_capability: str | None, cuda_runtime: str | None, torch_version: str, driver_version: str | None = None) -> dict[str, Any]:
     return {
         "os_name": os_name,
         "gpu_name": gpu_name,
@@ -41,10 +44,11 @@ def _hardware_key_payload(*, os_name: str, gpu_name: str, total_vram_mb: int | N
         "compute_capability": compute_capability,
         "cuda_runtime": cuda_runtime,
         "torch_version": torch_version,
+        "driver_version": driver_version,
     }
 
 
-def build_hardware_key(*, os_name: str, gpu_name: str, total_vram_mb: int | None, compute_capability: str | None, cuda_runtime: str | None, torch_version: str) -> str:
+def build_hardware_key(*, os_name: str, gpu_name: str, total_vram_mb: int | None, compute_capability: str | None, cuda_runtime: str | None, torch_version: str, driver_version: str | None = None) -> str:
     payload = _hardware_key_payload(
         os_name=os_name,
         gpu_name=gpu_name,
@@ -52,6 +56,7 @@ def build_hardware_key(*, os_name: str, gpu_name: str, total_vram_mb: int | None
         compute_capability=compute_capability,
         cuda_runtime=cuda_runtime,
         torch_version=torch_version,
+        driver_version=driver_version,
     )
     return sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
@@ -61,6 +66,7 @@ def detect_hardware_profile(*, device_index: int = 0) -> HardwareProfile:
     gpu_name = "cuda-unavailable"
     total_vram_mb: int | None = None
     compute_capability: str | None = None
+    driver_version: str | None = None
     if torch.cuda.is_available():
         try:
             gpu_name = str(torch.cuda.get_device_name(device_index))
@@ -75,6 +81,23 @@ def detect_hardware_profile(*, device_index: int = 0) -> HardwareProfile:
         except Exception:
             total_vram_mb = None
             compute_capability = None
+        try:
+            probe = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=driver_version",
+                    "--format=csv,noheader",
+                    "-i",
+                    str(device_index),
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=1.0,
+            )
+            driver_version = (probe.stdout.splitlines() or [""])[0].strip() or None
+        except Exception:
+            driver_version = None
     cuda_runtime = torch.version.cuda
     torch_version = torch.__version__
     hardware_key = build_hardware_key(
@@ -84,6 +107,7 @@ def detect_hardware_profile(*, device_index: int = 0) -> HardwareProfile:
         compute_capability=compute_capability,
         cuda_runtime=cuda_runtime,
         torch_version=torch_version,
+        driver_version=driver_version,
     )
     return HardwareProfile(
         hardware_key=hardware_key,
@@ -93,4 +117,5 @@ def detect_hardware_profile(*, device_index: int = 0) -> HardwareProfile:
         compute_capability=compute_capability,
         cuda_runtime=cuda_runtime,
         torch_version=torch_version,
+        driver_version=driver_version,
     )

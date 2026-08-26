@@ -81,7 +81,8 @@ class MLStressTest(unittest.TestCase):
                 },
                 gpu_scheduler={
                     "mode": "parallel_time_aware",
-                    "backend_priority": ["cuda_process", "exclusive"],
+                    "packing_backend": "cuda_process",
+                    "exclusive_fallback_enabled": True,
                     "parallel_job_cap": 4,
                     "priority_window_size": 4,
                     "memory": {

@@ -6,6 +6,7 @@ from hashlib import sha1
 from typing import Any
 import json
 
+from ..backend_mode import RUNNER_CONTRACT_SUBPROCESS_V1, normalize_runtime_backend
 from .jobs import normalize_runtime_probe_strategy
 
 
@@ -25,12 +26,15 @@ def build_batch_size_observation_key(
     hardware_key: str,
     backend_name: str,
     batch_size: int,
+    runner_contract: str = RUNNER_CONTRACT_SUBPROCESS_V1,
 ) -> str:
     payload = {
-        "backend_name": backend_name,
+        "backend_name": normalize_runtime_backend(backend_name, warn_legacy=False),
         "batch_size": int(batch_size),
         "hardware_key": hardware_key,
         "model_key": model_key,
+        "runner_contract": runner_contract,
+        "schema_version": 2,
         "shape_signature": shape_signature,
     }
     return sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -45,8 +49,18 @@ def normalize_group_signatures(signatures: list[str]) -> list[str]:
     return sorted(signature for signature in signatures if signature)
 
 
-def build_backend_scoped_pair_key(left_signature: str, right_signature: str, *, backend_name: str) -> str:
-    return f"{str(backend_name)}::{canonical_pair_key(left_signature, right_signature)}"
+def build_backend_scoped_pair_key(
+    left_signature: str,
+    right_signature: str,
+    *,
+    backend_name: str,
+    runner_contract: str = RUNNER_CONTRACT_SUBPROCESS_V1,
+) -> str:
+    backend = normalize_runtime_backend(backend_name, warn_legacy=False)
+    return (
+        f"v2::{runner_contract}::{backend}::"
+        f"{canonical_pair_key(left_signature, right_signature)}"
+    )
 
 
 def build_group_signature(signatures: list[str]) -> str:
@@ -72,13 +86,16 @@ def build_combination_key(
     backend_name: str,
     scheduler_mode: str,
     batch_vector: dict[str, int],
+    runner_contract: str = RUNNER_CONTRACT_SUBPROCESS_V1,
 ) -> str:
     payload = {
-        "backend_name": backend_name,
+        "backend_name": normalize_runtime_backend(backend_name, warn_legacy=False),
         "batch_vector": encode_batch_vector(batch_vector),
         "group_signature": group_signature,
         "hardware_key": hardware_key,
         "scheduler_mode": scheduler_mode,
+        "runner_contract": runner_contract,
+        "schema_version": 2,
     }
     return sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
@@ -89,13 +106,16 @@ def build_runtime_profile_key(
     backend_name: str,
     resolved_batch_size: int,
     strategy: str,
+    runner_contract: str = RUNNER_CONTRACT_SUBPROCESS_V1,
 ) -> str:
     payload = {
         "signature": signature,
         "hardware_key": hardware_key,
-        "backend_name": backend_name,
+        "backend_name": normalize_runtime_backend(backend_name, warn_legacy=False),
         "resolved_batch_size": int(resolved_batch_size),
         "strategy": normalize_runtime_probe_strategy(strategy),
+        "runner_contract": runner_contract,
+        "schema_version": 2,
     }
     return sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
@@ -106,7 +126,9 @@ def normalize_colocation_members(members: list[dict[str, Any]]) -> list[dict[str
         item: dict[str, Any] = {
             "signature": str(member["signature"]),
             "batch_size": int(member["batch_size"]),
-            "backend_name": str(member["backend_name"]),
+            "backend_name": normalize_runtime_backend(
+                member["backend_name"], warn_legacy=False
+            ),
         }
         backend_config = member.get("backend_config")
         if isinstance(backend_config, dict) and backend_config:
@@ -139,5 +161,7 @@ def build_colocation_profile_key(hardware_key: str, members: list[dict[str, Any]
     payload = {
         "hardware_key": str(hardware_key),
         "members": normalize_colocation_members(members),
+        "runner_contract": RUNNER_CONTRACT_SUBPROCESS_V1,
+        "schema_version": 2,
     }
     return sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()

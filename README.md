@@ -1,10 +1,14 @@
 # localml_scheduler
 
+Agent-owned NVIDIA CUDA documentation enrichment is documented in
+[`docs/cuda_docs_integration.md`](../docs/cuda_docs_integration.md). It is
+disabled by default and is not part of scheduling, admission, or execution.
+
 `localml_scheduler` is a reusable local-first ML job manager for single-machine agent workflows. V1 focuses on two practical capabilities:
 
 - a single-GPU scheduler with priority queueing, safe-point pause/resume, persistence, and restart recovery
 - a RAM-backed baseline-model cache with optional LRU entry-capacity and RAM-percent limits that keeps immutable CPU-side baselines warm and serves isolated copies to worker subprocesses
-- time-aware GPU packing that chooses ready jobs, batch sizes, and concurrent backends from predicted completion time and compatibility evidence, with average VRAM used only as a safety gate
+- time-aware GPU packing that chooses ready jobs and batch sizes inside one preset process backend from predicted completion time and compatibility evidence, with average VRAM used only as a safety gate
 - Linux overlap on a configured non-exclusive backend, admitted incrementally by the time-aware policy
 - reserved exclusive five-option calibration that persists timing and VRAM measurements for time-aware planning
 - one-epoch runtime profiling that makes new job families pack-eligible after the first exclusive calibration run
@@ -21,7 +25,7 @@ It is intentionally packaged as a root-level module so it can be used by MLEvolv
 - `scheduler/time_objective.py`: verified sequential-versus-packed drain-time scoring
 - `scheduler/telemetry.py`: lightweight `nvidia-smi` device telemetry for solo and packed runs
 - `execution/`: subprocess launcher, file-based control plane, worker entrypoint, and runner context
-- `execution/backends.py`: exclusive and MPS-backed launch backends
+- `execution/backends.py`: exclusive, independent CUDA-process, and MPS-client-process launch backends
 - `checkpointing/`: atomic local checkpoint save/load
 - `model_cache/`: in-memory LRU baseline cache plus a local socket server for worker access
 - `storage/`: SQLite-backed jobs, commands, checkpoints, cache metadata, and event history
@@ -53,6 +57,7 @@ python -m localml_scheduler.cli list
 python -m localml_scheduler.cli status <job_id>
 python -m localml_scheduler.cli cache-stats
 python -m localml_scheduler.cli report
+python -m localml_scheduler.cli scheduler migrate-backend-modes --dry-run
 ```
 
 Run the demo:
@@ -79,6 +84,9 @@ Preferred read-only tools for agent integration:
   Qdrant code docs, optimization recipes, and API-symbol chunks.
 - `get_code_optimization_context(candidate, graph_context=None, limit=8)`
   bridges graph-derived symptoms into vector retrieval.
+- `get_backend_design_guidance(effective_backend, runner_contract, pipeline_stage)`
+  returns exact-backend hard rules from the local seed corpus before optional
+  semantic ranking, so it remains available when Qdrant is disabled.
 
 Compatibility wrappers such as `get_job_design_context(...)`,
 `search_hardware_features(...)`, `get_hardware_feature_context(...)`, and
@@ -157,6 +165,15 @@ closes only new packed admission, and active work continues normally. Admission
 reopens after a complete window below the resume threshold. GPU/SM utilization
 is retained only as telemetry and profile evidence.
 
+The deployment also selects exactly one `gpu_scheduler.packing_backend`:
+`cuda_process` or `mps_process`. Both launch one independent OS process and
+CUDA context per job. `mps_process` additionally connects those client
+processes to the scheduler-owned NVIDIA MPS service. `exclusive` is a solo
+probe/safety fallback and is not an alternative draft-time optimization target.
+If MPS is unavailable, `mps_unavailable_policy` either permits the explicit
+exclusive fallback or fails; it never silently changes to packed
+`cuda_process` execution.
+
 ## Time-aware scheduling
 
 `parallel_time_aware` starts the shortest predicted solo job as an anchor and
@@ -172,16 +189,17 @@ predicted average-VRAM checks before any concurrent work begins.
 - `backend_awared` jointly enumerates pairs at an empty-GPU boundary and ranks
   empty-GPU pairs or active-group newcomers with deterministic Pareto fronts.
   The risk vectors are derived from a CPU-only AST fingerprint and differ for
-  MPS, CUDA streams, and ordinary CUDA processes. Static analysis only orders
+  MPS-client processes and ordinary CUDA processes. Static analysis only orders
   candidates; unknown placements still require the same measured live trial.
 
 Backend-aware mode applies backend compatibility, batch/accuracy, conservative
 VRAM overhead, known-bad exact-profile, and optimistic trial-amortization gates
 before ranking. Exact profile identity includes hardware/runtime identity,
-source/graph signature, dtype, batch vector, backend, and backend configuration;
-epoch count and submission time are excluded. MPS pair templates are limited to
-50/50, 60/40, and 40/60, and stream offsets to 0, quarter-step, and half-step.
-Nonzero stream offsets are rejected when step time is unavailable.
+source/graph signature, dtype, batch vector, canonical backend, runner contract,
+and backend configuration; epoch count and submission time are excluded. MPS
+pair templates are limited to 50/50, 60/40, and 40/60. Active client
+allocations are immutable after CUDA-context creation; unsafe incremental
+admission is declined and reconsidered after the active configuration drains.
 
 The analyzer never imports submitted modules or initializes CUDA. It recognizes
 common linear/GEMM, convolution, attention, normalization, activation,
@@ -375,7 +393,7 @@ The normal pause flow is:
 - `parallel_job_cap` is optional (`null` means incremental admission has no fixed-width cap)
 - the memory ceiling is detected/configured total VRAM times `predicted_budget_fraction`; it can reject an addition but cannot improve its score
 - the packed path is opt-in per job via `packing.eligible: true` and a stable `packing.signature`
-- backend compatibility is tracked per backend, so an MPS failure does not automatically poison a stream pairing
+- backend compatibility is tracked per canonical backend, so an MPS-process failure cannot poison a CUDA-process profile
 - concurrent additions must remain on the active non-exclusive backend
 - raw MLEvolve snippet execution remains conservative by default; without an explicit runtime-probe hook they stay exclusive-only for runtime-aware packing
 

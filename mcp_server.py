@@ -241,16 +241,22 @@ def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
                 "endpoint": CUDA_MCP_ENDPOINT,
             }
         facts = facts_from_knowledge_base(client, signature=signature)
+        backend = str(
+            getattr(client.settings.gpu_scheduler, "packing_backend", "cuda_process")
+        )
         return {
             "applicable": True,
             "topic": topic,
-            "query": build_query(topic, facts),
+            "query": build_query(topic, facts, effective_backend=backend),
             "endpoint": CUDA_MCP_ENDPOINT,
             "hardware": {
                 "gpu_name": facts.gpu_name,
                 "compute_capability": facts.capability_str,
                 "total_vram_mb": facts.total_vram_mb,
-                "budget_vram_mb": facts.budget_vram_mb,
+                "residual_group_budget_mb": facts.residual_group_budget_mb,
+                "active_group_usage_mb": facts.active_group_usage_mb,
+                "safety_reserve_mb": facts.safety_reserve_mb,
+                "backend_overhead_mb": facts.backend_overhead_mb,
                 "measured_peak_vram_mb": facts.measured_peak_vram_mb,
                 "measured_samples": facts.measured_samples,
             },
@@ -274,22 +280,27 @@ def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
         the claim.
         """
         facts = facts_from_knowledge_base(client, signature=signature)
+        backend = str(
+            getattr(client.settings.gpu_scheduler, "packing_backend", "cuda_process")
+        )
         records = to_records(
             topic=topic,
             answer=answer,
             facts=facts,
             source_refs=source_refs,
             verified_date=verified_date,
+            effective_backend=backend,
         )
         if not records:
-            return {"ingested": 0, "reason": "answer contained no actionable patterns"}
+            return {
+                "ingested": 0,
+                "reason": "answer lacked verified NVIDIA source-labelled context or was quarantined",
+            }
         result = client._code_store().ingest_records(records, dry_run=dry_run)
         return {
             "ingested": len(records),
             "dry_run": dry_run,
-            "recipe_ids": [r.get("recipe_id") for r in records],
-            "kept_recommended": len(records[0].get("recommended_patterns", [])),
-            "kept_avoid": len(records[0].get("avoid_patterns", [])),
+            "chunk_ids": [r.get("chunk_id") for r in records],
             "excluded_techniques": facts.excluded_techniques(),
             "store_result": result,
         }

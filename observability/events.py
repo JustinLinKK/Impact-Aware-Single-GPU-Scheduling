@@ -11,6 +11,42 @@ from ..storage.log_store import SchedulerLogStore
 from ..storage.state_store import StateStore
 
 
+CUDA_DOCS_EVENT_FIELDS = frozenset(
+    {
+        "role",
+        "topic",
+        "cache_key_hash",
+        "tier",
+        "timing_ms",
+        "latency_ms",
+        "status",
+        "source_domains",
+        "rollout_mode",
+    }
+)
+
+
+def sanitize_cuda_docs_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Allowlist enrichment telemetry so errors, code, and responses cannot leak."""
+
+    sanitized = {
+        key: value
+        for key, value in dict(payload or {}).items()
+        if key in CUDA_DOCS_EVENT_FIELDS
+    }
+    if "source_domains" in sanitized:
+        sanitized["source_domains"] = sorted(
+            {
+                str(value).strip().lower()
+                for value in sanitized["source_domains"] or []
+                if str(value).strip()
+            }
+        )[:16]
+    if "cache_key_hash" in sanitized:
+        sanitized["cache_key_hash"] = str(sanitized["cache_key_hash"])[:64]
+    return sanitized
+
+
 class EventLogger:
     """Write scheduler events to the primary store and optional sidecars."""
 

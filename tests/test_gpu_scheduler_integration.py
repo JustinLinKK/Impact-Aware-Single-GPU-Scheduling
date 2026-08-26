@@ -119,7 +119,8 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
                 scheduler_poll_interval_seconds=0.05,
                 gpu_scheduler={
                     "mode": "parallel_time_aware",
-                    "backend_priority": ["cuda_process", "exclusive"],
+                    "packing_backend": "cuda_process",
+                    "exclusive_fallback_enabled": True,
                 },
                 graph_db={"enabled": False},
                 hardware_feature_db={"enabled": False},
@@ -159,7 +160,9 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
                 scheduler_poll_interval_seconds=0.05,
                 gpu_scheduler={
                     "mode": "parallel_time_aware",
-                    "backend_priority": ["exclusive"],
+                    "packing_backend": "cuda_process",
+                    "exclusive_fallback_enabled": True,
+                    "cuda_process": {"enabled": False},
                 },
                 graph_db={"enabled": False},
                 hardware_feature_db={"enabled": False},

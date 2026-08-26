@@ -34,7 +34,8 @@ def _settings(tmp_path: Path) -> SchedulerSettings:
         runtime_root=tmp_path,
         gpu_scheduler={
             "mode": "parallel_time_aware",
-            "backend_priority": ["cuda_process", "exclusive"],
+            "packing_backend": "cuda_process",
+            "exclusive_fallback_enabled": True,
             "parallel_job_cap": 3,
             "memory": {
                 "gpu_vram_gib": 10,

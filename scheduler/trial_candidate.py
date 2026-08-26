@@ -15,17 +15,9 @@ from .source_fingerprint import StaticJobFingerprint
 @dataclass(frozen=True, slots=True)
 class BackendTrialConfig:
     allocation_percentages: tuple[int, ...] = ()
-    stream_offset_steps: float | None = None
-    mps_clients: int | None = None
-    streams_per_client: int | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
-            "allocation_percentages": list(self.allocation_percentages),
-            "stream_offset_steps": self.stream_offset_steps,
-            "mps_clients": self.mps_clients,
-            "streams_per_client": self.streams_per_client,
-        }
+        return {"allocation_percentages": list(self.allocation_percentages)}
 
     @property
     def stable_key(self) -> str:
@@ -95,7 +87,7 @@ class TrialCandidate:
             "backend_name": self.backend_name,
             "hardware_key": self.hardware_key,
             "members": members,
-            "schema_version": 1,
+            "schema_version": 2,
         }
         digest = sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")

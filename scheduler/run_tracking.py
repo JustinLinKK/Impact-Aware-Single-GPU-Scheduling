@@ -104,7 +104,7 @@ class RunTrackingMixin:
             ):
                 self._register_packed_fallback(
                     run_context,
-                    job.status_reason or "stream-backed worker failed",
+                    job.status_reason or "packed-backend worker failed",
                     payload={"failed_job_id": snapshot.job_id},
                 )
             return

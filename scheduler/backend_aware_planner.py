@@ -69,7 +69,6 @@ class BackendAwarePlacementPlanner:
         return self.priority.backend_configs(
             backend_name,
             mps_templates=self.config.mps_allocation_templates,
-            stream_offsets=self.config.stream_offset_templates_in_steps,
             active_config=active_config,
         )
 
@@ -207,7 +206,7 @@ class BackendAwarePlacementPlanner:
             if mandatory is not None and mandatory not in pair:
                 continue
             jobs_tuple = tuple(pair)
-            for backend_name in self.settings.gpu_scheduler.backend_priority:
+            for backend_name in (self.settings.gpu_scheduler.packing_backend,):
                 if (
                     backend_name == "exclusive"
                     or not backend_available.get(backend_name, False)
@@ -384,12 +383,6 @@ class BackendAwarePlacementPlanner:
             "candidates_rejected_by_amortization": rejected_amortization,
             "objective_version": self.settings.gpu_scheduler.objective.objective_version,
         }
-        start_delay: dict[str, float] = {}
-        if selected.backend_config.stream_offset_steps not in {None, 0.0}:
-            start_delay[second.job_id] = float(
-                selected.backend_config.stream_offset_steps
-                * (first_fingerprint.step_seconds or 0.0)
-            )
         trial_metadata = {
             "requires_live_trial": requires_trial,
             "candidate_job_id": first.job_id,
@@ -399,7 +392,6 @@ class BackendAwarePlacementPlanner:
             "pretrial_epoch_seconds": {
                 second.job_id: second_fingerprint.predicted_epoch_seconds
             },
-            "start_delay_seconds_by_job": start_delay,
             "source_fingerprint_signatures": {
                 job.job_id: fingerprint.execution_signature
                 for job, fingerprint in zip(
@@ -446,13 +438,15 @@ class BackendAwarePlacementPlanner:
         rejected_memory = rejected_amortization = 0
         for job in jobs[: self.config.ready_window_size]:
             for backend_name in backend_candidates:
+                if backend_name != self.settings.gpu_scheduler.packing_backend:
+                    continue
                 active_configs = [
                     active.metadata.get("placement_backend_config")
                     for active in active_jobs
                     if isinstance(active.metadata.get("placement_backend_config"), dict)
                 ]
                 # MPS client percentages are immutable after context creation.
-                if backend_name in {"mps", "mps_process"} and not active_configs:
+                if backend_name == "mps_process" and not active_configs:
                     continue
                 active_config = dict(active_configs[0]) if active_configs else None
                 for backend_config in self._backend_configs(

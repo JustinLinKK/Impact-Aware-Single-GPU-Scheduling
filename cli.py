@@ -54,6 +54,17 @@ def scheduler_rebuild_evidence_graph(
     typer.echo(json.dumps(result, indent=2, sort_keys=True))
 
 
+@scheduler_app.command("migrate-backend-modes")
+def scheduler_migrate_backend_modes(
+    settings: str | None = typer.Option(None, "--settings", help="Path to scheduler YAML config"),
+    dry_run: bool = typer.Option(True, "--dry-run/--execute", help="Report legacy rows by default; use --execute for the idempotent metadata migration"),
+) -> None:
+    client = _build_client(settings)
+    paths = [settings] if settings else []
+    result = client.migrate_backend_modes(dry_run=dry_run, config_paths=paths)
+    typer.echo(json.dumps(result, indent=2, sort_keys=True))
+
+
 @hardware_features_app.command("ingest")
 def hardware_features_ingest(
     settings: str | None = typer.Option(None, "--settings", help="Path to scheduler YAML config"),

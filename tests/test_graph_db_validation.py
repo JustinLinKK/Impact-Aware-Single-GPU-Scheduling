@@ -936,7 +936,6 @@ class GraphDatabaseValidationTest(unittest.TestCase):
                     "proposed_epochs": 4,
                     "requires_gpu": True,
                     "script_signature": "sig-resnet50",
-                    "backend_preference": "exclusive",
                     "uses_amp": True,
                     "notes": "baseline resnet50 training job",
                 },

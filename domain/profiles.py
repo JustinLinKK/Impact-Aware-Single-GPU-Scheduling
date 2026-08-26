@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 import json
 
+from ..backend_mode import normalize_runtime_backend
 from .common import parse_timestamp, to_primitive, utc_now
 from .identity import (
     build_backend_scoped_pair_key,
@@ -212,6 +213,7 @@ class PairProfile:
         backend_name: str,
         **kwargs: Any,
     ) -> "PairProfile":
+        backend_name = normalize_runtime_backend(backend_name)
         return cls(
             pair_key=build_backend_scoped_pair_key(left_signature, right_signature, backend_name=backend_name),
             left_signature=left_signature,
@@ -283,6 +285,7 @@ class CombinationProfile:
         batch_vector: dict[str, int],
         **kwargs: Any,
     ) -> "CombinationProfile":
+        backend_name = normalize_runtime_backend(backend_name)
         return cls(
             combination_key=build_combination_key(
                 group_signature,
@@ -406,6 +409,7 @@ class RuntimeProfile:
         **kwargs: Any,
     ) -> "RuntimeProfile":
         normalized_strategy = normalize_runtime_probe_strategy(strategy)
+        backend_name = normalize_runtime_backend(backend_name)
         return cls(
             profile_key=build_runtime_profile_key(
                 signature,
