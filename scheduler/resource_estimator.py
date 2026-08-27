@@ -115,6 +115,8 @@ class ResourceEstimator:
                     ml_epoch_predictions = {}
         estimates: list[BatchOptionEstimate] = []
         for batch_size in batch_sizes:
+            if not self._quality_safe(job, int(batch_size), backend_name):
+                continue
             memory_mb, memory_source = self._time_aware_memory_estimate(
                 job,
                 batch_size,
@@ -148,6 +150,51 @@ class ResourceEstimator:
                 )
             )
         return estimates
+
+    def _quality_safe(
+        self, job: TrainingJob, batch_size: int, backend_name: str
+    ) -> bool:
+        """Enforce measured quality limits inside the agent-approved envelope."""
+        contract = dict(job.metadata.get("training_quality_contract") or {})
+        allowed = {
+            max(1, int(value))
+            for value in contract.get("allowed_physical_batch_sizes") or []
+        }
+        if allowed and int(batch_size) not in allowed:
+            return False
+        hardware_key = self.repository.hardware_key()
+        observation = self.repository.get_batch_size_observation(
+            model_key=self.model_key(job),
+            shape_signature=self.shape_signature(job),
+            hardware_key=hardware_key,
+            backend_name=backend_name,
+            batch_size=int(batch_size),
+        )
+        if observation is None and backend_name != "exclusive":
+            observation = self.repository.get_batch_size_observation(
+                model_key=self.model_key(job),
+                shape_signature=self.shape_signature(job),
+                hardware_key=hardware_key,
+                backend_name="exclusive",
+                batch_size=int(batch_size),
+            )
+        if observation is None:
+            return True
+        max_seed_variance = contract.get("max_seed_variance")
+        if (
+            max_seed_variance is not None
+            and observation.seed_variance is not None
+            and float(observation.seed_variance) > float(max_seed_variance)
+        ):
+            return False
+        baseline = contract.get("baseline_metric")
+        maximize = contract.get("metric_maximize")
+        if baseline is None or maximize is None or observation.best_metric is None:
+            return True
+        tolerance = max(0.0, float(contract.get("quality_tolerance") or 0.0))
+        if bool(maximize):
+            return float(observation.best_metric) >= float(baseline) - tolerance
+        return float(observation.best_metric) <= float(baseline) + tolerance
 
     def _time_aware_memory_estimate(
         self,

@@ -161,13 +161,23 @@ def _run_time_aware_five_option_probe(context: RunnerContext, key_info: BatchPro
     requested = BatchResolution.requested_batch_size(context.job)
     if context.settings.gpu_scheduler.batch_options.require_power_of_two_original and not _is_power_of_two(requested):
         raise ValueError("time-aware exclusive probes require a power-of-two requested batch size")
-    exponent = requested.bit_length() - 1
-    proposals = [2 ** max(0, exponent + offset) for offset in context.settings.gpu_scheduler.batch_options.exponent_offsets]
+    contract = dict(context.job.metadata.get("training_quality_contract") or {})
+    approved_values = contract.get("allowed_physical_batch_sizes") or []
+    if approved_values:
+        proposals = sorted({max(1, int(value)) for value in approved_values})
+    else:
+        exponent = requested.bit_length() - 1
+        proposals = [2 ** max(0, exponent + offset) for offset in context.settings.gpu_scheduler.batch_options.exponent_offsets]
     cap = context.job.config.runner_kwargs.get(
         "probe_max_batch_size",
         context.settings.gpu_scheduler.batch_probe_max_batch_size,
     )
-    clipped = [min(value, max(1, int(cap))) if cap is not None else value for value in proposals]
+    if approved_values and cap is not None:
+        clipped = [value for value in proposals if value <= max(1, int(cap))]
+    else:
+        clipped = [min(value, max(1, int(cap))) if cap is not None else value for value in proposals]
+    if not clipped:
+        clipped = [requested]
     candidates = list(dict.fromkeys(max(1, int(value)) for value in clipped))
     probe = import_string(context.job.batch_probe.probe_target)
     warmup_steps = int(context.settings.gpu_scheduler.profiling.warmup_steps)
@@ -193,6 +203,7 @@ def _run_time_aware_five_option_probe(context: RunnerContext, key_info: BatchPro
         seconds_per_epoch = attempt.result.seconds_per_epoch
         if seconds_per_epoch is None and attempt.result.avg_step_time_ms is not None and attempt.result.steps_per_epoch:
             seconds_per_epoch = attempt.result.avg_step_time_ms * attempt.result.steps_per_epoch / 1000.0
+        resolved_candidate = BatchResolution.apply(context.job, batch_size)
         context.store.upsert_batch_size_observation(
             BatchSizeObservation(
                 observation_key=build_batch_size_observation_key(
@@ -208,13 +219,25 @@ def _run_time_aware_five_option_probe(context: RunnerContext, key_info: BatchPro
                 backend_name="exclusive",
                 batch_param_name=BatchResolution.param_name(context.job),
                 batch_size=batch_size,
+                effective_batch_size=resolved_candidate.metadata.get(
+                    "resolved_effective_batch_size"
+                ),
                 peak_vram_mb=attempt.result.peak_vram_mb,
                 avg_vram_mb=attempt.result.avg_vram_mb,
                 memory_total_mb=attempt.result.memory_total_mb,
                 avg_step_time_ms=attempt.result.avg_step_time_ms,
+                best_metric=existing.best_metric if existing else None,
+                metric_name=existing.metric_name if existing else None,
+                metric_maximize=existing.metric_maximize if existing else None,
+                best_epoch=existing.best_epoch if existing else None,
+                planned_epochs=existing.planned_epochs if existing else None,
+                completed_epochs=existing.completed_epochs if existing else None,
+                convergence_curve=(existing.convergence_curve if existing else []),
+                seed_variance=existing.seed_variance if existing else None,
                 observations=(existing.observations + 1) if existing else 1,
                 last_job_id=context.job.job_id,
                 metadata={
+                    **(existing.metadata if existing else {}),
                     "fits": attempt.result.fits,
                     "within_budget": attempt.within_budget,
                     "message": attempt.result.message,

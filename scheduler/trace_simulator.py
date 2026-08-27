@@ -973,7 +973,7 @@ def compare_policies(problem: TraceProblem) -> list[TraceMetrics]:
     serial = simulate_policy(problem, "serial_fifo", _serial_choice)
     return [
         serial,
-        simulate_policy(problem, "legacy_vram_fill", _fill_choice),
+        simulate_policy(problem, "vram_fill_reference", _fill_choice),
         simulate_recursive_time_aware(problem),
         simulate_recursive_time_aware(problem, backend_aware=True),
         oracle(problem, serial_baseline=serial),

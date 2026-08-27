@@ -62,7 +62,7 @@ def test_repeated_report_records_sample_variance_and_hardware_provenance() -> No
     report = aggregate_summaries(
         {
             "serial_fifo": [_summary(20, 12), _summary(22, 14)],
-            "legacy_vram_fill": [_summary(18, 13), _summary(20, 15)],
+            "vram_fill_reference": [_summary(18, 13), _summary(20, 15)],
             "parallel_time_aware": [_summary(10, 8), _summary(12, 10)],
         },
         hardware=_hardware(),

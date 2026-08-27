@@ -12,7 +12,7 @@ from .backend_mode import (
     normalize_packing_backend,
     normalize_runtime_backend,
 )
-from .domain import RunProfile
+from .domain import BatchSizeObservation, RunProfile
 
 _JOB_DESIGN_CANDIDATE_KEYS = {
     "stage",
@@ -22,6 +22,13 @@ _JOB_DESIGN_CANDIDATE_KEYS = {
     "packing_family",
     "proposed_batch_size",
     "proposed_epochs",
+    "effective_batch_size",
+    "gradient_accumulation_steps",
+    "quality_safe_physical_batch_sizes",
+    "quality_tolerance",
+    "metric_maximize",
+    "baseline_metric",
+    "max_seed_variance",
     "requires_gpu",
     "script_signature",
     "effective_backend",
@@ -670,12 +677,10 @@ class SchedulerKnowledgeBase:
         gpu_scheduler = getattr(settings, "gpu_scheduler", None)
         configured = getattr(gpu_scheduler, "packing_backend", None)
         if configured:
-            normalized["effective_backend"] = normalize_packing_backend(
-                configured, warn_legacy=False
-            )
+            normalized["effective_backend"] = normalize_packing_backend(configured)
         elif normalized.get("effective_backend"):
             normalized["effective_backend"] = normalize_packing_backend(
-                normalized["effective_backend"], warn_legacy=False
+                normalized["effective_backend"]
             )
         normalized["runner_contract"] = RUNNER_CONTRACT_SUBPROCESS_V1
         return normalized
@@ -1288,58 +1293,179 @@ class SchedulerKnowledgeBase:
         toolkit: str | None = None,
         shape_signature: str | None = None,
         current_batch_size: int | None = None,
+        candidate_batch_sizes: list[int] | None = None,
+        planned_epochs: int | None = None,
+        quality_tolerance: float = 0.0,
+        metric_maximize: bool | None = None,
+        baseline_metric: float | None = None,
+        max_effective_batch_size: int | None = None,
+        max_seed_variance: float | None = None,
     ) -> dict[str, Any]:
-        candidates = []
+        if not self._matches_toolkit(toolkit):
+            return {"found": False, "reason": "insufficient evidence"}
+        approved = (
+            {max(1, int(value)) for value in candidate_batch_sizes}
+            if candidate_batch_sizes
+            else None
+        )
+        observations = [
+            obs
+            for obs in self.store.list_batch_size_observations()
+            if (
+                model_or_signature in obs.model_key
+                or model_or_signature == obs.shape_signature
+            )
+            and (not shape_signature or obs.shape_signature == shape_signature)
+            and self._record_matches_hardware_filter(
+                hardware, hardware_key=obs.hardware_key
+            )
+            and (approved is None or int(obs.batch_size) in approved)
+        ]
+
+        baseline_observation = next(
+            (
+                obs
+                for obs in observations
+                if current_batch_size is not None
+                and int(obs.batch_size) == int(current_batch_size)
+                and obs.best_metric is not None
+            ),
+            None,
+        )
+        if baseline_metric is None and baseline_observation is not None:
+            baseline_metric = float(baseline_observation.best_metric)
+        if metric_maximize is None and baseline_observation is not None:
+            metric_maximize = baseline_observation.metric_maximize
+
+        evaluated: list[dict[str, Any]] = []
+        feasible: list[tuple[float, BatchSizeObservation, dict[str, Any]]] = []
+        for observation in observations:
+            reasons: list[str] = []
+            effective_batch = int(
+                observation.effective_batch_size or observation.batch_size
+            )
+            if (
+                max_effective_batch_size is not None
+                and effective_batch > int(max_effective_batch_size)
+            ):
+                reasons.append("effective_batch_exceeds_envelope")
+            if observation.metadata.get("fits") is False:
+                reasons.append("probe_did_not_fit")
+            if observation.metadata.get("within_budget") is False:
+                reasons.append("vram_budget_exceeded")
+            if (
+                max_seed_variance is not None
+                and observation.seed_variance is not None
+                and float(observation.seed_variance) > float(max_seed_variance)
+            ):
+                reasons.append("seed_variance_exceeds_envelope")
+            if baseline_metric is not None and observation.best_metric is not None:
+                tolerance = max(0.0, float(quality_tolerance))
+                if metric_maximize is True and float(observation.best_metric) < float(
+                    baseline_metric
+                ) - tolerance:
+                    reasons.append("quality_below_approved_floor")
+                elif metric_maximize is False and float(
+                    observation.best_metric
+                ) > float(baseline_metric) + tolerance:
+                    reasons.append("quality_above_approved_ceiling")
+            elif approved is None and current_batch_size is not None and int(
+                observation.batch_size
+            ) != int(current_batch_size):
+                reasons.append("no_quality_evidence_outside_current_batch")
+
+            seconds_per_epoch = observation.metadata.get("seconds_per_epoch")
+            if seconds_per_epoch is None and observation.avg_step_time_ms is not None:
+                steps_per_epoch = observation.metadata.get("steps_per_epoch")
+                if steps_per_epoch is not None:
+                    seconds_per_epoch = (
+                        float(observation.avg_step_time_ms)
+                        * float(steps_per_epoch)
+                        / 1000.0
+                    )
+            epochs = planned_epochs or observation.planned_epochs or 1
+            estimated_seconds = (
+                float(seconds_per_epoch) * max(1, int(epochs))
+                if seconds_per_epoch is not None
+                else None
+            )
+            audit = {
+                "batch_size": observation.batch_size,
+                "effective_batch_size": effective_batch,
+                "best_metric": observation.best_metric,
+                "seed_variance": observation.seed_variance,
+                "estimated_total_runtime_seconds": estimated_seconds,
+                "feasible": not reasons and estimated_seconds is not None,
+                "rejection_reasons": reasons,
+            }
+            evaluated.append(audit)
+            if not reasons and estimated_seconds is not None:
+                feasible.append((estimated_seconds, observation, audit))
+
+        if feasible:
+            feasible.sort(
+                key=lambda item: (
+                    item[0],
+                    abs(int(item[1].batch_size) - int(current_batch_size or item[1].batch_size)),
+                    int(item[1].batch_size),
+                )
+            )
+            estimated_seconds, best, _audit = feasible[0]
+            return {
+                "found": True,
+                "recommended_batch_size": best.batch_size,
+                "recommended_effective_batch_size": best.effective_batch_size
+                or best.batch_size,
+                "source": "constrained_time_minimization",
+                "objective": "minimize_expected_completion_time_subject_to_quality_and_memory",
+                "estimated_total_runtime_seconds": estimated_seconds,
+                "evidence": best.to_dict(),
+                "evaluated_candidates": evaluated,
+                "current_batch_size": current_batch_size,
+            }
+
+        # Memory-only profiles cannot prove a faster runtime or equal quality.
+        # Use the current/nearest approved point as a conservative fallback,
+        # never the largest observed batch.
+        profiles = []
         for profile in self.store.list_batch_probe_profiles():
             if (
-                model_or_signature
-                not in {
-                    profile.model_key,
-                    shape_signature and profile.shape_signature or "",
-                }
+                model_or_signature not in {profile.model_key, profile.shape_signature}
                 and model_or_signature not in profile.model_key
             ):
                 continue
             if shape_signature and profile.shape_signature != shape_signature:
                 continue
+            if approved is not None and int(profile.resolved_batch_size) not in approved:
+                continue
             if not self._record_matches_hardware_filter(
                 hardware, device_type=profile.device_type
             ):
                 continue
-            if not self._matches_toolkit(toolkit):
-                continue
-            candidates.append(profile)
-        if not candidates:
-            observations = [
-                obs
-                for obs in self.store.list_batch_size_observations()
-                if model_or_signature in obs.model_key
-                and self._record_matches_hardware_filter(
-                    hardware, hardware_key=obs.hardware_key
-                )
-            ]
-            if not observations:
-                return {"found": False, "reason": "insufficient evidence"}
-            observations.sort(
-                key=lambda item: (item.batch_size, item.observations), reverse=True
-            )
-            best = observations[0]
+            profiles.append(profile)
+        if not profiles:
             return {
-                "found": True,
-                "recommended_batch_size": best.batch_size,
-                "source": "batch_size_observation",
-                "evidence": best.to_dict(),
-                "current_batch_size": current_batch_size,
+                "found": False,
+                "reason": "no quality-safe candidate has runtime evidence",
+                "evaluated_candidates": evaluated,
             }
-        candidates.sort(
-            key=lambda item: (item.resolved_batch_size, item.observations), reverse=True
+        best = min(
+            profiles,
+            key=lambda item: (
+                abs(
+                    int(item.resolved_batch_size)
+                    - int(current_batch_size or item.resolved_batch_size)
+                ),
+                -int(item.observations),
+            ),
         )
-        best = candidates[0]
         return {
             "found": True,
             "recommended_batch_size": best.resolved_batch_size,
-            "source": "batch_probe_profile",
+            "source": "quality_conservative_profile_fallback",
+            "objective": "hold_current_or_nearest_approved_without_runtime_evidence",
             "evidence": best.to_dict(),
+            "evaluated_candidates": evaluated,
             "current_batch_size": current_batch_size,
         }
 
@@ -1529,7 +1655,7 @@ class SchedulerKnowledgeBase:
                 "retired_backend"
                 if is_retired_backend(backend)
                 else (
-                    "ambiguous_legacy_mps_profile"
+                    "noncanonical_mps_profile"
                     if backend.strip().lower() == "mps"
                     else f"backend_mismatch:{effective}"
                 )
@@ -1716,6 +1842,19 @@ class SchedulerKnowledgeBase:
                 model_or_signature=recommendation_key,
                 hardware="current",
                 current_batch_size=normalized_candidate.get("proposed_batch_size"),
+                candidate_batch_sizes=normalized_candidate.get(
+                    "quality_safe_physical_batch_sizes"
+                ),
+                planned_epochs=normalized_candidate.get("proposed_epochs"),
+                quality_tolerance=float(
+                    normalized_candidate.get("quality_tolerance") or 0.0
+                ),
+                metric_maximize=normalized_candidate.get("metric_maximize"),
+                baseline_metric=normalized_candidate.get("baseline_metric"),
+                max_effective_batch_size=normalized_candidate.get(
+                    "effective_batch_size"
+                ),
+                max_seed_variance=normalized_candidate.get("max_seed_variance"),
             )
             epoch_recommendation = self.recommend_epochs(
                 model_or_signature=recommendation_key,

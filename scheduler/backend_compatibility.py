@@ -67,7 +67,7 @@ class BackendCompatibilityPolicy:
         backend_name: str,
         backend_config: BackendTrialConfig,
     ) -> CompatibilityAssessment:
-        normalized = normalize_packing_backend(backend_name, warn_legacy=False)
+        normalized = normalize_packing_backend(backend_name)
         if normalized == "mps_process":
             return self._mps(fingerprints, normalized, backend_config)
         return self._process(fingerprints, normalized, backend_config)

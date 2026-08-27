@@ -611,7 +611,7 @@ def ingest(store: Any, records: list[dict[str, Any]], *, dry_run: bool = False) 
     """Write records into HWKD's CodeKnowledgeStore.
 
     Once written, HWKD's existing MCP tools (search_code_knowledge,
-    get_code_optimization_context, get_hardware_optimization_context) serve this
+    get_code_optimization_context and get_optimization_context serve this
     content joined with measured profiles, so the agent reaches NVIDIA guidance
     and this machine's numbers through one query.
     """

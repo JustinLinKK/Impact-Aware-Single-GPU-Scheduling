@@ -16,7 +16,6 @@ from ..backend_mode import (
     PACKED_BACKEND_MODES,
     normalize_backend_allowlist,
     normalize_packing_backend,
-    warn_backend_deprecation,
 )
 from ..redis_cache import RedisCacheSettings
 
@@ -125,7 +124,7 @@ class GpuMemorySettings:
         removed = sorted({"safe_vram_budget_gib", "vram_budget_fraction"} & raw.keys())
         if removed:
             raise ValueError(
-                "Removed legacy gpu_scheduler.memory settings: "
+                "Unsupported removed gpu_scheduler.memory settings: "
                 + ", ".join(removed)
                 + ". Use gpu_vram_gib and predicted_budget_fraction; VRAM is an admission constraint only."
             )
@@ -151,18 +150,10 @@ class TimeObjectiveSettings:
             raise ValueError("priority_weight must be non-negative")
         if not str(self.objective_version).strip():
             raise ValueError("objective_version is required")
-        if self.objective_version in {
-            "time_v3_flow_only",
-            "time_v4_colocation_gain",
-            "time_v5_piecewise_drain",
-        }:
-            previous_version = self.objective_version
-            warnings.warn(
-                f"{previous_version} is migrated to time_v6_verified_piecewise_drain",
-                UserWarning,
-                stacklevel=2,
+        if self.objective_version != "time_v6_verified_piecewise_drain":
+            raise ValueError(
+                "objective_version must be time_v6_verified_piecewise_drain"
             )
-            self.objective_version = "time_v6_verified_piecewise_drain"
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "TimeObjectiveSettings":
@@ -697,28 +688,17 @@ class GraphDBSettings:
     def __post_init__(self) -> None:
         self.enabled = bool(self.enabled)
         self.mode = str(self.mode or "mirror").strip().lower().replace("-", "_")
-        if self.mode == "primary":
-            self.mode = "mirror"
         if self.mode not in {"off", "mirror"}:
-            self.mode = "mirror"
+            raise ValueError("graph_db.mode must be 'off' or 'mirror'")
         if not self.enabled:
             self.mode = "off"
         self.provider = str(self.provider or "neo4j").strip().lower().replace("-", "_")
-        if self.provider == "legacy_sqlite":
-            self.provider = "sqlite"
+        if self.provider not in {"neo4j", "sqlite"}:
+            raise ValueError("graph_db.provider must be 'neo4j' or 'sqlite'")
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "GraphDBSettings":
-        raw = dict(payload or {})
-        aliases = {
-            "auto_import_legacy_sqlite": "import_sqlite_evidence",
-            "legacy_sqlite_path": "sqlite_evidence_path",
-            "allow_legacy_fallback": "allow_sqlite_fallback",
-        }
-        for old_name, current_name in aliases.items():
-            if old_name in raw and current_name not in raw:
-                raw[current_name] = raw.pop(old_name)
-        return cls(**raw)
+        return cls(**dict(payload or {}))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -895,13 +875,10 @@ class SchedulerSubmissionDefaults:
         )
         if removed:
             raise ValueError(
-                "Removed legacy submission-default settings: " + ", ".join(removed)
+                "Unsupported removed submission-default settings: " + ", ".join(removed)
             )
         instance = cls(**raw)
-        instance.backend_allowlist = normalize_backend_allowlist(
-            instance.backend_allowlist,
-            warn_legacy=True,
-        )
+        instance.backend_allowlist = normalize_backend_allowlist(instance.backend_allowlist)
         instance.runtime_probe_strategy = (
             str(instance.runtime_probe_strategy or "epoch_1")
             .strip()
@@ -944,9 +921,6 @@ class GpuSchedulerSettings:
     packing_backend: str = "mps_process"
     exclusive_fallback_enabled: bool = True
     mps_unavailable_policy: str = "exclusive"
-    # Read compatibility for one deprecation window. Internal code sees at most
-    # the authoritative packed backend plus the explicit exclusive fallback.
-    backend_priority: list[str] | None = None
     parallel_job_cap: int | None = None
     priority_window_size: int = 8
     oldest_window_size: int = 4
@@ -990,24 +964,6 @@ class GpuSchedulerSettings:
         )
         if self.mps_unavailable_policy not in {"exclusive", "fail"}:
             raise ValueError("mps_unavailable_policy must be 'exclusive' or 'fail'")
-        if self.backend_priority is None:
-            self.backend_priority = [self.packing_backend]
-            if self.exclusive_fallback_enabled:
-                self.backend_priority.append("exclusive")
-        else:
-            legacy_priority = normalize_backend_allowlist(self.backend_priority)
-            packed = [item for item in legacy_priority if item != "exclusive"]
-            if len(packed) != 1:
-                raise ValueError(
-                    "gpu_scheduler.backend_priority is ambiguous. Configure exactly one "
-                    "packing_backend (cuda_process or mps_process) plus optional exclusive fallback."
-                )
-            if packed[0] != self.packing_backend:
-                raise ValueError(
-                    "gpu_scheduler.backend_priority conflicts with authoritative packing_backend: "
-                    f"{packed[0]} != {self.packing_backend}"
-                )
-            self.backend_priority = legacy_priority or [self.packing_backend]
         if self.parallel_job_cap is not None:
             self.parallel_job_cap = max(1, int(self.parallel_job_cap))
         if self.startpoint_probe_max_models is not None:
@@ -1083,7 +1039,7 @@ class GpuSchedulerSettings:
                 "gpu_scheduler.stream was removed. Independently generated subprocess jobs "
                 "cannot be controlled by a parent CUDA stream; choose packing_backend."
             )
-        legacy_keys = {
+        removed_keys = {
             "adaptive",
             "allow_three_way_packing",
             "auto_pack",
@@ -1098,37 +1054,15 @@ class GpuSchedulerSettings:
             "batch_probe_min_batch_size",
             "batch_probe_max_search_rounds",
             "batch_probe_search_mode",
+            "backend_priority",
         }
-        removed = sorted(legacy_keys & raw.keys())
+        removed = sorted(removed_keys & raw.keys())
         if removed:
             raise ValueError(
-                "Removed legacy gpu_scheduler settings: "
+                "Unsupported removed gpu_scheduler settings: "
                 + ", ".join(removed)
                 + ". Configure parallel_time_aware with parallel_job_cap, colocation, objective, batch_options, and memory safety gates."
             )
-        legacy_priority = raw.get("backend_priority")
-        if legacy_priority is not None:
-            normalized_priority = normalize_backend_allowlist(legacy_priority)
-            packed = [item for item in normalized_priority if item != "exclusive"]
-            if len(packed) != 1:
-                raise ValueError(
-                    "gpu_scheduler.backend_priority is ambiguous. Replace it with one "
-                    "packing_backend: cuda_process or mps_process."
-                )
-            if "packing_backend" in raw:
-                configured = normalize_packing_backend(raw["packing_backend"])
-                if configured != packed[0]:
-                    raise ValueError(
-                        "gpu_scheduler.backend_priority conflicts with packing_backend"
-                    )
-            else:
-                warn_backend_deprecation(
-                    "gpu_scheduler.backend_priority is deprecated; use packing_backend. "
-                    "The single packed backend was migrated.",
-                    stacklevel=2,
-                )
-                raw["packing_backend"] = packed[0]
-            raw["backend_priority"] = normalized_priority
         return cls(**raw)
 
     def to_dict(self) -> dict[str, Any]:

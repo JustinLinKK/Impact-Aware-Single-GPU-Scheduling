@@ -1,6 +1,10 @@
 """Layered domain surface for the local scheduler."""
 
-from .batching import BatchResolution, build_batch_probe_shape_signature
+from .batching import (
+    BatchResolution,
+    TrainingParameterResolution,
+    build_batch_probe_shape_signature,
+)
 from .common import (
     _to_primitive,
     import_string,
@@ -97,6 +101,7 @@ __all__ = [
     "SchedulerReport",
     "SoloProfile",
     "TrainingJob",
+    "TrainingParameterResolution",
     "WorkloadIdentity",
     "build_backend_scoped_pair_key",
     "build_batch_probe_key",

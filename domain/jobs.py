@@ -75,11 +75,6 @@ class ResourceRequirements:
     estimated_ram_mb: int | None = None
     gpu_slots: int = 1
 
-    def __post_init__(self) -> None:
-        # Backward compatibility for clients that supplied the old ambiguous field.
-        if self.estimated_avg_vram_mb is None and self.estimated_vram_mb is not None:
-            self.estimated_avg_vram_mb = int(self.estimated_vram_mb)
-
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "ResourceRequirements":
         payload = payload or {}
@@ -147,7 +142,7 @@ class PackingSpec:
         if not self.backend_allowlist:
             return True
         return (
-            normalize_runtime_backend(backend_name, warn_legacy=False)
+            normalize_runtime_backend(backend_name)
             in self.backend_allowlist
         )
 

@@ -126,7 +126,7 @@ class _MirrorStateStore:
 
     def mark_pair_incompatible(self, *args: Any, **kwargs: Any):
         result = self._primary.mark_pair_incompatible(*args, **kwargs)
-        self._mirror_call("mark_pair_incompatible", *args, **kwargs)
+        self._mirror_call("record_pair_profile_evidence", result)
         return result
 
     def __getattr__(self, name: str) -> Any:

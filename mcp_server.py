@@ -93,6 +93,13 @@ def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
         toolkit: str | None = None,
         shape_signature: str | None = None,
         current_batch_size: int | None = None,
+        candidate_batch_sizes: list[int] | None = None,
+        planned_epochs: int | None = None,
+        quality_tolerance: float = 0.0,
+        metric_maximize: bool | None = None,
+        baseline_metric: float | None = None,
+        max_effective_batch_size: int | None = None,
+        max_seed_variance: float | None = None,
     ) -> dict[str, Any]:
         return client.recommend_batch_size(
             model_or_signature=model_or_signature,
@@ -100,6 +107,13 @@ def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
             toolkit=toolkit,
             shape_signature=shape_signature,
             current_batch_size=current_batch_size,
+            candidate_batch_sizes=candidate_batch_sizes,
+            planned_epochs=planned_epochs,
+            quality_tolerance=quality_tolerance,
+            metric_maximize=metric_maximize,
+            baseline_metric=baseline_metric,
+            max_effective_batch_size=max_effective_batch_size,
+            max_seed_variance=max_seed_variance,
         )
 
     @server.tool()
@@ -163,46 +177,6 @@ def build_mcp_server(settings: SchedulerConfig | None = None) -> FastMCP:
     @server.tool()
     def get_optimization_context(candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
         return client.get_optimization_context(candidate=candidate, limit=limit)
-
-    @server.tool()
-    def search_hardware_features(
-        query: str,
-        hardware_key: str = "current",
-        architecture: str | None = None,
-        vendor: str | None = None,
-        workload_type: str | None = None,
-        framework: str = "pytorch",
-        limit: int = 8,
-    ) -> list[dict[str, Any]]:
-        return client.search_hardware_features(
-            query=query,
-            hardware_key=hardware_key,
-            architecture=architecture,
-            vendor=vendor,
-            workload_type=workload_type,
-            framework=framework,
-            limit=limit,
-        )
-
-    @server.tool()
-    def get_hardware_feature_context(
-        hardware_key: str = "current",
-        workload_type: str | None = None,
-        model_family: str | None = None,
-        framework: str = "pytorch",
-        limit: int = 8,
-    ) -> dict[str, Any]:
-        return client.get_hardware_feature_context(
-            hardware_key=hardware_key,
-            workload_type=workload_type,
-            model_family=model_family,
-            framework=framework,
-            limit=limit,
-        )
-
-    @server.tool()
-    def get_hardware_optimization_context(candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
-        return client.get_hardware_optimization_context(candidate=candidate, limit=limit)
 
     @server.tool()
     def record_tuning_outcome(

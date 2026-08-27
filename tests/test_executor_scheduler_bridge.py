@@ -214,10 +214,10 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertEqual(len(fake_api.submitted_jobs), 1)
             submitted = fake_api.submitted_jobs[0]
             self.assertEqual(submitted.batch_probe.model_key, "safe-family")
-            self.assertEqual(submitted.config.runner_kwargs["batch_size"], 4)
-            self.assertEqual(submitted.metadata["resolved_batch_size"], 4)
+            self.assertEqual(submitted.config.runner_kwargs["batch_size"], 6)
+            self.assertEqual(submitted.metadata["resolved_batch_size"], 6)
             self.assertEqual(submitted.metadata["batch_probe_source"], "executor_power_of_two")
-            self.assertFalse(submitted.metadata["model_family_reuse_only"])
+            self.assertNotIn("model_family_reuse_only", submitted.metadata)
 
     def test_scheduler_submission_does_not_duplicate_model_family_probe(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -249,7 +249,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertEqual(train_job.batch_probe.model_key, "new-family")
             self.assertEqual(train_job.metadata["batch_probe_policy"], "time_aware_five_options")
 
-    def test_scheduler_submission_is_independent_of_legacy_family_probe_state(self) -> None:
+    def test_scheduler_submission_uses_native_candidate_probe_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir) / "runtime"
             workdir = Path(tmpdir) / "workdir"
@@ -284,8 +284,8 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             settings = SchedulerSettings(runtime_root=runtime_root)
             interpreter = Interpreter(working_dir=workdir, timeout=10, max_parallel_run=1)
             fake_api = _FakeSchedulerClient(settings, active_service=False)
-            legacy_cfg = SimpleNamespace(start_service=False, wait_timeout_seconds=5, wait_poll_interval_seconds=0.01)
-            interpreter.attach_scheduler(fake_api, legacy_cfg)
+            external_service_cfg = SimpleNamespace(start_service=False, wait_timeout_seconds=5, wait_poll_interval_seconds=0.01)
+            interpreter.attach_scheduler(fake_api, external_service_cfg)
 
             result = interpreter._run_scheduler_job(
                 code="print('bridge fallback service')\n",

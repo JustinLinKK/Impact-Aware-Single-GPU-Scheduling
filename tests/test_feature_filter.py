@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 
-from hardware_knowledge_graph import feature_filter as compatibility_filter
 from localml_scheduler.hardware_knowledge import feature_filter as canonical_filter
 
 
@@ -37,19 +36,11 @@ def test_runtime_backend_guidance_is_not_an_unconditioned_hardware_feature() -> 
         assert "mps_scheduler_compatibility" not in ids
 
 
-def test_compatibility_package_uses_canonical_implementation() -> None:
-    canonical = canonical_filter.query_hardware_features(
-        "GeForce RTX 5090", "training_evaluation"
-    )
-    compatibility = compatibility_filter.query_hardware_features(
-        "GeForce RTX 5090", "training_evaluation"
-    )
-    assert compatibility == canonical
-    assert compatibility_filter.query_hardware_node(
-        "GeForce RTX 5090", "model_design"
-    ) == canonical_filter.query_hardware_node(
-        "GeForce RTX 5090", "model_design"
-    )
+def test_noncanonical_stage_is_rejected() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="Unsupported pipeline stage"):
+        canonical_filter.query_hardware_features("GeForce RTX 5090", "model")
 
 
 def test_filtered_payload_has_no_source_urls() -> None:

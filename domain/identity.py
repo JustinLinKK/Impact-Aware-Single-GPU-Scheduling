@@ -29,7 +29,7 @@ def build_batch_size_observation_key(
     runner_contract: str = RUNNER_CONTRACT_SUBPROCESS_V1,
 ) -> str:
     payload = {
-        "backend_name": normalize_runtime_backend(backend_name, warn_legacy=False),
+        "backend_name": normalize_runtime_backend(backend_name),
         "batch_size": int(batch_size),
         "hardware_key": hardware_key,
         "model_key": model_key,
@@ -56,7 +56,7 @@ def build_backend_scoped_pair_key(
     backend_name: str,
     runner_contract: str = RUNNER_CONTRACT_SUBPROCESS_V1,
 ) -> str:
-    backend = normalize_runtime_backend(backend_name, warn_legacy=False)
+    backend = normalize_runtime_backend(backend_name)
     return (
         f"v2::{runner_contract}::{backend}::"
         f"{canonical_pair_key(left_signature, right_signature)}"
@@ -89,7 +89,7 @@ def build_combination_key(
     runner_contract: str = RUNNER_CONTRACT_SUBPROCESS_V1,
 ) -> str:
     payload = {
-        "backend_name": normalize_runtime_backend(backend_name, warn_legacy=False),
+        "backend_name": normalize_runtime_backend(backend_name),
         "batch_vector": encode_batch_vector(batch_vector),
         "group_signature": group_signature,
         "hardware_key": hardware_key,
@@ -111,7 +111,7 @@ def build_runtime_profile_key(
     payload = {
         "signature": signature,
         "hardware_key": hardware_key,
-        "backend_name": normalize_runtime_backend(backend_name, warn_legacy=False),
+        "backend_name": normalize_runtime_backend(backend_name),
         "resolved_batch_size": int(resolved_batch_size),
         "strategy": normalize_runtime_probe_strategy(strategy),
         "runner_contract": runner_contract,
@@ -126,9 +126,7 @@ def normalize_colocation_members(members: list[dict[str, Any]]) -> list[dict[str
         item: dict[str, Any] = {
             "signature": str(member["signature"]),
             "batch_size": int(member["batch_size"]),
-            "backend_name": normalize_runtime_backend(
-                member["backend_name"], warn_legacy=False
-            ),
+            "backend_name": normalize_runtime_backend(member["backend_name"]),
         }
         backend_config = member.get("backend_config")
         if isinstance(backend_config, dict) and backend_config:

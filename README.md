@@ -57,7 +57,6 @@ python -m localml_scheduler.cli list
 python -m localml_scheduler.cli status <job_id>
 python -m localml_scheduler.cli cache-stats
 python -m localml_scheduler.cli report
-python -m localml_scheduler.cli scheduler migrate-backend-modes --dry-run
 ```
 
 Run the demo:
@@ -88,9 +87,8 @@ Preferred read-only tools for agent integration:
   returns exact-backend hard rules from the local seed corpus before optional
   semantic ranking, so it remains available when Qdrant is disabled.
 
-Compatibility wrappers such as `get_job_design_context(...)`,
-`search_hardware_features(...)`, `get_hardware_feature_context(...)`, and
-`get_hardware_optimization_context(...)` remain available for older callers.
+`get_job_design_context(...)` remains the graph-only job-design evidence query;
+new optimization flows should normally use the combined context APIs above.
 
 For local development, start Qdrant and ingest the repo-curated seed corpus as
 code knowledge:
@@ -251,15 +249,15 @@ profile or admission stall.
 A stored profile must have at least two recent observations before its rates can
 be used. Immediate rejection additionally requires two consecutive bad live
 trials within 24 hours. An accepted trial clears bad confirmations, and the next
-trial replaces rather than averages with an expired profile. Legacy profiles
-without confirmation metadata are never trusted for immediate rejection.
+trial replaces rather than averages with an expired profile. Profiles without
+confirmation metadata are never trusted for immediate rejection.
 
 ### Task-scoped placement replay
 
 Jobs may provide a typed `workload_identity` with `task_key`, `dataset_key`,
 `architecture_key`, and `architecture_family`. The MLEvolve adapter also
-accepts these as direct arguments and uses `workflow_id` only as a legacy task
-fallback. Script introspection emits normalized exact and broad architecture
+accepts these as direct arguments. `workflow_id` is execution identity and is
+not reused as task identity. Script introspection emits normalized exact and broad architecture
 keys when they can be inferred. A reliable task/dataset identity and an
 architecture identity are both required for replay.
 
@@ -282,13 +280,13 @@ the same job back through normal evaluation. Configure this under
 three and both change fractions default to `0.25`.
 
 The local ML adapter consumes an epoch-time prediction only when the selected
-artifact explicitly declares the canonical `train_epoch_ms` target. Legacy
-PerfSeer `train_time` output is not treated as a full-epoch estimate.
+artifact explicitly declares the canonical `train_epoch_ms` target. The
+unsupported PerfSeer `train_time` output is not treated as a full-epoch estimate.
 
 The former throughput controls `makespan_weight`, `flow_time_weight`, and
 `min_aggregate_gain` are no longer accepted. `time_v3_flow_only`,
-`time_v4_colocation_gain`, and `time_v5_piecewise_drain` are migrated to
-`time_v6_verified_piecewise_drain` with a warning. The `colocation` defaults are
+`time_v4_colocation_gain`, and `time_v5_piecewise_drain` are no longer accepted;
+configure `time_v6_verified_piecewise_drain`. The `colocation` defaults are
 `min_gain: 1.0`, `trial_epochs: 2`, `trial_decision_timeout_seconds: 30`,
 `trial_evidence_timeout_min_seconds: 300`,
 `trial_evidence_timeout_max_seconds: 1800`,
@@ -348,7 +346,7 @@ The deterministic validation fixture can be run with:
 python -m localml_scheduler.scheduler.trace_simulator
 ```
 
-It compares serial FIFO, legacy VRAM-fill packing, the recursive time-aware
+It compares serial FIFO, a VRAM-fill reference policy, the recursive time-aware
 policy, and an exhaustive small-trace oracle, reporting makespan, flow time,
 waiting, starvation, jobs/hour, predicted/actual VRAM, realized slowdown, trial
 epochs, preserved rejected progress, admission stalls, and saved early-stop

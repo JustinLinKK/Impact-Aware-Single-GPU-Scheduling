@@ -394,7 +394,7 @@ class MLVramPredictor:
     def predict_seconds_per_epoch_options(self, job: TrainingJob, batch_sizes: Sequence[int]) -> dict[int, float]:
         """Return scheduler-grade epoch predictions when the artifact explicitly declares them.
 
-        The legacy ``train_time`` target is deliberately not accepted because
+        The unsupported ``train_time`` target is deliberately not accepted because
         it is not a measured full-epoch label.
         """
         if "train_epoch_ms" not in self._target_names:

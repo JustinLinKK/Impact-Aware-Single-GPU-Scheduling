@@ -19,7 +19,7 @@ class TrialPriorityPlanner:
         mps_templates: list[list[int]],
         active_config: dict[str, object] | None = None,
     ) -> tuple[BackendTrialConfig, ...]:
-        normalized = normalize_packing_backend(backend_name, warn_legacy=False)
+        normalized = normalize_packing_backend(backend_name)
         if active_config:
             return (
                 BackendTrialConfig(

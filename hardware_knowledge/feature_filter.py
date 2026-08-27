@@ -18,59 +18,30 @@ from utils.precision_policy import (
 # ---------------------------------------------------------------------------
 
 PIPELINE_STAGES = ("model_design", "datatype_precision", "training_evaluation")
-LEGACY_HARDWARE_STAGES = ("datatype", "model", "optimizer", "tuning")
-
-_STAGE_ALIASES = {
-    "data": "model_design",
-    "data_type": "model_design",
-    "data_processing": "model_design",
-    "data_processing_and_feature_engineering": "model_design",
-    "feature_engineering": "model_design",
-    "stage1": "model_design",
-    "stage_1": "model_design",
-    "stage1_candidate_construction": "model_design",
-    "candidate_construction": "model_design",
-    "model-design": "model_design",
-    "model_design": "model_design",
-    "model_structure": "model",
-    "datatype-precision": "datatype_precision",
-    "datatype_precision": "datatype_precision",
-    "datatype_quantization": "datatype_precision",
-    "datatype-quantization": "datatype_precision",
-    "quantization": "datatype_precision",
-    "training": "training_evaluation",
-    "training-evaluation": "training_evaluation",
-    "training_evaluation": "training_evaluation",
-    "training_parameters": "tuning",
-    "training_params": "tuning",
-    "precision": "tuning",
-}
 
 _STAGE_KEYWORDS: dict[str, list[str]] = {
-    "datatype": [
+    "model_design": [
         "data", "dataset", "dataloader", "modality", "shape",
         "sequence", "packing", "bucket", "decomposition", "decode",
         "image", "video", "wsi", "token", "tiled", "chunked",
         "channels_last",
-    ],
-    "model": [
         "attention", "flash-attn", "sdpa", "channels_last", "cnn", "unet",
         "transformer", "activation checkpointing", "sequence packing",
         "kv-cache", "tiled", "chunked", "image", "video", "wsi",
         "model", "architecture", "layer", "kernel", "extension", "sm_",
         "mig", "topology", "nvlink",
     ],
-    "optimizer": [
-        "optimizer", "adamw", "muon", "soap", "ademamix", "loss",
-        "cross-entropy", "cross entropy", "learning rate", "lr",
-        "weight_decay", "momentum", "ns_steps", "nesterov",
-        "adjust_lr_fn", "scheduler",
-    ],
-    "tuning": [
+    "datatype_precision": [
         "bf16", "fp16", "fp8", "fp4", "fp64", "tf32", "int8",
         "precision", "autocast", "mixed precision", "quantiz",
         "mxfp4", "mxfp8", "nvfp4", "gradscaler",
         "transformer engine", "tensor core",
+    ],
+    "training_evaluation": [
+        "optimizer", "adamw", "muon", "soap", "ademamix", "loss",
+        "cross-entropy", "cross entropy", "learning rate", "lr",
+        "weight_decay", "momentum", "ns_steps", "nesterov",
+        "adjust_lr_fn", "scheduler",
         "batch_size", "batch size", "batch", "grad_accum",
         "gradient accumulation", "epoch",
         "vram", "memory budget", "memory plan",
@@ -99,10 +70,8 @@ def query_hardware_node(
     hardware_name:
         GPU name to search, e.g. ``"rtx 4090"``.
     agent_stage:
-        ``"model_design"``, ``"datatype_precision"``, or
-        ``"training_evaluation"``. Low-level legacy filters
-        ``"datatype"``, ``"model"``, ``"optimizer"``, and ``"tuning"`` are
-        still accepted for manual inspection.
+        One of ``"model_design"``, ``"datatype_precision"``, or
+        ``"training_evaluation"``.
     """
     graph = _load_graph(graph_path)
     node, edges = _lookup_node(graph, hardware_name)
@@ -120,7 +89,7 @@ def query_hardware_node(
     recommended_patterns = _filter_patterns_by_stage(
         _as_str_list(props.get("recommended_patterns")), stage
     )
-    if stage in {"datatype_precision", "tuning"}:
+    if stage == "datatype_precision":
         recommended_patterns = [
             pattern
             for pattern in recommended_patterns
@@ -131,7 +100,7 @@ def query_hardware_node(
         graph,
         edges,
         stage,
-        precision_policy=precision_policy if stage in {"datatype_precision", "tuning"} else None,
+        precision_policy=precision_policy if stage == "datatype_precision" else None,
     )
 
     return _compact_dict({
@@ -145,7 +114,7 @@ def query_hardware_node(
         "sm_count": _as_int(props.get("sm_count")),
         "compute_capability": raw_cap,
         "stage_filter": stage,
-        "precision_policy": precision_policy.to_dict() if stage in {"datatype_precision", "tuning"} else None,
+        "precision_policy": precision_policy.to_dict() if stage == "datatype_precision" else None,
         **feature_index,
         "recommended_patterns": recommended_patterns,
         "avoid_patterns": _filter_patterns_by_stage(
@@ -164,32 +133,13 @@ def query_hardware_node(
 # ---------------------------------------------------------------------------
 
 _STAGE_CATEGORIES: dict[str, set[str]] = {
-    "datatype": {"data_pipeline"},
-    "model": {"compute_capability", "interconnect", "kernel_optimization", "tensor_core"},
-    "optimizer": {"optimizer"},
-    "tuning": {"data_pipeline", "interconnect", "kernel_optimization", "parallelism", "precision"},
-}
-
-_STAGE_FEATURE_IDS: dict[str, set[str]] = {
-    "optimizer": {"gram_newton_schulz_symmetric_gemm"},
-}
-
-_COMPOSITE_STAGE_SPECS: dict[str, tuple[tuple[str, set[str], set[str]], ...]] = {
-    "model_design": (
-        ("datatype", _STAGE_CATEGORIES["datatype"], _STAGE_FEATURE_IDS.get("datatype", set())),
-        (
-            "model",
-            {"compute_capability", "interconnect", "parallelism", "tensor_core"},
-            _STAGE_FEATURE_IDS.get("model", set()),
-        ),
-    ),
-    "datatype_precision": (
-        ("tuning", {"precision"}, set()),
-    ),
-    "training_evaluation": (
-        ("optimizer", _STAGE_CATEGORIES["optimizer"], _STAGE_FEATURE_IDS.get("optimizer", set())),
-        ("tuning", {"interconnect", "kernel_optimization", "parallelism"}, set()),
-    ),
+    "model_design": {
+        "compute_capability", "data_pipeline", "interconnect", "parallelism", "tensor_core"
+    },
+    "datatype_precision": {"precision"},
+    "training_evaluation": {
+        "interconnect", "kernel_optimization", "optimizer", "parallelism"
+    },
 }
 
 
@@ -210,8 +160,6 @@ def query_hardware_features(
         ``"model_design"`` returns data-pipeline and model-shape features;
         ``"datatype_precision"`` returns numeric precision features;
         ``"training_evaluation"`` returns optimizer and runtime features.
-        Low-level legacy filters (``"datatype"``, ``"model"``,
-        ``"optimizer"``, and ``"tuning"``) remain accepted for manual checks;
         ``None`` returns all features.
     """
     graph = _load_graph(graph_path)
@@ -247,7 +195,7 @@ def query_hardware_features(
 
         edge_props = edge.get("properties", {})
         visibility = None
-        if category == "precision" and stage in {"datatype_precision", "tuning"}:
+        if category == "precision" and stage == "datatype_precision":
             visibility = precision_feature_visibility(feature_id, precision_policy)
             if visibility == "hidden":
                 continue
@@ -304,10 +252,13 @@ def _load_graph(graph_path: str | Path | None = None) -> dict[str, Any]:
 def _normalize_stage(agent_stage: str | None) -> str | None:
     if agent_stage is None:
         return None
-    stage = str(agent_stage).strip().lower()
+    stage = str(agent_stage).strip().lower().replace("-", "_")
     if not stage or stage == "all":
         return None
-    return _STAGE_ALIASES.get(stage, stage)
+    if stage not in PIPELINE_STAGES:
+        expected = ", ".join(PIPELINE_STAGES)
+        raise ValueError(f"Unsupported pipeline stage {agent_stage!r}; expected {expected}, or all")
+    return stage
 
 
 def _filter_patterns_by_stage(
@@ -315,16 +266,7 @@ def _filter_patterns_by_stage(
 ) -> list[str]:
     if not stage:
         return patterns
-    component_stages = {
-        "model_design": ("datatype", "model"),
-        "datatype_precision": ("tuning",),
-        "training_evaluation": ("optimizer", "tuning"),
-    }.get(stage, (stage,))
-    keywords = [
-        keyword
-        for component in component_stages
-        for keyword in _STAGE_KEYWORDS.get(component, [])
-    ]
+    keywords = _STAGE_KEYWORDS.get(stage, [])
     if not keywords:
         return []
     return [
@@ -337,11 +279,7 @@ def _filter_patterns_by_stage(
 def _stage_specs(stage: str | None) -> tuple[tuple[str, set[str], set[str]], ...]:
     if not stage:
         return ()
-    if stage in _COMPOSITE_STAGE_SPECS:
-        return _COMPOSITE_STAGE_SPECS[stage]
-    if stage in LEGACY_HARDWARE_STAGES:
-        return ((stage, _STAGE_CATEGORIES.get(stage, set()), _STAGE_FEATURE_IDS.get(stage, set())),)
-    return ()
+    return ((stage, _STAGE_CATEGORIES[stage], set()),)
 
 
 def _feature_matches_stage(

@@ -18,13 +18,30 @@ class CandidateGenerator:
 
     def candidate_batch_sizes(self, job: TrainingJob) -> list[int]:
         """Return the five time-aware batch proposals after optional clipping."""
-        raw_values = self.time_aware_batch_proposals(job)
+        contract = dict(job.metadata.get("training_quality_contract") or {})
+        approved_values = contract.get("allowed_physical_batch_sizes") or []
+        if approved_values:
+            raw_values = sorted(
+                {max(1, int(value)) for value in approved_values}
+            )
+        else:
+            raw_values = self.time_aware_batch_proposals(job)
         explicit_cap = job.config.runner_kwargs.get(
             "probe_max_batch_size",
             self.settings.gpu_scheduler.batch_probe_max_batch_size,
         )
         cap = max(1, int(explicit_cap)) if explicit_cap is not None else None
-        clipped = [min(value, cap) if cap is not None else value for value in raw_values]
+        if approved_values and cap is not None:
+            clipped = [value for value in raw_values if value <= cap]
+        else:
+            clipped = [min(value, cap) if cap is not None else value for value in raw_values]
+        if not clipped:
+            clipped = [
+                int(
+                    job.requested_batch_size
+                    or self.estimator.resolved_batch_size(job)
+                )
+            ]
         return list(dict.fromkeys(max(1, int(value)) for value in clipped))
 
     def time_aware_batch_proposals(self, job: TrainingJob) -> list[int]:

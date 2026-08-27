@@ -1,4 +1,4 @@
-"""Hardware capability graph record loading and migration helpers."""
+"""Hardware capability graph record loading and schema conversion helpers."""
 
 from __future__ import annotations
 

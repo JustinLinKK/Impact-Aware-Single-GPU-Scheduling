@@ -164,7 +164,7 @@ class TimeAwareBatchProbeTest(unittest.TestCase):
             self.assertIsNotNone(restored)
             self.assertEqual(restored.resolved_batch_size, 4)
 
-    def test_legacy_search_mode_is_rejected(self) -> None:
+    def test_removed_search_mode_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "search_mode was removed"):
             BatchProbeSpec.from_dict({"enabled": True, "search_mode": "power_of_two"})
 

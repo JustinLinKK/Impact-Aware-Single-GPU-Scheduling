@@ -15,6 +15,7 @@ from localml_scheduler.execution.runner_protocol import RunnerContext
 from localml_scheduler.observability.events import EventLogger
 from localml_scheduler.domain import (
     BatchProbeSpec,
+    BatchResolution,
     CheckpointPolicy,
     SafePointType,
     TrainingJob,
@@ -45,6 +46,100 @@ def _build_context(settings: SchedulerSettings, job: TrainingJob) -> RunnerConte
 
 
 class MLEvolveRunnerTest(unittest.TestCase):
+    def test_run_script_resolves_coupled_training_parameters_and_quality(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            working_dir = Path(tmpdir) / "workspace"
+            working_dir.mkdir(parents=True, exist_ok=True)
+            script_path = working_dir / "candidate.py"
+            script_path.write_text(
+                "\n".join(
+                    [
+                        "import json",
+                        "from pathlib import Path",
+                        "from torch.utils.data import DataLoader",
+                        "batch_size = 4",
+                        "gradient_accumulation_steps = 4",
+                        "learning_rate = 0.01",
+                        "warmup_steps = 10",
+                        "total_training_steps = 100",
+                        "train_loader = DataLoader(list(range(20)), batch_size=batch_size)",
+                        "Path('resolved.json').write_text(json.dumps({",
+                        "    'batch': train_loader.batch_size,",
+                        "    'accumulation': gradient_accumulation_steps,",
+                        "    'learning_rate': learning_rate,",
+                        "    'warmup_steps': warmup_steps,",
+                        "    'scheduler_total_steps': total_training_steps,",
+                        "}), encoding='utf-8')",
+                        "print('MLEVOLVE_EPOCH_METRIC {\"epoch\": 1, \"metric\": 0.7, \"metric_name\": \"validation_score\"}')",
+                        "print('MLEVOLVE_EPOCH_METRIC {\"epoch\": 2, \"metric\": 0.8, \"metric_name\": \"validation_score\"}')",
+                        "print('Best epoch: 2')",
+                        "print('Final Validation Score: 0.8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            settings = SchedulerSettings(runtime_root=runtime_root)
+            job = TrainingJob.create(
+                runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                baseline_model_id="script",
+                baseline_model_path=str(script_path),
+                runner_kwargs={
+                    "script_path": str(script_path),
+                    "working_dir": str(working_dir),
+                    "result_path": str(working_dir / "result.json"),
+                    "timeout": 30,
+                    "batch_size": 4,
+                },
+                batch_probe=BatchProbeSpec(model_key="quality-script"),
+                max_epochs=3,
+                metadata={
+                    "placement_backend": "exclusive",
+                    "training_quality_contract": {
+                        "proposed_physical_batch_size": 4,
+                        "allowed_physical_batch_sizes": [4, 8],
+                        "base_gradient_accumulation_steps": 4,
+                        "target_effective_batch_size": 16,
+                        "base_learning_rate": 0.01,
+                        "learning_rate_scaling_policy": "linear",
+                        "base_warmup_steps": 10,
+                        "base_scheduler_total_steps": 100,
+                        "planned_epochs": 3,
+                    },
+                },
+            )
+            job = BatchResolution.apply(job, 8)
+            context = _build_context(settings, job)
+
+            result = run_mlevolve_script_job(context)
+
+            self.assertEqual(result["candidate_returncode"], 0)
+            resolved = json.loads(
+                (working_dir / "resolved.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                resolved,
+                {
+                    "batch": 8,
+                    "accumulation": 2,
+                    "learning_rate": 0.01,
+                    "warmup_steps": 10,
+                    "scheduler_total_steps": 100,
+                },
+            )
+            observations = context.store.list_batch_size_observations(
+                model_key="quality-script"
+            )
+            self.assertEqual(len(observations), 1)
+            observation = observations[0]
+            self.assertEqual(observation.batch_size, 8)
+            self.assertEqual(observation.effective_batch_size, 16)
+            self.assertEqual(observation.planned_epochs, 3)
+            self.assertEqual(observation.completed_epochs, 2)
+            self.assertEqual(observation.best_epoch, 2)
+            self.assertEqual(observation.best_metric, 0.8)
+            self.assertEqual(len(observation.convergence_curve), 2)
+
     def test_run_script_job_honors_resolved_batch_size_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir) / "runtime"

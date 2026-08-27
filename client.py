@@ -45,55 +45,6 @@ from .storage.state_store import StateStore
 
 
 _PIPELINE_HARDWARE_STAGES = ("model_design", "datatype_precision", "training_evaluation")
-_LEGACY_HARDWARE_STAGES = ("datatype", "model", "optimizer", "tuning")
-
-_HARDWARE_STAGE_ALIASES = {
-    "data": "model_design",
-    "data_type": "model_design",
-    "data_processing": "model_design",
-    "data_processing_and_feature_engineering": "model_design",
-    "feature_engineering": "model_design",
-    "stage1": "model_design",
-    "stage_1": "model_design",
-    "stage1_candidate_construction": "model_design",
-    "candidate_construction": "model_design",
-    "model_design": "model_design",
-    "model_structure": "model",
-    "architecture": "model",
-    "optimizer_selection": "optimizer",
-    "loss": "optimizer",
-    "datatype_quantization": "datatype_precision",
-    "quantization": "datatype_precision",
-    "training": "training_evaluation",
-    "training_evaluation": "training_evaluation",
-    "training_parameters": "tuning",
-    "training_params": "tuning",
-    "precision": "tuning",
-    "pre_submit_training_review": "training_evaluation",
-}
-
-_COMPOSITE_HARDWARE_STAGE_ALIASES = {
-    "hardware_context_lookup": ("model_design",),
-    "stage1_candidate_construction": ("model_design",),
-    "candidate_construction": ("model_design",),
-    "datatype_precision": ("datatype_precision",),
-    "datatype_quantization": ("datatype_precision",),
-    "training_evaluation": ("training_evaluation",),
-}
-
-_COMPOSITE_STAGE_FEATURE_CATEGORIES = {
-    "model_design": {
-        "datatype": {"data_pipeline"},
-        "model": {"compute_capability", "interconnect", "tensor_core"},
-    },
-    "datatype_precision": {
-        "tuning": {"precision"},
-    },
-    "training_evaluation": {
-        "optimizer": {"kernel_optimization", "optimizer"},
-        "tuning": {"interconnect", "kernel_optimization", "parallelism"},
-    },
-}
 
 _AGENT_STAGE_HARDWARE_STAGES = {
     "draft": ("model_design", "datatype_precision", "training_evaluation"),
@@ -298,20 +249,6 @@ class SchedulerClient:
         del query
         report: SchedulerReport = self.store.report()
         return report.to_dict()
-
-    def migrate_backend_modes(
-        self,
-        *,
-        dry_run: bool = True,
-        config_paths: list[str | Path] | None = None,
-    ) -> dict[str, Any]:
-        from .migrations import migrate_backend_mode_v2
-
-        return migrate_backend_mode_v2(
-            self.settings,
-            dry_run=dry_run,
-            config_paths=config_paths or [],
-        )
 
     def list_events(self, *, job_id: str | None = None, event_type: str | None = None) -> list[dict[str, Any]]:
         return self.store.list_events(job_id=job_id, event_type=event_type)
@@ -703,9 +640,12 @@ class SchedulerClient:
         normalized = str(stage or "").strip().lower().replace("-", "_")
         if not normalized or normalized == "all":
             return None
-        normalized = _HARDWARE_STAGE_ALIASES.get(normalized, normalized)
-        valid_stages = set(_PIPELINE_HARDWARE_STAGES) | set(_LEGACY_HARDWARE_STAGES)
-        return normalized if normalized in valid_stages else None
+        if normalized not in _PIPELINE_HARDWARE_STAGES:
+            expected = ", ".join(_PIPELINE_HARDWARE_STAGES)
+            raise ValueError(
+                f"Unsupported pipeline stage {stage!r}; expected {expected}, or all"
+            )
+        return normalized
 
     @classmethod
     def _normalize_hardware_stage_list(cls, value: Any) -> list[str]:
@@ -722,84 +662,10 @@ class SchedulerClient:
             ]
         stages: list[str] = []
         for item in raw_items:
-            normalized = str(item or "").strip().lower().replace("-", "_")
-            expanded = _COMPOSITE_HARDWARE_STAGE_ALIASES.get(normalized)
-            if expanded:
-                for stage in expanded:
-                    if stage not in stages:
-                        stages.append(stage)
-                continue
-            stage = cls._normalize_hardware_stage_name(normalized)
+            stage = cls._normalize_hardware_stage_name(item)
             if stage and stage not in stages:
                 stages.append(stage)
         return stages
-
-    @staticmethod
-    def _composite_stage_scope(stages: list[str]) -> str | None:
-        if stages == ["model_design"]:
-            return "model_design"
-        if stages == ["datatype_precision"]:
-            return "datatype_precision"
-        if stages == ["training_evaluation"]:
-            return "training_evaluation"
-        if stages == ["datatype", "model"]:
-            return "model_design"
-        if stages == ["datatype", "tuning"]:
-            return "datatype_precision"
-        if stages == ["optimizer", "tuning"]:
-            return "training_evaluation"
-        return None
-
-    @staticmethod
-    def _filter_static_stage_payloads(
-        *,
-        stage: str,
-        scope: str | None,
-        node_payload: dict[str, Any],
-        feature_payload: dict[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        allowed_categories = (_COMPOSITE_STAGE_FEATURE_CATEGORIES.get(scope or "") or {}).get(stage)
-        if not allowed_categories:
-            return node_payload, feature_payload
-
-        features = [
-            feature
-            for feature in list(feature_payload.get("features") or [])
-            if str(feature.get("category") or "") in allowed_categories
-        ]
-        allowed_feature_ids = {
-            str(feature.get("feature_id"))
-            for feature in features
-            if feature.get("feature_id")
-        }
-
-        filtered_node = dict(node_payload)
-        for key in (
-            "stage_feature_keys",
-            "recommended_feature_keys",
-            "not_recommended_feature_keys",
-            "conditional_feature_keys",
-        ):
-            if key in filtered_node:
-                filtered_node[key] = [
-                    item
-                    for item in list(filtered_node.get(key) or [])
-                    if SchedulerClient._feature_key_from_entry(item) in allowed_feature_ids
-                ]
-
-        filtered_features = dict(feature_payload)
-        filtered_features["features"] = features
-        filtered_features["feature_count"] = len(features)
-        return (
-            {key: value for key, value in filtered_node.items() if value not in (None, "", [], {})},
-            {key: value for key, value in filtered_features.items() if value not in (None, "", [], {})},
-        )
-
-    @staticmethod
-    def _feature_key_from_entry(value: Any) -> str:
-        if isinstance(value, (list, tuple)) and value:
-            return str(value[0])
-        return str(value or "")
 
     @classmethod
     def _hardware_stages_for_candidate(cls, candidate: dict[str, Any]) -> list[str]:
@@ -819,7 +685,6 @@ class SchedulerClient:
         hardware_name: str,
         stages: list[str],
         limit: int,
-        stage_scope: str | None = None,
         precision_mode: str = "normal",
     ) -> dict[str, Any]:
         if not hardware_name:
@@ -863,12 +728,6 @@ class SchedulerClient:
                 hardware_name,
                 stage,
                 precision_mode=precision_mode,
-            )
-            node_payload, feature_payload = SchedulerClient._filter_static_stage_payloads(
-                stage=stage,
-                scope=stage_scope,
-                node_payload=node_payload,
-                feature_payload=feature_payload,
             )
             if not node_payload.get("found") and not feature_payload.get("found"):
                 reason = str(node_payload.get("reason") or feature_payload.get("reason") or reason)
@@ -927,7 +786,6 @@ class SchedulerClient:
         stages = self._normalize_hardware_stage_list(pipeline_stage)
         if not stages:
             stages = list(_PIPELINE_HARDWARE_STAGES)
-        stage_scope = self._composite_stage_scope(stages)
         hardware_context = self._current_hardware_context_for_lookup(hardware_id)
         hardware = hardware_context.get("hardware") or {}
         hardware_name = str(
@@ -941,7 +799,6 @@ class SchedulerClient:
             hardware_name=hardware_name,
             stages=stages,
             limit=limit,
-            stage_scope=stage_scope,
             precision_mode=precision_mode,
         )
         result["hardware_context"] = hardware_context
@@ -1498,9 +1355,9 @@ class SchedulerClient:
                 matches = []
             if not matches:
                 try:
-                    matches = self.search_hardware_features(
+                    matches = self._feature_store().search(
                         query=query,
-                        hardware_key=hardware_key,
+                        hardware_context=hardware_context,
                         workload_type=workload,
                         framework="pytorch",
                         limit=max(1, min(4, int(limit))),
@@ -1562,109 +1419,6 @@ class SchedulerClient:
                 ),
                 3,
             ),
-        })
-
-    def search_hardware_features(
-        self,
-        *,
-        query: str,
-        hardware_key: str = "current",
-        architecture: str | None = None,
-        vendor: str | None = None,
-        workload_type: str | None = None,
-        framework: str | None = "pytorch",
-        limit: int = 8,
-    ) -> list[dict[str, Any]]:
-        # Deprecated compatibility wrapper. Prefer search_code_knowledge(...).
-        filters: dict[str, Any] = {"framework": framework}
-        if workload_type:
-            filters["workload_types"] = workload_type
-        matches = self.search_code_knowledge(
-            query=query,
-            filters=filters,
-            record_types=["code_doc_chunks", "optimization_recipe_chunks"],
-            limit=limit,
-        )
-        if matches:
-            return matches
-        hardware_context = self.get_hardware_context(hardware_key, include_scheduler_limits=True)
-        return self._feature_store().search(
-            query=query,
-            hardware_context=hardware_context,
-            architecture=architecture,
-            vendor=vendor,
-            workload_type=workload_type,
-            framework=framework,
-            limit=limit,
-        )
-
-    def get_hardware_feature_context(
-        self,
-        *,
-        hardware_key: str = "current",
-        workload_type: str | None = None,
-        model_family: str | None = None,
-        framework: str | None = "pytorch",
-        limit: int = 8,
-    ) -> dict[str, Any]:
-        # Deprecated compatibility wrapper. Prefer get_code_optimization_context(...).
-        hardware_context = self.get_hardware_context(hardware_key, include_scheduler_limits=True)
-        hardware = hardware_context.get("hardware") or {}
-        query_parts = [
-            str(hardware.get("gpu_name") or "current hardware"),
-            str(hardware.get("compute_capability") or ""),
-            str(workload_type or ""),
-            str(model_family or ""),
-            str(framework or ""),
-            "training optimization precision memory dataloader checkpointing",
-        ]
-        query = " ".join(part for part in query_parts if part.strip())
-        matches = self.search_code_knowledge(
-            query=query,
-            filters={
-                "framework": framework,
-                "workload_types": workload_type,
-                "model_families": model_family,
-            },
-            record_types=["code_doc_chunks", "optimization_recipe_chunks"],
-            limit=limit,
-        )
-        if not matches:
-            matches = self._feature_store().search(
-                query=query,
-                hardware_context=hardware_context,
-                workload_type=workload_type,
-                framework=framework,
-                limit=limit,
-            )
-        return {
-            "found": bool(matches),
-            "hardware_context": hardware_context,
-            "query": query,
-            "matches": matches,
-            "evidence_refs": [f"code_knowledge:{match.get('record_type', 'hardware_feature')}:{match['record_id']}" for match in matches if match.get("record_id")],
-        }
-
-    def get_hardware_optimization_context(self, *, candidate: dict[str, Any], limit: int = 8) -> dict[str, Any]:
-        # Deprecated compatibility wrapper. Prefer get_optimization_context(...).
-        context = self.get_optimization_context(candidate=candidate, limit=limit)
-        job_design_context = self.get_job_design_context(candidate, limit=limit)
-        feature_context = {
-            "found": any(context.get("vector_evidence", {}).values()),
-            "matches": (
-                list(context.get("vector_evidence", {}).get("recipes") or [])
-                + list(context.get("vector_evidence", {}).get("docs") or [])
-                + list(context.get("vector_evidence", {}).get("api_symbols") or [])
-            ),
-        }
-        return _sanitize_agent_response({
-            "hardware_context": context.get("hardware_context"),
-            "job_design_context": job_design_context,
-            "feature_context": feature_context,
-            "combined_recommendations": context.get("recommendations", []),
-            "risk_notes": context.get("risk_flags", []),
-            "evidence_refs": context.get("evidence_refs", []),
-            "confidence": context.get("confidence", 0.0),
         })
 
     @staticmethod

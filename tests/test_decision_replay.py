@@ -163,7 +163,7 @@ def test_workload_identity_round_trip_and_normalization() -> None:
     assert restored.to_job_spec().workload_identity.architecture_key == "resnet50"
 
 
-def test_mlevolve_adapter_accepts_identity_and_legacy_task_fallback() -> None:
+def test_mlevolve_adapter_requires_explicit_task_identity() -> None:
     explicit = build_mlevolve_job(
         workflow_id="workflow-1",
         baseline_model_id="baseline",
@@ -174,8 +174,8 @@ def test_mlevolve_adapter_accepts_identity_and_legacy_task_fallback() -> None:
         architecture_key="vit_b16",
         architecture_family="transformer",
     )
-    legacy = build_mlevolve_job(
-        workflow_id="legacy-workflow",
+    unidentified = build_mlevolve_job(
+        workflow_id="workflow-without-task",
         baseline_model_id="baseline",
         baseline_model_path="/tmp/baseline.pt",
         runner_target="pkg.runner:train",
@@ -187,8 +187,8 @@ def test_mlevolve_adapter_accepts_identity_and_legacy_task_fallback() -> None:
         architecture_key="vit-b16",
         architecture_family="transformer",
     )
-    assert legacy.workload_identity.task_key == "legacy-workflow"
-    assert not legacy.workload_identity.replay_eligible
+    assert unidentified.workload_identity.task_key is None
+    assert not unidentified.workload_identity.replay_eligible
 
 
 def test_three_rejected_width_two_attempts_learn_exclusive(tmp_path: Path) -> None:
@@ -461,7 +461,7 @@ def test_replayed_backend_failure_invalidates_and_restores_normal_probe_path(tmp
     )
 
 
-def test_replay_state_round_trip_and_legacy_restore(tmp_path: Path) -> None:
+def test_replay_state_round_trip_and_missing_replay_block(tmp_path: Path) -> None:
     service = _service(tmp_path)
     template = _learn_width_three(service)
     restored = PlacementReplayState.from_dict(service._placement_replay.to_dict())
@@ -486,26 +486,26 @@ def test_replay_state_round_trip_and_legacy_restore(tmp_path: Path) -> None:
     restarted._restore_scheduler_decision_state()
     assert restarted._placement_replay.template == template
 
-    legacy_service = SchedulerService.__new__(SchedulerService)
-    legacy_service.settings = _settings(tmp_path)
-    legacy_service.logger = Mock()
-    legacy_service._admission_gate = MemoryAdmissionGate(
+    incomplete_state_service = SchedulerService.__new__(SchedulerService)
+    incomplete_state_service.settings = _settings(tmp_path)
+    incomplete_state_service.logger = Mock()
+    incomplete_state_service._admission_gate = MemoryAdmissionGate(
         stop_fraction=0.95,
         resume_fraction=0.85,
         window_seconds=10,
     )
-    legacy_service._exclusive_probe_job_id = None
-    legacy_service._colocation_trial = None
-    legacy_service._colocation_stall = None
-    legacy_service._placement_replay = PlacementReplayState()
+    incomplete_state_service._exclusive_probe_job_id = None
+    incomplete_state_service._colocation_trial = None
+    incomplete_state_service._colocation_stall = None
+    incomplete_state_service._placement_replay = PlacementReplayState()
     (tmp_path / "scheduler_decision_state.json").write_text(
         json.dumps({"admission_open": True}),
         encoding="utf-8",
     )
 
-    legacy_service._restore_scheduler_decision_state()
+    incomplete_state_service._restore_scheduler_decision_state()
 
-    assert legacy_service._placement_replay == PlacementReplayState()
+    assert incomplete_state_service._placement_replay == PlacementReplayState()
 
 
 def test_state_objects_accept_files_without_scope_fields() -> None:
@@ -522,11 +522,11 @@ def test_state_objects_accept_files_without_scope_fields() -> None:
                     "batch_size": 4,
                     "total_training_seconds": 100,
                     "avg_vram_mb": 1000,
-                    "source": "legacy",
+                    "source": "unspecified",
                     "confidence": 0.9,
                 }
             ],
-            "member_job_ids": ["legacy-job"],
+            "member_job_ids": ["unscoped-job"],
         }
     )
 

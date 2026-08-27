@@ -147,12 +147,21 @@ class BatchSizeObservation:
     backend_name: str
     batch_param_name: str
     batch_size: int
+    effective_batch_size: int | None = None
     peak_vram_mb: int | None = None
     avg_vram_mb: float | None = None
     memory_total_mb: int | None = None
     avg_step_time_ms: float | None = None
     avg_gpu_utilization: float | None = None
     avg_memory_utilization: float | None = None
+    best_metric: float | None = None
+    metric_name: str | None = None
+    metric_maximize: bool | None = None
+    best_epoch: int | None = None
+    planned_epochs: int | None = None
+    completed_epochs: int | None = None
+    convergence_curve: list[dict[str, Any]] = field(default_factory=list)
+    seed_variance: float | None = None
     observations: int = 1
     last_job_id: str | None = None
     updated_at: str = field(default_factory=utc_now)
@@ -161,6 +170,17 @@ class BatchSizeObservation:
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "BatchSizeObservation":
         metadata = json.loads(row["metadata_json"]) if row.get("metadata_json") else {}
+        curve_payload = row.get("convergence_curve_json")
+        if isinstance(curve_payload, str):
+            try:
+                convergence_curve = json.loads(curve_payload)
+            except json.JSONDecodeError:
+                convergence_curve = []
+        elif isinstance(curve_payload, list):
+            convergence_curve = curve_payload
+        else:
+            convergence_curve = []
+        raw_maximize = row.get("metric_maximize")
         return cls(
             observation_key=row["observation_key"],
             model_key=row["model_key"],
@@ -169,12 +189,23 @@ class BatchSizeObservation:
             backend_name=row["backend_name"],
             batch_param_name=row["batch_param_name"],
             batch_size=row["batch_size"],
+            effective_batch_size=row.get("effective_batch_size"),
             peak_vram_mb=row["peak_vram_mb"],
             avg_vram_mb=row.get("avg_vram_mb"),
             memory_total_mb=row["memory_total_mb"],
             avg_step_time_ms=row["avg_step_time_ms"],
             avg_gpu_utilization=row["avg_gpu_utilization"],
             avg_memory_utilization=row["avg_memory_utilization"],
+            best_metric=row.get("best_metric"),
+            metric_name=row.get("metric_name"),
+            metric_maximize=(
+                bool(raw_maximize) if raw_maximize is not None else None
+            ),
+            best_epoch=row.get("best_epoch"),
+            planned_epochs=row.get("planned_epochs"),
+            completed_epochs=row.get("completed_epochs"),
+            convergence_curve=list(convergence_curve or []),
+            seed_variance=row.get("seed_variance"),
             observations=row["observations"],
             last_job_id=row["last_job_id"],
             updated_at=row["updated_at"],

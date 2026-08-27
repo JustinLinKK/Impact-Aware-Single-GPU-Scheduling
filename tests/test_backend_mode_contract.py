@@ -20,16 +20,14 @@ def test_canonical_packing_backend_round_trips(tmp_path, backend: str) -> None:
     assert "stream" not in emitted
 
 
-def test_legacy_mps_normalizes_once_and_is_not_emitted(tmp_path) -> None:
-    with pytest.warns(DeprecationWarning, match="mps_process"):
+def test_noncanonical_mps_backend_is_rejected(tmp_path) -> None:
+    with pytest.raises(ValueError, match="Unsupported packing backend"):
         settings = SchedulerSettings(
             runtime_root=tmp_path,
             gpu_scheduler={"packing_backend": "mps"},
         )
-    assert settings.gpu_scheduler.packing_backend == "mps_process"
-    assert settings.to_dict()["gpu_scheduler"]["packing_backend"] == "mps_process"
 
-    with pytest.warns(DeprecationWarning, match="mps_process"):
+    with pytest.raises(ValueError, match="Unsupported packing backend"):
         profile = RuntimeProfile.create(
             signature="model-a",
             hardware_key="gpu-a",
@@ -37,7 +35,6 @@ def test_legacy_mps_normalizes_once_and_is_not_emitted(tmp_path) -> None:
             resolved_batch_size=8,
             strategy="epoch_1",
         )
-    assert profile.backend_name == "mps_process"
     assert RUNNER_CONTRACT_SUBPROCESS_V1 == "subprocess_job_v1"
 
 
@@ -56,8 +53,8 @@ def test_retired_backend_aliases_fail_with_runner_explanation(
         PackingSpec(eligible=True, backend_allowlist=[retired])
 
 
-def test_ambiguous_legacy_backend_priority_fails(tmp_path) -> None:
-    with pytest.raises(ValueError, match="ambiguous"):
+def test_removed_backend_priority_fails(tmp_path) -> None:
+    with pytest.raises(ValueError, match="Unsupported removed gpu_scheduler settings"):
         SchedulerSettings(
             runtime_root=tmp_path,
             gpu_scheduler={

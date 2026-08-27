@@ -208,30 +208,19 @@ def test_time_aware_configuration_is_the_only_supported_policy() -> None:
         assert restored.gpu_scheduler.colocation.profile_rejection_min_bad_trials == 2
         assert restored.gpu_scheduler.colocation.profile_rejection_ttl_seconds == 86400
         assert restored.gpu_scheduler.colocation.live_trial_enabled
-        legacy_objective = SchedulerSettings(
-            runtime_root=tmpdir,
-            gpu_scheduler={
-                "mode": "parallel_time_aware",
-                "objective": {"objective_version": "time_v3_flow_only"},
-            },
-        )
-        assert legacy_objective.gpu_scheduler.objective.objective_version == "time_v6_verified_piecewise_drain"
-        prior_objective = SchedulerSettings(
-            runtime_root=tmpdir,
-            gpu_scheduler={
-                "mode": "parallel_time_aware",
-                "objective": {"objective_version": "time_v4_colocation_gain"},
-            },
-        )
-        assert prior_objective.gpu_scheduler.objective.objective_version == "time_v6_verified_piecewise_drain"
-        piecewise_objective = SchedulerSettings(
-            runtime_root=tmpdir,
-            gpu_scheduler={
-                "mode": "parallel_time_aware",
-                "objective": {"objective_version": "time_v5_piecewise_drain"},
-            },
-        )
-        assert piecewise_objective.gpu_scheduler.objective.objective_version == "time_v6_verified_piecewise_drain"
+        for removed_version in (
+            "time_v3_flow_only",
+            "time_v4_colocation_gain",
+            "time_v5_piecewise_drain",
+        ):
+            with pytest.raises(ValueError, match="objective_version must be"):
+                SchedulerSettings(
+                    runtime_root=tmpdir,
+                    gpu_scheduler={
+                        "mode": "parallel_time_aware",
+                        "objective": {"objective_version": removed_version},
+                    },
+                )
         assert restored.early_stopping.mode == "min"
         serialized_gpu = restored.gpu_scheduler.to_dict()
         assert serialized_gpu["mode"] == "parallel_time_aware"
@@ -252,7 +241,7 @@ def test_time_aware_configuration_is_the_only_supported_policy() -> None:
             )
         with pytest.raises(ValueError, match="min_bad_trials must be at least 1"):
             _settings(tmpdir, colocation={"profile_rejection_min_bad_trials": 0})
-        for legacy_mode in (
+        for removed_mode in (
             "serial_basic",
             "serial_batch_optimized",
             "parallel_default",
@@ -262,7 +251,7 @@ def test_time_aware_configuration_is_the_only_supported_policy() -> None:
             with pytest.raises(ValueError, match="only supports parallel_time_aware"):
                 SchedulerSettings(
                     runtime_root=tmpdir,
-                    gpu_scheduler={"mode": legacy_mode},
+                    gpu_scheduler={"mode": removed_mode},
                 )
         for removed_key, value in (
             ("max_packed_jobs_per_gpu", 3),
@@ -270,7 +259,7 @@ def test_time_aware_configuration_is_the_only_supported_policy() -> None:
             ("auto_pack", {}),
             ("parallel_optimizer", {}),
         ):
-            with pytest.raises(ValueError, match="Removed legacy gpu_scheduler settings"):
+            with pytest.raises(ValueError, match="Unsupported removed gpu_scheduler settings"):
                 SchedulerSettings(runtime_root=tmpdir, gpu_scheduler={removed_key: value})
         with pytest.raises(ValueError, match="no longer supports throughput scheduling controls"):
             SchedulerSettings(
@@ -320,7 +309,7 @@ def test_time_aware_placement_is_invariant_to_sm_utilization() -> None:
     assert plan_for_utilization(1.0) == baseline
 
 
-def test_time_score_starts_one_anchor_and_ignores_legacy_pair_slowdown() -> None:
+def test_time_score_starts_one_anchor_and_ignores_untrusted_pair_slowdown() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         settings = _settings(tmpdir)
         store = SQLiteStateStore(settings)
@@ -597,11 +586,11 @@ def test_trace_replay_compares_serial_fill_time_aware_and_oracle() -> None:
     assert set(results) == {
         "backend_awared",
         "serial_fifo",
-        "legacy_vram_fill",
+        "vram_fill_reference",
         "parallel_time_aware",
         "small_trace_oracle",
     }
-    assert results["parallel_time_aware"].makespan_seconds < results["legacy_vram_fill"].makespan_seconds
+    assert results["parallel_time_aware"].makespan_seconds < results["vram_fill_reference"].makespan_seconds
     assert results["parallel_time_aware"].mean_flow_seconds < results["serial_fifo"].mean_flow_seconds
     assert results["parallel_time_aware"].starvation_count == 0
     assert results["backend_awared"].hard_constraint_violations == 0
@@ -1531,9 +1520,9 @@ def test_profile_rejection_requires_two_recent_consecutive_bad_trials() -> None:
             now=now,
         )
         assert not planner.time_objective.profile_rejection_trusted(profile([]), now=now)
-        legacy = profile([bad_1, bad_2])
-        legacy.metadata.pop("evidence_policy")
-        assert not planner.time_objective.profile_rates_trusted(legacy, now=now)
+        unversioned = profile([bad_1, bad_2])
+        unversioned.metadata.pop("evidence_policy")
+        assert not planner.time_objective.profile_rates_trusted(unversioned, now=now)
 
 
 def test_expired_profile_is_replaced_instead_of_averaged() -> None:
@@ -2230,10 +2219,12 @@ def test_trace_simulator_preserves_two_rejected_epochs_and_models_stall() -> Non
 
 
 def test_ml_epoch_prediction_requires_canonical_declared_target(monkeypatch: pytest.MonkeyPatch) -> None:
-    legacy = object.__new__(MLVramPredictor)
-    legacy._target_names = ("train_mem", "train_time")
+    unsupported = object.__new__(MLVramPredictor)
+    unsupported._target_names = ("train_mem", "train_time")
     with pytest.raises(JobPredictionError, match="does not expose train_epoch_ms"):
-        legacy.predict_seconds_per_epoch_options(_job("legacy-ml", "legacy-ml-sig"), [4])
+        unsupported.predict_seconds_per_epoch_options(
+            _job("unsupported-ml", "unsupported-ml-sig"), [4]
+        )
 
     canonical = object.__new__(MLVramPredictor)
     canonical._target_names = ("train_mem", "train_epoch_ms")

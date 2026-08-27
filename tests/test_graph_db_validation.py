@@ -15,6 +15,7 @@ from localml_scheduler.domain import (
     BatchProbeProfile,
     BatchProbeSpec,
     BatchSizeObservation,
+    JobStatus,
     PackingSpec,
     RuntimeProfile,
     SoloProfile,
@@ -362,7 +363,7 @@ class _FailingPsycopg:
 
 
 class GraphDatabaseValidationTest(unittest.TestCase):
-    def test_neo4j_store_round_trips_jobs_profiles_and_run_profiles(self) -> None:
+    def test_neo4j_store_exposes_evidence_writes_only(self) -> None:
         driver = _FakeNeo4jDriver()
         graph_database = SimpleNamespace(driver=lambda uri, auth=None: driver)
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -388,7 +389,6 @@ class GraphDatabaseValidationTest(unittest.TestCase):
                 return_value=_test_hardware_profile(),
             ):
                 store = Neo4jStateStore(settings)
-                submitted = store.submit_job(job)
                 batch_probe = BatchProbeProfile(
                     probe_key="probe-1",
                     model_key="baseline-a",
@@ -397,7 +397,7 @@ class GraphDatabaseValidationTest(unittest.TestCase):
                     batch_param_name="batch_size",
                     resolved_batch_size=8,
                     observations=2,
-                    last_job_id=submitted.job_id,
+                    last_job_id=job.job_id,
                 )
                 runtime_profile = RuntimeProfile.create(
                     signature="sig-1",
@@ -409,48 +409,21 @@ class GraphDatabaseValidationTest(unittest.TestCase):
                     estimated_total_runtime_seconds=48.0,
                     confidence=0.9,
                     observations=1,
-                    last_job_id=submitted.job_id,
+                    last_job_id=job.job_id,
                 )
 
-                store.upsert_batch_probe_profile(batch_probe)
-                store.upsert_runtime_profile(runtime_profile)
-
-                self.assertEqual(
-                    store.get_job(submitted.job_id).job_id, submitted.job_id
-                )
-                self.assertEqual(len(store.list_jobs()), 1)
-                self.assertEqual(len(store.fetch_pending_commands()), 1)
-                self.assertEqual(
-                    len(
-                        store.list_events(
-                            job_id=submitted.job_id, event_type="job_submitted"
-                        )
-                    ),
-                    1,
-                )
-                self.assertEqual(
-                    store.get_batch_probe_profile("probe-1").resolved_batch_size, 8
-                )
-                self.assertEqual(
-                    store.get_runtime_profile(
-                        "sig-1",
-                        resolved_batch_size=8,
-                        backend_name="exclusive",
-                    ).estimated_total_runtime_seconds,
-                    48.0,
-                )
-                run_profiles = store.list_run_profiles(job_id=submitted.job_id)
-                self.assertEqual(len(run_profiles), 2)
-                self.assertEqual(
-                    {profile.run_kind for profile in run_profiles},
-                    {"batch_probe", "runtime_probe"},
+                store.record_batch_probe_evidence(batch_probe)
+                store.record_runtime_profile_evidence(runtime_profile)
+                store.record_scheduler_job_evidence(
+                    job.copy(status=JobStatus.COMPLETED)
                 )
 
-                pending = store.fetch_pending_commands()
-                store.mark_command_processed(pending[0].command_id)
-                self.assertEqual(store.fetch_pending_commands(), [])
+                self.assertFalse(hasattr(store, "submit_job"))
+                self.assertFalse(hasattr(store, "get_job"))
+                self.assertFalse(hasattr(store, "upsert_runtime_profile"))
+                self.assertTrue(driver.calls)
 
-    def test_state_store_falls_back_to_legacy_sqlite_when_neo4j_boot_fails(
+    def test_state_store_falls_back_to_sqlite_when_neo4j_boot_fails(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1169,17 +1142,6 @@ class GraphDatabaseValidationTest(unittest.TestCase):
                 },
                 limit=3,
             )
-            api.search_hardware_features(query="cuda training", limit=3)
-            api.get_hardware_feature_context(workload_type="vision_training", limit=3)
-            api.get_hardware_optimization_context(
-                candidate={
-                    "model_key": "resnet50",
-                    "script_signature": "sig-resnet50",
-                    "proposed_batch_size": 32,
-                },
-                limit=3,
-            )
-
             after_events = list(api.list_events())
             self.assertEqual(before_events, after_events)
 
@@ -1204,9 +1166,6 @@ class GraphDatabaseValidationTest(unittest.TestCase):
                 "search_code_knowledge",
                 "get_code_optimization_context",
                 "get_optimization_context",
-                "search_hardware_features",
-                "get_hardware_feature_context",
-                "get_hardware_optimization_context",
                 "record_tuning_outcome",
                 "get_cuda_docs_query",
                 "ingest_cuda_docs_answer",

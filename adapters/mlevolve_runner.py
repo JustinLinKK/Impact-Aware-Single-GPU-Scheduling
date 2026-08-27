@@ -8,18 +8,32 @@ from pathlib import Path
 from typing import Any
 import json
 import os
+import re
 import signal
+import statistics
 import subprocess
 import sys
 import time
 
 import humanize
 
-from engine.script_introspection import analyze_training_batch_contract
+from engine.script_introspection import (
+    GRADIENT_ACCUMULATION_PARAM_NAMES,
+    LEARNING_RATE_PARAM_NAMES,
+    SCHEDULER_TOTAL_STEPS_PARAM_NAMES,
+    WARMUP_STEPS_PARAM_NAMES,
+    analyze_training_batch_contract,
+)
 
 from ..execution.runner_protocol import RunnerContext
 from ..scheduler.telemetry import GpuTelemetrySample, NvidiaSmiTelemetrySampler
-from ..domain import BatchProbeTrialResult, BatchResolution
+from ..domain import (
+    BatchProbeTrialResult,
+    BatchResolution,
+    BatchSizeObservation,
+    build_batch_probe_shape_signature,
+    build_batch_size_observation_key,
+)
 
 _BATCH_OVERRIDE_VAR = "_MLEVOLVE_BATCH_SIZE_OVERRIDE"
 _EPOCH_COUNT_NAMES = {
@@ -31,6 +45,10 @@ _EPOCH_COUNT_NAMES = {
 }
 _EPOCH_OVERRIDE_VAR = "_MLEVOLVE_PROBE_MAX_EPOCHS"
 _PROBE_MODE_VAR = "_MLEVOLVE_PROBE_MODE"
+_GRADIENT_ACCUMULATION_OVERRIDE_VAR = "_MLEVOLVE_GRADIENT_ACCUMULATION_OVERRIDE"
+_LEARNING_RATE_OVERRIDE_VAR = "_MLEVOLVE_LEARNING_RATE_OVERRIDE"
+_WARMUP_STEPS_OVERRIDE_VAR = "_MLEVOLVE_WARMUP_STEPS_OVERRIDE"
+_SCHEDULER_TOTAL_STEPS_OVERRIDE_VAR = "_MLEVOLVE_SCHEDULER_TOTAL_STEPS_OVERRIDE"
 
 
 def _request_process_stop(proc: subprocess.Popen) -> None:
@@ -176,6 +194,25 @@ def _override_epoch_expr(original_value: ast.expr) -> ast.expr:
     )
 
 
+def _override_training_expr(
+    original_value: ast.expr, override_var: str, cast_name: str
+) -> ast.expr:
+    override_name = ast.Name(id=override_var, ctx=ast.Load())
+    return ast.IfExp(
+        test=ast.Compare(
+            left=override_name,
+            ops=[ast.IsNot()],
+            comparators=[ast.Constant(value=None)],
+        ),
+        body=ast.Call(
+            func=ast.Name(id=cast_name, ctx=ast.Load()),
+            args=[override_name],
+            keywords=[],
+        ),
+        orelse=original_value,
+    )
+
+
 class _BatchOverrideTransformer(ast.NodeTransformer):
     """Apply probe overrides only where static analysis proves training use."""
 
@@ -191,6 +228,26 @@ class _BatchOverrideTransformer(ast.NodeTransformer):
             if target_name in _EPOCH_COUNT_NAMES:
                 node.value = _override_epoch_expr(node.value)
                 self.modified = True
+            elif target_name in GRADIENT_ACCUMULATION_PARAM_NAMES:
+                node.value = _override_training_expr(
+                    node.value, _GRADIENT_ACCUMULATION_OVERRIDE_VAR, "int"
+                )
+                self.modified = True
+            elif target_name in LEARNING_RATE_PARAM_NAMES:
+                node.value = _override_training_expr(
+                    node.value, _LEARNING_RATE_OVERRIDE_VAR, "float"
+                )
+                self.modified = True
+            elif target_name in WARMUP_STEPS_PARAM_NAMES:
+                node.value = _override_training_expr(
+                    node.value, _WARMUP_STEPS_OVERRIDE_VAR, "int"
+                )
+                self.modified = True
+            elif target_name in SCHEDULER_TOTAL_STEPS_PARAM_NAMES:
+                node.value = _override_training_expr(
+                    node.value, _SCHEDULER_TOTAL_STEPS_OVERRIDE_VAR, "int"
+                )
+                self.modified = True
         return node
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AnnAssign:
@@ -199,6 +256,26 @@ class _BatchOverrideTransformer(ast.NodeTransformer):
             target_name = node.target.id
             if target_name in _EPOCH_COUNT_NAMES:
                 node.value = _override_epoch_expr(node.value)
+                self.modified = True
+            elif target_name in GRADIENT_ACCUMULATION_PARAM_NAMES:
+                node.value = _override_training_expr(
+                    node.value, _GRADIENT_ACCUMULATION_OVERRIDE_VAR, "int"
+                )
+                self.modified = True
+            elif target_name in LEARNING_RATE_PARAM_NAMES:
+                node.value = _override_training_expr(
+                    node.value, _LEARNING_RATE_OVERRIDE_VAR, "float"
+                )
+                self.modified = True
+            elif target_name in WARMUP_STEPS_PARAM_NAMES:
+                node.value = _override_training_expr(
+                    node.value, _WARMUP_STEPS_OVERRIDE_VAR, "int"
+                )
+                self.modified = True
+            elif target_name in SCHEDULER_TOTAL_STEPS_PARAM_NAMES:
+                node.value = _override_training_expr(
+                    node.value, _SCHEDULER_TOTAL_STEPS_OVERRIDE_VAR, "int"
+                )
                 self.modified = True
         return node
 
@@ -262,6 +339,10 @@ def _materialize_instrumented_script(
         f"{_BATCH_OVERRIDE_VAR} = os.environ.get('MLEVOLVE_BATCH_SIZE_OVERRIDE')\n"
         f"{_PROBE_MODE_VAR} = os.environ.get('MLEVOLVE_PROBE_MODE') == '1'\n"
         f"{_EPOCH_OVERRIDE_VAR} = int(os.environ['MLEVOLVE_PROBE_MAX_EPOCHS']) if os.environ.get('MLEVOLVE_PROBE_MAX_EPOCHS') else None\n"
+        f"{_GRADIENT_ACCUMULATION_OVERRIDE_VAR} = os.environ.get('MLEVOLVE_GRADIENT_ACCUMULATION_OVERRIDE')\n"
+        f"{_LEARNING_RATE_OVERRIDE_VAR} = os.environ.get('MLEVOLVE_LEARNING_RATE_OVERRIDE')\n"
+        f"{_WARMUP_STEPS_OVERRIDE_VAR} = os.environ.get('MLEVOLVE_WARMUP_STEPS_OVERRIDE')\n"
+        f"{_SCHEDULER_TOTAL_STEPS_OVERRIDE_VAR} = os.environ.get('MLEVOLVE_SCHEDULER_TOTAL_STEPS_OVERRIDE')\n"
         "_MLEVOLVE_PROBE_MAX_TRAIN_BATCHES = int(os.environ['MLEVOLVE_PROBE_MAX_TRAIN_BATCHES']) if os.environ.get('MLEVOLVE_PROBE_MAX_TRAIN_BATCHES') else None\n"
         "def _mlevolve_apply_probe_limits():\n"
         "    if not _MLEVOLVE_PROBE_MODE or _MLEVOLVE_PROBE_MAX_TRAIN_BATCHES is None:\n"
@@ -297,6 +378,10 @@ def _materialize_instrumented_script(
 def _base_script_env(
     batch_size_override: int | None = None,
     *,
+    gradient_accumulation_override: int | None = None,
+    learning_rate_override: float | None = None,
+    warmup_steps_override: int | None = None,
+    scheduler_total_steps_override: int | None = None,
     probe_mode: bool = False,
     probe_max_epochs: int | None = None,
     probe_max_train_batches: int | None = None,
@@ -304,6 +389,18 @@ def _base_script_env(
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     if batch_size_override is not None:
         env["MLEVOLVE_BATCH_SIZE_OVERRIDE"] = str(int(batch_size_override))
+    if gradient_accumulation_override is not None:
+        env["MLEVOLVE_GRADIENT_ACCUMULATION_OVERRIDE"] = str(
+            max(1, int(gradient_accumulation_override))
+        )
+    if learning_rate_override is not None:
+        env["MLEVOLVE_LEARNING_RATE_OVERRIDE"] = str(float(learning_rate_override))
+    if warmup_steps_override is not None:
+        env["MLEVOLVE_WARMUP_STEPS_OVERRIDE"] = str(max(0, int(warmup_steps_override)))
+    if scheduler_total_steps_override is not None:
+        env["MLEVOLVE_SCHEDULER_TOTAL_STEPS_OVERRIDE"] = str(
+            max(1, int(scheduler_total_steps_override))
+        )
     if probe_mode:
         env["MLEVOLVE_PROBE_MODE"] = "1"
     if probe_max_epochs is not None:
@@ -327,6 +424,243 @@ def _parse_batch_size_failure(stderr_text: str) -> str | None:
     if "out of memory" in lowered or "cuda out of memory" in lowered:
         return "cuda out of memory"
     return None
+
+
+def _metric_direction(metric_name: str | None, explicit: Any = None) -> bool | None:
+    if explicit is not None:
+        return bool(explicit)
+    lowered = str(metric_name or "").lower()
+    if any(token in lowered for token in ("loss", "error", "rmse", "mae", "mse")):
+        return False
+    if any(
+        token in lowered
+        for token in ("score", "accuracy", "auc", "f1", "precision", "recall")
+    ):
+        return True
+    return None
+
+
+def _parse_training_quality(
+    stdout: str, *, planned_epochs: int | None, metric_maximize: Any = None
+) -> dict[str, Any]:
+    """Parse structured epoch markers first, then common validation log formats."""
+    curve: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        if "MLEVOLVE_EPOCH_METRIC" in line:
+            payload_text = line.split("MLEVOLVE_EPOCH_METRIC", 1)[1].lstrip(" :")
+            try:
+                payload = json.loads(payload_text)
+                epoch = int(payload["epoch"])
+                metric = float(payload["metric"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            curve.append(
+                {
+                    "epoch": epoch,
+                    "metric": metric,
+                    "metric_name": str(
+                        payload.get("metric_name") or "validation_metric"
+                    ),
+                }
+            )
+            continue
+        epoch_match = re.search(
+            r"\bepoch\s*[:#]?\s*(\d+)(?:\s*/\s*\d+)?", line, re.IGNORECASE
+        )
+        metric_match = re.search(
+            r"\b((?:val|valid|validation)[_\s-]*(?:score|metric|loss|accuracy|auc|f1|rmse|mae|mse))\s*[:=]\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)",
+            line,
+            re.IGNORECASE,
+        )
+        if epoch_match and metric_match:
+            curve.append(
+                {
+                    "epoch": int(epoch_match.group(1)),
+                    "metric": float(metric_match.group(2)),
+                    "metric_name": metric_match.group(1).strip().replace(" ", "_"),
+                }
+            )
+
+    final_match = None
+    for final_match in re.finditer(
+        r"Final Validation Score\s*:\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)",
+        stdout,
+        re.IGNORECASE,
+    ):
+        pass
+    explicit_best_epoch = re.search(
+        r"\bbest[_\s-]*epoch\s*[:=]\s*(\d+)", stdout, re.IGNORECASE
+    )
+    completed_epochs = max(
+        (int(point["epoch"]) for point in curve),
+        default=0,
+    )
+    metric_name = curve[-1].get("metric_name") if curve else None
+    direction = _metric_direction(metric_name, metric_maximize)
+    best_metric = None
+    best_epoch = int(explicit_best_epoch.group(1)) if explicit_best_epoch else None
+    if curve:
+        selector = min if direction is False else max
+        best_point = selector(curve, key=lambda point: float(point["metric"]))
+        best_metric = float(best_point["metric"])
+        best_epoch = best_epoch or int(best_point["epoch"])
+    if final_match is not None:
+        best_metric = float(final_match.group(1))
+        metric_name = "Final Validation Score"
+        direction = _metric_direction(metric_name, metric_maximize)
+        if best_epoch is None:
+            best_epoch = completed_epochs or None
+    if completed_epochs == 0 and best_epoch is not None:
+        completed_epochs = best_epoch
+    if planned_epochs is not None:
+        completed_epochs = min(int(planned_epochs), completed_epochs)
+    return {
+        "planned_epochs": planned_epochs,
+        "completed_epochs": completed_epochs,
+        "best_epoch": best_epoch,
+        "best_metric": best_metric,
+        "metric_name": metric_name,
+        "metric_maximize": direction,
+        "convergence_curve": curve,
+    }
+
+
+def _record_training_quality_observation(
+    context: RunnerContext, quality: dict[str, Any], *, exec_time: float
+) -> None:
+    physical_batch = _resolved_batch_size(context)
+    if physical_batch is None:
+        return
+    job = context.job
+    backend_name = str(job.metadata.get("placement_backend") or "exclusive")
+    hardware_key = context.store.hardware_key()
+    model_key = str(job.batch_probe.model_key or job.baseline_model_id)
+    shape_signature = build_batch_probe_shape_signature(job)
+    existing = context.store.get_batch_size_observation(
+        model_key=model_key,
+        shape_signature=shape_signature,
+        hardware_key=hardware_key,
+        backend_name=backend_name,
+        batch_size=physical_batch,
+    )
+    metadata = dict(existing.metadata if existing else {})
+    samples = [
+        float(value)
+        for value in metadata.get("quality_samples") or []
+        if isinstance(value, (int, float))
+    ]
+    current_metric = quality.get("best_metric")
+    seed_samples = [
+        dict(item)
+        for item in metadata.get("quality_samples_by_seed") or []
+        if isinstance(item, dict) and item.get("metric") is not None
+    ]
+    if current_metric is not None:
+        samples.append(float(current_metric))
+        seed_samples.append(
+            {
+                "seed": job.metadata.get("random_seed"),
+                "metric": float(current_metric),
+                "job_id": job.job_id,
+            }
+        )
+    seed_metrics: dict[int, list[float]] = {}
+    unlabelled_metrics: list[float] = []
+    for item in seed_samples:
+        try:
+            metric = float(item["metric"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if item.get("seed") is None:
+            unlabelled_metrics.append(metric)
+            continue
+        try:
+            seed = int(item["seed"])
+        except (TypeError, ValueError):
+            unlabelled_metrics.append(metric)
+            continue
+        seed_metrics.setdefault(seed, []).append(metric)
+    per_seed_metrics = [statistics.fmean(values) for values in seed_metrics.values()]
+    variance_values = (
+        per_seed_metrics
+        if len(per_seed_metrics) > 1
+        else (unlabelled_metrics if not per_seed_metrics else [])
+    )
+    metadata.update(
+        {
+            "quality_samples": samples[-32:],
+            "quality_samples_by_seed": seed_samples[-32:],
+            "seconds_per_epoch": (
+                float(exec_time) / max(1, int(quality.get("completed_epochs") or 1))
+            ),
+            "training_parameter_resolution": dict(
+                job.metadata.get("training_parameter_resolution") or {}
+            ),
+            "early_stopping_required": bool(
+                (job.metadata.get("training_quality_contract") or {}).get(
+                    "early_stopping_required"
+                )
+            ),
+            "has_validation_early_stopping": bool(
+                job.metadata.get("has_validation_early_stopping")
+            ),
+        }
+    )
+    maximize = quality.get("metric_maximize")
+    best_metric = quality.get("best_metric")
+    best_epoch = quality.get("best_epoch")
+    if existing and existing.best_metric is not None:
+        if best_metric is None:
+            best_metric, best_epoch = existing.best_metric, existing.best_epoch
+        elif maximize is True and existing.best_metric > best_metric:
+            best_metric, best_epoch = existing.best_metric, existing.best_epoch
+        elif maximize is False and existing.best_metric < best_metric:
+            best_metric, best_epoch = existing.best_metric, existing.best_epoch
+
+    context.store.upsert_batch_size_observation(
+        BatchSizeObservation(
+            observation_key=build_batch_size_observation_key(
+                model_key,
+                shape_signature,
+                hardware_key,
+                backend_name,
+                physical_batch,
+            ),
+            model_key=model_key,
+            shape_signature=shape_signature,
+            hardware_key=hardware_key,
+            backend_name=backend_name,
+            batch_param_name=BatchResolution.param_name(job),
+            batch_size=physical_batch,
+            effective_batch_size=job.metadata.get("resolved_effective_batch_size"),
+            peak_vram_mb=existing.peak_vram_mb if existing else None,
+            avg_vram_mb=existing.avg_vram_mb if existing else None,
+            memory_total_mb=existing.memory_total_mb if existing else None,
+            avg_step_time_ms=existing.avg_step_time_ms if existing else None,
+            avg_gpu_utilization=existing.avg_gpu_utilization if existing else None,
+            avg_memory_utilization=(
+                existing.avg_memory_utilization if existing else None
+            ),
+            best_metric=best_metric,
+            metric_name=quality.get("metric_name")
+            or (existing.metric_name if existing else None),
+            metric_maximize=maximize
+            if maximize is not None
+            else (existing.metric_maximize if existing else None),
+            best_epoch=best_epoch,
+            planned_epochs=quality.get("planned_epochs"),
+            completed_epochs=quality.get("completed_epochs"),
+            convergence_curve=list(quality.get("convergence_curve") or []),
+            seed_variance=(
+                statistics.pvariance(variance_values)
+                if len(variance_values) > 1
+                else None
+            ),
+            observations=(existing.observations + 1) if existing else 1,
+            last_job_id=job.job_id,
+            metadata=metadata,
+        )
+    )
 
 
 def _run_probe_subprocess(
@@ -470,6 +804,9 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
     batch_size_override = (
         _resolved_batch_size(context) if instrumented.had_batch_rewrite else None
     )
+    parameter_resolution = dict(
+        context.job.metadata.get("training_parameter_resolution") or {}
+    )
 
     start_time = time.time()
     proc = subprocess.Popen(
@@ -479,7 +816,17 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
-        env=_base_script_env(batch_size_override=batch_size_override),
+        env=_base_script_env(
+            batch_size_override=batch_size_override,
+            gradient_accumulation_override=parameter_resolution.get(
+                "gradient_accumulation_steps"
+            ),
+            learning_rate_override=parameter_resolution.get("learning_rate"),
+            warmup_steps_override=parameter_resolution.get("warmup_steps"),
+            scheduler_total_steps_override=parameter_resolution.get(
+                "scheduler_total_steps"
+            ),
+        ),
     )
 
     exc_type: str | None = None
@@ -524,12 +871,39 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
             f"Execution time: {humanize.naturaldelta(exec_time)} seconds (time limit is {humanize.naturaldelta(timeout)})."
         )
 
+    planned_epochs = context.job.max_epochs or context.job.config.max_epochs
+    training_summary = _parse_training_quality(
+        stdout,
+        planned_epochs=int(planned_epochs) if planned_epochs is not None else None,
+        metric_maximize=context.job.metadata.get("metric_maximize"),
+    )
+    try:
+        context.store.update_job(
+            context.job.job_id,
+            metadata_updates={
+                "planned_epochs": training_summary.get("planned_epochs"),
+                "completed_epochs": training_summary.get("completed_epochs"),
+                "last_completed_epoch": training_summary.get("completed_epochs"),
+                "best_epoch": training_summary.get("best_epoch"),
+                "best_metric": training_summary.get("best_metric"),
+                "convergence_curve": training_summary.get("convergence_curve"),
+            },
+        )
+        _record_training_quality_observation(
+            context, training_summary, exec_time=exec_time
+        )
+    except Exception:
+        # Quality evidence must never turn a completed training run into a
+        # scheduler failure; the execution payload still carries the summary.
+        pass
+
     result = {
         "term_out": output,
         "exec_time": exec_time,
         "exc_type": exc_type,
         "exc_info": exc_info,
         "exc_stack": exc_stack,
+        "training_summary": training_summary,
     }
     _write_json_atomic(result_path, result)
     return {
@@ -538,4 +912,6 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
         "candidate_returncode": proc.returncode,
         "candidate_exc_type": exc_type,
         "batch_size_override": batch_size_override,
+        "training_parameter_resolution": parameter_resolution,
+        "training_summary": training_summary,
     }
