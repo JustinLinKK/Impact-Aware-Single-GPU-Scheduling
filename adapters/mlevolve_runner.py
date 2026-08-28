@@ -8,11 +8,13 @@ from pathlib import Path
 from typing import Any
 import json
 import os
+import queue
 import re
 import signal
 import statistics
 import subprocess
 import sys
+import threading
 import time
 
 import humanize
@@ -31,9 +33,12 @@ from ..domain import (
     BatchProbeTrialResult,
     BatchResolution,
     BatchSizeObservation,
+    ProgressSnapshot,
     build_batch_probe_shape_signature,
     build_batch_size_observation_key,
+    utc_now,
 )
+from ..profiling.runtime_probe import estimate_total_runtime_from_epoch_1
 
 _BATCH_OVERRIDE_VAR = "_MLEVOLVE_BATCH_SIZE_OVERRIDE"
 _EPOCH_COUNT_NAMES = {
@@ -663,6 +668,157 @@ def _record_training_quality_observation(
     )
 
 
+def _record_live_epoch_metric(
+    context: RunnerContext, line: str, *, started_at: float
+) -> None:
+    """Persist a duration prediction as soon as a generated script ends an epoch."""
+    if "MLEVOLVE_EPOCH_METRIC" not in line:
+        return
+    payload_text = line.split("MLEVOLVE_EPOCH_METRIC", 1)[1].lstrip(" :")
+    try:
+        payload = json.loads(payload_text)
+        epoch = max(1, int(payload["epoch"]))
+        metric = float(payload["metric"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return
+
+    elapsed = max(0.001, time.time() - started_at)
+    total_epochs = (
+        context.job.max_epochs
+        or context.job.config.max_epochs
+        or context.job.metadata.get("proposed_epochs")
+        or context.job.metadata.get("planned_epochs")
+    )
+    try:
+        total_epochs = max(epoch, int(total_epochs)) if total_epochs is not None else epoch
+    except (TypeError, ValueError):
+        total_epochs = epoch
+    backend_name = str(context.job.metadata.get("placement_backend") or "exclusive")
+    existing = context.get_runtime_profile(backend_name=backend_name)
+    estimate = (
+        float(existing.estimated_total_runtime_seconds)
+        if existing is not None and existing.estimated_total_runtime_seconds is not None
+        else None
+    )
+    if estimate is None and context.job.runtime_probe.enabled:
+        estimate = estimate_total_runtime_from_epoch_1(
+            startup_seconds=0.0,
+            epoch_1_seconds=elapsed / float(epoch),
+            total_epochs=int(total_epochs),
+        )
+        context.upsert_runtime_profile(
+            backend_name=backend_name,
+            strategy="epoch_1",
+            startup_seconds=0.0,
+            epoch_1_seconds=elapsed / float(epoch),
+            steps_per_epoch=None,
+            avg_step_time_ms=None,
+            estimated_total_runtime_seconds=estimate,
+            confidence=0.75,
+            source="mlevolve_stdout_epoch_marker",
+            observations=1,
+            metadata={"epoch": epoch, "metric_name": payload.get("metric_name")},
+        )
+
+    remaining = max(0.0, float(estimate) - elapsed) if estimate is not None else None
+    heartbeat_at = utc_now()
+    context.store.update_job(
+        context.job.job_id,
+        last_heartbeat_at=heartbeat_at,
+        metadata_updates={
+            "last_completed_epoch": epoch,
+            "runtime_estimated_total_runtime_seconds": estimate,
+            "runtime_remaining_runtime_seconds": remaining,
+            "runtime_profile_strategy": "epoch_1" if estimate is not None else None,
+            "runtime_profile_confidence": 0.75 if estimate is not None else None,
+        },
+    )
+    context.control_hook.control_plane.write_heartbeat(
+        ProgressSnapshot(
+            job_id=context.job.job_id,
+            epoch=epoch,
+            global_step=0,
+            phase="train",
+            metrics={str(payload.get("metric_name") or "validation_metric"): metric},
+            last_safe_point="epoch",
+            message="MLEVOLVE_EPOCH_METRIC",
+            estimated_total_runtime_seconds=estimate,
+            remaining_runtime_seconds=remaining,
+            heartbeat_at=heartbeat_at,
+        )
+    )
+
+
+def _stream_script_process(
+    proc: subprocess.Popen[str],
+    context: RunnerContext,
+    *,
+    started_at: float,
+    timeout: int,
+) -> tuple[str, str, bool]:
+    """Stream stdout/stderr so an epoch-one profile exists before completion."""
+    lines: queue.Queue[tuple[str, str]] = queue.Queue()
+
+    def pump(name: str, stream: Any) -> None:
+        if stream is None:
+            return
+        try:
+            for text in iter(stream.readline, ""):
+                lines.put((name, text))
+        finally:
+            stream.close()
+
+    readers = [
+        threading.Thread(target=pump, args=(name, stream), daemon=True)
+        for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr))
+    ]
+    for reader in readers:
+        reader.start()
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    timed_out = False
+    deadline = started_at + float(timeout)
+    termination_deadline: float | None = None
+    while proc.poll() is None or any(reader.is_alive() for reader in readers):
+        remaining = deadline - time.time()
+        if remaining <= 0 and proc.poll() is None and termination_deadline is None:
+            timed_out = True
+            _request_process_stop(proc)
+            deadline = time.time() + 2.0
+            termination_deadline = deadline
+        elif remaining <= 0 and proc.poll() is None:
+            proc.kill()
+            deadline = time.time() + 0.1
+        try:
+            name, text = lines.get(
+                timeout=max(0.01, min(0.1, remaining if remaining > 0 else 0.1))
+            )
+        except queue.Empty:
+            continue
+        if name == "stdout":
+            stdout_lines.append(text)
+            _record_live_epoch_metric(context, text, started_at=started_at)
+        else:
+            stderr_lines.append(text)
+
+    for reader in readers:
+        reader.join(timeout=0.2)
+    while not lines.empty():
+        name, text = lines.get_nowait()
+        if name == "stdout":
+            stdout_lines.append(text)
+            _record_live_epoch_metric(context, text, started_at=started_at)
+        else:
+            stderr_lines.append(text)
+    try:
+        proc.wait(timeout=0.1)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=2.0)
+    return "".join(stdout_lines), "".join(stderr_lines), timed_out
+
+
 def _run_probe_subprocess(
     *,
     python_executable: str,
@@ -810,7 +966,7 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
 
     start_time = time.time()
     proc = subprocess.Popen(
-        [python_executable, str(executable_script)],
+        [python_executable, "-u", str(executable_script)],
         cwd=str(working_dir),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -835,22 +991,16 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
     stdout = ""
     stderr = ""
 
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        exec_time = time.time() - start_time
-        if proc.returncode != 0:
-            exc_type, exc_info, exc_stack = _parse_exception(
-                stderr, working_dir, executable_script
-            )
-    except subprocess.TimeoutExpired:
-        try:
-            _request_process_stop(proc)
-            stdout, stderr = proc.communicate(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-        exec_time = time.time() - start_time
+    stdout, stderr, timed_out = _stream_script_process(
+        proc, context, started_at=start_time, timeout=timeout
+    )
+    exec_time = time.time() - start_time
+    if timed_out:
         exc_type = "TimeoutError"
+    elif proc.returncode != 0:
+        exc_type, exc_info, exc_stack = _parse_exception(
+            stderr, working_dir, executable_script
+        )
 
     output: list[str] = []
     if stdout:

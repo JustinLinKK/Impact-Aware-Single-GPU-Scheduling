@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 
 from localml_scheduler.adapters.mlevolve_runner import (
@@ -17,6 +19,8 @@ from localml_scheduler.domain import (
     BatchProbeSpec,
     BatchResolution,
     CheckpointPolicy,
+    PackingSpec,
+    RuntimeProbeSpec,
     SafePointType,
     TrainingJob,
 )
@@ -46,6 +50,61 @@ def _build_context(settings: SchedulerSettings, job: TrainingJob) -> RunnerConte
 
 
 class MLEvolveRunnerTest(unittest.TestCase):
+    def test_runtime_profile_is_persisted_before_script_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir) / "runtime"
+            working_dir = Path(tmpdir) / "workspace"
+            working_dir.mkdir(parents=True, exist_ok=True)
+            script_path = working_dir / "candidate.py"
+            script_path.write_text(
+                "\n".join(
+                    [
+                        "import time",
+                        "print('MLEVOLVE_EPOCH_METRIC {\"epoch\": 1, \"metric\": 0.7, \"metric_name\": \"validation_score\"}', flush=True)",
+                        "time.sleep(1.0)",
+                        "print('MLEVOLVE_EPOCH_METRIC {\"epoch\": 2, \"metric\": 0.8, \"metric_name\": \"validation_score\"}', flush=True)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            settings = SchedulerSettings(runtime_root=runtime_root)
+            job = TrainingJob.create(
+                runner_target="localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job",
+                baseline_model_id="streaming-script",
+                baseline_model_path=str(script_path),
+                runner_kwargs={
+                    "script_path": str(script_path),
+                    "working_dir": str(working_dir),
+                    "result_path": str(working_dir / "result.json"),
+                    "timeout": 30,
+                },
+                runtime_probe=RuntimeProbeSpec(enabled=True),
+                max_epochs=2,
+                packing=PackingSpec(signature="streaming-runtime-profile"),
+                metadata={"placement_backend": "exclusive"},
+            )
+            context = _build_context(settings, job)
+            result: dict[str, object] = {}
+            worker = threading.Thread(
+                target=lambda: result.update(run_mlevolve_script_job(context))
+            )
+            worker.start()
+            deadline = time.monotonic() + 0.8
+            profiles = []
+            while time.monotonic() < deadline:
+                profiles = context.store.list_runtime_profiles(
+                    signature="streaming-runtime-profile"
+                )
+                if profiles:
+                    break
+                time.sleep(0.02)
+            self.assertTrue(worker.is_alive())
+            self.assertEqual(len(profiles), 1)
+            self.assertIsNotNone(profiles[0].estimated_total_runtime_seconds)
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result["candidate_returncode"], 0)
+
     def test_run_script_resolves_coupled_training_parameters_and_quality(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir) / "runtime"
