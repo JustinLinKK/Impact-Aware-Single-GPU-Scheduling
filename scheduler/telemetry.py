@@ -4,12 +4,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Sequence
+import os
 import shutil
 import subprocess
 
 from ..domain import utc_now
 from ..domain import parse_timestamp
+
+
+def _resolve_nvidia_smi() -> str | None:
+    configured = os.environ.get("MLEVOLVE_NVIDIA_SMI")
+    if configured and Path(configured).is_file():
+        return configured
+    discovered = shutil.which("nvidia-smi")
+    if discovered:
+        return discovered
+    wsl_binary = Path("/usr/lib/wsl/lib/nvidia-smi")
+    return str(wsl_binary) if wsl_binary.is_file() else None
 
 
 @dataclass(slots=True)
@@ -91,7 +104,7 @@ class NvidiaSmiTelemetrySampler:
 
     def __init__(self, device_index: int = 0):
         self.device_index = device_index
-        self._binary = shutil.which("nvidia-smi")
+        self._binary = _resolve_nvidia_smi()
 
     def available(self) -> bool:
         return self._binary is not None
