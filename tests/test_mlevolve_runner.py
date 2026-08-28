@@ -104,6 +104,12 @@ class MLEvolveRunnerTest(unittest.TestCase):
             worker.join(timeout=5)
             self.assertFalse(worker.is_alive())
             self.assertEqual(result["candidate_returncode"], 0)
+            calibrated = context.store.list_runtime_profiles(
+                signature="streaming-runtime-profile"
+            )
+            self.assertGreaterEqual(
+                float(calibrated[0].estimated_total_runtime_seconds or 0.0), 0.9
+            )
 
     def test_run_script_resolves_coupled_training_parameters_and_quality(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

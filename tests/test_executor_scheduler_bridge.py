@@ -148,6 +148,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             )
             (workdir / "shared-start.ckpt").write_bytes(b"checkpoint")
             interpreter.attach_scheduler(fake_api, bridge_cfg)
+            interpreter.set_metric_direction(False)
 
             result = interpreter._run_scheduler_job(
                 code=(
@@ -173,6 +174,7 @@ class InterpreterSchedulerBridgeTest(unittest.TestCase):
             self.assertEqual(submitted.packing.backend_allowlist, ["cuda_process"])
             self.assertTrue(submitted.batch_probe.enabled)
             self.assertEqual(submitted.batch_probe.model_key, "scheduler-model-key")
+            self.assertIs(submitted.metadata["metric_maximize"], False)
             self.assertEqual(submitted.config.runner_kwargs["probe_timeout_seconds"], 45)
             self.assertEqual(submitted.config.runner_kwargs["probe_poll_interval_seconds"], 0.5)
             self.assertEqual(submitted.metadata["batch_probe_policy"], "time_aware_five_options")

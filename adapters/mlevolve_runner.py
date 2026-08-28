@@ -819,6 +819,41 @@ def _stream_script_process(
     return "".join(stdout_lines), "".join(stderr_lines), timed_out
 
 
+def _calibrate_runtime_profile(
+    context: RunnerContext, *, exec_time: float, training_summary: dict[str, Any]
+) -> None:
+    """Replace the first-epoch extrapolation with the observed wall-clock runtime."""
+    if not context.job.runtime_probe.enabled:
+        return
+    backend_name = str(context.job.metadata.get("placement_backend") or "exclusive")
+    existing = context.get_runtime_profile(backend_name=backend_name)
+    context.upsert_runtime_profile(
+        backend_name=backend_name,
+        strategy="epoch_1",
+        startup_seconds=(existing.startup_seconds if existing is not None else None),
+        epoch_1_seconds=(existing.epoch_1_seconds if existing is not None else None),
+        steps_per_epoch=(existing.steps_per_epoch if existing is not None else None),
+        avg_step_time_ms=(existing.avg_step_time_ms if existing is not None else None),
+        estimated_total_runtime_seconds=max(0.0, float(exec_time)),
+        confidence=0.95,
+        source="mlevolve_completed_wall_clock",
+        observations=(int(existing.observations) + 1) if existing is not None else 1,
+        metadata={
+            "completed_epochs": training_summary.get("completed_epochs"),
+            "best_epoch": training_summary.get("best_epoch"),
+        },
+    )
+    context.store.update_job(
+        context.job.job_id,
+        metadata_updates={
+            "runtime_estimated_total_runtime_seconds": max(0.0, float(exec_time)),
+            "runtime_remaining_runtime_seconds": 0.0,
+            "runtime_profile_strategy": "completed_wall_clock",
+            "runtime_profile_confidence": 0.95,
+        },
+    )
+
+
 def _run_probe_subprocess(
     *,
     python_executable: str,
@@ -1028,6 +1063,10 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
         metric_maximize=context.job.metadata.get("metric_maximize"),
     )
     try:
+        if exc_type is None:
+            _calibrate_runtime_profile(
+                context, exec_time=exec_time, training_summary=training_summary
+            )
         context.store.update_job(
             context.job.job_id,
             metadata_updates={
