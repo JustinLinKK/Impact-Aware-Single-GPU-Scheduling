@@ -13,6 +13,7 @@ import sys
 
 from ..domain import TrainingJob
 from ..config import SchedulerSettings
+from ..cuda_device_mapping import physical_cuda_device_selector
 from .executor import SubprocessExecutor, WorkerProcessHandle
 
 
@@ -60,7 +61,7 @@ class ExclusiveBackend:
         job = jobs[0]
         extra_env: dict[str, str] = {}
         if job.resource_requirements.requires_gpu:
-            extra_env["CUDA_VISIBLE_DEVICES"] = str(
+            extra_env["CUDA_VISIBLE_DEVICES"] = physical_cuda_device_selector(
                 self.settings.gpu_scheduler.device_index
             )
         return [self.executor.start(job, extra_env=extra_env)]
@@ -79,7 +80,9 @@ class CudaProcessBackend:
         if not jobs:
             raise ValueError("cuda_process backend expects at least one job")
         base_env = {
-            "CUDA_VISIBLE_DEVICES": str(self.settings.gpu_scheduler.device_index),
+            "CUDA_VISIBLE_DEVICES": physical_cuda_device_selector(
+                self.settings.gpu_scheduler.device_index
+            ),
             "OMP_NUM_THREADS": str(
                 self.settings.gpu_scheduler.cuda_process.default_omp_num_threads
             ),
@@ -114,7 +117,9 @@ class MPSBackend:
         mps_settings = self.settings.gpu_scheduler.mps
         return {
             **os.environ,
-            "CUDA_VISIBLE_DEVICES": str(self.settings.gpu_scheduler.device_index),
+            "CUDA_VISIBLE_DEVICES": physical_cuda_device_selector(
+                self.settings.gpu_scheduler.device_index
+            ),
             "CUDA_MPS_PIPE_DIRECTORY": mps_settings.pipe_directory,
             "CUDA_MPS_LOG_DIRECTORY": mps_settings.log_directory,
         }

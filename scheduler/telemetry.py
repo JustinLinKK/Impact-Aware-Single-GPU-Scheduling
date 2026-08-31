@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 
+from ..cuda_device_mapping import physical_cuda_device_selector
 from ..domain import utc_now
 from ..domain import parse_timestamp
 
@@ -104,6 +105,7 @@ class NvidiaSmiTelemetrySampler:
 
     def __init__(self, device_index: int = 0):
         self.device_index = device_index
+        self.device_selector = physical_cuda_device_selector(device_index)
         self._binary = _resolve_nvidia_smi()
 
     def available(self) -> bool:
@@ -116,7 +118,7 @@ class NvidiaSmiTelemetrySampler:
             result = subprocess.run(
                 [
                     self._binary,
-                    f"--id={self.device_index}",
+                    f"--id={self.device_selector}",
                     "--query-gpu=memory.used,memory.total,utilization.gpu,utilization.memory",
                     "--format=csv,noheader,nounits",
                 ],

@@ -11,6 +11,8 @@ import subprocess
 
 import torch
 
+from .cuda_device_mapping import physical_cuda_device_selector
+
 
 @dataclass(slots=True)
 class HardwareProfile:
@@ -88,7 +90,7 @@ def detect_hardware_profile(*, device_index: int = 0) -> HardwareProfile:
                     "--query-gpu=driver_version",
                     "--format=csv,noheader",
                     "-i",
-                    str(device_index),
+                    physical_cuda_device_selector(device_index),
                 ],
                 capture_output=True,
                 check=False,

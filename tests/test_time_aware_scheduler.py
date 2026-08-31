@@ -437,9 +437,9 @@ def test_non_power_of_two_requested_batch_falls_back_exclusive() -> None:
         assert "unavailable" in plan.reason
 
 
-def test_active_plus_new_jobs_respect_cap_memory_and_determinism() -> None:
+def test_active_plus_new_jobs_ignore_legacy_parallel_cap_and_use_memory_admission() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
-        settings = _settings(tmpdir, parallel_job_cap=2)
+        settings = _settings(tmpdir, parallel_job_cap=1)
         store = SQLiteStateStore(settings)
         planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
         active = _job("active", "active-sig")
@@ -885,6 +885,121 @@ def test_remaining_runtime_uses_batch_profile_epoch_time_without_runtime_profile
         assert planner.predicted_remaining_runtime_seconds(job, backend_name="cuda_process") == 48.0
 
 
+def test_runtime_estimate_reuses_completed_profile_within_same_branch() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir)
+        store = SQLiteStateStore(settings)
+        planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
+        shared_metadata = {
+            "experiment_mode": "hardware_aware",
+            "workflow_id": "petfinder-run",
+            "branch_id": 2,
+            "model_family": "efficientnet-b0",
+        }
+        observed = _job("observed", "observed-signature")
+        observed.max_epochs = observed.config.max_epochs = 8
+        observed.metadata.update(shared_metadata)
+        store.submit_job(observed)
+        store.upsert_runtime_profile(
+            RuntimeProfile.create(
+                signature="observed-signature",
+                hardware_key=store.hardware_key(),
+                backend_name="exclusive",
+                resolved_batch_size=4,
+                strategy="epoch_1",
+                epoch_1_seconds=30.0,
+                estimated_total_runtime_seconds=80.0,
+                confidence=0.95,
+                observations=2,
+                last_job_id=observed.job_id,
+                source="mlevolve_completed_wall_clock",
+                metadata={"completed_epochs": 8},
+            )
+        )
+
+        candidate = _job("candidate", "different-signature")
+        candidate.max_epochs = candidate.config.max_epochs = 4
+        candidate.metadata.update(shared_metadata)
+        assert planner.estimator.predicted_remaining_runtime_seconds(
+            candidate,
+            backend_name="exclusive",
+        ) == 40.0
+
+        other_branch = _job("other-branch", "other-signature")
+        other_branch.max_epochs = other_branch.config.max_epochs = 4
+        other_branch.metadata.update(shared_metadata | {"branch_id": 3})
+        assert planner.estimator.predicted_remaining_runtime_seconds(
+            other_branch,
+            backend_name="exclusive",
+        ) is None
+
+        other_family = _job("other-family", "other-family-signature")
+        other_family.max_epochs = other_family.config.max_epochs = 4
+        other_family.metadata.update(
+            shared_metadata | {"model_family": "efficientnet-b3"}
+        )
+        assert planner.estimator.predicted_remaining_runtime_seconds(
+            other_family,
+            backend_name="exclusive",
+        ) is None
+
+        baseline_candidate = _job("baseline", "baseline-signature")
+        baseline_candidate.max_epochs = baseline_candidate.config.max_epochs = 4
+        baseline_candidate.metadata.update(
+            shared_metadata | {"experiment_mode": "baseline"}
+        )
+        assert planner.estimator.predicted_remaining_runtime_seconds(
+            baseline_candidate,
+            backend_name="exclusive",
+        ) is None
+
+
+def test_zero_runtime_profile_falls_back_to_branch_epoch_estimate() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir)
+        store = SQLiteStateStore(settings)
+        planner = PlacementPlanner(settings, store, PriorityFifoPolicy(enable_priority_aging=False))
+        job = _job("zero-runtime", "zero-runtime-sig")
+        job.max_epochs = job.config.max_epochs = 4
+        job.metadata["last_completed_epoch"] = 1
+        store.upsert_runtime_profile(
+            RuntimeProfile.create(
+                signature="zero-runtime-sig",
+                hardware_key=store.hardware_key(),
+                backend_name="exclusive",
+                resolved_batch_size=4,
+                strategy="epoch_1",
+                estimated_total_runtime_seconds=0.0,
+                observations=1,
+                source="branch_profile",
+            )
+        )
+        store.upsert_batch_size_observation(
+            BatchSizeObservation(
+                observation_key=build_batch_size_observation_key(
+                    job.baseline_model_id,
+                    planner.estimator.shape_signature(job),
+                    store.hardware_key(),
+                    "exclusive",
+                    4,
+                ),
+                model_key=job.baseline_model_id,
+                shape_signature=planner.estimator.shape_signature(job),
+                hardware_key=store.hardware_key(),
+                backend_name="exclusive",
+                batch_param_name="batch_size",
+                batch_size=4,
+                avg_vram_mb=512.0,
+                metadata={"seconds_per_epoch": 12.0},
+            )
+        )
+
+        assert planner.predicted_remaining_runtime_seconds(job, backend_name="exclusive") == 36.0
+        options = planner.estimator.estimate_batch_options(job, "exclusive", [4])
+        assert options[0].seconds_per_epoch == 12.0
+        assert options[0].remaining_runtime_seconds == 36.0
+
+
 class _FailingBatchPredictor:
     last_sources: dict[str, str] = {}
     last_errors: dict[str, str] = {}
@@ -1061,7 +1176,7 @@ def test_time_aware_pair_rejects_incompatibility_and_cooldown_but_ignores_slowdo
 
 
 @pytest.mark.parametrize("cap", [1, 2, 3, None])
-def test_parallel_cap_values_start_one_anchor(cap: int | None) -> None:
+def test_legacy_parallel_cap_does_not_restrict_stack_anchor(cap: int | None) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         settings = _settings(tmpdir, parallel_job_cap=cap)
         store = SQLiteStateStore(settings)
@@ -1084,7 +1199,7 @@ def test_parallel_cap_values_start_one_anchor(cap: int | None) -> None:
         plan = planner.choose_plan(jobs, backend_available={"cuda_process": True, "exclusive": True})
         assert plan is not None
         assert len(plan.job_ids) == 1
-        assert plan.mode == ("exclusive" if cap == 1 else "stack_anchor")
+        assert plan.mode == "stack_anchor"
 
 
 @pytest.mark.parametrize(

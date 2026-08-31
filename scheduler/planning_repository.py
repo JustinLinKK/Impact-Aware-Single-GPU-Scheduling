@@ -13,6 +13,7 @@ from ..domain import (
     PairProfile,
     RuntimeProfile,
     SoloProfile,
+    TrainingJob,
 )
 
 
@@ -70,5 +71,15 @@ class PlanningRepository(Protocol):
         backend_name: str | None = None,
         hardware_key: str | None = None,
     ) -> RuntimeProfile | None: ...
+
+    def list_runtime_profiles(
+        self,
+        *,
+        signature: str | None = None,
+        hardware_key: str | None = None,
+        backend_name: str | None = None,
+    ) -> list[RuntimeProfile]: ...
+
+    def get_job(self, job_id: str) -> TrainingJob | None: ...
 
     def get_colocation_timing_profile(self, profile_key: str) -> ColocationTimingProfile | None: ...

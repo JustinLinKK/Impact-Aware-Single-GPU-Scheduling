@@ -57,6 +57,7 @@ python -m localml_scheduler.cli list
 python -m localml_scheduler.cli status <job_id>
 python -m localml_scheduler.cli cache-stats
 python -m localml_scheduler.cli report
+python -m localml_scheduler.cli scheduler migrate-backend-modes --dry-run
 ```
 
 Run the demo:
@@ -388,7 +389,7 @@ The normal pause flow is:
 ## Packed Execution Notes
 
 - `parallel_time_aware` is the only accepted mode; removed fixed-width and VRAM-fill mode names fail configuration validation
-- `parallel_job_cap` is optional (`null` means incremental admission has no fixed-width cap)
+- concurrency is derived incrementally from branch profiles and live GPU telemetry; no fixed job-count cap is configured
 - the memory ceiling is detected/configured total VRAM times `predicted_budget_fraction`; it can reject an addition but cannot improve its score
 - the packed path is opt-in per job via `packing.eligible: true` and a stable `packing.signature`
 - backend compatibility is tracked per canonical backend, so an MPS-process failure cannot poison a CUDA-process profile

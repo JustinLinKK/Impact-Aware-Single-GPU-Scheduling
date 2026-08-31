@@ -84,11 +84,10 @@ def test_hardware_name_check_does_not_mislabel_an_rtx_run_as_a10() -> None:
     assert not hardware_matches(_hardware("NVIDIA GeForce RTX 5090"), r"NVIDIA A10(?:\s|$)")
 
 
-def test_replay_time_aware_settings_use_fractional_budget_and_new_cap(tmp_path) -> None:
+def test_replay_time_aware_settings_use_incremental_admission(tmp_path) -> None:
     settings = build_settings(
         mode="parallel_time_aware",
         backend="cuda_process",
-        parallel_job_cap=3,
         gpu_vram_gib=22,
         runtime_root=tmp_path,
         cache_warm_top_k=0,
@@ -98,7 +97,7 @@ def test_replay_time_aware_settings_use_fractional_budget_and_new_cap(tmp_path) 
         cache_memory_budget_gib=0.0,
         predicted_budget_fraction=0.84,
     )
-    assert settings.gpu_scheduler.parallel_job_cap == 3
+    assert settings.gpu_scheduler.parallel_job_cap is None
     assert settings.gpu_scheduler.memory.predicted_budget_fraction == pytest.approx(0.84)
     assert settings.gpu_scheduler.memory.live_admission_stop_fraction == pytest.approx(0.90)
     assert settings.gpu_scheduler.colocation.min_gain == pytest.approx(1.0)

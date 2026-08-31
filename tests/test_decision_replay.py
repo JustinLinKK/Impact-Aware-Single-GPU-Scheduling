@@ -36,7 +36,6 @@ def _settings(tmp_path: Path) -> SchedulerSettings:
             "mode": "parallel_time_aware",
             "packing_backend": "cuda_process",
             "exclusive_fallback_enabled": True,
-            "parallel_job_cap": 3,
             "memory": {
                 "gpu_vram_gib": 10,
                 "predicted_budget_fraction": 0.9,
@@ -101,6 +100,7 @@ def _service(tmp_path: Path) -> SchedulerService:
     service._placement_replay = PlacementReplayState()
     service._admission_gate = SimpleNamespace(is_open=True)
     service._persist_scheduler_decision_state = Mock()
+    service._supervisor_active_job_ids = Mock(return_value=[])
 
     estimator = Mock()
     estimator.safe_budget_mb.return_value = 9_000.0
@@ -142,6 +142,7 @@ def _learn_width_three(service: SchedulerService) -> PlacementReplayTemplate:
     for episode in range(3):
         jobs = [_job(f"episode-{episode}-slot-{slot}") for slot in range(3)]
         service._stage_successful_pattern(jobs, backend_name="cuda_process")
+        service._finalize_pending_pattern()
     assert service._placement_replay.template is not None
     return service._placement_replay.template
 
@@ -227,7 +228,9 @@ def test_membership_episode_is_deduplicated(tmp_path: Path) -> None:
     jobs = [_job(f"slot-{slot}") for slot in range(3)]
 
     service._stage_successful_pattern(jobs, backend_name="cuda_process")
+    service._finalize_pending_pattern()
     service._stage_successful_pattern(jobs, backend_name="cuda_process")
+    service._finalize_pending_pattern()
 
     assert len(service._placement_replay.observations) == 1
 

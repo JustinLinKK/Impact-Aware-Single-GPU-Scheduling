@@ -364,12 +364,7 @@ class PlacementReplayMixin:
                 self._placement_replay.pending_observation = observation
         else:
             self._placement_replay.pending_observation = observation
-        cap = self.settings.gpu_scheduler.parallel_job_cap
-        if cap is not None and observation.target_width >= cap:
-            self._placement_replay.pending_observation = None
-            self._record_pattern_observation(observation)
-        else:
-            self._persist_scheduler_decision_state()
+        self._persist_scheduler_decision_state()
 
     def _finalize_pending_pattern(self) -> None:
         """Commit the staged placement after its run finishes cleanly."""
@@ -491,12 +486,6 @@ class PlacementReplayMixin:
         ):
             self._invalidate_placement_replay(
                 reason="invalid cached template", job=candidate
-            )
-            return False, None
-        configured_cap = self.settings.gpu_scheduler.parallel_job_cap
-        if configured_cap is not None and template.target_width > configured_cap:
-            self._invalidate_placement_replay(
-                reason="parallel cap changed", job=candidate
             )
             return False, None
         if active_jobs and any(

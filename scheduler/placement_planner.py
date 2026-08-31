@@ -165,10 +165,6 @@ class PlacementPlanner:
         if active_jobs and (packing_admission_stalled or trial_pending):
             return None
 
-        cap = self.settings.gpu_scheduler.parallel_job_cap
-        remaining_slots = None if cap is None else cap - len(active_jobs)
-        if remaining_slots is not None and remaining_slots <= 0:
-            return None
         normal_window = [job for job in window if job.scheduling_class == SchedulingClass.NORMAL]
         backend_aware_window = list(normal_window)
         if mandatory is not None:
@@ -190,13 +186,11 @@ class PlacementPlanner:
                 if pair_plan is not None:
                     return pair_plan
             anchor_candidates: list[tuple[tuple[object, ...], TrainingJob, str, object]] = []
-            allow_stack_anchor = cap != 1
             for job in normal_window:
                 packing_backend = self.settings.gpu_scheduler.packing_backend
                 backends = (
                     [packing_backend]
-                    if allow_stack_anchor
-                    and backend_available.get(packing_backend, False)
+                    if backend_available.get(packing_backend, False)
                     and self.compatibility.pack_eligible(
                         job, backend_name=packing_backend
                     )

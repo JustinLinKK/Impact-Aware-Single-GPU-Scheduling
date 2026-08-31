@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from ..profiling.runtime_probe import runtime_profile_for_job
 from ..domain import (
     BatchResolution,
+    RuntimeProfile,
     SoloProfile,
     TrainingJob,
     build_batch_probe_key,
@@ -61,7 +62,14 @@ class ResourceEstimator:
     def runtime_ready(self, job: TrainingJob, backend_name: str) -> bool:
         if not job.runtime_probe.enabled:
             return False
-        return runtime_profile_for_job(self.repository, job, backend_name=backend_name) is not None
+        exact_profile = runtime_profile_for_job(
+            self.repository,
+            job,
+            backend_name=backend_name,
+        )
+        if self._has_positive_runtime(exact_profile):
+            return True
+        return self.predicted_remaining_runtime_seconds(job, backend_name=backend_name) is not None
 
     def predicted_remaining_runtime_seconds(self, job: TrainingJob, *, backend_name: str) -> float | None:
         if job.metadata.get("runtime_remaining_runtime_seconds") is not None:
@@ -69,9 +77,22 @@ class ResourceEstimator:
                 return max(0.0, float(job.metadata["runtime_remaining_runtime_seconds"]))
             except (TypeError, ValueError):
                 pass
-        profile = runtime_profile_for_job(self.repository, job, backend_name=backend_name)
-        if profile is not None and profile.estimated_total_runtime_seconds is not None:
-            return max(0.0, float(profile.estimated_total_runtime_seconds))
+        profile, compatible = self._runtime_profile(
+            job,
+            self.resolved_batch_size(job),
+            backend_name,
+        )
+        if (
+            profile is not None
+            and not compatible
+            and profile.estimated_total_runtime_seconds is not None
+        ):
+            try:
+                estimated_total_runtime_seconds = float(profile.estimated_total_runtime_seconds)
+            except (TypeError, ValueError):
+                estimated_total_runtime_seconds = 0.0
+            if estimated_total_runtime_seconds > 0.0:
+                return estimated_total_runtime_seconds
         total_epochs = job.max_epochs or job.config.max_epochs
         try:
             remaining_epochs = max(
@@ -286,31 +307,52 @@ class ResourceEstimator:
         return 0.0, "missing"
 
     def _seconds_per_epoch(self, job: TrainingJob, batch_size: int, backend_name: str) -> tuple[float | None, str, float | None]:
-        profile = self.repository.get_runtime_profile(
-            job.packing.signature or job.job_id,
-            resolved_batch_size=int(batch_size),
-            backend_name=backend_name,
-        )
-        if profile is None and backend_name != "exclusive":
-            profile = self.repository.get_runtime_profile(
-                job.packing.signature or job.job_id,
-                resolved_batch_size=int(batch_size),
-                backend_name="exclusive",
-            )
+        profile, compatible = self._runtime_profile(job, batch_size, backend_name)
         if profile is not None:
+            if compatible:
+                try:
+                    completed_epochs = max(
+                        1,
+                        int(profile.metadata.get("completed_epochs")),
+                    )
+                    completed_runtime = float(
+                        profile.estimated_total_runtime_seconds or 0.0
+                    )
+                except (TypeError, ValueError):
+                    completed_epochs = 0
+                    completed_runtime = 0.0
+                if completed_epochs > 0 and completed_runtime > 0.0:
+                    return (
+                        completed_runtime / completed_epochs,
+                        "branch_profile_compatible",
+                        min(float(profile.confidence), 0.80),
+                    )
             if profile.epoch_1_seconds is not None and profile.epoch_1_seconds > 0:
                 return (
                     float(profile.epoch_1_seconds),
-                    str(profile.source or "branch_profile"),
-                    float(profile.confidence),
+                    (
+                        "branch_profile_compatible"
+                        if compatible
+                        else str(profile.source or "branch_profile")
+                    ),
+                    (
+                        min(float(profile.confidence), 0.80)
+                        if compatible
+                        else float(profile.confidence)
+                    ),
                 )
             total_epochs = job.max_epochs or job.config.max_epochs
             if profile.estimated_total_runtime_seconds is not None and total_epochs:
-                return (
-                    float(profile.estimated_total_runtime_seconds) / max(1, int(total_epochs)),
-                    str(profile.source or "branch_profile"),
-                    float(profile.confidence),
-                )
+                try:
+                    estimated_total_runtime_seconds = float(profile.estimated_total_runtime_seconds)
+                except (TypeError, ValueError):
+                    estimated_total_runtime_seconds = 0.0
+                if estimated_total_runtime_seconds > 0.0:
+                    return (
+                        estimated_total_runtime_seconds / max(1, int(total_epochs)),
+                        str(profile.source or "branch_profile"),
+                        float(profile.confidence),
+                    )
 
         hardware = self.repository.hardware_profile()
         observation = self.repository.get_batch_size_observation(
@@ -343,6 +385,101 @@ class ResourceEstimator:
             except (TypeError, ValueError):
                 pass
         return None, "missing", None
+
+    @staticmethod
+    def _has_positive_runtime(profile: RuntimeProfile | None) -> bool:
+        if profile is None:
+            return False
+        try:
+            return (
+                float(profile.estimated_total_runtime_seconds or 0.0) > 0.0
+                or float(profile.epoch_1_seconds or 0.0) > 0.0
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _runtime_profile(
+        self,
+        job: TrainingJob,
+        batch_size: int,
+        backend_name: str,
+    ) -> tuple[RuntimeProfile | None, bool]:
+        """Return an exact profile, then a branch-compatible measured profile."""
+        signature = job.packing.signature or job.job_id
+        profile = self.repository.get_runtime_profile(
+            signature,
+            resolved_batch_size=int(batch_size),
+            backend_name=backend_name,
+        )
+        if not self._has_positive_runtime(profile) and backend_name != "exclusive":
+            profile = self.repository.get_runtime_profile(
+                signature,
+                resolved_batch_size=int(batch_size),
+                backend_name="exclusive",
+            )
+        if self._has_positive_runtime(profile):
+            return profile, False
+        return (
+            self._compatible_branch_runtime_profile(
+                job,
+                batch_size=int(batch_size),
+                backend_name=backend_name,
+            ),
+            True,
+        )
+
+    def _compatible_branch_runtime_profile(
+        self,
+        job: TrainingJob,
+        *,
+        batch_size: int,
+        backend_name: str,
+    ) -> RuntimeProfile | None:
+        """Reuse timing only for the same workflow branch and model family."""
+        if str(job.metadata.get("experiment_mode") or "") != "hardware_aware":
+            return None
+        workflow_id = str(job.workflow_id or job.metadata.get("workflow_id") or "")
+        branch_id = job.metadata.get("branch_id")
+        model_family = str(
+            job.metadata.get("model_family") or job.packing.family or ""
+        )
+        if not workflow_id or branch_id is None or not model_family:
+            return None
+
+        backend_candidates = [backend_name]
+        if backend_name != "exclusive":
+            backend_candidates.append("exclusive")
+        for candidate_backend in backend_candidates:
+            profiles = self.repository.list_runtime_profiles(
+                hardware_key=self.repository.hardware_key(),
+                backend_name=candidate_backend,
+            )
+            for profile in profiles:
+                if int(profile.resolved_batch_size) != int(batch_size):
+                    continue
+                if not profile.last_job_id or not self._has_positive_runtime(profile):
+                    continue
+                observed_job = self.repository.get_job(profile.last_job_id)
+                if observed_job is None:
+                    continue
+                observed_workflow = str(
+                    observed_job.workflow_id
+                    or observed_job.metadata.get("workflow_id")
+                    or ""
+                )
+                observed_family = str(
+                    observed_job.metadata.get("model_family")
+                    or observed_job.packing.family
+                    or ""
+                )
+                if observed_workflow != workflow_id:
+                    continue
+                if str(observed_job.metadata.get("branch_id")) != str(branch_id):
+                    continue
+                if observed_family != model_family:
+                    continue
+                return profile
+        return None
 
     def solo_profile(self, job: TrainingJob) -> SoloProfile | None:
         if not job.packing.signature:
