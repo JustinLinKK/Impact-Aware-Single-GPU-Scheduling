@@ -117,6 +117,30 @@ class _FakeSchedulerClient:
 
 
 class InterpreterSchedulerBridgeTest(unittest.TestCase):
+    def test_scheduler_admission_bypasses_only_the_legacy_executor_slot_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir) / "workdir"
+            workdir.mkdir(parents=True, exist_ok=True)
+
+            def make_interpreter(scheduler_enabled: bool) -> Interpreter:
+                cfg = SimpleNamespace(
+                    start_cpu_id=0,
+                    cpu_number=4,
+                    scheduler=SimpleNamespace(enabled=scheduler_enabled),
+                    agent=SimpleNamespace(search=SimpleNamespace(parallel_search_num=None)),
+                )
+                interpreter = Interpreter(
+                    working_dir=workdir,
+                    timeout=10,
+                    max_parallel_run=2,
+                    cfg=cfg,
+                )
+                interpreter.current_parallel_run = 2
+                return interpreter
+
+            self.assertTrue(make_interpreter(True).check_current_status())
+            self.assertFalse(make_interpreter(False).check_current_status())
+
     def test_preflight_rejected_node_never_reaches_scheduler(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workdir = Path(tmpdir) / "workdir"
