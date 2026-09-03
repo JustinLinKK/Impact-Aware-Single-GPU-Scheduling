@@ -754,7 +754,7 @@ def _stream_script_process(
     context: RunnerContext,
     *,
     started_at: float,
-    timeout: int,
+    timeout: int | None,
 ) -> tuple[str, str, bool]:
     """Stream stdout/stderr so an epoch-one profile exists before completion."""
     lines: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -778,21 +778,31 @@ def _stream_script_process(
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
     timed_out = False
-    deadline = started_at + float(timeout)
+    deadline = started_at + float(timeout) if timeout is not None else None
     termination_deadline: float | None = None
     while proc.poll() is None or any(reader.is_alive() for reader in readers):
-        remaining = deadline - time.time()
-        if remaining <= 0 and proc.poll() is None and termination_deadline is None:
+        remaining = (deadline - time.time()) if deadline is not None else None
+        if (
+            remaining is not None
+            and remaining <= 0
+            and proc.poll() is None
+            and termination_deadline is None
+        ):
             timed_out = True
             _request_process_stop(proc)
             deadline = time.time() + 2.0
             termination_deadline = deadline
-        elif remaining <= 0 and proc.poll() is None:
+            remaining = deadline - time.time()
+        elif remaining is not None and remaining <= 0 and proc.poll() is None:
             proc.kill()
             deadline = time.time() + 0.1
+            remaining = deadline - time.time()
         try:
             name, text = lines.get(
-                timeout=max(0.01, min(0.1, remaining if remaining > 0 else 0.1))
+                timeout=max(
+                    0.01,
+                    min(0.1, remaining if remaining is not None and remaining > 0 else 0.1),
+                )
             )
         except queue.Empty:
             continue
@@ -987,7 +997,8 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
     script_path = Path(kwargs["script_path"]).resolve()
     working_dir = Path(kwargs["working_dir"]).resolve()
     result_path = Path(kwargs["result_path"]).resolve()
-    timeout = int(kwargs["timeout"])
+    configured_timeout = kwargs.get("timeout")
+    timeout = int(configured_timeout) if configured_timeout is not None else None
     python_executable = context.job.config.python_executable or sys.executable
 
     instrumented = _materialize_instrumented_script(script_path, working_dir)
@@ -1050,6 +1061,10 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
     if exc_type == "TimeoutError":
         output.append(
             f"Execution time: TimeoutError: Execution exceeded the time limit of {humanize.naturaldelta(timeout)}"
+        )
+    elif timeout is None:
+        output.append(
+            f"Execution time: {humanize.naturaldelta(exec_time)} seconds (no execution time limit configured)."
         )
     else:
         output.append(
