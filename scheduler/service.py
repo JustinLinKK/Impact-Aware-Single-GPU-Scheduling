@@ -106,6 +106,7 @@ class SchedulerService(
         self._active_runs: dict[str, ActiveRun] = {}
         self._device_samples: list[GpuTelemetrySample] = []
         self._last_telemetry_poll_at = 0.0
+        self._next_gpu_dispatch_attempt_at = 0.0
         memory = settings.gpu_scheduler.memory
         self._admission_gate = MemoryAdmissionGate(
             stop_fraction=memory.live_admission_stop_fraction,

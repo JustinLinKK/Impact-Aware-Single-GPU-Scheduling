@@ -228,6 +228,18 @@ class DispatchMixin:
             self._cancel_prepared_colocation_trial(
                 prepared_trial, reason="trial dispatch failed"
             )
+            if "occupied under exclusive_process" in str(exc).lower():
+                retry_seconds = max(
+                    1.0, float(self.settings.scheduler_poll_interval_seconds) * 20.0
+                )
+                self._next_gpu_dispatch_attempt_at = time.monotonic() + retry_seconds
+                self.logger.info(
+                    "Deferring GPU dispatch for %s for %.1fs: %s",
+                    ",".join(plan.job_ids),
+                    retry_seconds,
+                    exc,
+                )
+                return False
             if replayed:
                 self._invalidate_placement_replay(
                     reason="replayed backend dispatch failed",
@@ -500,6 +512,8 @@ class DispatchMixin:
         """
         concurrent_mode = bool(self.settings.gpu_scheduler.enabled)
         if not concurrent_mode and self._active_runs:
+            return
+        if time.monotonic() < self._next_gpu_dispatch_attempt_at:
             return
 
         while True:

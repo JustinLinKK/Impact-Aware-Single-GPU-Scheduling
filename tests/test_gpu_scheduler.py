@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -10,6 +11,7 @@ from localml_scheduler.config import SchedulerSettings
 from localml_scheduler.domain import (
     BatchSizeObservation,
     CombinationProfile,
+    JobStatus,
     PackingSpec,
     PreloadSource,
     ResourceRequirements,
@@ -20,6 +22,7 @@ from localml_scheduler.domain import (
 from localml_scheduler.execution.backends import MPSBackend
 from localml_scheduler.hardware import HardwareProfile, build_hardware_key
 from localml_scheduler.scheduler.placement_planner import PlacementPlanner
+from localml_scheduler.scheduler.planner_types import DispatchPlan
 from localml_scheduler.scheduler.policies import PriorityFifoPolicy
 from localml_scheduler.scheduler.service import SchedulerService
 from localml_scheduler.storage.sqlite_store import SQLiteStateStore
@@ -290,6 +293,38 @@ class GpuSchedulerUnitTest(unittest.TestCase):
             entries = service.cache.snapshot_entries()
             self.assertEqual(len(entries), 1)
             self.assertEqual(entries[0]["model_id"], "tree-startpoint")
+
+    def test_exclusive_gpu_owner_defers_dispatch_without_hot_retry(self) -> None:
+        """A busy exclusive GPU leaves the job runnable and records a retry delay."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = SchedulerSettings(runtime_root=Path(tmpdir) / "runtime")
+            store = SQLiteStateStore(settings)
+            job = TrainingJob.create(
+                job_id="exclusive-owner-job",
+                runner_target="builtins:dict",
+                baseline_model_id="exclusive-owner-job",
+                baseline_model_path="/tmp/none",
+            )
+            store.submit_job(job)
+            store.set_job_status(job.job_id, JobStatus.READY, reason="test", hold=False)
+            service = SchedulerService(settings, store=store)
+            service.supervisor = mock.Mock()
+            service.supervisor.dispatch.side_effect = RuntimeError(
+                "CUDA device 0 is occupied under exclusive_process"
+            )
+            plan = DispatchPlan(
+                mode="exclusive",
+                backend_name="exclusive",
+                job_ids=(job.job_id,),
+                reason="test exclusive dispatch",
+            )
+
+            with mock.patch.object(service, "_preload_job_baseline"):
+                self.assertFalse(service._dispatch_plan(plan))
+
+            self.assertGreater(service._next_gpu_dispatch_attempt_at, time.monotonic())
+            self.assertEqual(service.supervisor.dispatch.call_count, 1)
+            self.assertEqual(store.get_job(job.job_id).status, JobStatus.READY)
 
 
 if __name__ == "__main__":
