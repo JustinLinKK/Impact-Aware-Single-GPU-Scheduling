@@ -46,6 +46,62 @@ def _cuda_runtime_visible(device_index: int) -> bool:
         return False
 
 
+def _ensure_gpu_execution_slot_available(device_index: int) -> None:
+    """Reject a launch when another process owns an exclusive GPU context.
+
+    ``torch.cuda.is_available()`` only establishes that a device can be
+    enumerated.  Under NVIDIA's ``Exclusive_Process`` compute mode it remains
+    true even though a second process cannot create a CUDA context.  Checking
+    that condition before launching a worker keeps a hardware-allocation
+    failure from being attributed to the submitted training program.
+
+    The check deliberately fails open when ``nvidia-smi`` is absent or cannot
+    answer: scheduler deployment must remain usable on supported non-NVIDIA
+    test hosts, and the worker remains the final authority in that case.
+    """
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return
+    selector = physical_cuda_device_selector(device_index)
+    try:
+        compute_mode = subprocess.run(
+            [
+                nvidia_smi,
+                f"--id={selector}",
+                "--query-gpu=compute_mode",
+                "--format=csv,noheader",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+        if compute_mode.returncode != 0:
+            return
+        mode = compute_mode.stdout.strip().lower().replace(" ", "_")
+        if mode not in {"exclusive_process", "exclusive_thread"}:
+            return
+        processes = subprocess.run(
+            [
+                nvidia_smi,
+                f"--id={selector}",
+                "--query-compute-apps=pid",
+                "--format=csv,noheader",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    if processes.returncode == 0 and processes.stdout.strip():
+        raise RuntimeError(
+            f"CUDA device {selector} is occupied under {mode}; "
+            "deferring GPU job until its exclusive owner exits"
+        )
+
+
 @dataclass(slots=True)
 class ExclusiveBackend:
     settings: SchedulerSettings
@@ -61,6 +117,9 @@ class ExclusiveBackend:
         job = jobs[0]
         extra_env: dict[str, str] = {}
         if job.resource_requirements.requires_gpu:
+            _ensure_gpu_execution_slot_available(
+                self.settings.gpu_scheduler.device_index
+            )
             extra_env["CUDA_VISIBLE_DEVICES"] = physical_cuda_device_selector(
                 self.settings.gpu_scheduler.device_index
             )
@@ -79,6 +138,10 @@ class CudaProcessBackend:
     def launch(self, jobs: list[TrainingJob]) -> list[WorkerProcessHandle]:
         if not jobs:
             raise ValueError("cuda_process backend expects at least one job")
+        if any(job.resource_requirements.requires_gpu for job in jobs):
+            _ensure_gpu_execution_slot_available(
+                self.settings.gpu_scheduler.device_index
+            )
         base_env = {
             "CUDA_VISIBLE_DEVICES": physical_cuda_device_selector(
                 self.settings.gpu_scheduler.device_index
@@ -164,6 +227,7 @@ class MPSBackend:
     def _ensure_runtime(self) -> None:
         if not self.available() or not self.mps_binary:
             raise RuntimeError("MPS backend unavailable")
+        _ensure_gpu_execution_slot_available(self.settings.gpu_scheduler.device_index)
         daemon_env = self._daemon_env()
         Path(daemon_env["CUDA_MPS_PIPE_DIRECTORY"]).mkdir(parents=True, exist_ok=True)
         Path(daemon_env["CUDA_MPS_LOG_DIRECTORY"]).mkdir(parents=True, exist_ok=True)

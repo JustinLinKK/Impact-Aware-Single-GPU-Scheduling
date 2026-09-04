@@ -7,7 +7,11 @@ from unittest.mock import Mock, patch
 from localml_scheduler.config import SchedulerSettings
 from localml_scheduler.cuda_device_mapping import physical_cuda_device_selector
 from localml_scheduler.domain import TrainingJob
-from localml_scheduler.execution.backends import CudaProcessBackend, ExclusiveBackend
+from localml_scheduler.execution.backends import (
+    CudaProcessBackend,
+    ExclusiveBackend,
+    _ensure_gpu_execution_slot_available,
+)
 from localml_scheduler.execution.executor import WorkerProcessHandle
 from localml_scheduler.scheduler.telemetry import NvidiaSmiTelemetrySampler
 
@@ -68,3 +72,42 @@ def test_nvidia_smi_telemetry_samples_the_masked_physical_gpu(monkeypatch) -> No
 
     assert sample is not None
     assert "--id=2" in run.call_args.args[0]
+
+
+def test_exclusive_process_owner_blocks_gpu_dispatch(monkeypatch) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
+    monkeypatch.setattr(
+        "localml_scheduler.execution.backends.shutil.which",
+        lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None,
+    )
+    responses = [
+        SimpleNamespace(returncode=0, stdout="Exclusive_Process\n"),
+        SimpleNamespace(returncode=0, stdout="91234\n"),
+    ]
+
+    with patch(
+        "localml_scheduler.execution.backends.subprocess.run", side_effect=responses
+    ) as run:
+        try:
+            _ensure_gpu_execution_slot_available(0)
+        except RuntimeError as exc:
+            assert "occupied under exclusive_process" in str(exc)
+        else:
+            raise AssertionError("exclusive GPU owner must block dispatch")
+
+    assert "--id=2" in run.call_args_list[0].args[0]
+
+
+def test_default_compute_mode_does_not_block_gpu_dispatch(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "localml_scheduler.execution.backends.shutil.which",
+        lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None,
+    )
+    completed = SimpleNamespace(returncode=0, stdout="Default\n")
+
+    with patch(
+        "localml_scheduler.execution.backends.subprocess.run", return_value=completed
+    ) as run:
+        _ensure_gpu_execution_slot_available(0)
+
+    assert run.call_count == 1
