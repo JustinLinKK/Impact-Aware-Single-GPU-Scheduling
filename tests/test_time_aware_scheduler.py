@@ -581,6 +581,43 @@ def test_early_stop_hook_persists_state_and_completes_successfully() -> None:
         assert report.early_stopped_wall_time_saved_seconds == 42.0
 
 
+def test_nonzero_candidate_result_is_marked_failed_not_completed() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir)
+        settings.ensure_runtime_layout()
+        store = SQLiteStateStore(settings)
+        job = store.submit_job(
+            TrainingJob.create(
+                "pkg.runner:train",
+                "candidate",
+                "/tmp/candidate.py",
+                job_id="candidate-runtime-error",
+            )
+        )
+        events = EventLogger(store, settings.events_jsonl_path)
+
+        assert mark_job_completed(
+            settings,
+            store,
+            events,
+            job.job_id,
+            {
+                "reason": "mlevolve script executed",
+                "candidate_returncode": 1,
+                "candidate_exc_type": "RuntimeError",
+                "execution_result_path": "/tmp/result.json",
+            },
+        ) == 1
+
+        failed = store.get_job(job.job_id)
+        assert failed is not None
+        assert failed.status == JobStatus.FAILED
+        assert "RuntimeError" in (failed.status_reason or "")
+        failed_events = store.list_events(job_id=job.job_id, event_type="job_failed")
+        assert len(failed_events) == 1
+        assert failed_events[0]["payload"]["candidate_returncode"] == 1
+
+
 def test_trace_replay_compares_serial_fill_time_aware_and_oracle() -> None:
     results = {item.policy: item for item in compare_policies(benchmark_fixture())}
     assert set(results) == {
