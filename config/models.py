@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 import hashlib
 import sys
-import tempfile
 import warnings
 
 import yaml
@@ -1254,9 +1253,10 @@ class SchedulerConfig:
             # path while all other runtime files remain under runtime_root.
             if len(address.encode()) >= 100:
                 digest = hashlib.sha256(address.encode()).hexdigest()[:20]
-                return str(
-                    Path(tempfile.gettempdir()) / f"localml-scheduler-{digest}.sock"
-                )
+                # Do not use tempfile.gettempdir(): experiment controllers can
+                # deliberately redirect TMPDIR into a deep isolated run root,
+                # recreating the AF_UNIX path-length failure we are avoiding.
+                return str(Path("/tmp") / f"localml-scheduler-{digest}.sock")
             return address
         return (self.cache_server_host, self.cache_server_port)
 
