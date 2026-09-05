@@ -367,7 +367,25 @@ def _materialize_instrumented_script(
         "_mlevolve_apply_probe_limits()\n",
         filename=str(script_path),
     )
-    module.body = helper_module.body + module.body
+    insertion_index = 0
+    if (
+        module.body
+        and isinstance(module.body[0], ast.Expr)
+        and isinstance(module.body[0].value, ast.Constant)
+        and isinstance(module.body[0].value.value, str)
+    ):
+        insertion_index = 1
+    while (
+        insertion_index < len(module.body)
+        and isinstance(module.body[insertion_index], ast.ImportFrom)
+        and module.body[insertion_index].module == "__future__"
+    ):
+        insertion_index += 1
+    module.body = (
+        module.body[:insertion_index]
+        + helper_module.body
+        + module.body[insertion_index:]
+    )
     ast.fix_missing_locations(module)
 
     instrumented_dir = working_dir / "working" / "instrumented_scripts"
