@@ -201,7 +201,9 @@ class MPSBackend:
             if isinstance(selected_config, dict)
             else None
         )
-        if isinstance(configured_percentages, list) and len(configured_percentages) == len(jobs):
+        if all("mps_active_thread_pct" in job.metadata for job in jobs):
+            percentages = [int(job.metadata["mps_active_thread_pct"]) for job in jobs]
+        elif isinstance(configured_percentages, list) and len(configured_percentages) == len(jobs):
             percentages = [int(value) for value in configured_percentages]
         elif len(jobs) == 1:
             percentages = [100]

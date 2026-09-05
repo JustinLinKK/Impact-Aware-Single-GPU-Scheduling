@@ -84,6 +84,7 @@ def _settings(tmpdir: str, **gpu_overrides: object) -> SchedulerSettings:
         "packing_backend": "cuda_process",
         "exclusive_fallback_enabled": True,
         "parallel_job_cap": None,
+        "colocation": {"trial_epochs": 2},
         "memory": {
             "gpu_vram_gib": 10,
             "predicted_budget_fraction": 0.85,
@@ -201,7 +202,7 @@ def test_time_aware_configuration_is_the_only_supported_policy() -> None:
         assert restored.gpu_scheduler.parallel_job_cap == 3
         assert restored.gpu_scheduler.objective.objective_version == "time_v6_verified_piecewise_drain"
         assert restored.gpu_scheduler.colocation.min_gain == 1.0
-        assert restored.gpu_scheduler.colocation.trial_epochs == 2
+        assert restored.gpu_scheduler.colocation.trial_epochs == 1
         assert restored.gpu_scheduler.colocation.trial_decision_timeout_seconds == 30
         assert restored.gpu_scheduler.colocation.trial_evidence_timeout_min_seconds == 300
         assert restored.gpu_scheduler.colocation.trial_evidence_timeout_max_seconds == 1800

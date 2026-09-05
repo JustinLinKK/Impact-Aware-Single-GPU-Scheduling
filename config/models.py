@@ -387,7 +387,8 @@ class DecisionReplaySettings:
 @dataclass(slots=True)
 class ColocationSettings:
     min_gain: float = 1.0
-    trial_epochs: int = 2
+    trial_epochs: int = 1
+    cold_start_gain_margin: float = 0.03
     trial_decision_timeout_seconds: float = 30.0
     trial_evidence_timeout_min_seconds: float = 300.0
     trial_evidence_timeout_max_seconds: float = 1800.0
@@ -401,6 +402,9 @@ class ColocationSettings:
     def __post_init__(self) -> None:
         self.min_gain = float(self.min_gain)
         self.trial_epochs = int(self.trial_epochs)
+        self.cold_start_gain_margin = float(self.cold_start_gain_margin)
+        if not 0 <= self.cold_start_gain_margin < 1:
+            raise ValueError("colocation.cold_start_gain_margin must be in [0, 1)")
         self.trial_decision_timeout_seconds = float(self.trial_decision_timeout_seconds)
         self.trial_evidence_timeout_min_seconds = float(
             self.trial_evidence_timeout_min_seconds
@@ -454,6 +458,7 @@ class ColocationSettings:
         return {
             "min_gain": self.min_gain,
             "trial_epochs": self.trial_epochs,
+            "cold_start_gain_margin": self.cold_start_gain_margin,
             "trial_decision_timeout_seconds": self.trial_decision_timeout_seconds,
             "trial_evidence_timeout_min_seconds": self.trial_evidence_timeout_min_seconds,
             "trial_evidence_timeout_max_seconds": self.trial_evidence_timeout_max_seconds,

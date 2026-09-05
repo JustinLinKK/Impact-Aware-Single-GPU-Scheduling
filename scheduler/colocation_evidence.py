@@ -229,7 +229,7 @@ class ColocationEvidenceMixin:
             {
                 "last_trial_id": trial.trial_id,
                 "job_ids": [job.job_id for job in jobs],
-                "evidence_policy": "fresh_member_epochs_v1",
+                "evidence_policy": "fresh_step_windows_v1" if trial.cold_start else "fresh_member_epochs_v1",
                 "recent_trial_outcomes": recent_outcomes,
             }
         )

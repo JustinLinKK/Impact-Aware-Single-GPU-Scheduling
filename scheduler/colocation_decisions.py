@@ -29,6 +29,9 @@ class ColocationDecisionMixin:
         trial = self._colocation_trial
         if trial is None:
             return
+        if trial.cold_start:
+            self._evaluate_cold_start_trial(trial)
+            return
         candidate = self.store.get_job(trial.candidate_job_id)
         active_ids = set(self._supervisor_active_job_ids())
         if candidate is None:

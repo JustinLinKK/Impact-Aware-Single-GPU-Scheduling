@@ -162,26 +162,35 @@ class SQLiteStateStore:
         status_timestamps: dict[str, str] | None = None,
         metadata_updates: dict[str, Any] | None = None,
     ) -> TrainingJob:
-        job = self.get_job(job_id)
-        if job is None:
-            raise KeyError(f"Unknown job_id: {job_id}")
-        if status is not None:
-            job.mark_status(status, reason=reason)
-        elif reason is not None:
-            job.status_reason = reason
-        if hold is not None:
-            job.hold = hold
-        if latest_checkpoint_path is not None:
-            job.latest_checkpoint_path = latest_checkpoint_path
-        if last_heartbeat_at is not None:
-            job.last_heartbeat_at = last_heartbeat_at
-        if last_dispatched_at is not None:
-            job.last_dispatched_at = last_dispatched_at
-        if status_timestamps:
-            job.status_timestamps.update(status_timestamps)
-        if metadata_updates:
-            job.metadata.update(metadata_updates)
-        self.save_job(job)
+        # Control leases and step progress are written by different processes.
+        # Read/merge/write under one lock so neither writer can erase the other.
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT payload_json FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            job = TrainingJob.from_dict(json.loads(row["payload_json"]), historical_read=True) if row else None
+            if job is None:
+                raise KeyError(f"Unknown job_id: {job_id}")
+            if status is not None:
+                job.mark_status(status, reason=reason)
+            elif reason is not None:
+                job.status_reason = reason
+            if hold is not None:
+                job.hold = hold
+            if latest_checkpoint_path is not None:
+                job.latest_checkpoint_path = latest_checkpoint_path
+            if last_heartbeat_at is not None:
+                job.last_heartbeat_at = last_heartbeat_at
+            if last_dispatched_at is not None:
+                job.last_dispatched_at = last_dispatched_at
+            if status_timestamps:
+                job.status_timestamps.update(status_timestamps)
+            if metadata_updates:
+                job.metadata.update(metadata_updates)
+            connection.execute(
+                "UPDATE jobs SET status = ?, priority = ?, payload_json = ?, updated_at = ? WHERE job_id = ?",
+                (job.status.value, job.priority, job.to_json(), utc_now(), job_id),
+            )
+            connection.commit()
         return job
 
     def set_job_status(

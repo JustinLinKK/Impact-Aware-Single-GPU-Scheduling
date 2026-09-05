@@ -27,6 +27,7 @@ from ..storage.state_store import StateStore
 from .colocation_decisions import ColocationDecisionMixin
 from .colocation_evidence import ColocationEvidenceMixin
 from .colocation_trials import ColocationTrialMixin
+from .cold_start import ColdStartTrialMixin
 from .dispatching import DispatchMixin
 from .placement_replay import PlacementReplayMixin
 from .placement_planner import PlacementPlanner
@@ -51,6 +52,7 @@ from .telemetry import (
 
 
 class SchedulerService(
+    ColdStartTrialMixin,
     RunTrackingMixin,
     DispatchMixin,
     PlacementReplayMixin,
@@ -193,6 +195,10 @@ class SchedulerService(
                 if isinstance(trial, dict)
                 else None
             )
+            if self._colocation_trial is not None and self._colocation_trial.cold_start:
+                self._finish_cold_start_trial(
+                    self._colocation_trial, "inconclusive", "controller restarted"
+                )
             stall = payload.get("colocation_stall")
             self._colocation_stall = (
                 ColocationStallState.from_dict(stall)
@@ -318,7 +324,11 @@ class SchedulerService(
             # 3. Reconsider the active placement, then fill available slots.
             self._maybe_preempt()
             self._dispatch_pending_work()
-            self._stop_event.wait(self.settings.scheduler_poll_interval_seconds)
+            self._stop_event.wait(
+                min(0.05, self.settings.scheduler_poll_interval_seconds)
+                if self._colocation_trial is not None
+                else self.settings.scheduler_poll_interval_seconds
+            )
         self._write_service_heartbeat("stopped")
         self.logger.info("Scheduler service stopped")
 

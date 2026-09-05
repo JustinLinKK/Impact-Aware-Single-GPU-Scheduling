@@ -11,7 +11,7 @@ disabled by default and is not part of scheduling, admission, or execution.
 - time-aware GPU packing that chooses ready jobs and batch sizes inside one preset process backend from predicted completion time and compatibility evidence, with average VRAM used only as a safety gate
 - Linux overlap on a configured non-exclusive backend, admitted incrementally by the time-aware policy
 - reserved exclusive five-option calibration that persists timing and VRAM measurements for time-aware planning
-- one-epoch runtime profiling that makes new job families pack-eligible after the first exclusive calibration run
+- one-epoch cooperative addition trials that acquire missing profiles while preserving training progress
 - optional hardware-selected PerfSeer student prediction, with CPU-only
   TorchScript inference and per-job branch-profile fallback
 
@@ -66,6 +66,71 @@ Run the demo:
 python -m localml_scheduler.examples.demos submit
 python -m localml_scheduler.examples.demos bridge
 ```
+
+## Cold-start addition trials
+
+An eligible cooperative runner starts on the configured packing backend even
+without profiles. The scheduler admits one provisional newcomer at a time,
+keeps its requested physical batch, and persists preparation, pre-add timing,
+solo-reference collection, overlap measurement, and the decision in job/trial
+metadata. Missing profiles are unknown evidence. Explicit probes and unsupported
+runners retain their existing exclusive path.
+
+`gpu_scheduler.colocation.trial_epochs` defaults to **1**; explicit values and
+persisted targets are retained. Each reference uses two useful warmup updates
+and 8–64 measured updates targeting 100 ms, with a one-second collection limit
+at a safe update boundary. The newcomer may finish the trial early, while
+incumbents supply fresh step windows regardless of their epoch lengths.
+
+Complete timing evidence uses the existing drain objective. If epoch totals or
+subgroup timings are missing, the decision uses normalized throughput:
+`sum(solo_step_seconds / observed_step_seconds)` after versus before admission.
+Both halves must improve by `colocation.cold_start_gain_margin` (default 0.03).
+Both deteriorating halves reject; incomplete or borderline evidence is
+inconclusive. Inherited subgroup rates are not a verified completion forecast.
+Only a rejected/inconclusive newcomer checkpoints and requeues; another
+candidate or changed membership may still be tried. Solo references and packed
+windows are stored separately; inconclusive windows do not create bad profiles.
+
+Generated PyTorch scripts must call `script_scheduler_context()` inside their
+entrypoint before allocating CUDA memory, restore the returned context's
+checkpoint, and use `TrainingControlHook.safe_point` after complete optimizer
+updates. The helper is inactive outside scheduled execution. Preserve model,
+optimizer, scaler, LR scheduler, all RNG state, and the exact data position.
+[`examples/cold_start_runner.py`](examples/cold_start_runner.py) demonstrates
+this contract, including resumable partial epochs. Generation/review checks
+require these hooks; printed epoch logs provide telemetry only.
+
+Temporary yields retain Python, CUDA, optimizer, and iterator state and carry
+renewable owner/expiry leases. The controller polls at 50 ms while a trial is
+active. SQLite updates merge control and progress atomically. Events distinguish
+useful measurement time, yields, controller/synchronization time, startup, and
+checkpoint cost. Trial wall time includes useful training and must not be
+charged again as pure overhead.
+
+Admission preserves the 31 GiB ceiling, configured memory margins, live device
+usage and pending reservations. The newcomer receives a PyTorch caching-allocator
+limit before model allocation; this is not isolation for arbitrary CUDA
+extensions. Runners using unsupported allocators must declare
+`trial_allocator_supported=false` and an explicit `estimated_vram_mb` bound.
+MPS ceilings are recorded before launch (100% when unknown) and active clients
+are never resized. There is no fixed parallel-job cap.
+
+Run the bounded synthetic comparison with the project's PyTorch environment:
+
+```bash
+python -m scheduler_benchmark_test.cold_start_comparison --output runs/cold-start-5090
+```
+
+It uses four distinct regression models, three short epochs, BF16 compute,
+FP32 AdamW state, empty profile stores, and a labelled 2 ms simulated input gap.
+Two paired comparisons run in reversed order within a five-minute budget.
+The run directory contains settings, source evidence, SQLite/events, progress,
+checkpoints, results, and one combined Gantt/metric PNG refreshed after each arm.
+`--cpu-smoke` performs a small controller shakedown; `--previous-run PATH`
+includes diagnostic comparisons and subtracts their duration from that budget.
+These experiments test scheduling behavior, not Petfinder model quality or
+FLOP saturation. MPS hardware validation requires an environment with MPS.
 
 ## MCP Graph/Vector Surface
 

@@ -122,6 +122,10 @@ class RunnerContext:
             observations=observations,
             metadata=metadata,
         )
+        if self.job.metadata.get("cooperative_trial"):
+            # These runners may have yielded or overlapped. Only the controller's
+            # isolated step windows can establish their reusable solo timing.
+            return profile
         stored = self.store.upsert_runtime_profile(profile)
         self.event_logger.emit(
             "runtime_probe_profiled",

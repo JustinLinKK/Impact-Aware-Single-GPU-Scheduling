@@ -14,6 +14,7 @@ from ..domain import JobStatus, ProgressSnapshot, SafePointType, TrainingJob, ut
 from ..config import SchedulerSettings
 from ..storage.state_store import StateStore
 from ..scheduler.early_stopping import EarlyStoppingState, EarlyStoppingWatchdog
+from .trial_control import StepTrialControlMixin
 
 
 class PauseRequested(RuntimeError):
@@ -105,7 +106,7 @@ class ControlPlane:
             return ProgressSnapshot.from_dict(json.load(handle))
 
 
-class TrainingControlHook:
+class TrainingControlHook(StepTrialControlMixin):
     """Worker-side safe-point helper for pause/resume/cancel/checkpoint handling."""
 
     def __init__(
@@ -128,6 +129,8 @@ class TrainingControlHook:
     def _trial_command_at_epoch(self, epoch: int) -> ControlCommand | None:
         current = self.store.get_job(self.job.job_id)
         trial = dict((current.metadata if current is not None else {}).get("colocation_trial") or {})
+        if trial.get("cold_start"):
+            return None
         if not trial or int(epoch) < int(trial.get("target_epoch") or 0):
             return None
         decision = str(trial.get("decision") or "pending")
@@ -201,7 +204,13 @@ class TrainingControlHook:
         estimated_total_runtime_seconds: float | None = None,
         remaining_runtime_seconds: float | None = None,
     ) -> None:
+        cooperative = self._cooperative_step(
+            safe_point_type, epoch=epoch, global_step=global_step,
+            steps_per_epoch=steps_per_epoch, metrics=metrics,
+        )
         command = self.control_plane.read_command(self.job.job_id)
+        if cooperative and safe_point_type == SafePointType.STEP and command.action == "none" and not self._should_checkpoint(safe_point_type, epoch=epoch, global_step=global_step):
+            return
         observed_epoch_seconds: float | None = None
         epoch_interval_started_at: str | None = None
         epoch_interval_finished_at: str | None = None

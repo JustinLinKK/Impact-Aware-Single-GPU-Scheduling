@@ -55,6 +55,8 @@ class ColocationTrialState:
     scheduler_decision_mode: str = "baseline"
     estimated_trial_cost_seconds: float = 0.0
     setup_cost_seconds: float = 0.0
+    phase: str = "packed"
+    cold_start: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         """Serialize ColocationTrialState for durable scheduler state."""
@@ -74,6 +76,8 @@ class ColocationTrialState:
             "scheduler_decision_mode": self.scheduler_decision_mode,
             "estimated_trial_cost_seconds": self.estimated_trial_cost_seconds,
             "setup_cost_seconds": self.setup_cost_seconds,
+            "phase": self.phase,
+            "cold_start": dict(self.cold_start),
         }
 
     @classmethod
@@ -109,6 +113,8 @@ class ColocationTrialState:
                 payload.get("estimated_trial_cost_seconds") or 0.0
             ),
             setup_cost_seconds=float(payload.get("setup_cost_seconds") or 0.0),
+            phase=str(payload.get("phase") or "packed"),
+            cold_start=dict(payload.get("cold_start") or {}),
         )
 
 

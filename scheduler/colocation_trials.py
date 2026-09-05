@@ -147,10 +147,11 @@ class ColocationTrialMixin:
             return None
         start_epoch = int(candidate.metadata.get("last_completed_epoch", 0))
         total_epochs = candidate.max_epochs or candidate.config.max_epochs
-        if total_epochs is None:
+        cold_start = bool(metadata.get("cold_start"))
+        if total_epochs is None and not cold_start:
             return None
         target_epoch = min(
-            int(total_epochs),
+            int(total_epochs) if total_epochs is not None else start_epoch + self.settings.gpu_scheduler.colocation.trial_epochs,
             start_epoch + self.settings.gpu_scheduler.colocation.trial_epochs,
         )
         preexisting_job_ids = tuple(
@@ -210,6 +211,8 @@ class ColocationTrialMixin:
                 == "backend_awared"
                 else 0.0
             ),
+            phase="prepare" if cold_start else "packed",
+            cold_start={"references": {}, "pre_add": {}} if cold_start else {},
         )
         self._colocation_trial = trial
         self.store.update_job(
@@ -218,6 +221,8 @@ class ColocationTrialMixin:
                 "colocation_trial": {**trial.to_dict(), "decision": "pending"}
             },
         )
+        if cold_start:
+            self._cold_command(trial, candidate, "yield", "prepare", reset=True)
         self._persist_scheduler_decision_state()
         return trial
 
@@ -236,7 +241,8 @@ class ColocationTrialMixin:
                         **trial.to_dict(),
                         "decision": "cancelled",
                         "reason": reason,
-                    }
+                    },
+                    **({"trial_step_command": {}} if trial.cold_start else {}),
                 },
             )
         if (

@@ -436,7 +436,7 @@ class ResourceEstimator:
         backend_name: str,
     ) -> RuntimeProfile | None:
         """Reuse timing only for the same workflow branch and model family."""
-        if str(job.metadata.get("experiment_mode") or "") != "hardware_aware":
+        if str(job.metadata.get("experiment_mode") or "") == "baseline":
             return None
         workflow_id = str(job.workflow_id or job.metadata.get("workflow_id") or "")
         branch_id = job.metadata.get("branch_id")

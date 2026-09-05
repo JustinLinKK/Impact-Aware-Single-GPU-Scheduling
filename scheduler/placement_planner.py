@@ -20,6 +20,7 @@ from .policies import SchedulingPolicy
 from .queue import RunnableJobQueue
 from .resource_estimator import ResourceEstimator
 from .time_objective import TimeAwareObjectiveScorer
+from .cold_start import cold_start_plan
 
 
 class PlacementPlanner:
@@ -169,6 +170,24 @@ class PlacementPlanner:
         backend_aware_window = list(normal_window)
         if mandatory is not None:
             normal_window = [mandatory]
+
+        cooperative_plan = cold_start_plan(
+            self, normal_window, active_jobs, backend_available, active_vram_mb,
+            mandatory=mandatory, now=now,
+        )
+        if cooperative_plan is not None:
+            return cooperative_plan
+        if not active_jobs and anchor.metadata.get("cooperative_trial"):
+            budget = min(31 * 1024.0, self.estimator.safe_budget_mb())
+            allowance = budget - active_vram_mb - max(256.0, budget * 0.05)
+            if allowance <= 0:
+                return None
+        if active_jobs:
+            # A blocked cold-start combination must not bypass its guard via
+            # the profile-only planner or trigger that planner's batch sweep.
+            normal_window = [job for job in normal_window if not job.metadata.get("cooperative_trial")]
+            if not normal_window:
+                return None
 
         if not active_jobs:
             if (

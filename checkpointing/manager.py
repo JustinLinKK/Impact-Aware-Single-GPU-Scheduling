@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 import os
 import tempfile
+import time
 
 import torch
 
@@ -38,6 +39,7 @@ class CheckpointManager:
         global_step: int,
         reason: str,
     ) -> str:
+        started = time.perf_counter()
         directory = self.checkpoint_dir(job.job_id)
         filename = f"checkpoint_step_{global_step:08d}_epoch_{epoch:04d}.pt"
         final_path = directory / filename
@@ -72,6 +74,7 @@ class CheckpointManager:
                 "global_step": global_step,
                 "safe_point_type": safe_point_type.value,
                 "reason": reason,
+                "checkpoint_seconds": time.perf_counter() - started,
             },
         )
         self._prune(job)

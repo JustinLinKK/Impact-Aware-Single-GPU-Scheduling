@@ -96,6 +96,7 @@ class DispatchMixin:
     def _active_vram_occupancy(self) -> float:
         """Estimate VRAM currently occupied by materialized run groups."""
         active_vram_mb = 0.0
+        observed_reservations_mb = 0.0
         for group_id, run in self._active_runs.items():
             jobs = [
                 self.store.get_job(job_id)
@@ -104,10 +105,13 @@ class DispatchMixin:
                 )
             ]
             materialized = [job for job in jobs if job is not None]
+            observed_reservations_mb += sum(float(job.metadata.get("trial_reserved_mb") or 0.0) for job in materialized)
             if materialized:
                 active_vram_mb += self.planner.predicted_group_vram_mb(
                     materialized, backend_name=run.backend_name
                 )
+        if self._device_samples:
+            active_vram_mb = self._device_samples[-1].memory_used_mb + max(0.0, active_vram_mb - observed_reservations_mb)
         return active_vram_mb
 
     def _active_jobs(self) -> list[TrainingJob]:
@@ -153,7 +157,7 @@ class DispatchMixin:
                 )
                 for job in selected_jobs
             ]
-        if plan.backend_config or plan.trial_metadata.get(
+        if plan.backend_config or plan.trial_metadata.get("cooperative_trial") or plan.trial_metadata.get(
             "start_delay_seconds_by_job"
         ):
             delay_by_job = dict(
@@ -168,6 +172,18 @@ class DispatchMixin:
                     metadata={
                         **job.metadata,
                         "placement_backend_config": dict(plan.backend_config),
+                        **({
+                            "cooperative_trial": True,
+                            "trial_runner_ready": False,
+                            "trial_lease_expired": None,
+                            "trial_step_window": {},
+                            "trial_yield_ack": None,
+                            "skip_active_scheduler_probes": True,
+                            "trial_memory_limit_mb": plan.trial_metadata.get("memory_limit_mb"),
+                            "placement_backend": plan.backend_name,
+                            **({"mps_active_thread_pct": int(plan.backend_config["allocation_percentages"][0])}
+                               if plan.backend_name == "mps_process" else {}),
+                        } if plan.trial_metadata.get("cooperative_trial") else {}),
                         "placement_start_delay_seconds": float(
                             delay_by_job.get(job.job_id, 0.0)
                         ),
@@ -217,6 +233,8 @@ class DispatchMixin:
         )
 
         try:
+            for job in selected_jobs:
+                self.store.update_job(job.job_id, metadata_updates={"placement_backend": plan.backend_name})
             dispatched = self.supervisor.dispatch(
                 selected_jobs,
                 mode=plan.mode,
@@ -265,6 +283,7 @@ class DispatchMixin:
                     plan.backend_name,
                 )
                 try:
+                    self.store.update_job(fallback_job.job_id, metadata_updates={"placement_backend": "exclusive"})
                     fallback_decision = self.supervisor.dispatch(
                         [fallback_job], mode="exclusive", backend_name="exclusive"
                     )

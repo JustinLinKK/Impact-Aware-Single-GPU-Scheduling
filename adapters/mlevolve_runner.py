@@ -25,6 +25,7 @@ from engine.script_introspection import (
     SCHEDULER_TOTAL_STEPS_PARAM_NAMES,
     WARMUP_STEPS_PARAM_NAMES,
     analyze_training_batch_contract,
+    introspect_training_script,
 )
 
 from ..execution.runner_protocol import RunnerContext
@@ -690,13 +691,20 @@ def _record_live_epoch_metric(
     context: RunnerContext, line: str, *, started_at: float
 ) -> None:
     """Persist a duration prediction as soon as a generated script ends an epoch."""
-    if "MLEVOLVE_EPOCH_METRIC" not in line:
-        return
-    payload_text = line.split("MLEVOLVE_EPOCH_METRIC", 1)[1].lstrip(" :")
     try:
-        payload = json.loads(payload_text)
+        if "MLEVOLVE_EPOCH_METRIC" in line:
+            payload = json.loads(line.split("MLEVOLVE_EPOCH_METRIC", 1)[1].lstrip(" :"))
+        else:
+            match = re.search(r"\bEpoch\s+(\d+)(?:\s*/\s*(\d+))?\s*[:\s]", line, re.IGNORECASE)
+            metric_match = re.search(r"(?:valid(?:ation)?[_ ](?:rmse|loss|score)|val[_ ](?:rmse|loss|score))\s*[=:]\s*([\d.eE+-]+)", line, re.IGNORECASE)
+            if not match:
+                return
+            payload = {"epoch": int(match[1]), "metric": float(metric_match[1]) if metric_match else None}
+            if match[2] and not (context.job.max_epochs or context.job.config.max_epochs):
+                context.job.max_epochs = context.job.config.max_epochs = int(match[2])
+                context.store.save_job(context.job)
         epoch = max(1, int(payload["epoch"]))
-        metric = float(payload["metric"])
+        metric = float(payload["metric"]) if payload.get("metric") is not None else None
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return
 
@@ -712,6 +720,8 @@ def _record_live_epoch_metric(
     except (TypeError, ValueError):
         total_epochs = epoch
     backend_name = str(context.job.metadata.get("placement_backend") or "exclusive")
+    if context.job.metadata.get("cooperative_trial"):
+        return
     existing = context.get_runtime_profile(backend_name=backend_name)
     estimate = (
         float(existing.estimated_total_runtime_seconds)
@@ -757,7 +767,7 @@ def _record_live_epoch_metric(
             epoch=epoch,
             global_step=0,
             phase="train",
-            metrics={str(payload.get("metric_name") or "validation_metric"): metric},
+            metrics={str(payload.get("metric_name") or "validation_metric"): metric} if metric is not None else {},
             last_safe_point="epoch",
             message="MLEVOLVE_EPOCH_METRIC",
             estimated_total_runtime_seconds=estimate,
@@ -1018,6 +1028,16 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
     configured_timeout = kwargs.get("timeout")
     timeout = int(configured_timeout) if configured_timeout is not None else None
     python_executable = context.job.config.python_executable or sys.executable
+    planned_epochs = (
+        context.job.max_epochs or context.job.config.max_epochs
+        or context.job.metadata.get("planned_epochs")
+        or introspect_training_script(script_path.read_text()).get("proposed_epochs")
+    )
+    if planned_epochs is not None:
+        context.job = context.store.get_job(context.job.job_id) or context.job
+        context.job.max_epochs = context.job.config.max_epochs = int(planned_epochs)
+        context.job.metadata["planned_epochs"] = int(planned_epochs)
+        context.store.save_job(context.job)
 
     instrumented = _materialize_instrumented_script(script_path, working_dir)
     executable_script = instrumented.path
@@ -1036,7 +1056,7 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
-        env=_base_script_env(
+        env={**_base_script_env(
             batch_size_override=batch_size_override,
             gradient_accumulation_override=parameter_resolution.get(
                 "gradient_accumulation_steps"
@@ -1046,7 +1066,11 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
             scheduler_total_steps_override=parameter_resolution.get(
                 "scheduler_total_steps"
             ),
-        ),
+        ), **({
+            "MLEVOLVE_SCHEDULER_RUNTIME_ROOT": str(context.settings.runtime_root),
+            "MLEVOLVE_SCHEDULER_JOB_ID": context.job.job_id,
+            "PYTHONPATH": os.pathsep.join(filter(None, [str(Path(__file__).resolve().parents[2]), os.environ.get("PYTHONPATH")])),
+        } if context.job.metadata.get("cooperative_trial") else {})},
     )
 
     exc_type: str | None = None
@@ -1059,6 +1083,14 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
         proc, context, started_at=start_time, timeout=timeout
     )
     exec_time = time.time() - start_time
+    if context.job.metadata.get("cooperative_trial"):
+        from ..domain import JobStatus
+        from ..execution.control import PauseRequested, CancelRequested
+        current = context.store.get_job(context.job.job_id)
+        if current is not None and current.status == JobStatus.PAUSED:
+            raise PauseRequested(current.status_reason)
+        if current is not None and current.status == JobStatus.CANCELLED:
+            raise CancelRequested(current.status_reason)
     if timed_out:
         exc_type = "TimeoutError"
     elif proc.returncode != 0:
@@ -1096,7 +1128,7 @@ def run_mlevolve_script_job(context: RunnerContext) -> dict[str, Any]:
         metric_maximize=context.job.metadata.get("metric_maximize"),
     )
     try:
-        if exc_type is None:
+        if exc_type is None and not context.job.metadata.get("cooperative_trial"):
             _calibrate_runtime_profile(
                 context, exec_time=exec_time, training_summary=training_summary
             )
