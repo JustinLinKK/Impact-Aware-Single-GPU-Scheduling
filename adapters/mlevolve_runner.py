@@ -411,6 +411,9 @@ def _base_script_env(
     probe_max_train_batches: int | None = None,
 ) -> dict[str, str]:
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [
+        str(Path(__file__).resolve().parents[2]), os.environ.get("PYTHONPATH"),
+    ]))
     if batch_size_override is not None:
         env["MLEVOLVE_BATCH_SIZE_OVERRIDE"] = str(int(batch_size_override))
     if gradient_accumulation_override is not None:
