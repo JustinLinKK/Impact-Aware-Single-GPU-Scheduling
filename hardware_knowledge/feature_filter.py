@@ -367,6 +367,10 @@ def _merge_text_values(*values: Any) -> str:
 
 def _precision_pattern_allowed(pattern: str, policy: PrecisionPolicy) -> bool:
     text = str(pattern or "").lower().replace("-", "_")
+    if policy.mode == "conservative" and re.search(
+        r"\b(?:fp16|float16|bf16|bfloat16|fp64|float64|amp|autocast|gradscaler|quantiz\w*)\b", text
+    ):
+        return False
     requirements = {
         "mxfp8": "mxfp8_te",
         "nvfp4": "nvfp4_te",
