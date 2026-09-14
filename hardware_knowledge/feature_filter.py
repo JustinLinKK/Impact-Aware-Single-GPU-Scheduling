@@ -204,6 +204,7 @@ def query_hardware_features(
             "name": _feature_name(feat_props),
             "category": category,
             "description": feat_props.get("description"),
+            "design_summary": feat_props.get("design_summary"),
             "example_code": feat_props.get("example_code"),
             "api_symbols": feat_props.get("api_symbols", []),
             "usage": feat_props.get("usage"),

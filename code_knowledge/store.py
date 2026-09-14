@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-import hashlib
+import uuid
 import os
 from datetime import datetime, timezone
 
@@ -194,7 +194,7 @@ class CodeKnowledgeStore:
         return self.collection_names[schema_version]
 
     def _point_id(self, collection_name: str, record_id: str) -> str:
-        return hashlib.sha256(f"{collection_name}:{record_id}".encode("utf-8")).hexdigest()
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{collection_name}:{record_id}"))
 
     def _record_types(self, record_types: list[str] | None = None) -> list[str]:
         if not record_types:
@@ -229,6 +229,10 @@ class CodeKnowledgeStore:
 
     def ingest_records(self, records: list[dict[str, Any]], *, recreate: bool = False, dry_run: bool = False) -> dict[str, Any]:
         normalized = [validate_code_knowledge_record(record) for record in records]
+        from knowledge.records import from_source
+
+        concise = {record["record_id"]: from_source({**record, "design_summary": source.get("design_summary")}, domain="hardware")
+                   for source, record in zip(records, normalized)}
         if dry_run:
             return {
                 "ok": True,
@@ -236,6 +240,8 @@ class CodeKnowledgeStore:
                 "collections": list(self.collection_names.values()),
                 "record_count": len(normalized),
                 "record_ids": [record["record_id"] for record in normalized],
+                "design_record_count": sum(len(items) for items in concise.values()),
+                "awaiting_summary": [key for key, items in concise.items() if not items],
             }
         if not self.enabled:
             return {"ok": False, "reason": "code knowledge database disabled", "record_count": len(normalized)}
@@ -258,6 +264,26 @@ class CodeKnowledgeStore:
             ]
             if points:
                 client.upsert(collection_name=collection_name, points=points)
+            design_collection = collection_name + "_design_v2"
+            if not self._collection_exists(client, design_collection):
+                client.create_collection(
+                    collection_name=design_collection,
+                    vectors_config=models.VectorParams(size=self._dimension(), distance=self._distance()),
+                )
+            design_points = []
+            for record in collection_records:
+                summaries = concise[record["record_id"]]
+                payload = {key: value for key, value in record.items() if key not in {
+                    "text", "detail_text", "solution_summary", "usage_summary", "sample_code",
+                    "example_code", "recommended_patterns", "avoid_patterns", "problem_statement",
+                }}
+                payload.update(design_records_v2=summaries, source_record_id=record["record_id"])
+                vector = self._encode([" ".join(item["summary"] for item in summaries) or record["title"]])[0].tolist()
+                design_points.append(models.PointStruct(
+                    id=self._point_id(design_collection, record["record_id"]), vector=vector, payload=payload,
+                ))
+            if design_points:
+                client.upsert(collection_name=design_collection, points=design_points)
         return {
             "ok": True,
             "dry_run": False,
@@ -277,6 +303,62 @@ class CodeKnowledgeStore:
             else load_code_knowledge_records(source)
         )
         return self.ingest_records(records, recreate=recreate, dry_run=dry_run)
+
+    def search_design_knowledge(self, *, query: str, context: dict[str, Any], role: str = "draft", limit: int = 8) -> list[dict[str, Any]]:
+        from knowledge.records import select_records
+
+        if not self.enabled:
+            return []
+        try:
+            client = self._qdrant_client()
+            vector = self._encode([query])[0].tolist()
+            records = []
+            for base in self.collection_names.values():
+                collection = base + "_design_v2"
+                if not self._collection_exists(client, collection):
+                    continue
+                query_filter = self._design_filter(context, role)
+                for point in self._query_points(collection, vector, query_filter, max(1, int(limit))):
+                    payload = self._payload_from_point(point)
+                    if payload.get("source_type") == "nvidia_cuda_docs" and not self._nvidia_cuda_payload_visible(payload, context):
+                        continue
+                    if payload.get("source_type") == "nvidia_cuda_docs" and payload.get("record_type") == "optimization_recipe_chunks" and payload.get("review_status") != "reviewed":
+                        continue
+                    records.extend(payload.get("design_records_v2") or [])
+            return select_records(records, context, role=role)
+        except Exception:
+            return []
+
+    def _design_filter(self, context: dict[str, Any], role: str) -> Any:
+        """Discard incompatible metadata before vector ranking, including unknown runtime."""
+        models = self._qdrant_models()
+        aliases = {"hardware_keys": "hardware_key", "gpu_architectures": "gpu_architecture",
+                   "accelerator_names": "accelerator_names",
+                   "architectures": "gpu_architecture",
+                   "compute_capabilities": "compute_capability", "frameworks": "framework", "framework": "framework",
+                   "framework_versions": "framework_major_minor", "toolkit_versions": "cuda_major_minor",
+                   "driver_versions": "driver_major_minor", "backend_modes": "backend_mode",
+                   "runner_contracts": "runner_contract", "model_families": "model_family",
+                   "workload_types": "workload_type", "precision_modes": "precision_mode"}
+        for key in ("gpu_architecture", "compute_capability", "driver_major_minor", "cuda_major_minor", "framework", "framework_major_minor", "backend_mode", "runner_contract"):
+            aliases[f"applicability.{key}"] = key
+        must = []
+        for field, key in aliases.items():
+            actual = context.get(key)
+            if key == "model_family" and not actual and role == "draft":
+                continue
+            choices = ["", "*", "any", "all", "backend_neutral"]
+            if actual:
+                choices.extend(actual if isinstance(actual, list) else [actual])
+            if field == "precision_modes":
+                policies = context.get("allowed_precision_policies") or []
+                choices.extend(policies)
+                choices.extend(value.removesuffix("_amp").removesuffix("_te") for value in policies)
+            must.append(models.Filter(should=[
+                models.IsEmptyCondition(is_empty=models.PayloadField(key=field)),
+                models.FieldCondition(key=field, match=models.MatchAny(any=choices)),
+            ]))
+        return models.Filter(must=must)
 
     def _match_condition(self, key: str, value: Any) -> Any:
         models = self._qdrant_models()

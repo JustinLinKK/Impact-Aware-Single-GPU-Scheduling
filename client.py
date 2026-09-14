@@ -1180,6 +1180,9 @@ class SchedulerClient:
         vector_confidence = max(vector_confidences) if vector_confidences else 0.0
         confidence = round(max(graph_confidence, vector_confidence), 3)
         return {
+            "effective_backend": graph_context.get("effective_backend"),
+            "runner_contract": graph_context.get("runner_contract"),
+            "runtime_estimate": graph_context.get("runtime_estimate") or {"found": False, "reason": "insufficient evidence"},
             "hardware_context": graph_context.get("hardware_context"),
             "graph_evidence": graph_context.get("graph_evidence") or {"exact_profiles": [], "similar_profiles": [], "packed_profiles": []},
             "derived_diagnosis": graph_context.get("derived_diagnosis") or {"profile_symptoms": [], "optimization_targets": []},
@@ -1399,7 +1402,7 @@ class SchedulerClient:
             "Use conservative baseline-compatible models when evidence is low-confidence or required weights/packages are unavailable.",
         ]
         return _sanitize_agent_response({
-            "found": bool(options),
+            "found": any(option.get("evidence_refs") for option in options),
             "effective_backend": backend,
             "runner_contract": runner_contract,
             "backend_guidance": backend_guidance,
@@ -1414,8 +1417,7 @@ class SchedulerClient:
             ),
             "confidence": round(
                 max(
-                    [float(item.get("confidence") or 0.0) for item in options]
-                    + [float(backend_guidance.get("confidence") or 0.0)]
+                    [float(item.get("confidence") or 0.0) for item in options] or [0.0]
                 ),
                 3,
             ),

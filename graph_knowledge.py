@@ -1719,13 +1719,6 @@ class SchedulerKnowledgeBase:
 
         if risk_flags and any("batch_size_above" in flag for flag in risk_flags):
             add("high_vram_pressure", "reduce_vram", "avoid_oom")
-        if not candidate.get("uses_amp"):
-            add(
-                "precision_not_optimized",
-                "improve_precision_efficiency",
-                "enable_tensor_core",
-            )
-            add("tensor_core_not_used", "enable_tensor_core", "improve_throughput")
         for entry in matched_profiles:
             data = entry.get("data") or {}
             status = str(data.get("status") or "").lower()

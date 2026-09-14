@@ -278,6 +278,8 @@ class CudaDocsService:
                 applicable=True,
             )
         request = build_request(decision, applicability)
+        if getattr(self, "design_knowledge_version", "v1") == "v2":
+            request = replace(request, canonical_key=request.canonical_key + ":design-v2")
         if error_text and decision.sanitized_error_excerpt != str(error_text).strip():
             self.metrics.increment(
                 "cuda_docs_redactions_total",
@@ -483,7 +485,10 @@ class CudaDocsService:
             error_signature_class=request.error_signature_class,
             sanitized_error_excerpt=request.sanitized_error_excerpt,
         )
-        return build_request(decision, applicability)
+        rebuilt = build_request(decision, applicability)
+        if request.canonical_key.endswith(":design-v2"):
+            rebuilt = replace(rebuilt, canonical_key=rebuilt.canonical_key + ":design-v2")
+        return rebuilt
 
     def _finish_pending(self, key: str) -> None:
         with self._pending_lock:
@@ -727,6 +732,7 @@ class CudaDocsService:
             retrieved_date=date.today().isoformat(),
             max_raw_chars=self.settings.raw_response_max_chars,
             max_chunk_chars=self.settings.normalized_chunk_max_chars,
+            preserve_complete_text=request.canonical_key.endswith(":design-v2"),
         )
         if not normalized.valid:
             self.breaker.failure()

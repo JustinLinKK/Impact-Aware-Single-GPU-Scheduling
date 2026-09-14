@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from pathlib import Path
 from typing import Any
 import os
@@ -120,6 +122,14 @@ class HardwareKnowledgeGraphStore:
             )
         for item in relationships:
             props = {key: value for key, value in item.items() if key not in {"hardware_id", "feature_id"}}
+            from knowledge.records import from_source
+
+            source = self._public_result({
+                "hardware": next(row for row in hardware if row["hardware_id"] == item["hardware_id"]),
+                "feature": next(row for row in features if row["feature_id"] == item["feature_id"]),
+                "relationship": item,
+            })
+            props["design_records_v2_json"] = json.dumps(from_source(source, domain="hardware"), sort_keys=True)
             self._run_write(
                 """
                 MATCH (h:HardwareSpec {hardware_id: $hardware_id})
@@ -440,6 +450,7 @@ class HardwareKnowledgeGraphStore:
             "record_type": "hardware_knowledge_graph",
             "title": feature.get("name"),
             "summary_text": feature.get("description"),
+            "design_summary": feature.get("design_summary"),
             "detail_text": feature.get("how_to_use"),
             "hardware_id": hardware_id,
             "hardware_name": hardware.get("name"),
@@ -451,8 +462,11 @@ class HardwareKnowledgeGraphStore:
             "recommended": bool(relationship.get("recommended")),
             "performance_impact": relationship.get("performance_impact"),
             "software_requirements": list(relationship.get("software_requirements") or []),
-            "recommended_patterns": [recommended] if recommended else [],
-            "avoid_patterns": [limitation] if limitation else [],
+            "recommended_patterns": list(feature.get("recommended_patterns") or []) or ([recommended] if recommended else []),
+            "avoid_patterns": list(feature.get("avoid_patterns") or []) + ([limitation] if limitation else []),
+            "min_compute_capability": feature.get("min_compute_capability"),
+            "optimization_modes": feature.get("optimization_modes"),
+            "model_shape_limitations": feature.get("model_shape_limitations"),
             "sample_code": relationship.get("hardware_specific_sample_code") or feature.get("sample_code"),
             "hardware_match": {
                 "hardware_id": hardware_id,
@@ -465,6 +479,8 @@ class HardwareKnowledgeGraphStore:
             "last_verified": relationship.get("last_verified_at"),
             "confidence": 1.0 if relationship.get("verified") else 0.6,
             "evidence_ref": f"hardware_knowledge:HAS_FEATURE:{hardware_id}:{feature_id}",
+            "verified": bool(relationship.get("verified")),
+            "design_records_v2": json.loads(relationship.get("design_records_v2_json") or "[]"),
         })
 
 

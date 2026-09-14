@@ -293,6 +293,7 @@ def _base_record(payload: dict[str, Any], schema_version: str) -> dict[str, Any]
         "record_id": record_id,
         "title": title,
         "text": text,
+        "design_summary": str(payload.get("design_summary") or "").strip(),
         "source_id": str(payload.get("source_id") or "").strip(),
         "source_type": source_type,
         "source_title": source_title,
@@ -608,6 +609,12 @@ def convert_hardware_feature_records(records: list[dict[str, Any]]) -> list[dict
         first_source = source_refs[0] if source_refs else {}
         base = {
             "source_id": record["record_id"],
+            "design_summary": record.get("design_summary", ""),
+            "source_refs": source_refs,
+            "gpu_architectures": list(record.get("architectures") or []),
+            "accelerator_names": list(record.get("accelerator_names") or []),
+            "compute_capabilities": list(record.get("compute_capabilities") or []),
+            "avoid_patterns": list(record.get("avoid_patterns") or []),
             "source_type": "hardware_feature_record",
             "source_title": first_source.get("title", ""),
             "source_url": first_source.get("url", ""),

@@ -38,6 +38,7 @@ def normalize_mcp_result(
     max_raw_chars: int = 32000,
     max_chunk_chars: int = 4000,
     max_chunks: int = 8,
+    preserve_complete_text: bool = False,
 ) -> NormalizedCudaDocsResult:
     """Extract bounded source-labelled chunks from SDK or mapping results."""
 
@@ -72,9 +73,9 @@ def normalize_mcp_result(
     seen: set[tuple[str, str]] = set()
     raw_chars = 0
     for text, url, title, version in candidates:
-        text = _bounded_text(text, max_chunk_chars)
+        text = str(text).replace("\x00", " ").strip() if preserve_complete_text else _bounded_text(text, max_chunk_chars)
         raw_chars += len(text)
-        if raw_chars > max_raw_chars:
+        if not preserve_complete_text and raw_chars > max_raw_chars:
             remaining = max(0, max_raw_chars - (raw_chars - len(text)))
             text = text[:remaining]
         url = canonicalize_nvidia_source_url(url.strip().rstrip(".,;:"))
@@ -85,14 +86,14 @@ def normalize_mcp_result(
             continue
         seen.add(key)
         deduped.append((text, url, title.strip(), version.strip()))
-        if len(deduped) >= max(1, int(max_chunks)) or raw_chars >= max_raw_chars:
+        if len(deduped) >= max(1, int(max_chunks)) or (not preserve_complete_text and raw_chars >= max_raw_chars):
             break
 
     if not deduped:
         return NormalizedCudaDocsResult(
             chunks=(),
             source_refs=(),
-            raw_chars=min(raw_chars, max_raw_chars),
+            raw_chars=raw_chars if preserve_complete_text else min(raw_chars, max_raw_chars),
             rejected_reason="missing_valid_nvidia_source_url_or_text",
         )
 
@@ -129,7 +130,7 @@ def normalize_mcp_result(
     return NormalizedCudaDocsResult(
         chunks=tuple(chunks),
         source_refs=tuple(refs),
-        raw_chars=min(raw_chars, max_raw_chars),
+        raw_chars=raw_chars if preserve_complete_text else min(raw_chars, max_raw_chars),
     )
 
 

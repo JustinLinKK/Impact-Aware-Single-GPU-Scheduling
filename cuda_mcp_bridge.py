@@ -539,7 +539,7 @@ def to_records(
         "schema_version": CODE_DOC_SCHEMA_VERSION,
         "chunk_id": record_id,
         "title": f"{topic} on {facts.gpu_name or 'CUDA GPU'}",
-        "text": text[:32000],
+        "text": text if str(cache_key or "").endswith(":design-v2") else text[:32000],
         "source_id": record_id,
         "source_type": "nvidia_cuda_docs" if verified_refs else "unverified_cuda_docs",
         "source_title": str(primary.get("title") or "NVIDIA CUDA documentation"),

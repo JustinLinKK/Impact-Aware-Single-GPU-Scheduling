@@ -92,6 +92,7 @@ def validate_feature_record(payload: dict[str, Any]) -> dict[str, Any]:
         "record_id": str(payload["record_id"]).strip(),
         "title": str(payload["title"]).strip(),
         "summary_text": str(payload["summary_text"]).strip(),
+        "design_summary": str(payload.get("design_summary") or "").strip(),
         "detail_text": str(payload["detail_text"]).strip(),
         "vendor": str(payload["vendor"]).strip().lower(),
         "confidence": confidence,

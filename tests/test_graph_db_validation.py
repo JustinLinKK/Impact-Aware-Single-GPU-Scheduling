@@ -1086,11 +1086,11 @@ class GraphDatabaseValidationTest(unittest.TestCase):
             self.assertIn("exact_profiles", context["graph_evidence"])
             self.assertIn("similar_profiles", context["graph_evidence"])
             self.assertIn("packed_profiles", context["graph_evidence"])
-            self.assertIn(
+            self.assertNotIn(
                 "precision_not_optimized",
                 context["derived_diagnosis"]["profile_symptoms"],
             )
-            self.assertIn(
+            self.assertNotIn(
                 "enable_tensor_core",
                 context["derived_diagnosis"]["optimization_targets"],
             )
