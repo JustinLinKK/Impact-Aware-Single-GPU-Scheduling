@@ -15,7 +15,19 @@ disabled by default and is not part of scheduling, admission, or execution.
 - optional hardware-selected PerfSeer student prediction, with CPU-only
   TorchScript inference and per-job branch-profile fallback
 
-It is intentionally packaged as a root-level module so it can be used by MLEvolve or detached and integrated into other agent pipelines.
+This repository is checked out as MLEvolve's pinned `localml_scheduler/` Git
+submodule. The repository root is the Python package, preserving existing
+`localml_scheduler.*` imports and runner targets.
+
+Run the commands below from the MLEvolve root with its Python environment.
+The MLEvolve adapter and hardware-knowledge integration use the host's
+`engine/`, `utils/`, and `schema/` files; this extraction preserves those
+integration dependencies. Links to `../docs/` refer to MLEvolve documentation.
+
+For development, create a branch in this repository, commit and publish scheduler
+changes here, then record the tested revision in MLEvolve with
+`git add localml_scheduler`. A parent checkout restores that revision with
+`git submodule update --init --recursive`.
 
 ## Architecture
 

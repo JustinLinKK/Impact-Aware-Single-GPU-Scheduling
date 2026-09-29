@@ -1,0 +1,33 @@
+# Python, environments, and test output
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.venv/
+venv/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+
+# Local configuration and scheduler runtime state
+/configs/*.yaml
+/config.yaml
+/runtime/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+*.pid
+*.out
+logs/
+checkpoints/
+*.pth
+*.pt
+*.pkl
+*.bin
