@@ -1,4 +1,4 @@
-# localml_scheduler
+# Impact-Aware Single-GPU Scheduling
 
 Agent-owned NVIDIA CUDA documentation enrichment is documented in
 [`docs/cuda_docs_integration.md`](../docs/cuda_docs_integration.md). It is
