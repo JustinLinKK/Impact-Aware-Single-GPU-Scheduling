@@ -20,6 +20,9 @@ def convert_source_worker(
         source_root = str(Path(submodule_src).resolve())
         if source_root not in sys.path:
             sys.path.insert(0, source_root)
+        import torch
+
+        torch.set_num_threads(int(request.get("cpu_threads", 1)))
         from perfseer_student import encode_source
 
         encoded = encode_source(
@@ -60,6 +63,8 @@ def convert_source_options_worker(
             sys.path.insert(0, source_root)
 
         import torch
+
+        torch.set_num_threads(int(requests[0].get("cpu_threads", 1)))
         from torch.fx import symbolic_trace
         from torch.fx.passes.shape_prop import ShapeProp
         from perfseer_source_converter.converter import (

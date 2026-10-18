@@ -48,6 +48,103 @@ changes here, then record the tested revision in MLEvolve with
 - `examples/`: toy PyTorch training runner and a demo script
 - `adapters/`: thin helpers for wiring job submission from MLEvolve or other systems
 
+## Release integration (`paper`)
+
+| Component | Deployment | Integration interface | Overhead controls |
+| --- | --- | --- | --- |
+| Scheduler | One persistent service on the GPU host; optional embedded mode for a single agent process | `SchedulerHTTPClient` over loopback HTTP; `SchedulerClient` and `SchedulerService` for direct calls | Retain queue state, predictor, and telemetry sampler; reuse HTTP connections; submit at job boundaries and wait for completion events |
+| Resource predictor | CPU library inside the scheduler process | Direct calls through the existing `MLVramPredictor`, using `TrainingJob.metadata.perfseer_model` as the candidate description | Load the TorchScript deployment student once; bound the feature cache; limit CPU threads |
+
+Run from the MLEvolve root using its Python environment and initialized
+`PerfSeer-predictor` submodule. This release branch retains the host integration
+dependencies described above; it is not a standalone installation package.
+
+Create a private API token once, then start the service:
+
+```bash
+python -c 'import os, secrets; from pathlib import Path; p = Path("localml_scheduler/runtime/paper/api.token"); p.parent.mkdir(parents=True, exist_ok=True); fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600); os.write(fd, secrets.token_hex(32).encode()); os.close(fd)'
+python -m localml_scheduler.cli scheduler serve \
+  --settings localml_scheduler/examples/scheduler.paper.yaml \
+  --token-file localml_scheduler/runtime/paper/api.token
+```
+
+The endpoint binds to `127.0.0.1:8766` and requires the token on every request.
+It permits local job execution, so share the token only with trusted agents on
+the host. Use one service per runtime root/GPU. Keep that runtime root across
+restarts to retain SQLite queue state, checkpoints, and scheduling evidence.
+The example uses incremental CUDA-process admission and a 31 GiB memory ceiling.
+
+An agent submits work once, then waits at the job boundary:
+
+```python
+from pathlib import Path
+from localml_scheduler import SchedulerHTTPClient, TrainingJob
+
+token = Path("localml_scheduler/runtime/paper/api.token").read_text().strip()
+with SchedulerHTTPClient(token=token) as scheduler:
+    job = scheduler.submit(TrainingJob.create(
+        "my_pkg.training:run_training_job",
+        "candidate-1",
+        "/absolute/path/to/baseline.pt",
+        runner_kwargs={"batch_size": 32},
+        metadata={"perfseer_model": {
+            "source_path": "/absolute/path/to/model.py",
+            "entry": "build_model",
+            "input_shapes": [["$batch", 3, 224, 224]],
+            "input_dtypes": ["float32"],
+            "precision": "fp32_ieee",
+        }},
+    ))
+    result = scheduler.wait_for_completion(job.job_id, timeout=3600)
+    if result is not None:
+        print(result.status.value)  # COMPLETED, FAILED, or CANCELLED
+```
+
+The SDK imports without loading PyTorch or opening the scheduler database.
+Use one client per thread; keep it open across jobs. `inspect`, `list_jobs`,
+`pause`, `resume`, and `cancel` expose job boundaries without per-step RPCs.
+Paths and runner modules must be accessible to the service process. Keep the
+existing runner safe-point/checkpoint contract for pause/resume support.
+
+Completion uses a bounded HTTP long poll, awakened by worker-exit or queued
+cancellation notifications. The response contains a terminal event and job
+snapshot; an expired wait returns `None`. Persisted terminal state also serves
+late subscribers after a reconnect/restart. Inspect a stable job ID after an
+ambiguous submission error: submissions are not automatically retried, and
+duplicate IDs return HTTP 409. An HTTP client does not start another scheduler.
+
+For a single embedded agent, retain the service and use direct calls:
+
+```python
+from localml_scheduler import SchedulerClient, SchedulerConfig
+
+client = SchedulerClient(SchedulerConfig.from_file(
+    "localml_scheduler/examples/scheduler.paper.yaml"
+))
+service = client.create_service().start(background=True)
+try:
+    job = client.submit_from_file("/absolute/path/to/job.yaml")
+    result = service.wait_for_completion(job.job_id, timeout=3600)
+finally:
+    service.stop()
+```
+
+The active predictor remains the CPU-only TorchScript deployment student;
+inference is a direct call inside the service. Source import/tracing stays in
+timed CPU-only subprocesses. Cached features are keyed by source content,
+entry, shapes/batch size, dtypes, precision, constructor arguments, and artifact
+hash. `prediction.ml.cpu_threads` defaults to 1 and caps PyTorch intra-op threads
+in the scheduler process and conversion workers. In embedded mode this also
+sets the host process's PyTorch intra-op limit. The student is reloaded only
+when a new service is constructed. Unsupported hardware, incompatible artifacts,
+or individual conversion failures retain the existing branch-profile fallback.
+Timing labels retain their existing meaning; step time is not treated as a
+measured full-epoch label.
+
+Telemetry reuses an NVML connection and device handle for the service lifetime
+when available, with the existing `nvidia-smi` fallback otherwise. The scheduler
+continues its internal control/telemetry loop while agents wait for job outcomes.
+
 ## How To Run
 
 Start the scheduler:

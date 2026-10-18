@@ -38,6 +38,26 @@ def scheduler_start(settings: str | None = typer.Option(None, "--settings", help
         engine.stop()
 
 
+@scheduler_app.command("serve")
+def scheduler_serve(
+    token_file: Path = typer.Option(..., "--token-file", help="File containing the local API bearer token"),
+    settings: str | None = typer.Option(None, "--settings", help="Path to scheduler YAML config"),
+    port: int = typer.Option(8766, "--port", min=1, max=65535),
+) -> None:
+    from .http_server import SchedulerHTTPServer
+
+    client = _build_client(settings)
+    service = client.create_service()
+    with SchedulerHTTPServer(service, token=token_file.read_text(encoding="utf-8").strip(), port=port) as server:
+        try:
+            service.start(background=True)
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            service.stop()
+
+
 @scheduler_app.command("mcp")
 def scheduler_mcp(settings: str | None = typer.Option(None, "--settings", help="Path to scheduler YAML config")) -> None:
     run_mcp_stdio(settings)

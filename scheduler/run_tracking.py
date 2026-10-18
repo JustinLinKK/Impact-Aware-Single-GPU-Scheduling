@@ -35,6 +35,8 @@ class RunTrackingMixin:
         for snapshot in snapshots:
             run = self._active_runs.get(snapshot.group_id)
             self._handle_worker_exit(snapshot, run_context=run)
+        with self._completion_condition:
+            self._completion_condition.notify_all()
 
         remaining_by_group = self._supervisor_active_job_ids_by_group()
         for group_id, run in list(self._active_runs.items()):

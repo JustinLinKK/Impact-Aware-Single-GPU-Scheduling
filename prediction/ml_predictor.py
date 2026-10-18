@@ -184,6 +184,9 @@ class MLVramPredictor:
             if not artifact_path.is_file():
                 raise RuntimeError(f"predictor artifact is missing: {artifact_path}")
             self.artifact_hash = sha256(artifact_path.read_bytes()).hexdigest()
+            import torch
+
+            torch.set_num_threads(self.settings.cpu_threads)
             self._runtime = StudentRuntime(artifact_path, train_mem_index=train_mem_index)
             self._encoded_type = EncodedGraph
             self._smoke_test_runtime()
@@ -231,7 +234,7 @@ class MLVramPredictor:
         receiver, sender = context.Pipe(duplex=False)
         process = context.Process(
             target=convert_source_worker,
-            args=(sender, str(PERFSEER_SRC), specification.worker_request()),
+            args=(sender, str(PERFSEER_SRC), {**specification.worker_request(), "cpu_threads": self.settings.cpu_threads}),
             daemon=True,
         )
         process.start()
@@ -291,7 +294,7 @@ class MLVramPredictor:
             receiver, sender = context.Pipe(duplex=False)
             process = context.Process(
                 target=convert_source_options_worker,
-                args=(sender, str(PERFSEER_SRC), [spec.worker_request() for _, spec, _ in missing]),
+                args=(sender, str(PERFSEER_SRC), [{**spec.worker_request(), "cpu_threads": self.settings.cpu_threads} for _, spec, _ in missing]),
                 daemon=True,
             )
             process.start()

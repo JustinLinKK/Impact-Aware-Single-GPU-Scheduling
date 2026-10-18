@@ -634,6 +634,7 @@ class PredictionSettings:
     registry_path: str | None = None
     conversion_timeout_seconds: float = 15.0
     cache_size: int = 1024
+    cpu_threads: int = 1
     test_override_enabled: bool = False
     test_model_path: str | None = None
 
@@ -643,6 +644,7 @@ class PredictionSettings:
             0.1, float(self.conversion_timeout_seconds)
         )
         self.cache_size = max(1, int(self.cache_size))
+        self.cpu_threads = max(1, int(self.cpu_threads))
         if not self.test_override_enabled:
             self.test_model_path = None
 
@@ -669,6 +671,7 @@ class PredictionSettings:
                 "registry_path": self.registry_path,
                 "source_conversion_timeout_seconds": self.conversion_timeout_seconds,
                 "cache_size": self.cache_size,
+                "cpu_threads": self.cpu_threads,
                 "test_override_enabled": self.test_override_enabled,
                 "test_model_path": self.test_model_path,
             },

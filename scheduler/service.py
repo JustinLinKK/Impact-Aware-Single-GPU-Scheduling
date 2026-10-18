@@ -8,9 +8,10 @@ trials, and dispatch so this file remains a readable map of the overall flow.
 from __future__ import annotations
 
 from pathlib import Path
-from threading import Event, Thread
+from threading import Condition, Event, Thread
 from typing import Any
 import json
+import math
 import os
 import time
 
@@ -104,6 +105,7 @@ class SchedulerService(
         )
         self.cache_server = CacheServer(settings, self.cache)
         self._stop_event = Event()
+        self._completion_condition = Condition()
         self._thread: Thread | None = None
         self._active_runs: dict[str, ActiveRun] = {}
         self._device_samples: list[GpuTelemetrySample] = []
@@ -293,12 +295,36 @@ class SchedulerService(
     def stop(self) -> None:
         """Stop the loop, workers, cache server, and active log session."""
         self._stop_event.set()
+        with self._completion_condition:
+            self._completion_condition.notify_all()
         if self._thread is not None:
             self._thread.join(timeout=3.0)
         self.supervisor.shutdown()
         self.cache_server.stop()
+        close_telemetry = getattr(self.telemetry_sampler, "close", None)
+        if callable(close_telemetry):
+            close_telemetry()
         self._write_service_heartbeat("stopped")
         self.log_store.finish_session(status="stopped", stopped_at=utc_now())
+
+    def wait_for_completion(self, job_id: str, *, timeout: float = 30.0) -> TrainingJob | None:
+        """Wait for a terminal job, including outcomes persisted before this call."""
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("timeout must be finite and nonnegative")
+        deadline = time.monotonic() + timeout
+        with self._completion_condition:
+            while True:
+                job = self.store.get_job(job_id)
+                if job is None:
+                    raise KeyError(job_id)
+                if job.status.is_terminal:
+                    return job
+                if self._stop_event.is_set():
+                    raise RuntimeError("scheduler service stopped")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._completion_condition.wait(remaining)
 
     def run_forever(self) -> None:
         """Run scheduler ticks until stop is requested.
@@ -430,6 +456,8 @@ class SchedulerService(
             job_id, JobStatus.CANCELLED, reason="cancelled while queued", hold=True
         )
         self.event_logger.emit("job_cancelled", job_id=job_id, payload={"queued": True})
+        with self._completion_condition:
+            self._completion_condition.notify_all()
 
     def _handle_preload(self, payload: dict[str, Any]) -> None:
         """Load the baseline model requested by a preload command."""

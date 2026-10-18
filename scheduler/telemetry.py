@@ -1,4 +1,4 @@
-"""Lightweight GPU telemetry sampling via ``nvidia-smi``."""
+"""Persistent NVML telemetry with a best-effort ``nvidia-smi`` fallback."""
 
 from __future__ import annotations
 
@@ -107,11 +107,46 @@ class NvidiaSmiTelemetrySampler:
         self.device_index = device_index
         self.device_selector = physical_cuda_device_selector(device_index)
         self._binary = _resolve_nvidia_smi()
+        self._nvml = None
+        self._handle = None
+        try:
+            import pynvml
+
+            pynvml.nvmlInit()
+            self._nvml = pynvml
+            self._handle = (
+                pynvml.nvmlDeviceGetHandleByIndex(int(self.device_selector))
+                if self.device_selector.isdigit()
+                else pynvml.nvmlDeviceGetHandleByUUID(self.device_selector)
+            )
+        except Exception:
+            self.close()
+
+    def close(self) -> None:
+        if self._nvml is not None:
+            try:
+                self._nvml.nvmlShutdown()
+            except Exception:
+                pass
+            self._nvml = None
+            self._handle = None
 
     def available(self) -> bool:
-        return self._binary is not None
+        return self._handle is not None or self._binary is not None
 
     def sample(self) -> GpuTelemetrySample | None:
+        if self._handle is not None:
+            try:
+                memory = self._nvml.nvmlDeviceGetMemoryInfo(self._handle)
+                utilization = self._nvml.nvmlDeviceGetUtilizationRates(self._handle)
+                return GpuTelemetrySample(
+                    memory_used_mb=int(memory.used / (1024 * 1024)),
+                    memory_total_mb=int(memory.total / (1024 * 1024)),
+                    gpu_utilization=float(utilization.gpu) / 100.0,
+                    memory_utilization=float(utilization.memory) / 100.0,
+                )
+            except Exception:
+                self.close()
         if not self._binary:
             return None
         try:

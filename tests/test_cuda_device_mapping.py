@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import sys
 from unittest.mock import Mock, patch
 
 from localml_scheduler.config import SchedulerSettings
@@ -64,7 +65,9 @@ def test_backends_keep_workers_on_the_parent_masked_gpu(monkeypatch, tmp_path: P
 
 def test_nvidia_smi_telemetry_samples_the_masked_physical_gpu(monkeypatch) -> None:
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
+    monkeypatch.setitem(sys.modules, "pynvml", None)
     sampler = NvidiaSmiTelemetrySampler(device_index=0)
+    sampler._binary = "/usr/bin/nvidia-smi"
     completed = SimpleNamespace(returncode=0, stdout="1024, 23028, 50, 20\n")
 
     with patch("localml_scheduler.scheduler.telemetry.subprocess.run", return_value=completed) as run:
@@ -72,6 +75,28 @@ def test_nvidia_smi_telemetry_samples_the_masked_physical_gpu(monkeypatch) -> No
 
     assert sample is not None
     assert "--id=2" in run.call_args.args[0]
+
+
+def test_nvml_connection_is_reused_and_closed(monkeypatch) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
+    nvml = Mock()
+    nvml.nvmlDeviceGetMemoryInfo.return_value = SimpleNamespace(used=1024 ** 3, total=24 * 1024 ** 3)
+    nvml.nvmlDeviceGetUtilizationRates.return_value = SimpleNamespace(gpu=50, memory=20)
+    monkeypatch.setitem(sys.modules, "pynvml", nvml)
+    sampler = NvidiaSmiTelemetrySampler(device_index=0)
+    with patch("localml_scheduler.scheduler.telemetry.subprocess.run") as run:
+        for _ in range(2):
+            sample = sampler.sample()
+            assert sample.memory_used_mb == 1024
+            assert sample.memory_total_mb == 24576
+            assert sample.gpu_utilization == 0.5
+            assert sample.memory_utilization == 0.2
+        run.assert_not_called()
+    sampler.close()
+    sampler.close()
+    nvml.nvmlInit.assert_called_once()
+    nvml.nvmlDeviceGetHandleByIndex.assert_called_once_with(2)
+    nvml.nvmlShutdown.assert_called_once()
 
 
 def test_exclusive_process_owner_blocks_gpu_dispatch(monkeypatch) -> None:

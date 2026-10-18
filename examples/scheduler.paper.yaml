@@ -1,0 +1,12 @@
+runtime_root: localml_scheduler/runtime/paper
+prediction:
+  mode: ml_predictor
+  ml:
+    cpu_threads: 1
+    cache_size: 1024
+    source_conversion_timeout_seconds: 15
+gpu_scheduler:
+  mode: parallel_time_aware
+  packing_backend: cuda_process
+  memory:
+    gpu_vram_gib: 31

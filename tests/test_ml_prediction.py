@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -79,6 +80,23 @@ class _IncompatibleOverride(torch.nn.Module):
 
 
 class MLPredictionTest(unittest.TestCase):
+    def test_student_is_loaded_once_and_features_are_reused_across_jobs(self) -> None:
+        with patch.object(torch.jit, "load", wraps=torch.jit.load) as load:
+            predictor = MLVramPredictor(
+                PredictionSettings(mode="ml_predictor", cpu_threads=1),
+                hardware("NVIDIA A10", "8.6", 23028),
+            )
+            self.assertTrue(predictor.available, predictor.unavailable_reason)
+            first = predictor.predict_avg_vram_mb(model_job(SUPPORTED_SOURCE, job_id="first"), 2)
+            with patch("localml_scheduler.prediction.ml_predictor.multiprocessing.get_context") as spawn:
+                second = predictor.predict_avg_vram_mb(model_job(SUPPORTED_SOURCE, job_id="second"), 2)
+                spawn.assert_not_called()
+            self.assertEqual(first, second)
+            load.assert_called_once()
+            self.assertEqual(load.call_args.kwargs["map_location"], "cpu")
+            self.assertEqual(torch.get_num_threads(), 1)
+            self.assertEqual(PredictionSettings.from_dict(predictor.settings.to_dict()).cpu_threads, 1)
+
     def test_auto_selects_a10_and_runs_cpu_prediction(self) -> None:
         predictor = MLVramPredictor(
             PredictionSettings(mode="ml_predictor"),

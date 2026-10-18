@@ -1,6 +1,5 @@
 """Reusable local ML job scheduler with GPU-aware single-node execution."""
 
-from .client import SchedulerClient
 from .config import (
     BaselineCacheSettings,
     DecisionReplaySettings,
@@ -30,7 +29,20 @@ from .domain import (
     TrainingJob,
     WorkloadIdentity,
 )
-from .engine import SchedulerEngine
+from .http_client import SchedulerHTTPClient
+
+
+def __getattr__(name):
+    # HTTP-only agents should not import the scheduler's PyTorch runtime.
+    if name == "SchedulerClient":
+        from .client import SchedulerClient
+
+        return SchedulerClient
+    if name == "SchedulerEngine":
+        from .engine import SchedulerEngine
+
+        return SchedulerEngine
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "BatchProbeProfile",
@@ -61,6 +73,7 @@ __all__ = [
     "SchedulerClient",
     "SchedulerConfig",
     "SchedulerEngine",
+    "SchedulerHTTPClient",
     "SubmitJobRequest",
     "TrainingJob",
     "WorkloadIdentity",
