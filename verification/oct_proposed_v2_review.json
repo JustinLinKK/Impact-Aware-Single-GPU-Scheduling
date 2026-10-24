@@ -1,20 +1,29 @@
 {
   "passed": true,
-  "scope": "Research design and analytical arithmetic only",
+  "scope": "Research design, analytical arithmetic and synthetic CPU drift metric only",
   "branch": "oct_proposed_v2",
   "base_commit": "607d5e2df4614627238533bd8430cb4edc33c2f6",
   "original_proposal_commit": "05b3e86f50e59b34986b015bdc04750374ac819f",
-  "primary_sources": 6,
+  "primary_sources": 15,
   "arithmetic_checks": 11,
-  "independent_design_review": "Material issues resolved: distinct debt accounting, durable recovery, exact-group evidence, planning horizon separate from polling, trial budget overrun explicitly not hard-bounded",
+  "independent_design_review": "No material blockers after corrections to novel-model startup, pending work credit, composite phase timing, exact lesson retrieval scope, empty histogram semantics and intrinsic I/O accounting.",
   "runtime_files_changed": false,
   "gpu_experiments": false,
   "source_sha256": {
-    "docs/oct_proposed_v2.md": "89ef11f02f58cfb153eab27ee978b1746c461f69fa8add3f2405979b1e3e060a",
-    "docs/oct_proposed_v2_brief.md": "29c05383e29fb22cfaa73cadab48584cda8214e406fcc5e27c64db5169edaa05",
-    "docs/research/oct_proposed_v2/sources.json": "e1ecb254556b94dbb73bc66a3c6f852dc92653080a2157c3d9051434818f2dff",
+    "docs/oct_proposed_v2.md": "809ec12ccc1f6caa82edeee2e736846d34620e972f2203e764c0cc7d283cbd35",
+    "docs/oct_proposed_v2_brief.md": "2dd15735ee52ce4a88a1ccee731766d8c00f7389768743888c199c5e49e3df61",
+    "docs/research/oct_proposed_v2/sources.json": "201ed08160413fa0de5fcf3526b1b2db75e05c640bffd3f7d8c21ee315308735",
     "docs/research/oct_proposed_v2/check_examples.py": "6d29bd8d65e50adbc63daab6370c730cdc67d9ad73138e034070214ce9185c90",
-    "plan.md": "1b23030632342c4faad95f46c8b24ca07454aa5948b137f832b80b2d0e51251d",
-    "verification/oct_proposed_v2_examples.json": "43c763d6e69611ffdcd83dc426c42a383d5a465e1ca0d7235f2c7d0382ac8819"
-  }
+    "docs/research/oct_proposed_v2/agent_variance_delta.md": "6145aeb74c5e6ee752d74c0ffe5e599943dc40c36d21115dc78d629cf0b42b6e",
+    "docs/research/oct_proposed_v2/variance_delta.py": "ec31daadb576cc97fa6253f074aadb703f1146964b3bef03d8cc12a25746769c",
+    "docs/research/oct_proposed_v2/test_variance_delta.py": "2ddc3039e2f442b57e128443c114dfde56d6194de55a9332c634cfc7bfe1a8eb",
+    "plan.md": "e613fb22776080abf33bbe6cb82ce93e4306596080de161184f3c5886c049087",
+    "verification/oct_proposed_v2_examples.json": "43c763d6e69611ffdcd83dc426c42a383d5a465e1ca0d7235f2c7d0382ac8819",
+    "verification/oct_proposed_v2_agent_audit.json": "c7c857479c98a92efbfa411da956b321de1c0b1be08e5a7b5aee1dc3b0b9af2f",
+    "verification/oct_proposed_v2_variance_delta.json": "f6b03ae13c8c87864dac2ef8736b69780a8c1f18294efd1093a402413fbeab30"
+  },
+  "revision_parent_commit": "2dfeec6",
+  "primary_papers": 13,
+  "official_runtime_documents": 2,
+  "variance_delta_checks": 19
 }

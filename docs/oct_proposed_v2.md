@@ -1,7 +1,7 @@
-# oct_proposed_v2: fair progress with measured GPU sharing
+# oct_proposed_v2: fair progress for evolving agent workloads
 
 Research proposal, October 24, 2026. **This branch contains a design, source
-notes and checked arithmetic, not an implemented scheduler mode.** It starts
+notes and CPU reference checks, not an implemented scheduler mode.** It starts
 from `paper` commit `607d5e2`. The CPU student integration is currently in the
 separate, uncommitted `paper` checkout; implementing v2 must first integrate
 that reviewed change. The earlier `oct_proposed` branch remains independent.
@@ -10,6 +10,29 @@ The central decision is: **which addition produces useful extra training
 progress, repays its measurement cost, and avoids repeatedly neglecting the
 same waiting jobs?** A heavy job can be a good starting job, but heaviness alone
 does not make it the preferred main job.
+
+## Revision: new candidates are the normal case
+
+MLEvolve changes executable pipelines, not just a parameter in a known model.
+The default for a newly generated candidate is **unmeasured**. A parent, family
+or similar graph supplies a retrieval hint, not inherited performance evidence.
+Exact-group caching is useful for unchanged retries and recent observations of
+an active group; it is no longer the main strategy for reducing profiling cost.
+
+The added **variance delta** reports structural, workload-size, training-recipe,
+data-pipeline and observed-performance drift separately, together with missing
+information and environment incompatibilities. It is a diagnostic, not a
+probability or an admission threshold. Small structural drift does not imply
+small memory or interference drift. Signed resource changes and prediction
+uncertainty are separate outputs.
+
+The revised path is: **candidate manifest → CPU prediction and delta → brief
+current-job solo measurement → budgeted measurement of the actual sharing group
+→ keep only if the original gain and slowdown checks pass**. Collect useful
+training progress instead of launching duplicate profiling jobs. An exact,
+complete, fresh match can shorten measurement, but never bypass live gates.
+See [the agent-workload revision](research/oct_proposed_v2/agent_variance_delta.md)
+for the local code audit, research, metric, evidence contract and validation plan.
 
 ## How this differs from the other two designs
 
@@ -53,11 +76,14 @@ our GPU or workloads without a controlled experiment.
    service, within existing priority and starvation rules. If equally behind,
    prefer shorter trusted remaining time, then earlier submission.
 2. **While work runs:** keep existing jobs running. For each feasible newcomer,
-   first reuse fresh evidence for that exact combination. Rank profitable
+   first check complete workload identity and phase before considering fresh
+   evidence for that exact combination. Most agent-generated combinations need
+   current measurements. Rank profitable
    additions by conservative extra progress, then service deficit and duration.
 3. **For an unknown combination:** allow a bounded trial only if the trial
    budget, memory, backend and rollback checks pass. Use CPU student busy/time
-   predictions to order exploratory candidates, not to assert a co-run rate.
+   predictions plus variance delta and evidence completeness to order exploratory
+   candidates, not to assert a co-run rate. Unknown drift does not mean zero drift.
 4. **Keep a newcomer** only when measured progress gain covers its cost, no
    member violates the slowdown limit, and existing admission/trial gates pass.
 5. **When a job finishes or changes phase:** invalidate incompatible evidence
@@ -95,8 +121,10 @@ retroactively reprice previous work.
 
 The student remains CPU TorchScript. Its solo time estimate can initialize
 ordering, but measured same-hardware solo references are required for a committed
-progress comparison. Unsupported hardware or workload predictions use existing
-branch profiles. Busy remains an activity proxy; never add busy percentages to
+progress comparison. Unsupported hardware or workload predictions fall back to
+existing conservative branch/live-memory gates and waiting order, with a current
+solo measurement before a rate comparison. A family-compatible branch timing
+profile is advisory until the evidence contract is satisfied. Busy remains an activity proxy; never add busy percentages to
 decide whether a pack fits.
 
 ## Account for underserved jobs
@@ -104,7 +132,11 @@ decide whether a pack fits.
 Maintain a persistent ledger for each stable job ID. Default share weights w
 are one; explicit positive share weights are separate from priority numbers.
 Let E be admitted-to-queue jobs that are runnable, feasible alone and neither
-user-paused nor dependency-blocked. E includes all such jobs across priority
+user-paused nor dependency-blocked. A novel job may be provisionally eligible
+for a guarded solo start without a measured timing reference, as specified in
+the agent-workload contract. A job blocked on unsupported memory containment
+keeps its submission age but cannot reserve the GPU or accrue executable-service
+entitlement until admitted. E includes all such jobs across priority
 bands; priority affects dispatch order, not this equal-share accounting reference.
 Consequently a lower-priority job can accumulate debt while priority rules still
 delay it. Update the virtual reference while the
@@ -120,13 +152,29 @@ F is reference service; W is completed solo-equivalent work. A new arrival
 starts at zero. Waiting grows its debt; useful progress repays it. Preserve signed
 F-W in storage so earned credit survives; clamp only for ranking. Do not accrue
 entitlement while WSL is offline or the user pauses the study. Per-job fairness
-is the declared unit: it does not prevent a user from submitting many jobs.
-Tenant/workflow fairness would require a separate policy and authenticated identity.
+is the declared unit: retries retain one identity, but newly generated children
+are new jobs. A prolific agent can therefore receive more aggregate entitlement.
+Report this limitation and branch coverage in evaluation. Do not copy a parent
+ledger into every child or fusion source: that duplicates entitlement. Workflow
+weights and hierarchical branch shares are a separate policy requiring an explicit
+identity and budget contract; this revision does not silently change search priority.
 
 Existing effective priority and mandatory starvation reservations take precedence.
 Within the selected priority band, use debt bands to avoid ranking churn, then
 trusted remaining time and submission order. Missing solo references use waiting
 age until a solo baseline is acquired; do not fabricate W from predicted busy.
+Persist pre-reference committed-update cursors as unpriced progress. Once a valid
+same-phase solo reference is frozen, price that pending segment exactly once;
+never reprice work already settled against an earlier reference. While a segment
+is unpriced, use the age fallback, not an inflated zero-work debt. If a phase ends
+without a valid reference, credit measured solo wall time attributable to its
+committed useful updates as an explicitly tagged accounting fallback. Exclude
+setup, queue time, scheduler-induced yields, user pauses and lost updates; retain
+intrinsic data/input I/O time attributable to committed updates, as in the normal
+wall-time-per-update reference. Unmeasured shared segments remain unresolved and
+ineligible for debt comparisons until repaired; never synthesize a solo rate.
+This fallback cannot authorize packing. Retries/resumes reconcile the same durable
+cursor so phase changes cannot repeatedly claim work or erase earned service.
 An illustrative debt-band width is 30 solo-equivalent seconds; fix the width on
 validation traces. Retries retain the same ledger. Persist the last accounting
 timestamp, entitlement, earned work and reservation atomically. Release a
@@ -158,7 +206,8 @@ boundary, earliest plausible member completion and next known phase change.
 Use a separately configured planning interval (illustratively 120 seconds), not
 the routine telemetry or scheduler polling interval. Monitoring can be frequent
 without shrinking the amortization horizon. Remaining duration is
-epoch time times epochs left. C is an upper planning estimate of lost
+epoch time times epochs left only for a stationary single phase; for a composite
+job use the sum of future phase work or an explicitly unknown bound. C is an upper planning estimate of lost
 solo-equivalent work from setup, reference collection, switching and rollback.
 H is wall seconds; C and net_gain are solo-equivalent seconds. Short remaining
 work, early stopping and unknown duration reduce confidence in amortization.
@@ -178,18 +227,28 @@ safely, report the condition and drain; do not claim that SIGSTOP frees VRAM.
 
 ## Spend less time exploring
 
-Reuse the existing exact-group profile store and rejection TTL. Extend their
+Use the existing exact-group store for repeated observations of unchanged
+workloads, and rejection TTLs for unchanged failed attempts. For a new candidate,
+retrieve parent and nearby descriptors as priors using the variance-delta
+contract; do not substitute their measured rates or rejection labels. Extend their
 records with phase identity, empirical envelopes, measured setup/rollback cost,
-decision reason and observation count. A cache key includes all members with multiplicity, source
-fingerprints, approved physical batches, optimizer/accumulation/precision,
-hardware, backend/MPS configuration and capture schema. A pair result is never
+decision reason and observation count, extraction completeness and lineage provenance. A cache key includes all members with multiplicity, source
+complete executable/dependency/configuration/data manifests, approved physical
+batches, optimizer/accumulation/precision, execution phase and composite-job plan,
+hardware, backend/MPS configuration and capture schema. AST hashes, family keys
+and signatures that ignore batch are insufficient alone. Missing identity fields
+prevent exact reuse. Preserve per-instance rates for duplicate members; do not
+average away one slow member or discard backend configuration while merging evidence. A pair result is never
 treated as proof that the same pair plus a third job will work.
 
 Deduplicate a running trial, cool down rejected or inconclusive combinations,
 and invalidate affected entries after membership, configuration or phase changes.
 A single bad observation triggers a temporary cooldown; retain the existing
-repeated-bad-trial rule for a durable rejection. Profile lookup must not bypass
-live VRAM, current service reservations or mandatory runtime acceptance checks.
+repeated-bad-trial rule for a durable rejection. The same provenance checks apply to branch timing inheritance, solo references,
+group cache, lesson lookup and decision replay. Similar solo rates do not prove
+similar interference. Profile lookup must not bypass live VRAM, current service
+reservations or mandatory runtime acceptance checks. Unknown or stale memory
+evidence cannot become a permission to pack just because predicted time is good.
 
 Budget exploratory wall time with a persistent token bucket. An illustrative
 starting setting is a 30-second initial/capacity credit, replenished at 3% of
@@ -241,20 +300,24 @@ GPU experiment, or evidence of a measured speedup.
 The existing scheduler already has normalized-throughput checks, drain-time
 estimation, profile caching and rejection TTLs. Those are reused, not claimed
 as new contributions. Proposed extensions are service-debt ranking/reservation,
-cost-aware candidate ordering, empirically conservative evidence, phase-aware
-reuse and a persistent exploration budget.
+cost-aware candidate ordering, empirically conservative evidence, novelty-aware
+measurement, complete phase/configuration identity and a persistent exploration
+budget. The new CPU reference metric is an isolated research utility; no extractor,
+profile gate or live policy is wired into scheduler execution.
 
 | Area | Existing integration point | Proposed addition |
 |---|---|---|
 | Candidate order | `scheduler/placement_planner.py` | Separate optional policy; debt bands and no forced heavy replacement |
-| Estimates | `scheduler/resource_estimator.py` | Versioned solo references and reliability/horizon fields |
+| Estimates | `scheduler/resource_estimator.py` | Gate inherited timing by complete identity; separate prior from measured rate |
+| Agent metadata | MLEvolve `engine/executor.py`, `engine/preflight.py` | Final artifact manifest, all source IDs, extraction coverage and component phases |
+| Delta evidence | `lesson_profile_database/evidence.py` | Replace call-name-only similarity as a performance hint with versioned descriptors; never turn `controlled` into permission |
 | Measurement | `scheduler/cold_start.py`, `colocation_trials.py`, `colocation_evidence.py` | Envelopes, setup cost and individual slowdown evidence |
 | Admission | `scheduler/colocation_decisions.py`, `time_objective.py` | Net-progress filter alongside existing drain-gain checks |
 | Persistence | `scheduler/recovery.py`, job store and runtime profile records | Ledger cursor, reservation, token balance and versioned cache |
 | Fairness/drift | `scheduler/service.py`, `telemetry.py`, `contention_guard.py` | Debt updates, phase invalidation and drain reservation |
 | Progress cursor | `execution/trial_control.py`, `execution/control.py` | Idempotent committed-update and rollback accounting |
 | Cache identity | `domain/identity.py` | Extend full colocation keys with explicit phase/configuration identity |
-| Decision replay | `scheduler/placement_replay.py` | Recheck debt, reservations and trial budget rather than replaying stale slot order |
+| Decision replay | `scheduler/placement_replay.py` | Recheck full identity, individual current rates, debt and budget; family/average-VRAM matching cannot waive a trial |
 
 Keep CPU TorchScript, branch-profile/live VRAM admission, the current 31 GiB
 (31744 MiB) ceiling or any stricter configured limit, approved training batches,
@@ -266,7 +329,9 @@ Compare baseline, implemented busy_anchor, v1 and v2 using the same arrivals,
 hardware, approved batches, progress targets, seeds and profiling costs. Include
 short bursts behind long jobs, low-busy bad partners, high-busy good partners,
 short overlap, three-way interference, stale phase measurements, heavy survivors,
-unknown durations, many new arrivals, and crash/resume with service debt.
+unknown durations, many new arrivals, and crash/resume with service debt. Add
+same-family width/depth/input changes, optimizer-only changes, expensive input
+pipelines, unseen operators, fusion/ensembles, and failed descriptor extraction.
 
 First implement pure CPU decision tests and replay recorded branch profiles;
 then run controlled GPU trials only as a separate implementation/experiment task.
@@ -276,7 +341,17 @@ training progress, trial seconds and rejection rate, prediction/cache misses,
 decision CPU time, VRAM/OOM and training quality. Measure occupancy/FLOPs directly
 if claimed. Include cold and warm caches and held-out workloads; fix thresholds
 before test traces. Ablate debt, overhead budget, phase invalidation and predictor
-hints to establish what actually helps.
+hints to establish what actually helps. Also ablate the variance-delta prior
+against family reuse, no reuse, and complete-identity-only reuse. Hold out whole
+lineages, tasks and mutation types; random parent/child splits would leak. Test
+false low-drift matches, measurement overhead and target-specific error calibration.
+
+Fixed arrival traces isolate scheduling behavior but do not reproduce an agent
+search: completion order affects what MLEvolve generates next. A later end-to-end
+comparison must also fix agent/model settings, search wall budget, tasks and seeds,
+and report valid candidates, branch coverage and best validation quality over wall
+time. Report generated workloads as outcomes instead of pretending both arms saw
+the same queue. Keep evaluation/test data out of scheduling and threshold tuning.
 
 Save every trace. After each experiment create the required Gantt-above-metric
 plots in one PNG, with all comparison arms together. No schedule experiment has

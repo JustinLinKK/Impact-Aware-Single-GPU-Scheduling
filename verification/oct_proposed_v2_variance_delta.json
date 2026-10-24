@@ -1,0 +1,27 @@
+{
+  "passed": true,
+  "scope": "Synthetic CPU descriptor contract only; no real-model extraction, calibration, admission, trace replay or GPU experiment",
+  "command": "python3 -m unittest discover -s docs/research/oct_proposed_v2 -p test_variance_delta.py -v",
+  "count": 19,
+  "tests": [
+    "test_absent_observation_is_unknown_static_features_still_visible",
+    "test_edge_types_and_direction_are_visible",
+    "test_extreme_finite_inputs_do_not_silently_produce_nan",
+    "test_graph_node_renaming_is_invariant",
+    "test_histogram_counts_preserve_repetition",
+    "test_identical_descriptors_zero_is_not_an_admission_decision",
+    "test_incomplete_component_reports_partial_values_only",
+    "test_incomplete_histogram_cannot_assume_missing_label_zero",
+    "test_invalid_graph_and_work_limits",
+    "test_invalid_numbers_rejected",
+    "test_missing_field_never_zero",
+    "test_opposing_changes_do_not_cancel",
+    "test_optimizer_change_without_forward_change",
+    "test_pipeline_change_without_graph_change",
+    "test_rewired_graph_with_same_call_counts_is_visible",
+    "test_signed_change_distinguishes_growth_and_shrinkage",
+    "test_unknown_schema_or_extra_feature_rejected",
+    "test_width_change_with_same_graph_is_visible_in_scale",
+    "test_zero_values_and_floor"
+  ]
+}

@@ -1,6 +1,6 @@
 {
   "accessed": "2026-10-24",
-  "scope": "Primary papers; mechanisms and applicability, not a comprehensive survey or performance reproduction",
+  "scope": "Primary papers and official runtime documentation; mechanisms and applicability, not a comprehensive survey or performance reproduction",
   "sources": [
     {
       "system": "Gandiva",
@@ -55,6 +55,87 @@
       "evidence": "Accounts for dynamic training throughput and user-defined adaptation schedules in fairness and efficiency planning.",
       "adaptation": "Version measurements by phase and approved training configuration; refresh stale evidence.",
       "limit": "V2 does not implement its market equilibrium or stochastic dynamic programming."
+    },
+    {
+      "system": "MLEvolve",
+      "year": 2026,
+      "url": "https://arxiv.org/html/2606.06473v1",
+      "locator": "Progressive MCGS and Appendix G examples (version 1 inspected)",
+      "evidence": "Cross-branch evolution can combine backbones, losses and preprocessing.",
+      "adaptation": "Treat full candidate pipelines and all lineage sources as context.",
+      "limit": "Local implementation audit takes precedence; paper examples do not quantify our mutation distribution."
+    },
+    {
+      "system": "AIDE",
+      "year": 2025,
+      "url": "https://arxiv.org/html/2502.13138v1",
+      "locator": "Section 3.2 solution operators",
+      "evidence": "Search operators draft, debug and improve executable ML solutions.",
+      "adaptation": "Track actual mutations, not just stage labels.",
+      "limit": "A related agent architecture, not a scheduler or our local code."
+    },
+    {
+      "system": "MLE-STAR",
+      "year": 2025,
+      "url": "https://arxiv.org/html/2506.15692v3",
+      "locator": "Method: model retrieval, refinement and ensembling",
+      "evidence": "Refines pipeline components and combines solutions.",
+      "adaptation": "Represent component plans and pipeline changes.",
+      "limit": "Does not provide GPU interference guarantees."
+    },
+    {
+      "system": "Quasar",
+      "year": 2014,
+      "url": "https://csl.stanford.edu/~christos/publications/2014.quasar.asplos.pdf",
+      "locator": "Section 3 classification; Section 4.1 dynamic behavior",
+      "evidence": "Brief new-application/dataset profiling is combined with past observations and refreshed on behavior changes.",
+      "adaptation": "Use historical priors plus current-candidate measurements.",
+      "limit": "Cluster findings and profiling machinery are not reproduced."
+    },
+    {
+      "system": "NeuSight",
+      "year": 2025,
+      "url": "https://arxiv.org/abs/2407.13853",
+      "locator": "Abstract and tile-level prediction method; ASPLOS 2025",
+      "evidence": "Composes tile-level predictions to forecast unseen-model/hardware latency.",
+      "adaptation": "Prefer operator/tensor descriptors over a family name.",
+      "limit": "Solo performance generalization is not co-run generalization."
+    },
+    {
+      "system": "Weisfeiler-Lehman Graph Kernels",
+      "year": 2011,
+      "url": "https://www.jmlr.org/papers/v12/shervashidze11a.html",
+      "locator": "Abstract and neighborhood-label feature construction",
+      "evidence": "Uses iterative labeled graph neighborhoods for efficient graph comparison.",
+      "adaptation": "Directed typed neighborhood histogram as a lossy structural descriptor.",
+      "limit": "Not an isomorphism proof or performance metric; our distance is an adaptation."
+    },
+    {
+      "system": "Adaptive Conformal Inference Under Distribution Shift",
+      "year": 2021,
+      "url": "https://proceedings.neurips.cc/paper_files/paper/2021/hash/0d441de75945e5acbc865406fc9a2559-Abstract.html",
+      "locator": "Abstract and long-run coverage objective",
+      "evidence": "Adapts uncertainty sets to changing distributions.",
+      "adaptation": "Monitor calibration under drift, keeping per-target uncertainty separate from distance.",
+      "limit": "No conformal method is implemented; long-run coverage is not per-job safety."
+    },
+    {
+      "system": "PyTorch allocator fraction",
+      "year": 2026,
+      "url": "https://docs.pytorch.org/docs/2.14/generated/torch.cuda.memory.set_per_process_memory_fraction.html",
+      "locator": "API contract / Understanding CUDA Memory Usage",
+      "evidence": "The fraction limits the caching allocator and raises allocator OOM when exceeded.",
+      "adaptation": "State the limits of guarded solo calibration.",
+      "limit": "Allocator limiting and live telemetry do not guarantee a whole-process VRAM ceiling."
+    },
+    {
+      "system": "PyTorch CUDA memory visibility",
+      "year": 2026,
+      "url": "https://docs.pytorch.org/docs/2.14/torch_cuda_memory.html",
+      "locator": "API contract / Understanding CUDA Memory Usage",
+      "evidence": "Direct CUDA or third-party allocations can exist outside the PyTorch allocator.",
+      "adaptation": "State the limits of guarded solo calibration.",
+      "limit": "Allocator limiting and live telemetry do not guarantee a whole-process VRAM ceiling."
     }
   ]
 }

@@ -1,0 +1,27 @@
+{
+  "audited_at_utc": "2026-10-24T08:06:41.402233+00:00",
+  "root": "/home/justin/MLEvolve",
+  "note": "Read-only audit of live local sources, which include pre-existing uncommitted work; these runtime sources are not included or edited by v2. Line references are pinned by these hashes.",
+  "source_sha256": {
+    "agents/improve_agent.py": "c4e0fb37b27384b1e00e06cfd113b920290474fe79f670a60a699ee47ac9fc03",
+    "agents/debug_agent.py": "26020b12d3e416d1fd770046889a1f06d7db4622482e64958a2ea5200909f47e",
+    "agents/fusion_agent.py": "c7019dce5dabb5989f48b36132522aa0275f684e529450719df7985bbf652cc0",
+    "agents/aggregation_agent.py": "18581f0987cb8d5d0cd6ef0b0824912368fbfab890d39bf96a9b65343b13c95d",
+    "agents/triggers.py": "784b0d9e4adda21ebf79f1b1c11fd8c44041df65878a8b9c2abf5e183786fba7",
+    "engine/agent_search.py": "6f0e1197d89565153c40cd72b1e971a7eab705be647169d427d109e775994644",
+    "engine/search_node.py": "56a3cb8b2b14743aef5706486ddb3a126a31a0e8952590836fd2e851257eabb2",
+    "engine/executor.py": "e95ab3af7b82348a73f0079b430b1d20dd78c79ae0fe399433322666b299030f",
+    "engine/preflight.py": "3d3649d2826ba518feb35a7c738d3a37ac952b6e30090a231bff6964043ed538",
+    "engine/script_introspection.py": "86a5948448c66f9a9aea632f4142a9431f5e2223f79fe15c5f2062be2386fe18",
+    "lesson_profile_database/evidence.py": "ee087a8911d405402b029ea64a501fa4799acd2032c037ecbfca79806e95eb96",
+    "lesson_profile_database/identity.py": "15163a39f50d6cb1914b1f96fd74580aa47efb60e6416485259b9f532b03d946",
+    "docs/lesson_profile_database.md": "6d8bf1c30fad110887cb835c4a92e7b187e48701bbd561725522f47778d9373a",
+    "localml_scheduler/scheduler/resource_estimator.py": "32fad5942a24cdf9c32b0721e30b7d2621de1791f232e1675663f27edc444a70",
+    "localml_scheduler/scheduler/placement_replay.py": "0455a694014250b0ac401ff80e40305d04a3eff0bfac5d7f1dff190d67155608",
+    "localml_scheduler/scheduler/time_objective.py": "929bc0d9277572084c8d41c30cb6a07942a7e7e6c2085420a138e00a4c2d942d",
+    "localml_scheduler/scheduler/colocation_evidence.py": "664ed00fc0ff0da596416b4a3084fadae2e05370b2e922b507b24073103fc7a4",
+    "localml_scheduler/domain/identity.py": "765f4c90df96991f970fea45c0540745373371876397e77f78c7bb52fd8c6d99",
+    "localml_scheduler/scheduler/cold_start.py": "ec2dc86d9d1c067a55398cb65080c55e58096beaab84e43dd8dd0f3ec8d615d8",
+    "localml_scheduler/execution/trial_control.py": "6fd2d27f9dac255eed33766cfe59788bb91c57b8f3bce92a27ee8f91c68a8270"
+  }
+}

@@ -1,53 +1,56 @@
-# A second scheduler proposal
+# Scheduling models an agent has never tried
 
-**Choose jobs by fair progress, and share the GPU only when measured gains repay the cost.**
+**Revised v2: use past runs as clues, then measure the new candidate before sharing the GPU.**
 
-The current scheduler starts heavy jobs and tries lighter additions. The first
-proposal aims to reduce total completion delays. This second proposal, on
-`oct_proposed_v2`, balances extra training progress, waiting jobs and trial overhead.
+MLE Agent can change the backbone, optimizer, input size, data pipeline or combine
+several models. Two jobs called “ResNet” can therefore behave very differently.
+Our local audit also found that “improve” may replace a pipeline, while “debug”
+may retry identical code. Stage and family labels are not reliable drift measures.
 
-## What we can borrow
+## What “variance delta” means
 
-| Scheduler | Useful lesson |
+It is a breakdown of change from a reference job, not a confidence percentage.
+
+| Change | What we check |
 |---|---|
-| [Gandiva](https://www.usenix.org/system/files/osdi18-xiao.pdf) | Measure how jobs perform together; low busy alone is insufficient. |
-| [Gavel](https://www.usenix.org/system/files/osdi20-narayanan_deepak.pdf) | Keep performance evidence for each job combination. |
-| [Tiresias](https://www.usenix.org/system/files/nsdi19-gu.pdf) | Consider work already received and protect waiting jobs. |
-| [Themis](https://www.usenix.org/system/files/nsdi20-paper-mahajan.pdf) | Evaluate fairness alongside overall efficiency. |
+| Structure | Operators, connections, trainable layers and optimizer work. |
+| Size | Tensor shapes, activation/state size and amount of computation. |
+| Recipe | Batch, precision, accumulation, optimizer and checkpointing. |
+| Pipeline | Augmentation, input waits, folds and sequential/concurrent models. |
+| Observed | Current step time, variability and peak memory. |
 
-[Salus](https://arxiv.org/abs/1902.04610) also shows that fast switching needs runtime
-support. [Shockwave](https://www.usenix.org/system/files/nsdi23-zheng.pdf) motivates
-refreshing measurements when training behavior changes. We borrow mechanisms;
-their reported speedups are not evidence of a speedup on our GPU.
+Missing information stays **unknown**. We keep predicted resource increases and
+uncertainty separate. A small structural delta never proves that sharing is safe.
+For example, wider layers may keep the same topology but need much more memory;
+heavier augmentation can change GPU utilization without changing the model.
 
-## How v2 decides
+## How the revised scheduler would decide
 
-1. **Choose a main job:** within existing priority rules, prefer the job furthest
-   behind its reference share of progress. If tied, use remaining time and arrival order.
-2. **Choose a partner:** reuse fresh measurements for the exact group. Predictors
-   help order new trials; measured progress decides whether sharing works.
-3. **Pay for the trial:** skip additions whose likely overlap is too short to
-   repay startup and measurement costs. Keep a budget for exploratory trial time.
-4. **Protect each job:** reject a group that harms one member too much, even if
-   total throughput improves. Memory and backend checks still apply.
-5. **Prevent repeated waiting:** reserve a turn for an overdue job. If it cannot
-   join, stop adding more work and let incumbents finish. No new fairness-driven
-   preemption is assumed.
+1. **Identify the actual job.** Record final code/configuration, all parents,
+   execution phases and what the descriptor could not capture.
+2. **Use history to choose a trial.** Compare the new job with its parents and
+   similar workloads. CPU TorchScript predictions help order candidates.
+3. **Measure useful training.** Collect the candidate's current solo rate, then
+   test a promising sharing group within the existing trial budget.
+4. **Keep only worthwhile sharing.** Extra progress must repay measurement cost,
+   every job must pass slowdown checks, and memory/backend gates still apply.
+5. **Refresh when behavior changes.** A new phase or changed configuration retires
+   old evidence. Waiting jobs retain v2's service and reservation rules.
 
-## A simple example
+An unchanged retry can reuse eligible fresh evidence. A new model cannot inherit
+a group's performance just because its family or delta looks similar.
 
-A runs alone at **1.0×** its solo rate. Adding low-busy B leaves A at **0.55×**
-and B at **0.15×**: together they deliver **0.70×**, so reject the pair.
+## Research behind the change
 
-A busier C instead gives A **0.90×** and C **0.75×**: total **1.65×**. Over 120
-seconds, a cost of 12 solo-equivalent seconds leaves **66 seconds of extra useful
-work**. With only 10 seconds of overlap, the gain is **−5.5**, so skip it.
-These are illustrative numbers, not benchmark results; each member must also
-pass its slowdown limit.
+[Quasar](https://csl.stanford.edu/~christos/publications/2014.quasar.asplos.pdf)
+already addresses unfamiliar workloads using brief measurements plus history.
+[NeuSight](https://arxiv.org/abs/2407.13853) motivates operator/tensor descriptions;
+[MLEvolve](https://arxiv.org/html/2606.06473v1) motivates tracking complete evolving
+pipelines. These are adaptations, not evidence of a speedup on our GPU.
 
-The model stays on CPU through TorchScript. Branch profiles and live VRAM remain
-authoritative, with no fixed job-count cap. This is a research design, not a
-deployed scheduler. Its next test is a controlled comparison against baseline,
-heavy-first and the first proposal, including trial overhead and tail waiting time.
+Saved on local branch **oct_proposed_v2**. This is a research design with a tested
+CPU metric reference; it is not deployed. Validation must measure both scheduler
+overhead and agent search quality over wall time, because job completion affects
+which candidate the agent generates next.
 
 Full specification: [oct_proposed_v2.md](oct_proposed_v2.md).
