@@ -1,0 +1,20 @@
+{
+  "passed": true,
+  "scope": "Research design and analytical arithmetic only",
+  "branch": "oct_proposed_v2",
+  "base_commit": "607d5e2df4614627238533bd8430cb4edc33c2f6",
+  "original_proposal_commit": "05b3e86f50e59b34986b015bdc04750374ac819f",
+  "primary_sources": 6,
+  "arithmetic_checks": 11,
+  "independent_design_review": "Material issues resolved: distinct debt accounting, durable recovery, exact-group evidence, planning horizon separate from polling, trial budget overrun explicitly not hard-bounded",
+  "runtime_files_changed": false,
+  "gpu_experiments": false,
+  "source_sha256": {
+    "docs/oct_proposed_v2.md": "89ef11f02f58cfb153eab27ee978b1746c461f69fa8add3f2405979b1e3e060a",
+    "docs/oct_proposed_v2_brief.md": "29c05383e29fb22cfaa73cadab48584cda8214e406fcc5e27c64db5169edaa05",
+    "docs/research/oct_proposed_v2/sources.json": "e1ecb254556b94dbb73bc66a3c6f852dc92653080a2157c3d9051434818f2dff",
+    "docs/research/oct_proposed_v2/check_examples.py": "6d29bd8d65e50adbc63daab6370c730cdc67d9ad73138e034070214ce9185c90",
+    "plan.md": "1b23030632342c4faad95f46c8b24ca07454aa5948b137f832b80b2d0e51251d",
+    "verification/oct_proposed_v2_examples.json": "43c763d6e69611ffdcd83dc426c42a383d5a465e1ca0d7235f2c7d0382ac8819"
+  }
+}

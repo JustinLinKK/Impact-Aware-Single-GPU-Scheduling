@@ -1,0 +1,60 @@
+{
+  "accessed": "2026-10-24",
+  "scope": "Primary papers; mechanisms and applicability, not a comprehensive survey or performance reproduction",
+  "sources": [
+    {
+      "system": "Gandiva",
+      "year": 2018,
+      "url": "https://www.usenix.org/system/files/osdi18-xiao.pdf",
+      "locator": "Section 4.2.2 Packing; packing evaluation discussion",
+      "evidence": "Profiles progress when jobs share a GPU and keeps or reverses packing according to observed benefit.",
+      "adaptation": "Use actual co-run progress to validate busy-based candidate hints.",
+      "limit": "Its time slicing, migration and cluster mechanisms are not our existing process runtime."
+    },
+    {
+      "system": "Tiresias",
+      "year": 2019,
+      "url": "https://www.usenix.org/system/files/nsdi19-gu.pdf",
+      "locator": "Sections 3.2 and 3.2.2; Avoiding starvation",
+      "evidence": "Scheduling uses attained service with unknown or partial duration information and promotes waiting jobs.",
+      "adaptation": "Track historical work and waiting debt; retain starvation reservations.",
+      "limit": "Our nonpreemptive policy does not inherit Tiresias's preemptive scheduling behavior."
+    },
+    {
+      "system": "Themis",
+      "year": 2020,
+      "url": "https://www.usenix.org/system/files/nsdi20-paper-mahajan.pdf",
+      "locator": "Introduction finish-time fairness definition; Section 3.3",
+      "evidence": "Uses finish-time fairness relative to an isolated-share reference and auctions among disadvantaged applications.",
+      "adaptation": "Measure service shortfall and individual harm, using an explicitly different service-debt heuristic.",
+      "limit": "No auction, finish-time fairness theorem, or multi-GPU reference is reproduced."
+    },
+    {
+      "system": "Gavel",
+      "year": 2020,
+      "url": "https://www.usenix.org/system/files/osdi20-narayanan_deepak.pdf",
+      "locator": "Sections 3.1 (effective throughput and space sharing), 3.2, 4.1 and 4.3",
+      "evidence": "Models throughput under resource allocations, including distinct rates for colocated combinations.",
+      "adaptation": "Normalize each job by its same-configuration solo rate and use exact-group measurements.",
+      "limit": "A single-GPU incremental heuristic does not implement its cluster allocation optimizer."
+    },
+    {
+      "system": "Salus",
+      "year": 2019,
+      "url": "https://arxiv.org/abs/1902.04610",
+      "locator": "Abstract, original author submission",
+      "evidence": "A consolidated execution service provides iteration scheduling, fast switching and memory sharing.",
+      "adaptation": "Treat fast preemption as a separate runtime capability, not a free policy option.",
+      "limit": "TensorFlow execution-service primitives are not automatically available to separate PyTorch processes."
+    },
+    {
+      "system": "Shockwave",
+      "year": 2023,
+      "url": "https://www.usenix.org/system/files/nsdi23-zheng.pdf",
+      "locator": "Sections 2.3, 3 and 5",
+      "evidence": "Accounts for dynamic training throughput and user-defined adaptation schedules in fairness and efficiency planning.",
+      "adaptation": "Version measurements by phase and approved training configuration; refresh stale evidence.",
+      "limit": "V2 does not implement its market equilibrium or stochastic dynamic programming."
+    }
+  ]
+}
