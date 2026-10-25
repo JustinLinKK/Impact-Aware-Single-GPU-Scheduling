@@ -582,3 +582,10 @@ The normal pause flow is:
 python -m pytest -q localml_scheduler/tests
 python -m pytest -q localml_scheduler/tests/test_ml_stress.py
 ```
+
+### Published A100 student integration
+
+The optional 17-input `S_A100` CPU adapter uses an explicit public release code
+path and extracted checkpoint directory. See [configuration and the actual-model
+integration smoke test](docs/a100_student_integration.md). Student timing can
+inform batch options; measured branch memory remains authoritative.

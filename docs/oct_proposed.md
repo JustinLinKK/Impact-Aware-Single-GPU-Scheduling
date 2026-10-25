@@ -99,3 +99,10 @@ Adopt the alternative only if its improvement in mean JCT is robust without
 unacceptable p95 slowdown/fairness regressions, memory failures or quality loss.
 Keep `busy_anchor` and baseline selectable regardless of the result. A negative
 result is useful evidence, not a reason to retune against the test set.
+
+## Publication integration check
+
+This branch also includes the optional released `S_A100` CPU adapter and its
+[actual-model integration smoke test](a100_student_integration.md). This adds
+compatible model loading and scheduler estimates; the completion-aware policy
+above remains a proposal and has not been deployed or benchmarked.

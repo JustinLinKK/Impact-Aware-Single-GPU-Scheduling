@@ -147,10 +147,23 @@ class MLVramPredictor:
         self._target_names: tuple[str, ...] = ()
         self.last_sources: dict[str, str] = {}
         self.last_errors: dict[str, str] = {}
+        self.requires_branch_memory = bool(settings.student_release_path)
+        self._released = None
         self._initialize()
 
     def _initialize(self) -> None:
         try:
+            if self.settings.student_release_path:
+                if self.settings.registry_path or self.settings.test_override_enabled:
+                    raise ValueError("student_release_path cannot be combined with a registry or test override")
+                from .released_student import ReleasedStudentRuntime
+                self._released = ReleasedStudentRuntime(self.settings.student_release_path, self.settings, self.hardware)
+                self._runtime = self._released
+                self.model_id = self._released.model_id
+                self.artifact_hash = self._released.artifact_hash
+                self._target_names = tuple(self._released.contract["targets"])
+                self.available = True
+                return
             if not PERFSEER_SRC.is_dir():
                 raise RuntimeError(f"PerfSeer submodule source is missing: {PERFSEER_SRC}")
             if str(PERFSEER_SRC) not in sys.path:
@@ -354,6 +367,8 @@ class MLVramPredictor:
 
     def predict_avg_vram_options(self, job: TrainingJob, batch_sizes: Sequence[int]) -> dict[int, float]:
         """Predict all requested batches with one trace/conversion bundle."""
+        if getattr(self, "_released", None) is not None:
+            return {batch: values[4] for batch, values in self._released_options(job, batch_sizes).items()}
         if not self.available:
             unavailable_error = self.unavailable_reason or "ML predictor unavailable"
             self.last_sources[job.job_id] = "branch_profile"
@@ -400,6 +415,8 @@ class MLVramPredictor:
         The unsupported ``train_time`` target is deliberately not accepted because
         it is not a measured full-epoch label.
         """
+        if getattr(self, "_released", None) is not None:
+            return {batch: values[2] / 1000.0 for batch, values in self._released_options(job, batch_sizes).items()}
         if "train_epoch_ms" not in self._target_names:
             raise JobPredictionError("predictor artifact does not expose train_epoch_ms")
         if not self.available:
@@ -423,3 +440,19 @@ class MLVramPredictor:
                 raise
             raise JobPredictionError(f"{type(exc).__name__}: {exc}") from exc
         return {batch_size: self._job_epoch_seconds[key] for batch_size, key in zip(ordered_sizes, keys, strict=True)}
+
+    def _released_options(self, job, batch_sizes):
+        try:
+            values = self._released.predict_options(job, batch_sizes)
+            self.last_sources[job.job_id] = "ml_predictor"
+            self.last_errors.pop(job.job_id, None)
+            return values
+        except Exception as exc:
+            self.last_sources[job.job_id] = "branch_profile"
+            self.last_errors[job.job_id] = str(exc)
+            raise JobPredictionError(str(exc)) from exc
+
+    def predict_busy_percent_options(self, job, batch_sizes):
+        if self._released is None:
+            raise JobPredictionError("released A100 student is unavailable")
+        return {batch: values[3] for batch, values in self._released_options(job, batch_sizes).items()}
