@@ -125,7 +125,8 @@ class ResourceEstimator:
         ml_epoch_predictions: dict[int, float] = {}
         if self.ml_predictor is not None:
             try:
-                ml_predictions = self.ml_predictor.predict_avg_vram_options(job, batch_sizes)
+                ml_predictions = ({} if getattr(self.ml_predictor, "requires_branch_memory", False)
+                                  else self.ml_predictor.predict_avg_vram_options(job, batch_sizes))
             except JobPredictionError:
                 ml_predictions = {}
             epoch_predictor = getattr(self.ml_predictor, "predict_seconds_per_epoch_options", None)
@@ -225,6 +226,8 @@ class ResourceEstimator:
         *,
         ml_predictions: dict[int, float] | None = None,
     ) -> tuple[float, str]:
+        if getattr(self.ml_predictor, "requires_branch_memory", False):
+            ml_predictions = {}  # Released predictions never replace branch memory admission.
         if ml_predictions is not None and int(batch_size) in ml_predictions:
             return float(ml_predictions[int(batch_size)]), "ml_predictor"
         if ml_predictions is None and self.ml_predictor is not None:
@@ -490,6 +493,9 @@ class ResourceEstimator:
         return self.estimate_avg_vram_mb(job, self.resolved_batch_size(job), backend_name) > 0.0
 
     def estimate_avg_vram_mb(self, job: TrainingJob, batch_size: int, backend_name: str) -> float:
+        if getattr(self.ml_predictor, "requires_branch_memory", False):
+            job.metadata["vram_prediction_source"] = "branch_profile"
+            return self._estimate_branch_avg_vram_mb(job, batch_size, backend_name)
         if self.ml_predictor is not None:
             try:
                 value = self.ml_predictor.predict_avg_vram_mb(job, batch_size)

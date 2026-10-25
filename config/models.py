@@ -632,6 +632,8 @@ class BaselineCacheSettings:
 class PredictionSettings:
     mode: str = PREDICTION_MODE_BRANCH_PROFILE
     registry_path: str | None = None
+    student_release_path: str | None = None
+    student_model_path: str | None = None
     conversion_timeout_seconds: float = 15.0
     cache_size: int = 1024
     cpu_threads: int = 1
@@ -640,6 +642,8 @@ class PredictionSettings:
 
     def __post_init__(self) -> None:
         self.mode = normalize_prediction_mode(self.mode)
+        if self.student_model_path and not self.student_release_path:
+            raise ValueError("student_model_path requires student_release_path")
         self.conversion_timeout_seconds = max(
             0.1, float(self.conversion_timeout_seconds)
         )
@@ -669,6 +673,8 @@ class PredictionSettings:
             "mode": self.mode,
             "ml": {
                 "registry_path": self.registry_path,
+                "student_release_path": self.student_release_path,
+                "student_model_path": self.student_model_path,
                 "source_conversion_timeout_seconds": self.conversion_timeout_seconds,
                 "cache_size": self.cache_size,
                 "cpu_threads": self.cpu_threads,

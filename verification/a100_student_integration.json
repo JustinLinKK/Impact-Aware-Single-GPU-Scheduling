@@ -1,0 +1,34 @@
+{
+  "schema": "released-a100-scheduler-integration-v1",
+  "branch": "oct_proposed_v2",
+  "proposal_parent_commit": "8e95542e622c2374eb3a991d2c5f7a5c9f3a5a00",
+  "verified_at_utc": "2026-10-25T04:20:41.751968+00:00",
+  "passed": true,
+  "tests": {
+    "command": "CUDA_VISIBLE_DEVICES= PERFSEER_RELEASE_ROOT=<public-code-root> PERFSEER_A100_PROBE=<pinned-TRAIN-probe> python -m pytest tests/test_released_a100_student.py tests/test_config_models.py tests/test_time_aware_scheduler.py tests/test_quality_safe_batching.py -q",
+    "passed": 88,
+    "integration_tests": 7,
+    "skipped": 0
+  },
+  "torch_version": "2.11.0+cu130",
+  "device": "cpu",
+  "cuda_initialized": false,
+  "public_checkpoint_archive_sha256": "0dbd48676c272e3113539178bc2a9974a59d5bb27a8b8329a7a1280041993b2d",
+  "student_sha256": "ff968d0816eba99cc7765c297a3ee9d4e7ee8a4c4b0f40b5e2dcd72e0b2b419f",
+  "normalization_sha256": "2f3bba49352fc8eae69cb3615d925a99739e10b3ff15048d4f922696cbf2eae0",
+  "architecture_sha256": "f273a6fd53464ab03c81b4492a494e48b55c6d659e68bca3efcabc6360c0053d",
+  "train_probe_sha256": "8877f50d1030e6541634a38806efeb164569690c49ecceb841d934e388175fe9",
+  "probe_rows": 2,
+  "probe_source_split": 0,
+  "direct_torchscript_parity": "bit-exact predictions and memory_upper",
+  "source_sha256": {
+    "config/models.py": "25753d60e857ee6a34f13971eb0d8444a93e95621a902daa43736776526e4edb",
+    "prediction/ml_predictor.py": "c2cac7f09f9f0d2306704033380a3f37dc24dcaaa412655eb68f8fe90489d216",
+    "prediction/source_worker.py": "00b02a0fe975279c5fcabc4c25c3ea4314e96fe66da92dff895136b23ce4377b",
+    "prediction/released_student.py": "8988bf145ecf2eac576af863393f9bb3ac3409e5862ea1db1d0d2e2a62f960a3",
+    "scheduler/resource_estimator.py": "77210ad807b60560644885bd491782eb467e481feefc2fe5a0191fd925e20967",
+    "tests/test_released_a100_student.py": "f8420bb1741fc9c8e5a33939c5bf7081e3382ddf562c5153cde93d935779d994",
+    "docs/a100_student_integration.md": "eb820cda2108cabe514e7602d76f79f26dc8fdde0c8b6ef9504a0d2bb5b05ef9"
+  },
+  "scope": "CPU loading, real source graph capture, packed TRAIN-feature inference, physical units, scheduling estimates, measured-memory gating and failure fallback. No GPU experiment, training launch, policy benchmark or new-model accuracy claim."
+}
