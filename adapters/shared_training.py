@@ -16,13 +16,14 @@ import math
 import os
 from pathlib import Path
 import random
+import time
 from typing import Any, Callable
 
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset, default_collate
 
-from ..domain import BatchResolution, SafePointType
+from ..domain import BatchResolution, SafePointType, utc_now
 from ..execution.script_context import script_scheduler_context
 from ..prediction.job_contract import prediction_metadata
 
@@ -122,6 +123,55 @@ def _check_runtime_recipe(workload, context):
         raise ValueError("predictor/runtime training budget mismatch")
 
 
+def _completion_metadata(context):
+    if context is None:
+        return {}
+    store = getattr(context, "store", None)
+    current = store.get_job(context.job.job_id) if store is not None else None
+    return dict(current.metadata if current is not None else getattr(context.job, "metadata", {}))
+
+
+def _publish_completion_metadata(context, updates):
+    if context is None:
+        return
+    if not hasattr(context.job, "metadata"):
+        context.job.metadata = {}
+    context.job.metadata.update(updates)
+    store = getattr(context, "store", None)
+    if store is not None:
+        store.update_job(context.job.job_id, metadata_updates=updates)
+
+
+def _record_completion_phase(context, phase, seconds, *, identity, epoch, global_step):
+    """Keep wall-clock evidence out of the deterministic training checkpoint."""
+    if (context is None or phase not in {"validation", "finalization"}
+            or not isinstance(identity, str) or not identity
+            or not math.isfinite(seconds) or seconds < 0):
+        return
+    metadata = _completion_metadata(context)
+    if metadata.get("runtime_completion_identity") != identity:
+        return
+    store = getattr(context, "store", None)
+    history = list(metadata.get("runtime_phase_timing_history") or [])
+    history.append({"phase": phase, "seconds": float(seconds), "identity": identity,
+                    "hardware_key": store.hardware_key() if store is not None else None,
+                    "epoch": int(epoch), "global_step": int(global_step),
+                    "finished_at": utc_now(), "source": f"shared_training.{phase}"})
+    updates = {"runtime_phase_timing_history": history[-64:],
+               "runtime_nonupdate_phase_counter": int(metadata.get("runtime_nonupdate_phase_counter") or 0) + 1}
+    if phase == "finalization":
+        updates["runtime_finalization_complete"] = True
+    _publish_completion_metadata(context, updates)
+
+
+def _phase_clock(device):
+    # Drain preceding CUDA work before starting, and phase work before stopping.
+    # Scheduler safe-point waits are outside both timing boundaries.
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return time.perf_counter()
+
+
 def run_candidate_training(prepare: Callable[[], CandidateWorkload], *, context=None):
     """Call directly under __main__; prepare must not allocate CUDA at import.
 
@@ -190,6 +240,28 @@ def run_candidate_training(prepare: Callable[[], CandidateWorkload], *, context=
         if device.type == "cuda":
             torch.cuda.set_rng_state_all(saved["cuda_rng"])
 
+    completion_metadata = _completion_metadata(context)
+    checkpoint_epoch = 0
+    if resume is not None and completion_metadata.get("runtime_completion_identity") == signature:
+        # A user may restore an older checkpoint while the job metadata still
+        # describes a later run. Never let that metadata skip pending work.
+        checkpoint_epoch = max(0, min(completed_epochs,
+            int(completion_metadata.get("runtime_checkpoint_completed_epoch") or 0)))
+    completion_updates = {
+        "runtime_completion_identity": signature,
+        "runtime_total_optimizer_updates": recipe.epochs * recipe.steps_per_epoch,
+        "runtime_planned_epochs": recipe.epochs,
+        "runtime_has_finalizer": workload.finalize is not None,
+        "runtime_checkpoint_completed_step": global_step,
+        "runtime_checkpoint_completed_epoch": checkpoint_epoch,
+        "runtime_final_checkpoint_complete": False,
+        "runtime_finalization_complete": False,
+        "runtime_nonupdate_phase_counter": int(completion_metadata.get("runtime_nonupdate_phase_counter") or 0),
+    }
+    if completion_metadata.get("runtime_completion_identity") != signature:
+        completion_updates["runtime_phase_timing_history"] = []
+    _publish_completion_metadata(context, completion_updates)
+
     def state_factory():
         return {"contract": CONTRACT, "signature": signature,
                 "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(),
@@ -214,6 +286,7 @@ def run_candidate_training(prepare: Callable[[], CandidateWorkload], *, context=
         # Validation is a separately committed phase. A pause on the final STEP
         # resumes pending validation instead of skipping/repeating an update.
         if global_step == (completed_epochs + 1) * recipe.steps_per_epoch:
+            validation_started = _phase_clock(device)
             model.eval()
             with torch.no_grad():
                 metrics = {k: float(v) for k, v in workload.validate(model, device).items()}
@@ -227,7 +300,12 @@ def run_candidate_training(prepare: Callable[[], CandidateWorkload], *, context=
             history.append({"epoch": completed_epochs, "global_step": global_step, **metrics})
             print("MLEVOLVE_EPOCH_METRIC " + json.dumps({"epoch": completed_epochs,
                   "metric": score, "metric_name": workload.selection_metric}), flush=True)
+            _record_completion_phase(context, "validation", _phase_clock(device) - validation_started,
+                identity=signature, epoch=completed_epochs, global_step=global_step)
             safe_point(SafePointType.EPOCH, metrics)
+            # A scheduler budget may stop here after validation and its checkpoint,
+            # without performing another optimizer update or repeating validation.
+            safe_point(SafePointType.MANUAL)
             continue
         epoch, step = divmod(global_step, recipe.steps_per_epoch)
         order = torch.randperm(len(workload.train_dataset), generator=torch.Generator().manual_seed(recipe.seed + epoch))
@@ -250,6 +328,7 @@ def run_candidate_training(prepare: Callable[[], CandidateWorkload], *, context=
     # Final training checkpoint retains last-update state, separate from the
     # validation-selected model used for inference/submission below.
     safe_point(SafePointType.EXPLICIT)
+    finalization_started = _phase_clock(device)
     workload.output_dir = Path(workload.output_dir)
     _atomic_save(state_factory(), workload.output_dir / "training_state.pt")
     _atomic_save({"model_state": best_state, "metric": best_metric, "signature": signature}, workload.output_dir / "selected_model.pt")
@@ -262,4 +341,6 @@ def run_candidate_training(prepare: Callable[[], CandidateWorkload], *, context=
               "determinism": recipe.determinism}
     (workload.output_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     print(f"Final Validation Score: {best_metric}", flush=True)
+    _record_completion_phase(context, "finalization", _phase_clock(device) - finalization_started,
+        identity=signature, epoch=completed_epochs, global_step=global_step)
     return result

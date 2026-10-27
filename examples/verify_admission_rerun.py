@@ -21,6 +21,7 @@ def main():
     p=argparse.ArgumentParser();p.add_argument('--jobs',type=Path,required=True);p.add_argument('--dataset',type=Path,required=True)
     p.add_argument('--release-root',required=True);p.add_argument('--model-dir',required=True);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--cancer-jobs',type=Path);p.add_argument('--cancer-dataset',type=Path)
+    p.add_argument('--max-incumbent-slowdown-fraction',type=float,choices=[.10,.50])
     p.add_argument('--scheduler-commit',required=True);p.add_argument('--local-rtx-test',action='store_true');a=p.parse_args()
     root=a.output.resolve();root.mkdir(parents=True,exist_ok=False)
     os.environ.update(MLEVOLVE_INPUT_DIR=str(a.dataset.resolve()),OMP_NUM_THREADS='1',MKL_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1',NUMEXPR_NUM_THREADS='1')
@@ -31,9 +32,32 @@ def main():
     settings=SchedulerSettings(runtime_root=root/'runtime',scheduler_poll_interval_seconds=.05,prediction=prediction,
         graph_db={'enabled':False},hardware_knowledge_graph={'enabled':False},hardware_feature_db={'enabled':False},
         early_stopping={'enabled':False},gpu_scheduler={'packing_backend':'cuda_process','batch_probe_enabled':False,
+            'colocation':({'cold_start_max_incumbent_slowdown_fraction':a.max_incumbent_slowdown_fraction}
+                          if a.max_incumbent_slowdown_fraction is not None else {}),
             'memory':{'gpu_vram_gib':initial['total_mib']/1024,'predicted_budget_fraction':.9}})
     settings.ensure_runtime_layout();save(settings.runtime_root/'scheduler_settings.json',settings.to_dict())
     client=SchedulerClient(settings);service=client.create_service()
+    # Observe the production control boundary rather than infer add-only
+    # behavior from job status (a yielded worker still has RUNNING status).
+    admission_commands=[];admission_pauses=[]
+    original_command=service._cold_command
+    def checked_command(trial,job,action,kind,**kwargs):
+        is_candidate=job.job_id==trial.candidate_job_id
+        admission_commands.append({'trial_id':trial.trial_id,'job_id':job.job_id,
+            'candidate':is_candidate,'action':action,'kind':kind,
+            'step':job.metadata.get('runtime_global_step')})
+        assert is_candidate or action!='yield','admission yielded an incumbent'
+        return original_command(trial,job,action,kind,**kwargs)
+    service._cold_command=checked_command
+    original_pause=service.supervisor.request_pause
+    def checked_pause(job_id,*args,**kwargs):
+        trial=service._colocation_trial
+        if trial is not None:
+            admission_pauses.append({'trial_id':trial.trial_id,'job_id':job_id,
+                'candidate_job_id':trial.candidate_job_id})
+            assert job_id==trial.candidate_job_id,'admission paused an incumbent'
+        return original_pause(job_id,*args,**kwargs)
+    service.supervisor.request_pause=checked_pause
     if a.local_rtx_test:
         # Test-only target injection. Telemetry and allocator retain real RTX
         # capacity; production GPU identity checks are never modified.
@@ -121,7 +145,7 @@ def main():
                                  'student_model_devices':model_devices,'cpu_inference_calls':cpu_calls,'cancer_checks':cancer_checks})
     jobs.sort(key=lambda j:service.planner.estimator.workload_rank(j,prefer_high=True))
     anchor=jobs[0];client.submit(anchor);service.start(background=True)
-    started=time.monotonic();paused_state=None;pause_sent=False;resume_sent=False;joined=False;error=None;samples=[]
+    started=time.monotonic();paused_state=None;pause_sent=False;resume_sent=False;joined=False;error=None;samples=[];exit_receipts={}
     try:
         while time.monotonic()-started<600:
             current={j.job_id:j for j in client.store.list_jobs()};first=current.get(anchor.job_id)
@@ -136,7 +160,12 @@ def main():
                 joined=True
             if any(j.status in {JobStatus.FAILED,JobStatus.CANCELLED} for j in current.values()):raise RuntimeError('candidate failed; inspect preserved execution logs')
             samples.append({'seconds':time.monotonic()-started,'jobs':{j.baseline_model_id:{'status':j.status.value,'step':j.metadata.get('runtime_global_step',0)} for j in current.values()}})
-            if joined and len(current)==3 and all(j.status==JobStatus.COMPLETED for j in current.values()):break
+            if joined and len(current)==3 and all(j.status==JobStatus.COMPLETED
+                    and service.supervisor.has_reaped_process(j.job_id)
+                    and not service.supervisor.has_live_process(j.job_id)
+                    and service.supervisor.observed_exit_code(j.job_id)==0 for j in current.values()):
+                exit_receipts={j.job_id:service.supervisor.observed_exit_code(j.job_id) for j in current.values()}
+                break
             time.sleep(.1)
         else:raise TimeoutError('slow-start preflight exceeded ten-minute cap')
     except BaseException:error=traceback.format_exc()
@@ -149,22 +178,47 @@ def main():
             service.supervisor.shutdown()
         service.stop()
         events=client.store.list_events();save(root/'events.json',events);save(root/'timeline.json',samples)
+        save(root/'admission-controls.json',{'commands':admission_commands,'pauses':admission_pauses})
     if error:
         save(root/'verification.json',{'complete':False,'error':error,'scheduler_commit':a.scheduler_commit});raise RuntimeError(error)
     completed=[]
     for job in client.store.list_jobs():
         state=torch.load(root/job.baseline_model_id/'working/shared_training/training_state.pt',map_location='cpu',weights_only=False)
         assert state['global_step']==256 and all(int(v['step'])==256 for v in state['optimizer_state']['state'].values())
-        completed.append({'name':job.baseline_model_id,'updates':state['global_step'],'status':job.status.value})
+        assert exit_receipts.get(job.job_id)==0,'successful worker exit was not observed'
+        completed.append({'name':job.baseline_model_id,'updates':state['global_step'],'status':job.status.value,
+                          'worker_exit_observed':True,'worker_exit_code':exit_receipts[job.job_id]})
     trials=[e for e in events if e['event_type']=='colocation_trial_started']
     windows=[e['payload'] for e in events if e['event_type']=='trial_step_window' and e['payload'].get('complete')]
     assert trials and windows,'test did not exercise real overlap measurements'
     assert any(w['elapsed_seconds']>1 for w in windows),'slow-input regression condition was not reached'
-    assert len(trials)<=9,'admission retries exceeded three attempts per candidate'
-    assert not any(e['event_type']=='cold_start_phase' and e['payload']['phase'] in ['reference','reference_barrier'] for e in events),'unexpected exclusive solo profiling'
+    # Three candidates and at most two distinct retirements per candidate:
+    # the retry bound includes the reviewed retirement recovery mechanism.
+    assert len(trials)<=27,'admission retries exceeded the finite cohort bound'
+    assert not any(e['event_type']=='cold_start_phase' and e['payload']['phase'] not in
+        ['prepare','pre_add','overlap_warmup','measure_overlap'] for e in events),'unexpected non-add-only profiling phase'
+    incumbent_steps={}
+    for command in admission_commands:
+        if not command['candidate'] and isinstance(command['step'],int):
+            incumbent_steps.setdefault((command['trial_id'],command['job_id']),[]).append(command['step'])
+    assert any(max(values)>min(values) for values in incumbent_steps.values()),'no incumbent progress observed during admission'
+    decisions=[e['payload'] for e in events if e['event_type']=='cold_start_trial_decided']
+    scored=[d for d in decisions if d.get('admission_policy')=='add_only_bounded_interference_v1'
+        and d.get('objective')=='bounded_incumbent_interference' and d.get('incumbent_step_time_ratios')
+        and d.get('common_measurement_interval',{}).get('finished_at',0)>
+            d.get('common_measurement_interval',{}).get('started_at',0)]
+    assert scored and any(w.get('kind')=='measure_overlap' for w in windows),'new admission scorer did not execute on real overlapping windows'
+    threshold=settings.gpu_scheduler.colocation.cold_start_max_incumbent_slowdown_fraction
+    assert all(d.get('max_incumbent_slowdown_fraction')==threshold for d in scored)
+    incumbent_yields=sum(not c['candidate'] and c['action']=='yield' for c in admission_commands)
+    incumbent_pauses=sum(p['job_id']!=p['candidate_job_id'] for p in admission_pauses)
+    assert incumbent_yields==incumbent_pauses==0,'admission interrupted an incumbent'
     result={'complete':True,'scheduler_commit':a.scheduler_commit,'scope':'integration/liveness; not performance or predictor accuracy',
         'student':'S_A10','student_sha256':predictor.artifact_hash,'actual_gpu':initial,'test_only_target_override':a.local_rtx_test,
         'cancer_checks':cancer_checks,'cpu_inference_calls':cpu_calls,
+        'admission_policy':'add_only_bounded_interference_v1','incumbent_yields':incumbent_yields,
+        'max_incumbent_slowdown_fraction':threshold,'scored_overlap_decisions':len(scored),
+        'incumbent_admission_pauses':incumbent_pauses,'candidate_rollback_count':len(admission_pauses),
         'jobs':completed,'manual_pause_step':paused_state['global_step'],'resumed':resume_sent,
         'trial_count':len(trials),'completed_measurement_windows':len(windows),'longest_window_seconds':max(w['elapsed_seconds'] for w in windows),
         'pause_count':sum(e['event_type']=='job_paused' for e in events),'exclusive_profile_phases':0,'elapsed_seconds':time.monotonic()-started,

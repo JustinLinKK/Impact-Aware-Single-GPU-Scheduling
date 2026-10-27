@@ -113,7 +113,7 @@ def test_replay_choice_ignores_age_but_retains_explicit_priority():
     assert _time_aware_choice(replace(problem, jobs=swapped), swapped, 10000).members[0].job_id == "b"
 
 
-def test_busy_indicator_prefers_heavy_idle_and_light_joining(tmp_path):
+def test_scalar_busy_helper_ranks_but_cooperative_fallback_requires_bound_profile(tmp_path):
     _, _, planner, jobs = setup(tmp_path)
     class Predictor:
         available = True
@@ -124,12 +124,13 @@ def test_busy_indicator_prefers_heavy_idle_and_light_joining(tmp_path):
     planner.predicted_remaining_runtime_seconds = lambda job, **kwargs: None
     for j in jobs: j.metadata["trial_allocator_supported"] = True
     idle = planner.choose_plan(jobs[:2], backend_available={"cuda_process": True})
-    assert idle.job_ids == ("b",)
+    assert planner.estimator.workload_rank(jobs[1], prefer_high=True) < planner.estimator.workload_rank(jobs[0], prefer_high=True)
+    assert idle.job_ids == ("a",)
     joining = planner.choose_plan(jobs[:2], active_jobs=jobs[2:], backend_available={"cuda_process": True})
     assert joining.job_ids == ("a",)
-    # Ordering hints nominate work; measured timing still decides trial gain.
+    # An unbound scalar or a nominal duration cannot override original FIFO.
     planner.predicted_remaining_runtime_seconds = lambda job, **kwargs: {"a": 1, "b": 10}[job.job_id]
-    assert planner.choose_plan(jobs[:2], backend_available={"cuda_process": True}).job_ids == ("b",)
+    assert planner.choose_plan(jobs[:2], backend_available={"cuda_process": True}).job_ids == ("a",)
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -1, 101, "unknown"])

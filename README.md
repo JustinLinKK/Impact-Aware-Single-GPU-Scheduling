@@ -8,10 +8,10 @@ disabled by default and is not part of scheduling, admission, or execution.
 
 - a single-GPU scheduler with priority queueing, safe-point pause/resume, persistence, and restart recovery
 - a RAM-backed baseline-model cache with optional LRU entry-capacity and RAM-percent limits that keeps immutable CPU-side baselines warm and serves isolated copies to worker subprocesses
-- time-aware GPU packing that chooses ready jobs and batch sizes inside one preset process backend from predicted completion time and compatibility evidence, with average VRAM used only as a safety gate
+- incremental GPU packing with predicted workload ordering, VRAM filtering, and live interference checks inside one configured process backend
 - Linux overlap on a configured non-exclusive backend, admitted incrementally by the time-aware policy
 - reserved exclusive five-option calibration that persists timing and VRAM measurements for time-aware planning
-- one-epoch cooperative addition trials that acquire missing profiles while preserving training progress
+- cooperative add-only trials that preserve incumbent execution and newcomer training progress
 - optional hardware-selected PerfSeer student prediction, with CPU-only
   TorchScript inference and per-job branch-profile fallback
 
@@ -181,54 +181,64 @@ python -m localml_scheduler.examples.demos bridge
 
 ## Cold-start addition trials
 
-An eligible cooperative runner starts on the configured packing backend even
-without profiles. The scheduler admits one provisional newcomer at a time,
-keeps its requested physical batch, and persists preparation, pre-add timing,
-overlap measurement and the decision. With valid released predictions for every
-member, CPU-generated virtual profiles replace per-job exclusive profiling:
-rounded peak VRAM controls initial fit, and step cost supplies fixed work weights.
-The trial skips solo-reference phases entirely. Predictions remain labelled as
-predicted evidence. Partial/unsupported predictions use the existing measured
-reference fallback; explicitly requested probes and unsupported runners keep
-their existing exclusive path.
+The default cooperative policy keeps the running group intact and tries **one
+newcomer at a time**. CPU predictions replace mandatory exclusive profiling for
+candidate selection: rounded peak VRAM filters fit within the 90% device budget,
+and predicted busy ranks heavier idle-GPU anchors and lighter additions.
+Submission time chooses the oldest job within a comparable busy group.
+Predicted time and busy are relative indicators, not measured seconds, additive
+GPU capacity, or numerical weights in an admission score.
 
-`gpu_scheduler.colocation.trial_epochs` defaults to **1**. A new worker first
-acknowledges its current preparation token, so an old readiness flag cannot
-start a trial. Timing windows collect two warmup updates and two complete halves
-of at least eight measured updates in total, targeting at least one second or
-64 updates. Slow steps do not discard an incomplete window after one second.
-Timeouts use observed step durations, with a separate 300-second absolute trial
-limit; the predictor's relative time indicator never controls a wall-clock timer.
-The candidate's optimizer-step allowance also lets a trial cross an epoch boundary.
+The newcomer acknowledges a fresh preparation token and waits while incumbents
+continue training. The scheduler records their natural pre-add step rates, then
+releases the newcomer and records overlap rates. Each observation has two
+timing halves, warmup updates, and phase-clean measurements that
+exclude validation/checkpoint time. No incumbent is yielded or paused for this
+comparison. Natural membership changes invalidate the comparison; surviving
+workers continue, and the newcomer alone can be held for fresh evidence.
+Overlap timing starts only after every member demonstrates productive progress.
+Stale fast-job windows are refreshed when they do not overlap the slower members'
+measurement intervals; startup delay cannot masquerade as low interference.
+These checks require the shared wrapper's runtime identity and non-update phase
+counter. A custom cooperative runner without that evidence can run alone, but
+cannot establish phase-clean add-only admission from ordinary step logs.
 
-In the prediction-first path, the decision compares
-`sum(predicted_step_cost / observed_step_seconds)` after versus before joining,
-using one frozen model/hardware scale. The active group supplies the short
-pre-add window; the newcomer then joins directly. This measures predicted-work
-throughput, not exact completion-time gain. No predicted cost is saved as a measured
-time profile. Actual observations can later refine memory and timing estimates.
+The default **add-only bounded-interference** policy requires productive newcomer
+progress and no more than **10% observed step-time slowdown for any incumbent in
+either half**. This tolerance is an experimental protection choice, not a
+mathematical estimate of total-time savings. Missing/noisy evidence cannot become
+a fabricated solo rate. If the addition is rejected or inconclusive, only the
+newcomer checkpoints and requeues; its completed updates are preserved.
+The limit compares each addition with the current pack, not with each job's
+original solo speed; successive accepted additions can compound slowdown.
 
-In the measurement fallback, complete timing evidence uses the drain objective.
-If epoch totals or subgroup timings are missing, it uses normalized throughput:
-`sum(solo_step_seconds / observed_step_seconds)` after versus before admission.
-Both halves must improve by `colocation.cold_start_gain_margin` (default 0.03).
-Both deteriorating halves reject; incomplete or borderline evidence is
-inconclusive. Inherited subgroup rates are not a verified completion forecast.
-Only a rejected/inconclusive newcomer checkpoints and requeues; another
-candidate or changed membership may still be tried. Solo references and packed
-windows are stored separately; inconclusive windows do not create bad profiles.
+A trial has a 600-second absolute deadline and cannot extend the job's original
+optimizer-update budget. Readiness, slow-input measurement windows, checkpoint
+serialization, and worker teardown have distinct evidence. A candidate whose
+process is still exiting blocks another admission until it is physically gone.
+The scheduler can grow beyond three concurrent jobs when memory and interference
+checks permit; it does not search combinations by pausing the current group.
+
+Without the newcomer's solo timing, these observations cannot prove which
+arrangement minimizes makespan. A 10% limit can reject some beneficial overlaps
+and accept some unhelpful ones. Total completion time is assessed in a separate
+matched replay, including validation, artifacts, checkpoints, and successful
+worker exits. The optional completion-proxy research implementation collects
+additional subgroup timing and is not the default add-only admission path.
 
 Retries have a 30-second cooldown and finite limits: two failed attempts for one
-group and three for one candidate. A candidate that exhausts these attempts gets
-a solo turn, preventing repeated checkpoint/restart overhead and starvation.
-Workers retain their process handles until they have actually exited; a draining
-worker blocks a new admission. These limits are configurable under
-`gpu_scheduler.colocation.cold_start_*`.
+group and three for a candidate's current set of competing jobs. An exhausted
+candidate waits for a natural solo opportunity. Its earlier failures do not veto
+new additions once it becomes the running anchor. An exhausted, unheld queued
+job can receive a fresh three-attempt budget only after every incumbent from its
+failed trials and its own worker have exited with positive supervisor evidence.
+Each renewal consumes new retirement evidence once; exact-group blocks,
+cooldowns, and lifetime failures persist. Missing evidence after restart remains
+conservative. Limits are configurable under `gpu_scheduler.colocation.cold_start_*`.
 
-The [October 27 verification receipt](verification/admission-work-ranking-20261027.json)
-records the lifecycle regressions, CPU student inference, real-image cancer
-training and three-job pause/resume/overlap check. These integration checks do
-not establish a scheduling speedup; that requires the matched A10 replay.
+The [earlier October 27 receipt](verification/admission-work-ranking-20261027.json)
+records tests for the preceding policy. The add-only revision requires its own
+integration checks and matched A10 replay; unit tests do not establish speedup.
 
 Generated PyTorch scripts must call `script_scheduler_context()` inside their
 entrypoint before allocating CUDA memory, restore the returned context's
@@ -236,8 +246,11 @@ checkpoint, and use `TrainingControlHook.safe_point` after complete optimizer
 updates. The helper is inactive outside scheduled execution. Preserve model,
 optimizer, scaler, LR scheduler, all RNG state, and the exact data position.
 [`examples/cold_start_runner.py`](examples/cold_start_runner.py) demonstrates
-this contract, including resumable partial epochs. Generation/review checks
-require these hooks; printed epoch logs provide telemetry only.
+basic checkpoint and safe-point control, including resumable partial epochs.
+For the complete add-only timing contract, use the
+[shared training wrapper](docs/shared-training-wrapper.md), which supplies runtime
+identity and phase counters automatically. Generation/review checks require
+these hooks; printed epoch logs provide telemetry only.
 
 Temporary yields retain Python, CUDA, optimizer, and iterator state and carry
 renewable owner/expiry leases. The controller polls at 50 ms while a trial is
@@ -360,8 +373,9 @@ When this block is absent, the scheduler tries the job source with
 propagation run in a timed subprocess with GPU visibility disabled. An
 unsupported source, timeout, or invalid result falls back only that job.
 
-There is one production placement mode: `parallel_time_aware`. Its objective is
-verified drain-time gain, never GPU-memory utilization. Predicted average used
+There is one production placement mode: `parallel_time_aware`. The default cooperative
+path uses add-only bounded-interference trials; the older measured-profile path
+uses drain-time estimates. Neither path maximizes memory utilization. Predicted average used
 VRAM in MiB (`avg_vram_mb`) is only a hard admission constraint. Device-level
 memory is averaged over a time window: sustained use at the stop threshold
 closes only new packed admission, and active work continues normally. Admission
@@ -379,14 +393,14 @@ exclusive fallback or fails; it never silently changes to packed
 
 ## Time-aware scheduling
 
-With a released student, `parallel_time_aware` uses predicted busy **ordering**
-to choose a heavier idle-GPU anchor and lighter joining candidates. Within equal
-busy hints, it prefers lower `epoch_cost × remaining_epochs`. Missing hints sort
-after available hints; measured remaining time, explicit priority and job ID
-provide fallbacks. Without predictor hints it uses measured remaining runtime.
-Submission time and waiting duration do not override that ordering. Each addition
-must pass scheduling class, backend and pair compatibility, live-admission, batch-option, and
-predicted average-VRAM checks before any concurrent work begins.
+With a released student, `parallel_time_aware` filters candidates by backend,
+compatibility, and VRAM feasibility, then groups their predicted busy indicators
+into strict five-point bands. It prefers heavier bands for an idle-GPU anchor
+and lighter bands for a joining candidate. Within the chosen band it uses
+original submission time, then stable job ID. Rejection and checkpoint resume do
+not reset age. There is no incumbent preemption for admission or fairness.
+This FIFO tie-break reduces overtaking among comparable jobs; it is not a strict
+maximum-wait guarantee across different busy bands.
 
 `gpu_scheduler.scheduler_decision_mode` selects the trial ordering layer:
 
@@ -607,31 +621,20 @@ The normal pause flow is:
 
 ### Admission ranking and memory boundaries
 
-Submission timestamps, elapsed waiting time, and queue sequence do not influence
-admission ranking. Static explicit priority selects the bounded candidate window;
-workload indicators nominate feasible work. With complete matching student
-profiles, cooperative cold-start admission groups feasible candidates whose busy
-indicators are less than five points from the group's highest value (idle GPU)
-or lowest value (joining). Within each group, higher relative step cost chooses
-the idle anchor and lower relative step cost chooses a joining candidate.
-Remaining epoch cost, measured time, explicit priority and stable ID break ties.
-This five-point grouping is a ranking heuristic, not a calibrated confidence
-interval; step cost is relative wall-step work, not FLOPs or GPU occupancy.
-It avoids letting tiny near-ceiling busy differences outweigh large work-cost
-differences. Missing or incompatible profiles retain the prior busy/remaining-cost
-ordering. Known indicators precede unknown; invalid predictions never mean zero
-work. The backend-aware path retains its profile-quality, Pareto-risk,
-gain, confidence, uncertainty and headroom ordering before this final priority/
-workload/identity tie-break. Busy is an ordering hint, not additive GPU capacity.
-Final acceptance uses live predicted-work throughput (or measured drain gain
-when using the measurement fallback), not the busy score itself.
+The complete matching student path uses **VRAM feasibility → busy band →
+original submission time → stable ID**. Bands are anchored at the highest busy
+value for an idle anchor or the lowest for an addition; members differ from that
+anchor by strictly less than five points. Predicted step cost and remaining cost
+do not precede FIFO within a band. The five-point grouping is an exploratory
+ranking heuristic, not a calibrated uncertainty interval. Invalid predictions
+never mean zero workload, and busy is not additive GPU occupancy.
 
-The historical `PriorityFifoPolicy` name and aging/oldest-window/starvation-time
-configuration fields remain accepted for compatibility, but cannot promote or
-reserve an old job. Operational timestamps remain for arrival availability,
-leases, timeouts, progress, and reporting. The original v2 research proposal
-contains historical waiting/fairness ideas; those ideas are not the runtime
-admission rules described here.
+The default cooperative path admits by observed incumbent interference and
+newcomer progress. Legacy measured-profile and backend-aware paths retain their
+own evidence and risk checks. Operational timestamps also control arrival
+availability, leases, timeouts, and progress reporting. Restoring FIFO does not
+enable priority preemption or silently turn historical aging settings into a
+hard starvation guarantee.
 
 The default predicted budget and live stop threshold are both 90% of total VRAM.
 A live sample at or above 90% immediately stops further admission. The 85%

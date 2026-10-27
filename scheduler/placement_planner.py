@@ -1,7 +1,8 @@
 """Incremental time-aware GPU placement planning.
 
-VRAM is a feasibility constraint in this module. It is never an objective to
-maximize; placement value comes exclusively from projected/measured drain time.
+VRAM is a feasibility constraint. Cooperative admission orders feasible jobs by
+predicted busy bands and FIFO, then validates live incumbent interference.
+Legacy measured-profile placement retains its projected drain-time objective.
 """
 
 from __future__ import annotations
@@ -69,14 +70,18 @@ class PlacementPlanner:
         return int(job.priority)
 
     def _time_aware_window(self, jobs: list[TrainingJob], *, now: datetime) -> tuple[list[TrainingJob], TrainingJob | None]:
-        """Bound candidates by static priority; arrival/wait time never rank jobs."""
+        """Preserve all cooperative candidates for feasibility/busy/FIFO ranking."""
         probe_feature_enabled = self.settings.gpu_scheduler.exclusive_probe.enabled
         normal_jobs = [job for job in jobs if job.scheduling_class == SchedulingClass.NORMAL
                        or (job.scheduling_class == SchedulingClass.EXCLUSIVE_PROBE and not probe_feature_enabled)]
-        priority = sorted(normal_jobs, key=lambda job: (-int(job.priority), job.job_id))[
+        # Cooperative admission applies feasibility/busy/FIFO before selection;
+        # an upstream static-priority window must not hide eligible older jobs.
+        cooperative = [job for job in normal_jobs if job.metadata.get("cooperative_trial")]
+        priority = sorted([job for job in normal_jobs if not job.metadata.get("cooperative_trial")],
+                          key=lambda job: (-int(job.priority), job.job_id))[
             : self.settings.gpu_scheduler.priority_window_size]
         probes = [job for job in jobs if probe_feature_enabled and job.scheduling_class == SchedulingClass.EXCLUSIVE_PROBE]
-        window = sorted([*priority, *probes], key=lambda job: (-int(job.priority), job.job_id))
+        window = sorted([*cooperative, *priority, *probes], key=lambda job: (-int(job.priority), job.job_id))
         return window, None
 
     def _fastest_time_option(self, job: TrainingJob, backend_name: str):

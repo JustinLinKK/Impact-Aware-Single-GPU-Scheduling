@@ -9,6 +9,13 @@ import torch
 from ..domain import SafePointType, utc_now
 
 
+def _phase_proof(metadata):
+    identity = metadata.get("runtime_completion_identity")
+    counter = metadata.get("runtime_nonupdate_phase_counter")
+    return (identity if isinstance(identity, str) and identity.strip() else None,
+            counter if isinstance(counter, int) and not isinstance(counter, bool) and counter >= 0 else None)
+
+
 def configure_trial_memory(context):
     """Limit the PyTorch allocator before a cooperative runner builds its model."""
     allowance = context.job.metadata.get("trial_memory_limit_mb")
@@ -47,6 +54,7 @@ class StepTrialControlMixin:
             job = self.store.get_job(self.job.job_id)
             state["command"] = dict((job.metadata if job else {}).get("trial_step_command") or {})
             state["trial"] = dict((job.metadata if job else {}).get("colocation_trial") or {})
+            state["total_optimizer_updates"] = (job.metadata if job else {}).get("runtime_total_optimizer_updates")
             state["poll_at"] = now + 0.05
         if now >= state["publish_at"] or safe_point_type != SafePointType.STEP or epoch != state.get("published_epoch"):
             updates = {
@@ -78,6 +86,12 @@ class StepTrialControlMixin:
             at_boundary = (
                 command.get("candidate") and command.get("action") == "measure"
                 and global_step >= int(command.get("target_step") or 2**63)
+                and global_step < int(state.get("total_optimizer_updates") or 2**63)
+                # Complete this epoch's validation/checkpoint before enforcing
+                # the update budget at the wrapper's post-EPOCH MANUAL point.
+                and safe_point_type != SafePointType.EPOCH
+                and not (safe_point_type == SafePointType.STEP and steps_per_epoch
+                         and global_step % steps_per_epoch == 0)
             )
             reference_done = command.get("kind") == "reference" and state.get("complete") and state.get("token") == command.get("token")
             if command.get("action") != "yield" and not preparing and not at_boundary and not reference_done:
@@ -91,7 +105,28 @@ class StepTrialControlMixin:
                     self.event_logger.emit("trial_worker_released", job_id=self.job.job_id, payload={"token": state.pop("yield_token"), "yield_seconds": duration, "global_step": global_step})
                 state["yield_token"] = token
                 state["yield_started"] = time.monotonic()
-                self.store.update_job(self.job.job_id, metadata_updates={"trial_yield_ack": token})
+                snapshot_job = self.store.get_job(self.job.job_id)
+                snapshot_metadata = snapshot_job.metadata if snapshot_job else {}
+                # A completion comparison needs one exact safe-point snapshot;
+                # ordinary progress publication above is deliberately throttled.
+                self.store.update_job(self.job.job_id, metadata_updates={
+                    "trial_yield_ack": token,
+                    "trial_yield_snapshot": {
+                        "token": token, "owner": command.get("owner"),
+                        "global_step": global_step, "steps_per_epoch": steps_per_epoch,
+                        "completed_epochs": epoch, "observed_at": time.time(),
+                        "completion_identity": snapshot_metadata.get("runtime_completion_identity"),
+                        "total_optimizer_updates": snapshot_metadata.get("runtime_total_optimizer_updates"),
+                        "planned_epochs": snapshot_metadata.get("runtime_planned_epochs"),
+                        "checkpoint_completed_step": snapshot_metadata.get("runtime_checkpoint_completed_step", 0),
+                        "checkpoint_completed_epoch": snapshot_metadata.get("runtime_checkpoint_completed_epoch", 0),
+                        "final_checkpoint_complete": snapshot_metadata.get("runtime_final_checkpoint_complete", False),
+                        "finalization_complete": snapshot_metadata.get("runtime_finalization_complete", False),
+                    },
+                    "runtime_global_step": global_step,
+                    "runtime_steps_per_epoch": steps_per_epoch,
+                    "last_completed_epoch": epoch,
+                })
                 self.event_logger.emit("trial_worker_yielded", job_id=self.job.job_id, payload={"token": token, "global_step": global_step})
             external = self.control_plane.read_command(self.job.job_id)
             if external.action in {"pause", "cancel"}:
@@ -112,6 +147,11 @@ class StepTrialControlMixin:
             state.update({"token": command.get("token"), "start_step": global_step,
                           "command_started": time.perf_counter(), "samples": [], "complete": False,
                           "block_step": global_step + 2, "block_started": None})
+        if command.get("action") == "measure" and not state["complete"] and safe_point_type != SafePointType.STEP:
+            # A window spanning validation/checkpoint work cannot also be used
+            # as a training-only rate with separately charged phase reserves.
+            state.update({"start_step": global_step, "command_started": time.perf_counter(),
+                          "samples": [], "block_step": global_step + 2, "block_started": None})
         if command.get("action") == "measure" and not state["complete"] and safe_point_type == SafePointType.STEP:
             if global_step >= state["start_step"] + 2 and state["block_started"] is None:
                 self._trial_sync()
@@ -119,6 +159,9 @@ class StepTrialControlMixin:
                 state["block_step"] = global_step
                 state["measurement_step"] = global_step
                 state["measurement_started_at"] = time.time()
+                measured_job = self.store.get_job(self.job.job_id)
+                identity, counter = _phase_proof(measured_job.metadata if measured_job else {})
+                state["measurement_identity"], state["measurement_phase_counter"] = identity, counter
                 self.store.update_job(self.job.job_id, metadata_updates={"trial_measurement_progress": {
                     "token": command["token"], "started_at": state["measurement_started_at"],
                     "global_step": global_step,
@@ -127,6 +170,12 @@ class StepTrialControlMixin:
             elif state["block_started"] is not None and global_step - state["block_step"] >= 4:
                 self._trial_sync()
                 finished = time.perf_counter()
+                measured_job = self.store.get_job(self.job.job_id)
+                identity, phase_counter = _phase_proof(measured_job.metadata if measured_job else {})
+                if phase_counter != state["measurement_phase_counter"] or identity != state["measurement_identity"]:
+                    state.update({"start_step": global_step, "command_started": finished,
+                                  "samples": [], "block_step": global_step + 2, "block_started": None})
+                    return True  # A directly observed non-update phase invalidated this window.
                 count = global_step - state["block_step"]
                 state["samples"].append((finished - state["block_started"]) / count)
                 state["block_started"], state["block_step"] = finished, global_step
@@ -149,6 +198,8 @@ class StepTrialControlMixin:
                         "samples": samples, "steps": steps, "start_step": state["measurement_step"],
                         "end_step": global_step, "elapsed_seconds": elapsed, "finished_at": utc_now(),
                         "started_at": state["measurement_started_at"],
+                        "nonupdate_phase_counter": state["measurement_phase_counter"],
+                        "excludes_nonupdate_phases": identity is not None and phase_counter is not None,
                     }
                     self.store.update_job(self.job.job_id, metadata_updates={"trial_step_window": window})
                     self.event_logger.emit("trial_step_window", job_id=self.job.job_id, payload=window)

@@ -55,42 +55,27 @@ def test_predicted_peak_rejection_cannot_be_bypassed_by_exclusive_fallback(tmp_p
 
 @pytest.mark.parametrize("scale", [.001, 1, 1000])
 @pytest.mark.parametrize("overlap,expected", [(1.1, "accepted"), (3., "rejected")])
-def test_online_trial_skips_all_solo_reference_phases_and_never_saves_synthetic_time(tmp_path, scale, overlap, expected):
-    settings, store, planner, jobs = setup(tmp_path)
-    planner.estimator.ml_predictor = virtual_predictor(scale)
-    for job in jobs[:2]:
-        store.update_job(job.job_id, status=JobStatus.RUNNING, metadata_updates={
-            "trial_runner_ready": True, "runtime_steps_per_epoch": 100})
-    supervisor = Mock()
-    supervisor.active_job_ids.return_value = ["a", "b"]
-    supervisor.request_pause.return_value = True
-    service = SchedulerService(settings, store=store, supervisor=supervisor)
-    service.planner.estimator.ml_predictor = planner.estimator.ml_predictor
-    plan = planner.choose_plan([jobs[1]], active_jobs=[jobs[0]], backend_available={"cuda_process": True})
-    trial = service._prepare_colocation_trial(plan, jobs[1])
-    store.update_job("b", metadata_updates={"trial_yield_ack": store.get_job("b").metadata["trial_step_command"]["token"]})
-    def window(name, seconds):
-        token = store.get_job(name).metadata["trial_step_command"]["token"]
-        store.update_job(name, metadata_updates={"trial_step_window": {
-            "token": token, "complete": True, "halves": [seconds, seconds]}})
-    with patch.object(service, "_save_cold_reference", side_effect=AssertionError("no solo profile writes")), \
-         patch.object(service.planner.time_objective, "estimate_gain", side_effect=AssertionError("no invented ETA")):
-        service._evaluate_colocation_trial()
-        assert trial.phase == "pre_add"
-        window("a", 1)
-        service._evaluate_colocation_trial()
-        assert trial.phase == "measure_overlap" and trial.cold_start["reference_queue"] == []
-        window("a", overlap)
-        window("b", overlap)
+def test_online_trial_uses_selected_measured_reference_and_never_synthetic_seconds(tmp_path, scale, overlap, expected):
+    from localml_scheduler.tests.test_completion_trials import fixture, start_measurements, measure_group, ack
+    _, store, _, service, trial = fixture(tmp_path)
+    for profile in trial.cold_start["predicted_work_profiles"].values():
+        profile["step_cost"] *= scale
+        profile["epoch_cost"] *= scale
+    with patch.object(service, "_save_cold_reference", side_effect=AssertionError("no synthetic profile writes")), \
+         patch.object(service.planner.time_objective, "estimate_gain", side_effect=AssertionError("no whole-epoch ETA")):
+        start_measurements(store, service, trial)
+        assert trial.cold_start["completion"]["measuring"] == ["b"]
+        measure_group(store, service, trial, seconds=1)
+        measure_group(store, service, trial, seconds=overlap)
+        ack(store, ["a", "b"])
         service._evaluate_colocation_trial()
     result = store.get_job("b").metadata["colocation_trial"]
     assert result["decision"] == expected
-    assert result["result"]["objective"] == "predicted_work_throughput"
-    assert result["result"]["solo_profile_measurements"] == 0
-    assert result["result"]["half_gains"] == pytest.approx([1.5/overlap]*2)
-    for job in jobs[:2]:
-        assert store.get_runtime_profile(job.packing.signature, resolved_batch_size=64, backend_name="cuda_process") is None
-        assert not store.get_job(job.job_id).metadata.get("trial_solo_reference")
+    assert result["result"]["objective"] == "modeled_completion_proxy_v1"
+    assert result["result"]["predictor_role"] == "ordering and VRAM guard only"
+    for name in ["a", "b"]:
+        assert store.get_runtime_profile(name, resolved_batch_size=64, backend_name="cuda_process") is None
+    assert not store.get_job("c").metadata.get("trial_step_command")
 
 
 def test_partial_or_mixed_artifact_profiles_use_existing_measurement_fallback(tmp_path):

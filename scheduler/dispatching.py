@@ -596,6 +596,7 @@ class DispatchMixin:
                         self._persist_scheduler_decision_state()
                         continue
                     runnable = [reserved]
+            runnable = self._refresh_cold_start_cohorts(runnable, active_job_ids)
             active_vram_mb = self._active_vram_occupancy()
             plan = self.planner.choose_plan(
                 runnable,

@@ -65,6 +65,10 @@ class WorkerSupervisor:
             settings, self.executor, backends=backends
         )
         self._groups: dict[str, PlacementGroupHandle] = {}
+        # Absence from a freshly constructed supervisor is not exit evidence.
+        # These receipts belong only to this supervisor and the latest launch.
+        self._reaped_job_ids: set[str] = set()
+        self._reaped_exit_codes: dict[str, int] = {}
 
     def _concurrency_enabled(self) -> bool:
         return bool(self.settings.gpu_scheduler.enabled)
@@ -154,6 +158,18 @@ class WorkerSupervisor:
         """Include a paused child's parent while it is still unwinding."""
         return any(worker.handle.process.poll() is None for group in self._groups.values()
                    for name, worker in group.workers.items() if name == job_id)
+
+    def has_reaped_process(self, job_id: str) -> bool:
+        """Whether this supervisor observed exit after the job's latest launch."""
+        return job_id in self._reaped_job_ids
+
+    def observed_exit_code(self, job_id: str) -> int | None:
+        """Return the observed exit code; missing evidence is not success."""
+        return self._reaped_exit_codes.get(job_id)
+
+    def _record_process_exit(self, job_id: str, returncode: int) -> None:
+        self._reaped_exit_codes[job_id] = returncode
+        self._reaped_job_ids.add(job_id)
 
     def placement_for(
         self,
@@ -297,6 +313,8 @@ class WorkerSupervisor:
         if backend is None:
             return decision
         for job in jobs:
+            self._reaped_job_ids.discard(job.job_id)
+            self._reaped_exit_codes.pop(job.job_id, None)
             self.control_plane.initialize_job(job.job_id)
             self.control_plane.clear_command(job.job_id)
         handles = backend.launch(jobs)
@@ -334,17 +352,19 @@ class WorkerSupervisor:
                         JobStatus.CANCELLED,
                         JobStatus.PAUSED,
                     }:
-                        if worker.handle.process.poll() is None:
+                        returncode = worker.handle.process.poll()
+                        if returncode is None:
                             continue  # Keep the process handle until real exit.
                         snapshots.append(
                             WorkerSnapshot(
                                 job_id=job_id,
                                 group_id=group_id,
                                 alive=False,
-                                returncode=worker.handle.process.poll(),
+                                returncode=returncode,
                                 reported_by="store",
                             )
                         )
+                        self._record_process_exit(job_id, returncode)
                         del group.workers[job_id]
                         continue
                     returncode = worker.handle.process.poll()
@@ -359,6 +379,7 @@ class WorkerSupervisor:
                             reported_by="process",
                         )
                     )
+                    self._record_process_exit(job_id, returncode)
                     del group.workers[job_id]
                     continue
                 returncode = worker.handle.process.poll()
@@ -373,6 +394,7 @@ class WorkerSupervisor:
                         reported_by="process",
                     )
                 )
+                self._record_process_exit(job_id, returncode)
                 del group.workers[job_id]
             self._refresh_group_shape(group_id)
         return snapshots
@@ -400,16 +422,20 @@ class WorkerSupervisor:
                 seen_processes.add(process.pid)
                 terminate_process_tree(process, timeout=2.0)
         self._groups = {}
+        self._reaped_job_ids.clear()
+        self._reaped_exit_codes.clear()
 
     def _refresh_group_shape(self, group_id: str) -> None:
         group = self._groups.get(group_id)
         if group is None:
             return
-        alive_workers = {
-            job_id: worker
-            for job_id, worker in group.workers.items()
-            if worker.handle.process.poll() is None
-        }
+        alive_workers = {}
+        for job_id, worker in group.workers.items():
+            returncode = worker.handle.process.poll()
+            if returncode is None:
+                alive_workers[job_id] = worker
+            else:
+                self._record_process_exit(job_id, returncode)
         group.workers = alive_workers
         group.fallback_order = [
             job_id for job_id in group.fallback_order if job_id in alive_workers

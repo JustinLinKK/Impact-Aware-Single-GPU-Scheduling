@@ -155,45 +155,16 @@ def test_origin_reuses_compatible_branch_profile_but_baseline_does_not(tmp_path,
     assert (profile is not None) == expected
 
 
-def test_state_machine_collects_missing_references_and_accepts(tmp_path):
-    settings, store, planner, jobs = setup(tmp_path)
-    active = jobs[:2]
-    for job in active:
-        store.set_job_status(job.job_id, JobStatus.RUNNING, reason="fixture")
-        store.update_job(job.job_id, metadata_updates={"trial_runner_ready": True})
-    supervisor = Mock()
-    supervisor.active_job_ids.return_value = ["a", "b"]
-    service = SchedulerService(settings, store=store, supervisor=supervisor)
-    plan = planner.choose_plan([jobs[1]], active_jobs=[jobs[0]], backend_available={"cuda_process": True})
-    trial = service._prepare_colocation_trial(plan, jobs[1])
-    assert trial.target_epoch == 1
-    store.update_job("b", metadata_updates={"trial_yield_ack": store.get_job("b").metadata["trial_step_command"]["token"]})
+def test_state_machine_collects_selected_measured_reference_without_predictor(tmp_path):
+    from localml_scheduler.tests.test_completion_trials import fixture, initial_pair_evidence, ack
+    _, store, _, service, trial = fixture(tmp_path)
+    trial.cold_start["predicted_work_profiles"] = {}
+    initial_pair_evidence(store, service, trial)
+    ack(store, ["a", "b"])
     service._evaluate_colocation_trial()
-    assert trial.phase == "pre_add"
-
-    def window(name, halves):
-        job = store.get_job(name)
-        token = job.metadata["trial_step_command"]["token"]
-        store.update_job(name, metadata_updates={"trial_step_window": {"token": token, "complete": True, "halves": halves}})
-
-    window("a", [1, 1])
-    service._evaluate_colocation_trial()
-    assert trial.phase == "reference_barrier"
-    for name in ("a", "b"):
-        token = store.get_job(name).metadata["trial_step_command"]["token"]
-        store.update_job(name, metadata_updates={"trial_yield_ack": token})
-    service._evaluate_colocation_trial()
-    assert trial.phase == "reference"
-    window("b", [1, 1])
-    service._evaluate_colocation_trial()
-    assert trial.phase == "measure_overlap"
-    window("a", [1.1, 1.1])
-    window("b", [1.1, 1.1])
-    service._evaluate_colocation_trial()
-    assert service._colocation_trial is None
     result = store.get_job("b").metadata["colocation_trial"]
     assert result["decision"] == "accepted"
-    assert result["result"]["objective"] == "normalized_throughput"
+    assert result["result"]["objective"] == "modeled_completion_proxy_v1"
     assert not store.get_job("a").metadata["trial_step_command"]
 
 
@@ -212,7 +183,7 @@ def test_controller_restart_releases_all_owned_yields(tmp_path):
     assert all(not store.get_job(job.job_id).metadata["trial_step_command"] for job in jobs[:2])
 
 
-def test_missing_subgroup_uses_throughput_without_calibration(tmp_path):
+def test_legacy_throughput_phase_cannot_substitute_for_add_only_evidence(tmp_path):
     settings, store, planner, jobs = setup(tmp_path)
     for index, job in enumerate(jobs):
         store.update_job(job.job_id, status=JobStatus.RUNNING, metadata_updates={
@@ -233,8 +204,8 @@ def test_missing_subgroup_uses_throughput_without_calibration(tmp_path):
         }})
     service._evaluate_colocation_trial()
     decision = store.get_job("c").metadata["colocation_trial"]
-    assert decision["decision"] == "accepted"
-    assert decision["result"]["objective"] == "normalized_throughput"
+    assert decision["decision"] == "inconclusive"
+    assert "identity changed or is missing" in decision["reason"]
     assert decision["target_epoch"] == 1
 
 
@@ -332,26 +303,32 @@ def test_concurrent_progress_preserves_controller_commands(tmp_path):
     assert all(metadata[f"{prefix}-{index}"] == index for prefix in ("controller", "worker") for index in range(30))
 
 
-def test_generated_script_submission_rejects_requeues_and_completes(tmp_path, monkeypatch):
+def test_shared_generated_script_rejects_injected_slowdown_requeues_and_completes(tmp_path, monkeypatch):
     import torch
     from localml_scheduler.client import SchedulerClient
-    from localml_scheduler.examples import cold_start_runner
+    from localml_scheduler.tests.fixtures import shared_training_candidate
     from localml_scheduler.domain import CheckpointPolicy
 
     settings = SchedulerSettings(runtime_root=tmp_path / "runtime", scheduler_poll_interval_seconds=0.05,
         graph_db={"enabled": False}, hardware_knowledge_graph={"enabled": False}, hardware_feature_db={"enabled": False},
         gpu_scheduler={"packing_backend": "cuda_process", "batch_probe_enabled": False,
+                       "colocation": {"cold_start_max_incumbent_slowdown_fraction": .10},
                        "memory": {"gpu_vram_gib": 32}})
     client = SchedulerClient(settings)
     baseline = tmp_path / "baseline.pt"
     torch.save({}, baseline)
     script = tmp_path / "generated.py"
-    script.write_text(Path(cold_start_runner.__file__).read_text())
+    source = Path(shared_training_candidate.__file__).read_text()
+    source = source.replace("EPOCHS = 2", "EPOCHS = 3").replace("return 64", "return 960")
+    source = source.replace("TrainingRecipe(BATCH_SIZE, 12, EPOCHS)", "TrainingRecipe(BATCH_SIZE, 240, EPOCHS)")
+    script.write_text(source)
     for name in ("incumbent", "newcomer"):
+        work = tmp_path / name
+        work.mkdir()
         client.submit(TrainingJob.create(
             "localml_scheduler.adapters.mlevolve_runner:run_mlevolve_script_job", name, str(baseline), job_id=name, max_epochs=3,
-            runner_kwargs={"script_path": str(script), "working_dir": str(tmp_path), "result_path": str(tmp_path / f"{name}.json"),
-                           "width": 16, "batch_size": 4, "steps_per_epoch": 240, "input_delay_seconds": 0.003},
+            runner_kwargs={"script_path": str(script), "working_dir": str(work), "result_path": str(work / "result.json"),
+                           "batch_size": 4},
             resource_requirements=ResourceRequirements(requires_gpu=False),
             packing=PackingSpec(eligible=True, signature=name, backend_allowlist=["cuda_process"]),
             checkpoint_policy=CheckpointPolicy(save_every_epoch=False, keep_last_n=5),
@@ -361,13 +338,24 @@ def test_generated_script_submission_rejects_requeues_and_completes(tmp_path, mo
     # This CPU lifecycle check supplies a simulated capacity and must not depend
     # on whether CUDA is hidden or another process occupies the host GPU.
     monkeypatch.setattr(service.telemetry_sampler, "sample", lambda: None)
-    monkeypatch.setattr("localml_scheduler.scheduler.cold_start.normalized_throughput", lambda *args: ("rejected", [0.6, 0.6]))
     monkeypatch.setattr(service.planner.time_objective, "estimate_gain", lambda *args, **kwargs: None)
+    measured_window = service._cold_window
+    def injected_incumbent_slowdown(job):
+        result = measured_window(job)
+        trial = service._colocation_trial
+        if result and trial and trial.phase == "measure_overlap" and job.job_id in trial.preexisting_job_ids:
+            # Fault injection only changes the measured slowdown; actual child
+            # optimizer progress, token, phase proof, interval, and resume all
+            # remain necessary to reach the production admission decision.
+            result = {**result, "halves": [value * 1.2 for value in trial.cold_start["add_only"]["pre_add"][job.job_id]]}
+        return result
+    monkeypatch.setattr(service, "_cold_window", injected_incumbent_slowdown)
     service.start(background=True)
     try:
         deadline = time.monotonic() + 25
         while time.monotonic() < deadline:
-            if all(job.status.is_terminal for job in client.store.list_jobs()):
+            if all(job.status.is_terminal and service.supervisor.has_reaped_process(job.job_id)
+                   for job in client.store.list_jobs()):
                 break
             time.sleep(0.05)
         else:
@@ -378,6 +366,12 @@ def test_generated_script_submission_rejects_requeues_and_completes(tmp_path, mo
     assert all(job.status == JobStatus.COMPLETED for job in jobs)
     pauses = client.store.list_events(event_type="job_paused")
     assert [event["job_id"] for event in pauses] == ["newcomer"]
+    decisions = client.store.list_events(event_type="cold_start_trial_decided")
+    scored = [event["payload"] for event in decisions
+              if event["payload"].get("objective") == "bounded_incumbent_interference"]
+    assert len(scored) == 1 and scored[0]["decision"] == "rejected"
+    assert scored[0]["incumbent_step_time_ratios"]["incumbent"] == pytest.approx([1.2, 1.2])
+    assert scored[0]["common_measurement_interval"]
     for job in jobs:
         saved = torch.load(job.latest_checkpoint_path, map_location="cpu", weights_only=False)["state"]
         assert saved["global_step"] == 720

@@ -154,6 +154,15 @@ class ResourceEstimator:
         return (*self.busy_rank(job, prefer_high=prefer_high, batch_size=batch_size),
                 cost is None, cost if cost is not None else 0.0)
 
+    def cooperative_busy_ranks(self, jobs, *, prefer_high, required_jobs=None):
+        """Only the strict busy-band ordinal is used by default admission.
+
+        The previous relative-work ranker remains a research helper. Its work
+        and remaining-cost values never precede original FIFO in this policy.
+        """
+        ranks = self.cooperative_work_ranks(jobs, prefer_high=prefer_high, required_jobs=required_jobs)
+        return None if ranks is None else {name: (rank[0],) for name, rank in ranks.items()}
+
     def predicted_profile(self, job: TrainingJob, batch_size: int | None = None) -> dict | None:
         """A virtual, hardware-bound profile; missing data stays unknown."""
         from math import isfinite

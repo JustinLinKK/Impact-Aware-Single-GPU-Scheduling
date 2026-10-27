@@ -76,7 +76,8 @@ def test_worker_collects_complete_slow_window_across_resumed_epoch(tmp_path, mon
 
 
 def test_stale_resume_ready_and_progress_cannot_start_measurement_deadline(tmp_path):
-    settings, store, _, service, trial = pending_trial(tmp_path)
+    from localml_scheduler.tests.test_completion_trials import fixture, window
+    settings, store, _, service, trial = fixture(tmp_path)
     trial.started_at = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
     store.update_job("b", metadata_updates={"trial_yield_ack": "old-launch-token"})
     service._evaluate_colocation_trial()
@@ -96,14 +97,10 @@ def test_stale_resume_ready_and_progress_cannot_start_measurement_deadline(tmp_p
     }})
     service._evaluate_colocation_trial()
     assert service._colocation_trial is trial  # More than the old two seconds.
-    publish_window(store, "a")
+    window(store, "a", 0.3)
     service._evaluate_colocation_trial()
-    assert trial.phase == "measure_overlap"
-    store.update_job("b", metadata_updates={"last_completed_epoch": 1, "runtime_global_step": 520})
-    publish_window(store, "a", 0.35)
-    publish_window(store, "b", 0.35)
-    service._evaluate_colocation_trial()
-    assert store.get_job("b").metadata["colocation_trial"]["decision"] == "accepted"
+    assert trial.phase == "completion_initial_barrier"
+    assert service._colocation_trial is trial
 
 
 def test_hung_first_step_has_absolute_bound_even_without_progress(tmp_path):
@@ -193,8 +190,11 @@ def test_inconclusive_retries_are_finite_across_groups_then_run_solo(tmp_path):
     assert original_key in current.metadata["cold_start_blocked_groups"]
     assert current.metadata["cold_start_solo_required"]
     solo = planner.choose_plan([store.get_job("a"), current], backend_available=available)
-    assert solo.job_ids == ("b",) and not solo.trial_metadata["requires_live_trial"]
-    assert planner.choose_plan([store.get_job("a")], active_jobs=[current], backend_available=available) is None
+    assert solo.job_ids == ("a",) and not solo.trial_metadata["requires_live_trial"]
+    solo = planner.choose_plan([current], backend_available=available)
+    assert solo.job_ids == ("b",)
+    current.status = JobStatus.RUNNING
+    assert planner.choose_plan([store.get_job("a")], active_jobs=[current], backend_available=available).job_ids == ("a",)
 
 
 @pytest.mark.parametrize("monitor_via_store", [False, True])
@@ -226,3 +226,9 @@ def test_cold_start_bounds_round_trip_and_reject_nonfinite_values():
     for value in (0, -1, float("nan"), float("inf")):
         with pytest.raises(ValueError):
             ColocationSettings(cold_start_trial_timeout_seconds=value)
+    for value in (.10, .50):
+        settings = ColocationSettings(cold_start_max_incumbent_slowdown_fraction=value)
+        assert ColocationSettings.from_dict(settings.to_dict()).cold_start_max_incumbent_slowdown_fraction == value
+    for value in (-1, 1, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            ColocationSettings(cold_start_max_incumbent_slowdown_fraction=value)

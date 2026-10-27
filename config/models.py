@@ -390,11 +390,13 @@ class ColocationSettings:
     min_gain: float = 1.0
     trial_epochs: int = 1
     cold_start_gain_margin: float = 0.03
+    cold_start_max_incumbent_slowdown_fraction: float = 0.10
     cold_start_prepare_timeout_seconds: float = 120.0
     cold_start_window_min_seconds: float = 1.0
     cold_start_window_timeout_min_seconds: float = 15.0
     cold_start_window_timeout_max_seconds: float = 120.0
-    cold_start_trial_timeout_seconds: float = 300.0
+    cold_start_trial_timeout_seconds: float = 600.0
+    cold_start_measurement_epoch_limit: int = 2
     cold_start_retry_cooldown_seconds: float = 30.0
     cold_start_max_group_attempts: int = 2
     cold_start_max_attempts: int = 3
@@ -412,6 +414,9 @@ class ColocationSettings:
         self.min_gain = float(self.min_gain)
         self.trial_epochs = int(self.trial_epochs)
         self.cold_start_gain_margin = float(self.cold_start_gain_margin)
+        self.cold_start_max_incumbent_slowdown_fraction = float(self.cold_start_max_incumbent_slowdown_fraction)
+        if not math.isfinite(self.cold_start_max_incumbent_slowdown_fraction) or not 0 <= self.cold_start_max_incumbent_slowdown_fraction < 1:
+            raise ValueError("colocation.cold_start_max_incumbent_slowdown_fraction must be finite in [0, 1)")
         if not 0 <= self.cold_start_gain_margin < 1:
             raise ValueError("colocation.cold_start_gain_margin must be in [0, 1)")
         for name in (
@@ -429,7 +434,7 @@ class ColocationSettings:
             self.cold_start_prepare_timeout_seconds, self.cold_start_window_timeout_max_seconds
         ):
             raise ValueError("colocation cold-start trial timeout must cover preparation and a window")
-        for name in ("cold_start_max_group_attempts", "cold_start_max_attempts"):
+        for name in ("cold_start_max_group_attempts", "cold_start_max_attempts", "cold_start_measurement_epoch_limit"):
             value = int(getattr(self, name))
             if value < 1:
                 raise ValueError(f"colocation.{name} must be at least 1")
@@ -488,11 +493,13 @@ class ColocationSettings:
             "min_gain": self.min_gain,
             "trial_epochs": self.trial_epochs,
             "cold_start_gain_margin": self.cold_start_gain_margin,
+            "cold_start_max_incumbent_slowdown_fraction": self.cold_start_max_incumbent_slowdown_fraction,
             **{name: getattr(self, name) for name in (
                 "cold_start_prepare_timeout_seconds", "cold_start_window_min_seconds",
                 "cold_start_window_timeout_min_seconds", "cold_start_window_timeout_max_seconds",
                 "cold_start_trial_timeout_seconds", "cold_start_retry_cooldown_seconds",
                 "cold_start_max_group_attempts", "cold_start_max_attempts",
+                "cold_start_measurement_epoch_limit",
             )},
             "trial_decision_timeout_seconds": self.trial_decision_timeout_seconds,
             "trial_evidence_timeout_min_seconds": self.trial_evidence_timeout_min_seconds,

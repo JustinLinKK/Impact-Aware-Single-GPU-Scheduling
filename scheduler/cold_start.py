@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from math import isfinite
 import time
 
 from ..domain import BatchResolution, JobStatus, RuntimeProfile, build_colocation_profile_key, utc_now
 from .planner_types import DispatchPlan
 from .resource_estimator import COOPERATIVE_BUSY_GROUP_WIDTH_PP
+from .add_only_trials import ADD_ONLY_POLICY, AddOnlyTrialMixin
 
 
 def reference_identity(job):
@@ -28,8 +29,7 @@ def cold_start_plan(planner, jobs, active, available, used_mb, *, mandatory, now
         return None
     # Supervisor membership includes workers while their checkpoint/exit drains.
     # Admitting against that transient group used to bypass the rejection key.
-    if any(job.status in {JobStatus.PAUSING, JobStatus.PAUSED, JobStatus.RECOVERABLE} or job.status.is_terminal
-           or job.metadata.get("cold_start_solo_required") for job in active):
+    if any(job.status in {JobStatus.PAUSING, JobStatus.PAUSED, JobStatus.RECOVERABLE} or job.status.is_terminal for job in active):
         return None
     if any(
         not job.metadata.get("cooperative_trial")
@@ -69,18 +69,12 @@ def cold_start_plan(planner, jobs, active, available, used_mb, *, mandatory, now
         candidates.append((job, key, config, batch))
     if not candidates:
         return None
-    work_ranks = planner.estimator.cooperative_work_ranks(
+    busy_ranks = planner.estimator.cooperative_busy_ranks(
         [item[0] for item in candidates], prefer_high=not active, required_jobs=active)
     ordered = []
     for job, key, config, batch in candidates:
-        if work_ranks is not None:
-            rank = work_ranks[job.job_id]
-        else:
-            remaining = planner.predicted_remaining_runtime_seconds(job, backend_name=backend)
-            rank = (planner.estimator.workload_rank(job, prefer_high=not active, batch_size=batch),
-                    remaining is None, remaining if remaining is not None else 0.0)
-        ordered.append(((not (not active and job.metadata.get("cold_start_solo_required")),
-                         *rank, -planner._effective_priority(job, now=now), job.job_id),
+        rank = busy_ranks[job.job_id] if busy_ranks is not None else (0,)
+        ordered.append(((*rank, original_submission_rank(job), job.job_id),
                         job, key, config))
     _, job, key, config = min(ordered, key=lambda item: item[0])
     profiles = {member.job_id: planner.estimator.predicted_profile(member)
@@ -96,6 +90,7 @@ def cold_start_plan(planner, jobs, active, available, used_mb, *, mandatory, now
         backend_config=config,
         trial_metadata={
             "cooperative_trial": True,
+            "admission_policy": ADD_ONLY_POLICY,
             "cold_start": bool(active),
             "requires_live_trial": bool(active),
             "preexisting_job_ids": [member.job_id for member in active],
@@ -105,15 +100,26 @@ def cold_start_plan(planner, jobs, active, available, used_mb, *, mandatory, now
         },
         objective_breakdown={"cold_start": bool(active), "gain": None,
                              "profile_origin": "predicted_workload" if profiles else "measurement_fallback",
-                             "candidate_ranking_policy": "cooperative_busy_groups_relative_work_v1" if work_ranks is not None else "legacy_workload_rank",
+                             "candidate_ranking_policy": "cooperative_busy_band_fifo_v1" if busy_ranks is not None else "fifo_missing_consistent_busy_profiles",
                              **({"busy_group_width_pp": COOPERATIVE_BUSY_GROUP_WIDTH_PP,
                                  "busy_group_basis": "heuristic; not predictive confidence or capacity",
-                                 "eligible_work_ranks": {name: list(rank) for name, rank in work_ranks.items()}}
-                                if work_ranks is not None else {}),
+                                 "eligible_busy_ranks": {name: list(rank) for name, rank in busy_ranks.items()}}
+                                if busy_ranks is not None else {}),
                              "candidate_memory_mib": planner.estimator.estimate_peak_vram_mb(job, BatchResolution.resolved_batch_size(job), backend)},
         mandatory_anchor_job_id=mandatory.job_id if mandatory else None,
         objective_version=settings.objective.objective_version,
     )
+
+
+def original_submission_rank(job):
+    """Resume/rejection never gives a job a newer FIFO timestamp."""
+    try:
+        submitted = datetime.fromisoformat(job.submitted_at)
+        if submitted.tzinfo is None:
+            submitted = submitted.replace(tzinfo=timezone.utc)
+        return submitted.timestamp()
+    except (TypeError, ValueError):
+        return float("inf")
 
 
 def cold_group_blocked(job, key, settings, now):
@@ -121,12 +127,25 @@ def cold_group_blocked(job, key, settings, now):
     attempt = (job.metadata.get("cold_start_group_attempts") or {}).get(key) or {}
     return bool(
         job.metadata.get("cold_start_solo_required")
-        or int(job.metadata.get("cold_start_failed_attempts", 0)) >= settings.cold_start_max_attempts
+        or cold_failure_cohort(job)["failed_attempts"] >= settings.cold_start_max_attempts
         or key in job.metadata.get("cold_start_blocked_groups", [])
         or int(attempt.get("failures", 0)) >= settings.cold_start_max_group_attempts
         or float(job.metadata.get("cold_start_retry_after", 0)) > now
         or float(attempt.get("retry_after", 0)) > now
     )
+
+
+def cold_failure_cohort(job):
+    """Legacy failures remain exhausted unless every failure has new proof."""
+    lifetime = int(job.metadata.get("cold_start_failed_attempts", 0))
+    cohort = job.metadata.get("cold_start_failure_cohort") or {}
+    return {
+        "generation": int(cohort.get("generation", 0)),
+        "failed_attempts": int(cohort.get("failed_attempts", lifetime)),
+        "incumbent_job_ids": list(cohort.get("incumbent_job_ids", [])),
+        "proof_complete": cohort.get("proof_complete", lifetime == 0) is True,
+        "retired_incumbent_job_ids": list(cohort.get("retired_incumbent_job_ids", [])),
+    }
 
 
 def normalized_throughput(references, pre_add, packed, candidate_id, margin):
@@ -153,7 +172,62 @@ def normalized_throughput(references, pre_add, packed, candidate_id, margin):
     return "inconclusive", gains
 
 
-class ColdStartTrialMixin:
+class ColdStartTrialMixin(AddOnlyTrialMixin):
+    def _refresh_cold_start_cohorts(self, jobs, active_job_ids):
+        """Renew an exhausted queued job only after its entire cohort retires.
+
+        Each renewal consumes at least one new terminal incumbent identity.
+        For a finite set of N other job identities there are at most N renewals,
+        each granting at most cold_start_max_attempts further failed trials.
+        Planning stays read-only; this service-side transition is durable before
+        choosing an anchor, and never changes an already protected live worker.
+        Exit proof is local to the supervisor generation, so a fresh supervisor
+        conservatively cannot renew credit based only on persisted statuses.
+        """
+        settings = self.settings.gpu_scheduler.colocation
+        has_live_process = getattr(self.supervisor, "has_live_process", None)
+        has_reaped_process = getattr(self.supervisor, "has_reaped_process", None)
+        if (not settings.live_trial_enabled or not callable(has_live_process) or not callable(has_reaped_process)
+                or self._colocation_trial is not None):
+            return jobs
+        refreshed = []
+        for snapshot in jobs:
+            # Re-read persisted credit even if a caller retained an old snapshot.
+            job = self.store.get_job(snapshot.job_id)
+            if job is None or not job.is_runnable():
+                continue
+            cohort = cold_failure_cohort(job)
+            incumbents = cohort["incumbent_job_ids"]
+            retired = set(cohort["retired_incumbent_job_ids"])
+            eligible = (
+                job.metadata.get("cooperative_trial")
+                and job.job_id not in active_job_ids and has_live_process(job.job_id) is False
+                and has_reaped_process(job.job_id) is True
+                and cohort["failed_attempts"] >= settings.cold_start_max_attempts
+                and cohort["proof_complete"] and bool(incumbents)
+                and all(isinstance(name, str) and name and name != job.job_id for name in incumbents)
+            )
+            if eligible and set(incumbents) - retired:
+                contributors = [self.store.get_job(name) for name in incumbents]
+                if all(member is not None and member.status.is_terminal
+                       and member.job_id not in active_job_ids and has_live_process(member.job_id) is False
+                       and has_reaped_process(member.job_id) is True
+                       for member in contributors):
+                    previous = cohort
+                    cohort = {"generation": previous["generation"] + 1, "failed_attempts": 0,
+                              "incumbent_job_ids": [], "proof_complete": True,
+                              "retired_incumbent_job_ids": sorted(retired | set(incumbents))}
+                    job = self.store.update_job(job.job_id, metadata_updates={
+                        "cold_start_failure_cohort": cohort, "cold_start_solo_required": False,
+                    })
+                    self.event_logger.emit("cold_start_cohort_retired", job_id=job.job_id, payload={
+                        "previous_cohort": previous, "next_generation": cohort["generation"],
+                        "lifetime_failed_attempts": int(job.metadata.get("cold_start_failed_attempts", 0)),
+                        "reason": "all contributing incumbents terminal; candidate and incumbent exits observed by current supervisor",
+                    })
+            refreshed.append(job)
+        return refreshed
+
     def _save_cold_reference(self, job, halves):
         self.store.update_job(job.job_id, metadata_updates={"trial_solo_reference": {
             "identity": reference_identity(job), "halves": halves, "at": time.time(),
@@ -212,7 +286,9 @@ class ColdStartTrialMixin:
                 action = "yield" if job.job_id == trial.candidate_job_id else "measure"
             elif phase == "reference":
                 action = "measure" if job.job_id == measuring else "yield"
-            elif phase == "measure_overlap":
+            elif phase == "completion_measure":
+                action = "measure" if job.job_id in (measuring or []) else "yield"
+            elif phase in {"overlap_warmup", "measure_overlap", "completion_provisional"}:
                 action = "measure"
             else:
                 action = "yield"
@@ -269,6 +345,8 @@ class ColdStartTrialMixin:
     def _finish_cold_start_trial(self, trial, decision, reason, result=None):
         candidate = self.store.get_job(trial.candidate_job_id)
         result = result or {}
+        result.setdefault("admission_policy", trial.cold_start.get("admission_policy", ADD_ONLY_POLICY))
+        failure_audit = {}
         for job_id in [*trial.preexisting_job_ids, trial.candidate_job_id]:
             job = self.store.get_job(job_id)
             if job is None:
@@ -280,10 +358,18 @@ class ColdStartTrialMixin:
             blocked = list(candidate.metadata.get("cold_start_blocked_groups") or [])
             attempts = dict(candidate.metadata.get("cold_start_group_attempts") or {})
             failures = int(candidate.metadata.get("cold_start_failed_attempts", 0))
+            cohort = cold_failure_cohort(candidate)
             settings = self.settings.gpu_scheduler.colocation
             retry_after = float(candidate.metadata.get("cold_start_retry_after", 0))
             if decision != "accepted":
                 failures += 1
+                cohort["failed_attempts"] += 1
+                original = trial.cold_start.get("admission_incumbent_job_ids")
+                valid_proof = (isinstance(original, list) and bool(original)
+                               and all(isinstance(name, str) and name and name != candidate.job_id for name in original))
+                cohort["proof_complete"] = cohort["proof_complete"] and valid_proof
+                cohort["incumbent_job_ids"] = sorted((set(cohort["incumbent_job_ids"])
+                    | set(original if valid_proof else []) | set(trial.preexisting_job_ids)) - {candidate.job_id})
                 retry_after = time.time() + settings.cold_start_retry_cooldown_seconds
                 # Keep both the planned and actual group identities. A worker
                 # draining mid-trial must not make its original key retryable.
@@ -297,17 +383,21 @@ class ColdStartTrialMixin:
                 "cold_start_blocked_groups": blocked,
                 "cold_start_group_attempts": attempts,
                 "cold_start_failed_attempts": failures,
+                "cold_start_failure_cohort": cohort,
                 "cold_start_retry_after": retry_after,
-                "cold_start_solo_required": failures >= settings.cold_start_max_attempts,
+                "cold_start_solo_required": cohort["failed_attempts"] >= settings.cold_start_max_attempts,
                 "colocation_trial": {**trial.to_dict(), "phase": "decide", "decision": decision, "reason": reason, "result": result},
                 "cold_trial_completed": True,
             })
-            if decision != "accepted" and not candidate.status.is_terminal:
+            failure_audit = {"lifetime_failed_attempts": failures, "failure_cohort": cohort}
+            if decision != "accepted" and not candidate.status.is_terminal and not candidate.hold:
                 if self.supervisor.request_pause(candidate.job_id, reason=reason, hold=False):
                     self.store.update_job(candidate.job_id, status=JobStatus.PAUSING, reason=reason, hold=False)
         self.event_logger.emit("cold_start_trial_decided", job_id=trial.candidate_job_id, payload={
             "trial_id": trial.trial_id, "decision": decision, "reason": reason,
+            "admission_policy": result["admission_policy"],
             "wall_seconds": max(0.0, time.time() - datetime.fromisoformat(trial.started_at).timestamp()),
+            **failure_audit,
             **result,
         })
         self._colocation_trial = None
@@ -318,6 +408,9 @@ class ColdStartTrialMixin:
         if candidate is None:
             self._finish_cold_start_trial(trial, "inconclusive", "candidate disappeared")
             return
+        if not self._admission_phase_supported(trial):
+            self._finish_cold_start_trial(trial, "inconclusive", "unsupported legacy cold-start phase")
+            return
         settings = self.settings.gpu_scheduler.colocation
         elapsed = time.time() - datetime.fromisoformat(trial.started_at).timestamp()
         if elapsed >= settings.cold_start_trial_timeout_seconds:
@@ -326,6 +419,9 @@ class ColdStartTrialMixin:
         active = self._active_jobs()
         expected = {*trial.preexisting_job_ids, trial.candidate_job_id}
         jobs = [job for job in active if job.job_id in expected]
+        if not self._admission_commands_valid(trial, jobs):
+            self._finish_cold_start_trial(trial, "inconclusive", "missing or unsafe admission command")
+            return
         if candidate.status.is_terminal or candidate.metadata.get("trial_lease_expired") == trial.trial_id:
             self._finish_cold_start_trial(trial, "inconclusive", "candidate completed or measurement lease expired")
             return
@@ -352,6 +448,8 @@ class ColdStartTrialMixin:
                 keys = trial.cold_start.setdefault("admission_profile_keys", [])
                 if trial.profile_key not in keys:
                     keys.append(trial.profile_key)
+                trial.cold_start.pop("completion", None)
+                trial.cold_start.pop("add_only", None)
                 self._cold_phase(trial, "prepare", [*remaining, candidate])
                 return
             self._finish_cold_start_trial(trial, "accepted" if not remaining and candidate.job_id in {job.job_id for job in jobs} else "inconclusive", "pack membership changed")
@@ -386,102 +484,19 @@ class ColdStartTrialMixin:
             return
         for job in jobs:
             command = job.metadata.get("trial_step_command") or {}
-            self._cold_command(trial, job, command.get("action", "yield"), command.get("kind", trial.phase))
+            self._cold_command(trial, job, command["action"], command["kind"])
         if any(job.metadata.get("trial_lease_expired") == trial.trial_id for job in jobs):
             self._finish_cold_start_trial(trial, "inconclusive", "measurement lease expired")
             return
         windows = {job.job_id: self._cold_window(job) for job in jobs}
-        step_budget_exhausted = int(candidate.metadata.get("runtime_global_step", 0)) >= int(trial.cold_start.get("target_step", 2**63))
-        if trial.phase != "measure_overlap" and step_budget_exhausted:
-            self._finish_cold_start_trial(trial, "inconclusive", "reference optimizer-step budget exhausted")
+        if self._evaluate_admission_phase(trial, jobs, windows):
             return
         if trial.phase == "pre_add":
             if not all(windows[job_id] for job_id in trial.preexisting_job_ids):
                 if self._cold_measurement_timed_out(trial, [job for job in jobs if job.job_id in trial.preexisting_job_ids and not windows[job.job_id]]):
                     self._finish_cold_start_trial(trial, "inconclusive", "pre-add reference timed out")
                 return
-            pre_add = {job_id: windows[job_id]["halves"] for job_id in trial.preexisting_job_ids}
-            trial.cold_start["pre_add"] = pre_add
-            if predicted:
-                # Progress is measured online, weighted by fixed predicted work.
-                # No per-job solo reference measurement or synthetic time profile.
-                trial.cold_start["references"] = {
-                    j.job_id: [float(predicted[j.job_id]["step_cost"])] * 2 for j in jobs}
-                trial.cold_start["reference_queue"] = []
-                self._cold_phase(trial, "measure_overlap", jobs)
-                return
-            references = trial.cold_start["references"]
-            for job in jobs:
-                reference = job.metadata.get("trial_solo_reference") or {}
-                ttl = self.settings.gpu_scheduler.colocation.profile_rejection_ttl_seconds
-                if reference.get("identity") == reference_identity(job) and 0 <= time.time() - float(reference.get("at", 0)) < ttl:
-                    references[job.job_id] = reference["halves"]
-                else:
-                    profile = self.store.get_runtime_profile(job.packing.signature or job.job_id,
-                        resolved_batch_size=BatchResolution.resolved_batch_size(job), backend_name=trial.backend_name)
-                    if profile is not None and self.planner.time_objective.profile_is_fresh(profile) and profile.metadata.get("reference_identity") == reference_identity(job) and profile.metadata.get("reference_halves"):
-                        references[job.job_id] = profile.metadata["reference_halves"]
-            if len(trial.preexisting_job_ids) == 1:
-                job = next(job for job in jobs if job.job_id != candidate.job_id)
-                references[job.job_id] = pre_add[job.job_id]
-                self._save_cold_reference(job, pre_add[job.job_id])
-            queue = [job.job_id for job in jobs if job.job_id not in references]
-            trial.cold_start["reference_queue"] = queue
-            self._cold_phase(trial, "reference_barrier" if queue else "measure_overlap", jobs, measuring=queue[0] if queue else None)
+            trial.cold_start["pre_add"] = {job_id: windows[job_id]["halves"] for job_id in trial.preexisting_job_ids}
+            self._begin_cold_admission(trial, jobs, windows)
             return
-        if trial.phase == "reference_barrier":
-            if all(job.metadata.get("trial_yield_ack") == (job.metadata.get("trial_step_command") or {}).get("token") for job in jobs):
-                self._cold_phase(trial, "reference", jobs, measuring=trial.cold_start["measuring"])
-            elif time.time() - float(trial.cold_start["phase_started_at"]) > settings.cold_start_prepare_timeout_seconds:
-                self._finish_cold_start_trial(trial, "inconclusive", "safe-step yield timed out")
-            return
-        if trial.phase == "reference":
-            job_id = trial.cold_start["measuring"]
-            window = windows[job_id]
-            if window is None:
-                if self._cold_measurement_timed_out(trial, [job for job in jobs if job.job_id == job_id]):
-                    self._finish_cold_start_trial(trial, "inconclusive", "solo reference timed out")
-                return
-            job = next(job for job in jobs if job.job_id == job_id)
-            trial.cold_start["references"][job_id] = window["halves"]
-            self._save_cold_reference(job, window["halves"])
-            queue = trial.cold_start["reference_queue"]
-            queue.remove(job_id)
-            self._cold_phase(trial, "reference_barrier" if queue else "measure_overlap", jobs, measuring=queue[0] if queue else None)
-            return
-        if trial.phase != "measure_overlap":
-            self._finish_cold_start_trial(trial, "inconclusive", "unknown trial phase")
-            return
-        if not all(windows.values()):
-            if step_budget_exhausted:
-                self._finish_cold_start_trial(trial, "inconclusive", "measurement optimizer-step budget exhausted")
-            elif self._cold_measurement_timed_out(trial, [job for job in jobs if not windows[job.job_id]]):
-                self._finish_cold_start_trial(trial, "inconclusive", "overlap measurement timed out after optimizer progress")
-            return
-        packed = {job_id: window["halves"] for job_id, window in windows.items()}
-        old = [job for job in jobs if job.job_id != candidate.job_id]
-        pre_add = trial.cold_start["pre_add"]
-        references = trial.cold_start["references"]
-        active_rates = {job.job_id: sum(pre_add[job.job_id]) / 2 * int(job.metadata.get("runtime_steps_per_epoch") or 0) for job in old}
-        packed_rates = {job.job_id: sum(packed[job.job_id]) / 2 * int(job.metadata.get("runtime_steps_per_epoch") or 0) for job in jobs}
-        solo = (sum(references[candidate.job_id]) / 2 * int(candidate.metadata.get("runtime_steps_per_epoch") or 0)
-                if not predicted else 0.0)
-        gain = self.planner.time_objective.estimate_gain(
-            old, candidate, backend_name=trial.backend_name,
-            active_epoch_seconds=active_rates, candidate_solo_epoch_seconds=solo,
-            packed_epoch_seconds=packed_rates,
-        ) if not predicted and all(value > 0 for value in [solo, *active_rates.values(), *packed_rates.values()]) else None
-        if gain is not None and any(phase.inherited_parent_rates for phase in [*gain.sequential_phases, *gain.packed_phases]):
-            gain = None
-        decision, halves = normalized_throughput(references, pre_add, packed, candidate.job_id, self.settings.gpu_scheduler.colocation.cold_start_gain_margin)
-        result = {"objective": "normalized_throughput", "half_gains": halves, "references": references, "pre_add": pre_add, "packed": packed, "measurement_windows": windows}
-        if predicted:
-            result.update({"objective": "predicted_work_throughput", "reference_unit": "model_step_cost",
-                           "measurement_unit": "seconds_per_optimizer_step",
-                           "predicted_work_profiles": predicted, "solo_profile_measurements": 0})
-        if gain is not None:
-            result.update({"objective": "projected_drain", "gain": gain.gain, "sequential_seconds": gain.sequential_drain_seconds, "packed_seconds": gain.packed_drain_seconds})
-            decision = "accepted" if gain.gain >= self.settings.gpu_scheduler.colocation.min_gain and decision == "accepted" else "rejected" if gain.gain < self.settings.gpu_scheduler.colocation.min_gain and decision == "rejected" else "inconclusive"
-        if decision != "inconclusive" and all(packed_rates.values()):
-            self._persist_colocation_timing_profile(jobs, packed_rates, trial, sources={job.job_id: "fresh_step_window" for job in jobs}, gain=gain.gain if gain is not None else None, decision=decision if gain is not None else None)
-        self._finish_cold_start_trial(trial, decision, "measured cold-start " + decision, result)
+        self._finish_cold_start_trial(trial, "inconclusive", "unsupported legacy cold-start phase")

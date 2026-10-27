@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import math
 import os
 import tempfile
 import time
@@ -65,6 +66,9 @@ class CheckpointManager:
             str(final_path),
             metadata={"epoch": epoch, "global_step": global_step, "reason": reason},
         )
+        self._prune(job)
+        checkpoint_seconds = time.perf_counter() - started
+        self._record_completion_timing(job, checkpoint_seconds, safe_point_type, epoch, global_step)
         self.event_logger.emit(
             "checkpoint_saved",
             job_id=job.job_id,
@@ -74,11 +78,32 @@ class CheckpointManager:
                 "global_step": global_step,
                 "safe_point_type": safe_point_type.value,
                 "reason": reason,
-                "checkpoint_seconds": time.perf_counter() - started,
+                "checkpoint_seconds": checkpoint_seconds,
             },
         )
-        self._prune(job)
         return str(final_path)
+
+    def _record_completion_timing(self, job, seconds, safe_point_type, epoch, global_step):
+        identity = job.metadata.get("runtime_completion_identity")
+        if not isinstance(identity, str) or not identity or not math.isfinite(seconds) or seconds < 0:
+            return
+        current = self.store.get_job(job.job_id) or job
+        if current.metadata.get("runtime_completion_identity") != identity:
+            return
+        history = list(current.metadata.get("runtime_phase_timing_history") or [])
+        history.append({"phase": "checkpoint", "seconds": float(seconds), "identity": identity,
+                        "hardware_key": self.store.hardware_key(),
+                        "epoch": int(epoch), "global_step": int(global_step),
+                        "finished_at": utc_now(), "source": "checkpoint_manager.save_checkpoint"})
+        updates = {"runtime_phase_timing_history": history[-64:],
+                   "runtime_nonupdate_phase_counter": int(current.metadata.get("runtime_nonupdate_phase_counter") or 0) + 1,
+                   "runtime_checkpoint_completed_step": int(global_step)}
+        if safe_point_type == SafePointType.EPOCH:
+            updates["runtime_checkpoint_completed_epoch"] = int(epoch)
+        if safe_point_type == SafePointType.EXPLICIT:
+            updates["runtime_final_checkpoint_complete"] = True
+        job.metadata.update(updates)
+        self.store.update_job(job.job_id, metadata_updates=updates)
 
     def load_checkpoint(self, checkpoint_path: str | Path) -> dict[str, Any]:
         return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
