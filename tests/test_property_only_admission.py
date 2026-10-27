@@ -113,7 +113,7 @@ def test_replay_choice_ignores_age_but_retains_explicit_priority():
     assert _time_aware_choice(replace(problem, jobs=swapped), swapped, 10000).members[0].job_id == "b"
 
 
-def test_validated_busy_breaks_time_ties_heavy_when_idle_light_when_joining(tmp_path):
+def test_busy_indicator_prefers_heavy_idle_and_light_joining(tmp_path):
     _, _, planner, jobs = setup(tmp_path)
     class Predictor:
         available = True
@@ -127,9 +127,9 @@ def test_validated_busy_breaks_time_ties_heavy_when_idle_light_when_joining(tmp_
     assert idle.job_ids == ("b",)
     joining = planner.choose_plan(jobs[:2], active_jobs=jobs[2:], backend_available={"cuda_process": True})
     assert joining.job_ids == ("a",)
-    # Time remains authoritative when estimates are available.
+    # Ordering hints nominate work; measured timing still decides trial gain.
     planner.predicted_remaining_runtime_seconds = lambda job, **kwargs: {"a": 1, "b": 10}[job.job_id]
-    assert planner.choose_plan(jobs[:2], backend_available={"cuda_process": True}).job_ids == ("a",)
+    assert planner.choose_plan(jobs[:2], backend_available={"cuda_process": True}).job_ids == ("b",)
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -1, 101, "unknown"])

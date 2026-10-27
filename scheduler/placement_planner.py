@@ -135,6 +135,15 @@ class PlacementPlanner:
             return None
 
         normal_window = [job for job in window if job.scheduling_class == SchedulingClass.NORMAL]
+        if getattr(self.estimator.ml_predictor, "uses_predicted_profiles", False):
+            allowance = self.estimator.safe_budget_mb() - active_vram_mb
+            if allowance <= 0:
+                return None
+            backend = self.settings.gpu_scheduler.packing_backend
+            normal_window = [job for job in normal_window if
+                self.estimator.estimate_peak_vram_mb(job, self.estimator.resolved_batch_size(job), backend) <= allowance]
+            if not normal_window:
+                return None  # Do not bypass a predicted peak rejection via solo fallback.
         backend_aware_window = list(normal_window)
         if mandatory is not None:
             normal_window = [mandatory]
@@ -188,7 +197,7 @@ class PlacementPlanner:
                     solo_remaining = self._predicted_solo_remaining(job)
                     if option is not None and solo_remaining is not None:
                         anchor_candidates.append(
-                            ((solo_remaining, -self._effective_priority(job, now=now), self.estimator.busy_rank(job, prefer_high=True, batch_size=option.batch_size), job.job_id), job, backend_name, option)
+                            ((self.estimator.workload_rank(job, prefer_high=True, batch_size=option.batch_size), solo_remaining, -self._effective_priority(job, now=now), job.job_id), job, backend_name, option)
                         )
             if anchor_candidates:
                 _, selected_job, backend_name, option = min(anchor_candidates, key=lambda item: item[0])
@@ -196,7 +205,7 @@ class PlacementPlanner:
                     mode="stack_anchor",
                     backend_name=backend_name,
                     job_ids=(selected_job.job_id,),
-                    reason="shortest remaining-time stack anchor",
+                    reason="workload-ranked stack anchor with measured runtime",
                     batch_overrides={selected_job.job_id: option.batch_size},
                     objective_breakdown={
                         "remaining_runtime_seconds": option.remaining_runtime_seconds,
@@ -213,21 +222,24 @@ class PlacementPlanner:
             if exclusive_candidates:
                 option, selected_job = min(
                     exclusive_candidates,
-                    key=lambda item: (item[0].remaining_runtime_seconds, -self._effective_priority(item[1], now=now), self.estimator.busy_rank(item[1], prefer_high=True, batch_size=item[0].batch_size), item[1].job_id),
+                    key=lambda item: (self.estimator.workload_rank(item[1], prefer_high=True, batch_size=item[0].batch_size), item[0].remaining_runtime_seconds, -self._effective_priority(item[1], now=now), item[1].job_id),
                 )
                 return DispatchPlan(
                     mode="exclusive",
                     backend_name="exclusive",
                     job_ids=(selected_job.job_id,),
-                    reason="shortest remaining-time exclusive fallback",
+                    reason="workload-ranked exclusive fallback with measured runtime",
                     batch_overrides={selected_job.job_id: option.batch_size},
                     mandatory_anchor_job_id=mandatory.job_id if mandatory else None,
                     objective_version=self.settings.gpu_scheduler.objective.objective_version,
                 )
+            fallback = min(normal_window, key=lambda job: (
+                self.estimator.workload_rank(job, prefer_high=True),
+                -self._effective_priority(job, now=now), job.job_id), default=anchor)
             return DispatchPlan(
                 mode="exclusive",
                 backend_name="exclusive",
-                job_ids=(anchor.job_id,),
+                job_ids=(fallback.job_id,),
                 reason="runtime estimate unavailable; exclusive fallback",
                 mandatory_anchor_job_id=mandatory.job_id if mandatory else None,
                 objective_version=self.settings.gpu_scheduler.objective.objective_version,
@@ -270,7 +282,7 @@ class PlacementPlanner:
             )
             if solo_remaining is not None and has_backend_option:
                 ordered_candidates.append(
-                    ((solo_remaining, -self._effective_priority(job, now=now), self.estimator.busy_rank(job, prefer_high=False), job.job_id), job)
+                    ((self.estimator.workload_rank(job, prefer_high=False), solo_remaining, -self._effective_priority(job, now=now), job.job_id), job)
                 )
         for _, candidate_job in sorted(ordered_candidates, key=lambda item: item[0]):
             evaluations = [

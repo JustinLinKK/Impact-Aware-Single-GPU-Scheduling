@@ -172,7 +172,9 @@ class MLVramPredictor:
         self._target_names: tuple[str, ...] = ()
         self.last_sources: dict[str, str] = {}
         self.last_errors: dict[str, str] = {}
-        self.requires_branch_memory = bool(settings.student_release_path)
+        self.requires_branch_memory = False
+        self.uses_predicted_profiles = bool(settings.student_release_path)
+        self.requires_measured_runtime = bool(settings.student_release_path)
         self._released = None
         self._initialize()
 
@@ -435,10 +437,12 @@ class MLVramPredictor:
         return self.predict_avg_vram_options(job, [batch_size])[int(batch_size)]
 
     def predict_seconds_per_epoch_options(self, job: TrainingJob, batch_sizes: Sequence[int]) -> dict[int, float]:
-        """Return scheduler-grade epoch predictions when the artifact explicitly declares them.
+        """Return nominal epoch seconds for diagnostics/legacy callers.
 
-        The unsupported ``train_time`` target is deliberately not accepted because
-        it is not a measured full-epoch label.
+        Released students require measured runtime for duration-based admission:
+        their epoch output is a step-derived cost, not a calibrated wall-clock ETA.
+        Use predict_epoch_cost_options for ranking. The unsupported ``train_time``
+        target is deliberately not accepted as a full-epoch label.
         """
         if getattr(self, "_released", None) is not None:
             return {batch: values[2] / 1000.0 for batch, values in self._released_options(job, batch_sizes).items()}
@@ -478,6 +482,34 @@ class MLVramPredictor:
             raise JobPredictionError(str(exc)) from exc
 
     def predict_busy_percent_options(self, job, batch_sizes):
+        """Compatibility API: nominal NVML proxy scale, suitable for ordering only."""
+        return self.predict_busy_indicator_options(job, batch_sizes)
+
+    def predict_epoch_cost_options(self, job, batch_sizes):
+        """Step-derived epoch cost for ordering on the selected hardware/model.
+
+        Scale is nominal milliseconds; no measured wall-clock calibration is
+        implied. Multiplying by remaining epochs gives a remaining-work proxy.
+        """
+        if self._released is None:
+            raise JobPredictionError("released hardware student is unavailable")
+        return {batch: values[2] for batch, values in self._released_options(job, batch_sizes).items()}
+
+    def predict_profile_options(self, job, batch_sizes):
+        """Input-only virtual profiles; never recorded as measured observations."""
+        if self._released is None:
+            raise JobPredictionError("released hardware student is unavailable")
+        return {batch: {
+            "kind": "predicted_workload", "artifact_sha256": self.artifact_hash,
+            "hardware": self._released.contract["trained_hardware"],
+            "batch_size": batch, "job_signature": job.packing.signature or job.job_id,
+            "step_cost": values[0], "epoch_cost": values[2], "busy_indicator": values[3],
+            "avg_vram_mib": values[4], "peak_vram_mib": max(values[4:6]),
+            "calibration": "uncalibrated_prior", "requires_online_validation": True,
+        } for batch, values in self._released_options(job, batch_sizes).items()}
+
+    def predict_busy_indicator_options(self, job, batch_sizes):
+        """Workload heaviness proxy; never sum it or infer GPU capacity from it."""
         if self._released is None:
             raise JobPredictionError("released hardware student is unavailable")
         return {batch: values[3] for batch, values in self._released_options(job, batch_sizes).items()}

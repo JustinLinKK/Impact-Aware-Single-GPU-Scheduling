@@ -1,8 +1,8 @@
 """Verified 17-tensor paper-release student, used as a CPU ranking signal.
 
 The six outputs already have physical units. NVML busy is kernel-active time,
-not SM occupancy or FLOP utilization. Memory outputs never replace branch
-profiles or live memory admission. No training labels are read here.
+not SM occupancy or FLOP utilization. Memory outputs provide initial fit estimates;
+exact observations and live memory bounds refine admission. No labels are read.
 """
 from __future__ import annotations
 
@@ -40,7 +40,9 @@ CONTRACT = {
     "targets": TARGETS, "units": ("ms", "ms", "ms", "percent", "MiB", "MiB"),
     "epoch_semantics": "wall step milliseconds multiplied by explicit optimizer steps per epoch",
     "busy_semantics": "NVML kernel-active-time workload proxy; not true SM occupancy",
-    "memory_semantics": "advisory predictions only; branch profiles and live VRAM gate admission",
+    "scheduling_semantics": "epoch cost and busy are ordering hints; measured timing is required for ETA and co-location gain",
+    "epoch_calibration": "derived from single-step training labels; not calibrated for whole-epoch data/evaluation overhead",
+    "memory_semantics": "rounded predicted profile for initial fit; exact measurements supersede it; live VRAM and allocator limits gate execution",
     "vram_postprocessing": {"method": "ceiling", "bucket_bytes": VRAM_BUCKET_BYTES,
                             "minimum_bytes": VRAM_BUCKET_BYTES, "transport_unit": "MiB",
                             "scope": "predict_options; predict_tensors retains raw model outputs"},
@@ -88,7 +90,7 @@ def steps_for_job(job, batch_size):
 
 
 class ReleasedStudentRuntime:
-    requires_branch_memory = True
+    requires_branch_memory = False
 
     def __init__(self, release_path, settings, hardware):
         import torch

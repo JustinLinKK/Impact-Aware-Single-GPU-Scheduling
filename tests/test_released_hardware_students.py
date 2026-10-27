@@ -61,7 +61,10 @@ def test_actual_hardware_student_source_capture(public_paths, source_job, device
     predictor._released.last_capture_audits.clear()
     assert predictor._released.predict_options(source_job, [4, 8]) == values
     assert predictor._released.last_capture_audits == audits
-    assert predictor.requires_branch_memory
+    profiles = predictor.predict_profile_options(source_job, [4, 8])
+    assert predictor.uses_predicted_profiles and not predictor.requires_branch_memory
+    assert profiles[4]["epoch_cost"] == values[4][2]
+    assert profiles[8]["peak_vram_mib"] == max(values[8][4:6])
     assert not torch.cuda.is_initialized()
 
 

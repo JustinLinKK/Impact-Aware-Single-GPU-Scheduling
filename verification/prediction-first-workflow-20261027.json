@@ -1,0 +1,71 @@
+{
+  "schema": "prediction-first-workflow-v1",
+  "verified_at_utc": "2026-10-27T05:26:08.919574+00:00",
+  "branch": "oct_proposed_v2",
+  "base_commit": "8c29d36b007c1685678fd3a2145dd8be255749df",
+  "relevant_checks_passed": true,
+  "full_cpu_regression": {
+    "passed": 428,
+    "subtests_passed": 11,
+    "skipped": 3,
+    "deselected": 1,
+    "deselected_test": "test_general_search_requires_complete_exact_applicability_for_nvidia_records",
+    "reason": "Known unrelated baseline failure reproduced in verification/indicator-policy-20261027-tests.txt and on untouched base in scheduler-integration-20261027.json"
+  },
+  "test_log_sha256": "5a86925cc9ff6083ba5b2b7eb12e91041e64ca805c1930ef7104cf3968584789",
+  "primary_training_sources": {
+    "portable/model/starter.py": "70bc3c7b442e9366a8e69828e04bafe9eb0568344ed574ed62e4b236c792644d",
+    "student_training/pretrain_objective.py": "7caabe40954486109a018a867db3dcc2ebe3be00963100732ce69d89a2825402",
+    "student_training/runtime/student.py": "7e6b991ffe816fbddd45b28e790f61c173101fd4f5a9825f651bb67c45733e3e",
+    "student_training/support.py": "b178be24ce4e6ae937e58908687f4ed31bd8c978ef4af5f0a85d78aaaaae7feb",
+    "portable/v5_objectives.py": "a8415f44c1727a52faf3250af1ea4a3a8e16b20fcef42461859a0313b17beae1",
+    "reports/comparison.json": "e312b5f6588d52439baa94d83a2f452088b55b9be142f3c3fcfdb74c1a740dd2"
+  },
+  "verified_workflow": [
+    "Empty measured-profile store admits supported cooperative anchor/newcomer from CPU predicted profiles.",
+    "Predicted peak VRAM is used for fit and reservations; exact observations override it.",
+    "Peak rejection cannot bypass via exclusive fallback; 90 percent live/allocator safeguards retained.",
+    "Complete same-model/hardware profiles skip all per-job solo reference collection.",
+    "Online measured progress is weighted by frozen predicted step cost; scale cancels in before/after work-rate ratio.",
+    "No predicted work enters measured seconds, drain-time gains or solo runtime profile writes.",
+    "Identity changes invalidate trial; mixed/partial predictions retain measurement fallback.",
+    "Actual released CPU students, source conversion, raw-value parity, profile APIs and scheduler consumption verified."
+  ],
+  "petfinder": {
+    "source_count": 2,
+    "raw_values_unchanged": true,
+    "idle_anchor_order": [
+      "candidate_01",
+      "candidate_00"
+    ],
+    "joining_order": [
+      "candidate_00",
+      "candidate_01"
+    ],
+    "student_sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+    "cooperative_hooks_present": false,
+    "scope": "Actual CPU predictions; simulated compliant-runner state-machine tests; not accepted generated training nodes or a GPU overlap benchmark."
+  },
+  "artifact_receipt_sha256": "62a3012b732920bdd9bfe80c8fe3329f8980248c48798133a488b29b27063880",
+  "source_sha256": {
+    "README.md": "7d428ec9f84633d3172cac2ffd3fe2c4b8d54138527ca85fcd0b2c37ebeeff17",
+    "docs/a100_student_integration.md": "b16638b70f2f62dc4632f6136b0cf3b7aafe8d1462418ec058f39959ce6dee3e",
+    "plan.md": "05fb737fac532b71df6c99e976d3ca396aa84d6857953b24fe0bfc7ec5ce98e9",
+    "prediction/ml_predictor.py": "17a44c0b39581982294b5e923c09224c2dc213b6bc69ba68da9d113498291cd0",
+    "prediction/released_student.py": "676e060ee0e511680004c8311e2682c4be9914be4b2fecf4e776c91548752286",
+    "scheduler/backend_aware_planner.py": "88f6d5d709bf6545bcd9eeb0d1cbb0486e922d0b769b0529f7b80e81d0e83c70",
+    "scheduler/cold_start.py": "be2e0ef110d3718bfa5107dca61e15b25d9e7649e5d3ab42842f7be62b48e2a5",
+    "scheduler/colocation_trials.py": "a4ddee7446efe50930edc7ac8e2560954a5873180368acd88e7f7e69612708c3",
+    "scheduler/placement_planner.py": "2b63779eff33f7405f7e364b6fdba1c562766543d0ec7e6ad3c4a5cd67aba012",
+    "scheduler/resource_estimator.py": "26f1beb9d906c711ccc676787deb19f290e8529d37d8d010b188744ea40500c6",
+    "tests/test_property_only_admission.py": "55db50d632b3033c9adaf75869b1398cb606c1b8685e2bfe8cc93d6bc2710d57",
+    "tests/test_released_a100_student.py": "f581888040360ae9c58944f0111969a183dbb7c1aaf9628ab5c6ef8dc133e8ea",
+    "tests/test_released_hardware_students.py": "ce20b7d18de695f7afac2ba699234de9fd2a848a0f0facb2b1be5ff965baa500",
+    "verification/mlevolve_petfinder_20261027/verify_predictions.py": "5631da7cbb742f95bce91d9ebcee65632d6f0fad28bab949956e2deae8309528",
+    "tests/test_prediction_first_workflow.py": "09bee5b387687d271ddca379765788a05d1bf3d3c676c1e3dcdbc2ca992a30d4",
+    "tests/test_predictor_indicator_policy.py": "fe351ece5ca2ecc0354c233a47e44fb4cc5e0810e5c78b14b7969ff6d8b89971",
+    "docs/predictor-indicator-policy.md": "a3b36bb26d72342486b693920c8733defa0b146a0fbc294988346325a3f237dc"
+  },
+  "gpu_training_or_cloud_launched": false,
+  "deployment": "Branch publication only; no production worker restart."
+}

@@ -62,13 +62,19 @@ def cold_start_plan(planner, jobs, active, available, used_mb, *, mandatory, now
             continue
         remaining = planner.predicted_remaining_runtime_seconds(job, backend_name=backend)
         ordered.append(((
+            planner.estimator.workload_rank(job, prefer_high=not active, batch_size=batch),
             remaining is None, remaining if remaining is not None else 0.0,
             -planner._effective_priority(job, now=now),
-            planner.estimator.busy_rank(job, prefer_high=not active, batch_size=batch), job.job_id,
+            job.job_id,
         ), job, key, config))
     if not ordered:
         return None
     _, job, key, config = min(ordered, key=lambda item: item[0])
+    profiles = {member.job_id: planner.estimator.predicted_profile(member)
+                for member in [*active, job]}
+    if (not all(profiles.values()) or
+            len({(p["artifact_sha256"], p["hardware"]) for p in profiles.values() if p}) != 1):
+        profiles = {}  # Never mix measured seconds and predicted work units.
     return DispatchPlan(
         mode="concurrent_group" if active else "stack_anchor",
         backend_name=backend,
@@ -82,8 +88,11 @@ def cold_start_plan(planner, jobs, active, available, used_mb, *, mandatory, now
             "preexisting_job_ids": [member.job_id for member in active],
             "profile_key": key,
             "memory_limit_mb": allowance,
+            "predicted_work_profiles": profiles,
         },
-        objective_breakdown={"cold_start": bool(active), "gain": None},
+        objective_breakdown={"cold_start": bool(active), "gain": None,
+                             "profile_origin": "predicted_workload" if profiles else "measurement_fallback",
+                             "candidate_memory_mib": planner.estimator.estimate_peak_vram_mb(job, BatchResolution.resolved_batch_size(job), backend)},
         mandatory_anchor_job_id=mandatory.job_id if mandatory else None,
         objective_version=settings.objective.objective_version,
     )
@@ -243,6 +252,21 @@ class ColdStartTrialMixin:
         if self._device_samples and self._device_samples[-1].memory_used_mb > self.planner.estimator.safe_budget_mb():
             self._finish_cold_start_trial(trial, "inconclusive", "live memory budget exceeded")
             return
+        predicted = trial.cold_start.get("predicted_work_profiles") or {}
+        if predicted:
+            # Freeze one shared model/hardware scale throughout the trial.
+            try:
+                valid = (len({(predicted[j.job_id]["artifact_sha256"], predicted[j.job_id]["hardware"])
+                              for j in jobs}) == 1 and all(
+                    predicted[j.job_id]["batch_size"] == BatchResolution.resolved_batch_size(j)
+                    and predicted[j.job_id]["job_signature"] == (j.packing.signature or j.job_id)
+                    and isfinite(float(predicted[j.job_id]["step_cost"]))
+                    and float(predicted[j.job_id]["step_cost"]) > 0 for j in jobs))
+            except (KeyError, TypeError, ValueError):
+                valid = False
+            if not valid:
+                self._finish_cold_start_trial(trial, "inconclusive", "predicted profile identity changed")
+                return
         if trial.phase == "prepare":
             self._cold_command(trial, candidate, "yield", "prepare")
             if not all(job.metadata.get("trial_runner_ready") for job in jobs):
@@ -269,6 +293,14 @@ class ColdStartTrialMixin:
                 return
             pre_add = {job_id: windows[job_id]["halves"] for job_id in trial.preexisting_job_ids}
             trial.cold_start["pre_add"] = pre_add
+            if predicted:
+                # Progress is measured online, weighted by fixed predicted work.
+                # No per-job solo reference measurement or synthetic time profile.
+                trial.cold_start["references"] = {
+                    j.job_id: [float(predicted[j.job_id]["step_cost"])] * 2 for j in jobs}
+                trial.cold_start["reference_queue"] = []
+                self._cold_phase(trial, "measure_overlap", jobs)
+                return
             references = trial.cold_start["references"]
             for job in jobs:
                 reference = job.metadata.get("trial_solo_reference") or {}
@@ -321,16 +353,21 @@ class ColdStartTrialMixin:
         references = trial.cold_start["references"]
         active_rates = {job.job_id: sum(pre_add[job.job_id]) / 2 * int(job.metadata.get("runtime_steps_per_epoch") or 0) for job in old}
         packed_rates = {job.job_id: sum(packed[job.job_id]) / 2 * int(job.metadata.get("runtime_steps_per_epoch") or 0) for job in jobs}
-        solo = sum(references[candidate.job_id]) / 2 * int(candidate.metadata.get("runtime_steps_per_epoch") or 0)
+        solo = (sum(references[candidate.job_id]) / 2 * int(candidate.metadata.get("runtime_steps_per_epoch") or 0)
+                if not predicted else 0.0)
         gain = self.planner.time_objective.estimate_gain(
             old, candidate, backend_name=trial.backend_name,
             active_epoch_seconds=active_rates, candidate_solo_epoch_seconds=solo,
             packed_epoch_seconds=packed_rates,
-        ) if all(value > 0 for value in [solo, *active_rates.values(), *packed_rates.values()]) else None
+        ) if not predicted and all(value > 0 for value in [solo, *active_rates.values(), *packed_rates.values()]) else None
         if gain is not None and any(phase.inherited_parent_rates for phase in [*gain.sequential_phases, *gain.packed_phases]):
             gain = None
         decision, halves = normalized_throughput(references, pre_add, packed, candidate.job_id, self.settings.gpu_scheduler.colocation.cold_start_gain_margin)
         result = {"objective": "normalized_throughput", "half_gains": halves, "references": references, "pre_add": pre_add, "packed": packed, "measurement_windows": windows}
+        if predicted:
+            result.update({"objective": "predicted_work_throughput", "reference_unit": "model_step_cost",
+                           "measurement_unit": "seconds_per_optimizer_step",
+                           "predicted_work_profiles": predicted, "solo_profile_measurements": 0})
         if gain is not None:
             result.update({"objective": "projected_drain", "gain": gain.gain, "sequential_seconds": gain.sequential_drain_seconds, "packed_seconds": gain.packed_drain_seconds})
             decision = "accepted" if gain.gain >= self.settings.gpu_scheduler.colocation.min_gain and decision == "accepted" else "rejected" if gain.gain < self.settings.gpu_scheduler.colocation.min_gain and decision == "rejected" else "inconclusive"

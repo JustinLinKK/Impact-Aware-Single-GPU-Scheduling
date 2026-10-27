@@ -67,11 +67,11 @@ def test_source_conversion_actual_model_units_cache_and_steps(predictor, job):
     assert len(predictor._released.cache) == count
     job.metadata["perfseer_model"]["steps_per_epoch_by_batch"] = {"4": 40}
     assert math.isclose(predictor.predict_seconds_per_epoch_options(job, [4])[4], seconds[4] * 2, rel_tol=1e-4)
-    assert predictor.requires_branch_memory
+    assert predictor.uses_predicted_profiles and not predictor.requires_branch_memory
     assert not torch.cuda.is_initialized()
 
 
-def test_estimator_uses_actual_epoch_prediction_and_measured_memory(settings, job, tmp_path):
+def test_estimator_separates_actual_student_indicators_from_measured_timing(settings, job, tmp_path):
     config = SchedulerSettings(runtime_root=tmp_path / "runtime", prediction=settings.to_dict(),
         graph_db={"enabled": False}, hardware_feature_db={"enabled": False})
     store = SQLiteStateStore(config)
@@ -81,18 +81,31 @@ def test_estimator_uses_actual_epoch_prediction_and_measured_memory(settings, jo
         def hardware_key(self): return hardware().hardware_key
         def __getattr__(self, name): return getattr(store, name)
     estimator = ResourceEstimator(config, Repository())
+    virtual = estimator.predicted_profile(job, 4)
+    assert virtual["kind"] == "predicted_workload"
+    assert estimator.estimate_avg_vram_mb(job, 4, "exclusive") == virtual["avg_vram_mib"]
+    assert estimator.estimate_peak_vram_mb(job, 4, "cuda_process") == virtual["peak_vram_mib"]
+    assert estimator.prediction_metadata(job.job_id)["vram_prediction_source"] == "predicted_profile"
     observation = BatchSizeObservation(observation_key=build_batch_size_observation_key(
         "tiny", estimator.shape_signature(job), hardware().hardware_key, "exclusive", 4),
         batch_param_name="batch_size", model_key="tiny", shape_signature=estimator.shape_signature(job),
         hardware_key=hardware().hardware_key, backend_name="exclusive", batch_size=4,
         avg_vram_mb=777, peak_vram_mb=888)
     store.upsert_batch_size_observation(observation)
+    # A valid model and measured memory do not establish measured epoch timing.
+    assert estimator.ml_predictor.requires_measured_runtime
+    assert estimator.estimate_batch_options(job, "exclusive", [4]) == []
+    assert estimator.predicted_remaining_runtime_seconds(job, backend_name="exclusive") is None
+    cost = estimator.ml_predictor.predict_epoch_cost_options(job, [4])[4]
+    assert estimator.predicted_epoch_cost(job, 4) == cost
+    assert estimator.predicted_remaining_cost(job, 4) == cost * 3
+    observation.metadata["seconds_per_epoch"] = 9.0
+    store.upsert_batch_size_observation(observation)
     result, = estimator.estimate_batch_options(job, "exclusive", [4])
-    expected = estimator.ml_predictor.predict_seconds_per_epoch_options(job, [4])[4]
-    assert result.seconds_per_epoch == expected
-    assert result.remaining_runtime_seconds == expected * 3
+    assert result.seconds_per_epoch == 9.0
+    assert result.remaining_runtime_seconds == 27.0
     assert result.avg_vram_mb == 777
-    assert result.source == "branch_profile+ml_predictor"
+    assert result.source == "branch_profile"
     assert estimator.estimate_avg_vram_mb(job, 4, "exclusive") == 777
     assert estimator.estimate_peak_vram_mb(job, 4, "exclusive") == 888
     assert estimator.predicted_busy_percent(job, 4) == estimator.ml_predictor.predict_busy_percent_options(job, [4])[4]
@@ -106,7 +119,7 @@ def test_hardware_and_config_contract(settings):
         PredictionSettings(student_model_path="/missing")
     wrong = MLVramPredictor(settings, hardware("NVIDIA V100"))
     assert not wrong.available and "trained for A100" in wrong.unavailable_reason
-    assert wrong.requires_branch_memory
+    assert wrong.requires_measured_runtime and wrong.uses_predicted_profiles
 
 
 def test_corrupted_normalizer_rejected(settings, predictor, tmp_path):

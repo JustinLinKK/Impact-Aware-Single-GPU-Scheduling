@@ -63,18 +63,23 @@ and `graph_step_semantics: complete_optimizer_step`. The graph must match the
 requested batch, accumulation and target hardware. Unsupported conversion,
 missing step semantics or invalid artifacts fall back to branch profiles.
 
-The scheduling estimator uses student epoch predictions for batch options, while
-measured branch memory and existing live VRAM gates remain authoritative. The
-student memory remains advisory; busy participates in property-based planner tie-breaks. The release does not implement
+The scheduler uses student epoch cost and busy as ordering hints; measured timing
+is required for ETA, batch-duration and co-location gain calculations. Busy chooses
+heavier idle anchors and lighter joining jobs; remaining epoch cost breaks ties.
+Rounded predicted peak memory supports admission with an empty profile store;
+exact matching observations and live VRAM refine it. Complete predicted profiles
+also replace per-job solo references in cooperative trials: live progress is
+weighted by fixed predicted step cost. See the [training/indicator audit](predictor-indicator-policy.md).
+The release does not implement
 the proposed completion-aware/fair-progress policy or validate its performance.
 
-Run the repeatable integration test from the scheduler repository:
+Run the repeatable integration test from the parent of `localml_scheduler`:
 
 ```sh
 CUDA_VISIBLE_DEVICES='' \
 PERFSEER_RELEASE_ROOT=/absolute/PerfSeer-release \
 PERFSEER_STUDENT_MODEL_DIR=/absolute/extracted/PerfSeer-release-v1/checkpoints/S_A100 \
-python -m pytest tests/test_released_a100_student.py -q
+python -m pytest localml_scheduler/tests/test_released_a100_student.py -q
 ```
 
 This exercises real model loading, source conversion, units, batch-dependent

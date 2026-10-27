@@ -212,7 +212,8 @@ class ColocationTrialMixin:
                 else 0.0
             ),
             phase="prepare" if cold_start else "packed",
-            cold_start={"references": {}, "pre_add": {}} if cold_start else {},
+            cold_start={"references": {}, "pre_add": {},
+                        "predicted_work_profiles": dict(metadata.get("predicted_work_profiles") or {})} if cold_start else {},
         )
         self._colocation_trial = trial
         self.store.update_job(

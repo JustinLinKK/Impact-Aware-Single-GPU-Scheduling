@@ -62,3 +62,48 @@ and relative wall-time cost is 1.00x versus 1.13398x. Release metric boundary/ti
 checks passed. Evidence is in verification/release-output-alignment-20261027.json;
 the original raw prediction receipt remains intact. No measured accuracy or GPU
 throughput improvement is claimed.
+
+## October 26 local time: predictor indicator semantics
+
+Audit the released teacher/student losses, epoch construction and scoring before
+changing scheduling. Confirmed log-time regression plus ranking, soft-hurdle busy,
+and step-times-count epoch construction on one-step labels. Found that nominal
+student seconds overrode measured epoch timing. Separate workload indicator APIs
+from the measured-duration path; use heavy-idle/light-joining busy order, then
+remaining epoch cost for nominations. Measured time continues to govern gain,
+ETA and replay; preserve all memory/trial guards and paused/active model work.
+Verify actual public students, scale/order invariance, unknown-hint handling,
+measured-time precedence and PetFinder source predictions; run the CPU regression
+suite and publish a reviewed ordinary update to oct_proposed_v2.
+
+Verified: 44 focused tests pass (one optional TRAIN probe skipped). Full CPU
+suite: 418 passed, 11 subtests passed, 3 skipped and the same pre-existing optional
+CUDA-document search failure already reproduced on the untouched base. Both
+actual PetFinder predictions are bit-for-bit unchanged; the new policy chooses
+the heavier candidate_01 anchor and lighter candidate_00 joiner. Measured-duration
+precedence, scale/order invariance and unknown-indicator behavior are covered.
+Source audit and receipts are in docs/predictor-indicator-policy.md and
+verification/indicator-policy-20261027.json. No model retraining or GPU trial.
+
+Latest user clarification: prediction must replace required exclusive profiling
+for every pending job. Full-path review found released VRAM was ignored and the
+cold-start state machine still collected solo references. Add explicit virtual
+profiles (cost/busy/rounded memory/model identity), use predicted peak for initial
+admission with exact-measurement override, and skip solo-reference collection
+when all trial members have compatible predictions. Compare observed optimizer
+step throughput weighted by fixed predicted work, never model costs as measured
+seconds. Retain supported-runner, live memory, checkpoint and fallback guards.
+Test empty profile stores, zero solo phases, scale invariance, invalid identity,
+actual public artifacts, and the no-bypass peak-memory guard. The saved PetFinder
+sources lack cooperative hooks; document that previous inference success is not
+a full live scheduler/agent training integration result.
+
+Final workflow regression: 428 tests and 11 subtests pass, three optional/live-GPU
+checks skip; the known unrelated CUDA-document search test is explicitly excluded
+after reproduction in the earlier full run. Actual A100/A10G/A10/transfer student
+CPU checks pass, including virtual memory with no measured profiles. Prediction
+first state-machine tests accept/reject online progress without solo reference
+phases or synthetic measured profiles and enforce peak-memory rejection in every
+fallback. Actual PetFinder output/weights remain unchanged. Added short-term
+inline-hook and longer-term shared-runner recommendations with pause/resume smoke
+verification; no code-agent regeneration or GPU experiment claimed.

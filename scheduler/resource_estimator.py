@@ -36,6 +36,7 @@ class ResourceEstimator:
     def __init__(self, settings: SchedulerSettings, repository: PlanningRepository):
         self.settings = settings
         self.repository = repository
+        self._memory_sources: dict[str, str] = {}
         self.ml_predictor = (
             MLVramPredictor(settings.prediction, repository.hardware_profile()) if settings.prediction.mode == PREDICTION_MODE_ML_PREDICTOR else None
         )
@@ -54,7 +55,9 @@ class ResourceEstimator:
         """Validated student NVML busy is a ranking hint, never GPU capacity."""
         from math import isfinite
         predictor = self.ml_predictor
-        method = getattr(predictor, "predict_busy_percent_options", None)
+        method = getattr(predictor, "predict_busy_indicator_options", None)
+        if not callable(method):
+            method = getattr(predictor, "predict_busy_percent_options", None)
         if not getattr(predictor, "available", False) or not callable(method):
             return None
         batch = self.resolved_batch_size(job) if batch_size is None else int(batch_size)
@@ -68,6 +71,72 @@ class ResourceEstimator:
         """Tie-break with known busy before unknown; do not treat missing as idle."""
         busy = self.predicted_busy_percent(job, batch_size)
         return (busy is None, (-busy if prefer_high else busy) if busy is not None else 0.0)
+
+    def predicted_epoch_cost(self, job: TrainingJob, batch_size: int | None = None) -> float | None:
+        """Relative cost hint; never insert into seconds-based timing evidence."""
+        from math import isfinite
+        predictor = self.ml_predictor
+        method = getattr(predictor, "predict_epoch_cost_options", None)
+        if not getattr(predictor, "available", False) or not callable(method):
+            return None
+        batch = self.resolved_batch_size(job) if batch_size is None else int(batch_size)
+        try:
+            value = float(method(job, [batch])[batch])
+        except (JobPredictionError, ValueError, TypeError, KeyError):
+            return None
+        return value if isfinite(value) and value > 0 else None
+
+    def predicted_remaining_cost(self, job: TrainingJob, batch_size: int | None = None) -> float | None:
+        from math import isfinite
+        epoch_cost = self.predicted_epoch_cost(job, batch_size)
+        if epoch_cost is None:
+            return None
+        try:
+            total = job.max_epochs or job.config.max_epochs
+            remaining = max(0, int(total) - max(0, int(job.metadata.get("last_completed_epoch", 0))))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        value = epoch_cost * remaining
+        return value if isfinite(value) else None
+
+    def workload_rank(self, job: TrainingJob, *, prefer_high: bool, batch_size: int | None = None) -> tuple:
+        """Heavy idle anchor / light joining job, then shorter remaining work.
+
+        Both hints come from the same selected hardware student. Unknown hints
+        sort after known ones and are never interpreted as zero work. Callers
+        append measured-time/explicit-priority/stable-ID fallbacks.
+        """
+        cost = self.predicted_remaining_cost(job, batch_size)
+        return (*self.busy_rank(job, prefer_high=prefer_high, batch_size=batch_size),
+                cost is None, cost if cost is not None else 0.0)
+
+    def predicted_profile(self, job: TrainingJob, batch_size: int | None = None) -> dict | None:
+        """A virtual, hardware-bound profile; missing data stays unknown."""
+        from math import isfinite
+        predictor = self.ml_predictor
+        method = getattr(predictor, "predict_profile_options", None)
+        if not getattr(predictor, "available", False) or not callable(method):
+            return None
+        batch = self.resolved_batch_size(job) if batch_size is None else int(batch_size)
+        try:
+            profile = dict(method(job, [batch])[batch])
+            if (profile["batch_size"] != batch or not profile["artifact_sha256"]
+                    or not profile["hardware"] or profile["kind"] != "predicted_workload"
+                    or profile["job_signature"] != (job.packing.signature or job.job_id)):
+                return None
+            for name in ("step_cost", "epoch_cost", "avg_vram_mib", "peak_vram_mib"):
+                if not isfinite(float(profile[name])) or float(profile[name]) <= 0:
+                    return None
+            busy = float(profile["busy_indicator"])
+            if not isfinite(busy) or not 0 <= busy <= 100:
+                return None
+            return profile
+        except (JobPredictionError, ValueError, TypeError, KeyError):
+            return None
+
+    def _record_memory_source(self, job, source):
+        self._memory_sources[job.job_id] = source
+        job.metadata["vram_prediction_source"] = source
 
     def resolved_batch_size(self, job: TrainingJob) -> int:
         return BatchResolution.resolved_batch_size(job)
@@ -144,12 +213,13 @@ class ResourceEstimator:
         ml_epoch_predictions: dict[int, float] = {}
         if self.ml_predictor is not None:
             try:
-                ml_predictions = ({} if getattr(self.ml_predictor, "requires_branch_memory", False)
+                ml_predictions = ({} if getattr(self.ml_predictor, "uses_predicted_profiles", False)
+                                  or getattr(self.ml_predictor, "requires_branch_memory", False)
                                   else self.ml_predictor.predict_avg_vram_options(job, batch_sizes))
             except JobPredictionError:
                 ml_predictions = {}
             epoch_predictor = getattr(self.ml_predictor, "predict_seconds_per_epoch_options", None)
-            if callable(epoch_predictor):
+            if callable(epoch_predictor) and not getattr(self.ml_predictor, "requires_measured_runtime", False):
                 try:
                     ml_epoch_predictions = epoch_predictor(job, batch_sizes)
                 except JobPredictionError:
@@ -245,6 +315,9 @@ class ResourceEstimator:
         *,
         ml_predictions: dict[int, float] | None = None,
     ) -> tuple[float, str]:
+        if getattr(self.ml_predictor, "uses_predicted_profiles", False):
+            value = self.estimate_avg_vram_mb(job, batch_size, backend_name)
+            return value, self._memory_sources.get(job.job_id, "branch_profile")
         if getattr(self.ml_predictor, "requires_branch_memory", False):
             ml_predictions = {}  # Released predictions never replace branch memory admission.
         if ml_predictions is not None and int(batch_size) in ml_predictions:
@@ -512,6 +585,23 @@ class ResourceEstimator:
         return self.estimate_avg_vram_mb(job, self.resolved_batch_size(job), backend_name) > 0.0
 
     def estimate_avg_vram_mb(self, job: TrainingJob, batch_size: int, backend_name: str) -> float:
+        if getattr(self.ml_predictor, "uses_predicted_profiles", False):
+            # Exact observations win; family/scaled profiles do not displace a
+            # source-specific prediction for a novel agent-generated model.
+            for backend in dict.fromkeys((backend_name, "exclusive")):
+                observation = self.repository.get_batch_size_observation(
+                    model_key=self.model_key(job), shape_signature=self.shape_signature(job),
+                    hardware_key=self.repository.hardware_key(), backend_name=backend,
+                    batch_size=int(batch_size))
+                if observation and observation.avg_vram_mb is not None and observation.avg_vram_mb > 0:
+                    self._record_memory_source(job, "branch_profile")
+                    return float(observation.avg_vram_mb)
+            profile = self.predicted_profile(job, batch_size)
+            if profile is not None:
+                self._record_memory_source(job, "predicted_profile")
+                return float(profile["avg_vram_mib"])
+            self._record_memory_source(job, "branch_profile")
+            return self._estimate_branch_avg_vram_mb(job, batch_size, backend_name)
         if getattr(self.ml_predictor, "requires_branch_memory", False):
             job.metadata["vram_prediction_source"] = "branch_profile"
             return self._estimate_branch_avg_vram_mb(job, batch_size, backend_name)
@@ -580,7 +670,22 @@ class ResourceEstimator:
             batch_size=batch_size,
         )
         if observation and observation.peak_vram_mb is not None:
+            self._record_memory_source(job, "branch_profile")
             return float(observation.peak_vram_mb)
+
+        if getattr(self.ml_predictor, "uses_predicted_profiles", False):
+            if backend_name != "exclusive":
+                exact = self.repository.get_batch_size_observation(
+                    model_key=self.model_key(job), shape_signature=self.shape_signature(job),
+                    hardware_key=hardware.hardware_key, backend_name="exclusive", batch_size=int(batch_size))
+                if exact and exact.peak_vram_mb is not None and exact.peak_vram_mb > 0:
+                    self._record_memory_source(job, "branch_profile")
+                    return float(exact.peak_vram_mb)
+            profile = self.predicted_profile(job, batch_size)
+            if profile is not None:
+                self._record_memory_source(job, "predicted_profile")
+                return float(profile["peak_vram_mib"])
+            self._record_memory_source(job, "branch_profile")
 
         related = self.repository.list_batch_size_observations(
             model_key=self.model_key(job),
@@ -615,6 +720,8 @@ class ResourceEstimator:
         return 0.0
 
     def predicted_group_vram_mb(self, jobs: list[TrainingJob], *, backend_name: str) -> float:
+        if getattr(self.ml_predictor, "uses_predicted_profiles", False):
+            return sum(self.estimate_peak_vram_mb(job, self.resolved_batch_size(job), backend_name) for job in jobs)
         return sum(self.estimate_avg_vram_mb(job, self.resolved_batch_size(job), backend_name) for job in jobs)
 
     def prediction_metadata(self, job_id: str) -> dict[str, str | None]:
@@ -624,6 +731,6 @@ class ResourceEstimator:
                 "vram_prediction_error": None,
             }
         return {
-            "vram_prediction_source": self.ml_predictor.last_sources.get(job_id, "branch_profile"),
+            "vram_prediction_source": self._memory_sources.get(job_id, self.ml_predictor.last_sources.get(job_id, "branch_profile")),
             "vram_prediction_error": self.ml_predictor.last_errors.get(job_id),
         }

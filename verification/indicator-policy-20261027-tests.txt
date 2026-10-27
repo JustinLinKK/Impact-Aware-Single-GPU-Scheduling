@@ -1,0 +1,71 @@
+........................................................................ [ 17%]
+......................................F................................. [ 34%]
+........................................................ss..... [ 49%]
+..................................................................s..... [ 66%]
+...................................................................... [ 82%]
+........................................................................ [ 99%]
+.                                                                        [100%]
+=================================== FAILURES ===================================
+_ test_general_search_requires_complete_exact_applicability_for_nvidia_records _
+
+tmp_path = PosixPath('/tmp/pytest-of-justin/pytest-51/test_general_search_requires_c0')
+
+    def test_general_search_requires_complete_exact_applicability_for_nvidia_records(
+        tmp_path,
+    ) -> None:
+        qdrant = _Qdrant()
+        store = CodeKnowledgeStore(
+            SchedulerConfig(runtime_root=tmp_path),
+            qdrant_client=qdrant,
+            qdrant_models=_Models,
+            embedding_model=_Embedding(),
+        )
+        a10 = _record(cache_key="localml:cuda_docs:v2:a10")
+        v100 = _record(
+            facts=_facts(gpu="Tesla V100", capability=(7, 0), backend_hash="v100"),
+            cache_key="localml:cuda_docs:v2:v100",
+        )
+        mps = _record(
+            backend="mps_process",
+            cache_key="localml:cuda_docs:v2:mps",
+        )
+        store.ingest_records([a10, v100, mps])
+
+        assert (
+            store.search(
+                query="CUDA execution",
+                filters={"framework": "pytorch"},
+                record_types=["code_doc_chunks"],
+            )
+            == []
+        )
+        exact = {
+            "source_type": "nvidia_cuda_docs",
+            "verified_source": True,
+            **{
+                f"applicability.{key}": value
+                for key, value in a10["applicability"].items()
+                if key != "remote_tool_schema_hash"
+            },
+        }
+        rows = store.search(
+            query="CUDA execution",
+            filters=exact,
+            record_types=["code_doc_chunks"],
+        )
+>       assert [row["record_id"] for row in rows] == [a10["chunk_id"]]
+E       AssertionError: assert [] == ['nvidia.cuda...1ae7188284b2']
+E
+E         Right contains one more item: 'nvidia.cuda_mcp.5b59d305699d1ae7188284b2'
+E         Use -v to get more diff
+
+localml_scheduler/tests/test_cuda_docs_schema_roundtrip.py:265: AssertionError
+=============================== warnings summary ===============================
+worktrees/oct_proposed_v2/localml_scheduler/tests/test_released_hardware_students.py::test_precomputed_training_graph_roundtrip_uses_strict_17_tensor_schema
+  /home/justin/MLEvolve/.venv/lib/python3.11/site-packages/torch/backends/mkldnn/__init__.py:96: UserWarning: TF32 acceleration on top of oneDNN is available for Intel GPUs. The current Torch version does not have Intel GPU Support. (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:231.)
+    torch._C._set_onednn_allow_tf32(_allow_tf32)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED localml_scheduler/tests/test_cuda_docs_schema_roundtrip.py::test_general_search_requires_complete_exact_applicability_for_nvidia_records
+1 failed, 418 passed, 3 skipped, 1 warning, 11 subtests passed in 138.48s (0:02:18)

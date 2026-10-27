@@ -1,0 +1,73 @@
+{
+  "schema": "predictor-indicator-policy-v1",
+  "verified_at_utc": "2026-10-27T05:12:10.130980+00:00",
+  "base_commit": "8c29d36b007c1685678fd3a2145dd8be255749df",
+  "branch": "oct_proposed_v2",
+  "relevant_checks_passed": true,
+  "training_sources_sha256": {
+    "portable/model/starter.py": "70bc3c7b442e9366a8e69828e04bafe9eb0568344ed574ed62e4b236c792644d",
+    "student_training/pretrain_objective.py": "7caabe40954486109a018a867db3dcc2ebe3be00963100732ce69d89a2825402",
+    "student_training/runtime/student.py": "7e6b991ffe816fbddd45b28e790f61c173101fd4f5a9825f651bb67c45733e3e",
+    "student_training/support.py": "b178be24ce4e6ae937e58908687f4ed31bd8c978ef4af5f0a85d78aaaaae7feb",
+    "portable/v5_objectives.py": "a8415f44c1727a52faf3250af1ea4a3a8e16b20fcef42461859a0313b17beae1",
+    "portable/README.md": "a2c5b23a29c4326ac70ce6e74745d77c65406a904fc3001ab64c2576d6566894",
+    "reports/comparison.json": "e312b5f6588d52439baa94d83a2f452088b55b9be142f3c3fcfdb74c1a740dd2"
+  },
+  "focused_suite": {
+    "passed": 44,
+    "skipped": 1,
+    "skip": "optional A100 input-only TRAIN probe"
+  },
+  "full_suite": {
+    "passed": 418,
+    "subtests_passed": 11,
+    "skipped": 3,
+    "failed": 1,
+    "exit_code": 1,
+    "failure": "test_general_search_requires_complete_exact_applicability_for_nvidia_records",
+    "preexisting_failure_evidence": "verification/scheduler-integration-20261027.json",
+    "note": "The attempted relative-path deselect did not match the collected worktree node ID; the known unrelated test ran and failed. No test is hidden."
+  },
+  "full_suite_log_sha256": "3c64c3b697d9bd0602307641a2f4d4ca39ac743bd0fe9d8f24c47cd3cb731ad1",
+  "checks": [
+    "Released epoch predictions cannot populate duration estimates without measured timing.",
+    "Real S_A100 keeps observed 9 seconds/epoch and 777/888 MiB memory instead of substituting raw student time.",
+    "Common time rescaling and monotonic in-range busy remapping preserve decisions.",
+    "High busy indicator sums do not impose a capacity threshold.",
+    "Missing/invalid predictions or epoch budgets remain unknown.",
+    "Student CPU artifact, source capture, cache, hardware and physical output contracts remain valid."
+  ],
+  "petfinder": {
+    "raw_predictions_unchanged": true,
+    "idle_anchor_order": [
+      "candidate_01",
+      "candidate_00"
+    ],
+    "joining_order": [
+      "candidate_00",
+      "candidate_01"
+    ],
+    "receipt": "verification/mlevolve_petfinder_20261027/predictions-indicator-policy.json",
+    "student_sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267"
+  },
+  "cuda_training_or_cloud_launched": false,
+  "source_sha256": {
+    "README.md": "9a5aa7ab13b5fb7ac98e684008d983ea812a46080e1a1352eb0c8f2f330408b7",
+    "docs/a100_student_integration.md": "6ef702e96c956c7415be832b6a39c26a64505571efe131504ba8cb833057d16d",
+    "plan.md": "0e6c45a611465510a4b3e5bfa2e0ac1f2a6f5977bdc6f931f72e7616d199b88d",
+    "prediction/ml_predictor.py": "14cfea562a0f5fb52e7eac50eacfabeb6dc81d1f185ade8fcded0371869ecf71",
+    "prediction/released_student.py": "1be8acbee2c9caf464f86bf31d9931f3c666c2731dc470e89eb8a9a01b0a5ae1",
+    "scheduler/backend_aware_planner.py": "88f6d5d709bf6545bcd9eeb0d1cbb0486e922d0b769b0529f7b80e81d0e83c70",
+    "scheduler/cold_start.py": "e461c65bd9fc73793cd8f647fa92d129214025712fa0717f084d769657626f41",
+    "scheduler/placement_planner.py": "1471430a7f8343d1d8c914a4e08f22d3cfe7022d72f5dfb2127ac43bcbbf79aa",
+    "scheduler/resource_estimator.py": "081e4a24fa2b0697c063f1f74cded90ed7fcad97adcea974a107690153ec0ba9",
+    "tests/test_property_only_admission.py": "55db50d632b3033c9adaf75869b1398cb606c1b8685e2bfe8cc93d6bc2710d57",
+    "tests/test_released_a100_student.py": "11ab685824e8e13014b795ff404bbd952aabd0b5e2718fd661f749688bb043ca",
+    "verification/mlevolve_petfinder_20261027/verify_predictions.py": "2e26e12baeadf8d99090b08c8ad1d334fac5c88eec95996e5fdefdb2ef3a8986",
+    "tests/test_predictor_indicator_policy.py": "fe351ece5ca2ecc0354c233a47e44fb4cc5e0810e5c78b14b7969ff6d8b89971",
+    "docs/predictor-indicator-policy.md": "9c70e30197013124dad3e145d4f416bc620b391258825fef205f129188b1fcc7"
+  },
+  "superseded_by": "verification/prediction-first-workflow-20261027.json",
+  "scope": "Intermediate indicator-only review before the prediction-first clarification; source hashes describe that historical state.",
+  "test_log_formatting": "Trailing whitespace removed; output text otherwise unchanged."
+}

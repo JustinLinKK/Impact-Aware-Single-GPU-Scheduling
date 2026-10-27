@@ -1,0 +1,14 @@
+........................................................................ [ 16%]
+........................................................................ [ 33%]
+.......................................................ss...... [ 48%]
+........................................................................ [ 64%]
+...s.................................................................... [ 81%]
+...................................................................... [ 97%]
+..........                                                               [100%]
+=============================== warnings summary ===============================
+worktrees/oct_proposed_v2/localml_scheduler/tests/test_released_hardware_students.py::test_precomputed_training_graph_roundtrip_uses_strict_17_tensor_schema
+  /home/justin/MLEvolve/.venv/lib/python3.11/site-packages/torch/backends/mkldnn/__init__.py:96: UserWarning: TF32 acceleration on top of oneDNN is available for Intel GPUs. The current Torch version does not have Intel GPU Support. (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:231.)
+    torch._C._set_onednn_allow_tf32(_allow_tf32)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+428 passed, 3 skipped, 1 deselected, 1 warning, 11 subtests passed in 149.36s (0:02:29)

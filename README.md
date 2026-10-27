@@ -33,7 +33,7 @@ changes here, then record the tested revision in MLEvolve with
 
 - `schemas.py`: serializable job, checkpoint policy, progress, and cache schemas
 - `scheduler/`: policy, queue, service loop, recovery, and worker supervision
-- `scheduler/placement_planner.py`: shortest-anchor, one-newcomer-at-a-time placement planning
+- `scheduler/placement_planner.py`: workload-ranked anchor, one-newcomer-at-a-time placement planning
 - `scheduler/time_objective.py`: verified sequential-versus-packed drain-time scoring
 - `scheduler/telemetry.py`: lightweight `nvidia-smi` device telemetry for solo and packed runs
 - `execution/`: subprocess launcher, file-based control plane, worker entrypoint, and runner context
@@ -184,9 +184,13 @@ python -m localml_scheduler.examples.demos bridge
 An eligible cooperative runner starts on the configured packing backend even
 without profiles. The scheduler admits one provisional newcomer at a time,
 keeps its requested physical batch, and persists preparation, pre-add timing,
-solo-reference collection, overlap measurement, and the decision in job/trial
-metadata. Missing profiles are unknown evidence. Explicit probes and unsupported
-runners retain their existing exclusive path.
+overlap measurement and the decision. With valid released predictions for every
+member, CPU-generated virtual profiles replace per-job exclusive profiling:
+rounded peak VRAM controls initial fit, and step cost supplies fixed work weights.
+The trial skips solo-reference phases entirely. Predictions remain labelled as
+predicted evidence. Partial/unsupported predictions use the existing measured
+reference fallback; explicitly requested probes and unsupported runners keep
+their existing exclusive path.
 
 `gpu_scheduler.colocation.trial_epochs` defaults to **1**; explicit values and
 persisted targets are retained. Each reference uses two useful warmup updates
@@ -194,8 +198,15 @@ and 8–64 measured updates targeting 100 ms, with a one-second collection limit
 at a safe update boundary. The newcomer may finish the trial early, while
 incumbents supply fresh step windows regardless of their epoch lengths.
 
-Complete timing evidence uses the existing drain objective. If epoch totals or
-subgroup timings are missing, the decision uses normalized throughput:
+In the prediction-first path, the decision compares
+`sum(predicted_step_cost / observed_step_seconds)` after versus before joining,
+using one frozen model/hardware scale. The active group supplies the short
+pre-add window; the newcomer then joins directly. This measures predicted-work
+throughput, not exact completion-time gain. No predicted cost is saved as a measured
+time profile. Actual observations can later refine memory and timing estimates.
+
+In the measurement fallback, complete timing evidence uses the drain objective.
+If epoch totals or subgroup timings are missing, it uses normalized throughput:
 `sum(solo_step_seconds / observed_step_seconds)` after versus before admission.
 Both halves must improve by `colocation.cold_start_gain_margin` (default 0.03).
 Both deteriorating halves reject; incomplete or borderline evidence is
@@ -353,21 +364,24 @@ exclusive fallback or fails; it never silently changes to packed
 
 ## Time-aware scheduling
 
-`parallel_time_aware` starts the shortest predicted solo job as an anchor and
-then admits one candidate at a time, shortest remaining runtime first.
+With a released student, `parallel_time_aware` uses predicted busy **ordering**
+to choose a heavier idle-GPU anchor and lighter joining candidates. Within equal
+busy hints, it prefers lower `epoch_cost × remaining_epochs`. Missing hints sort
+after available hints; measured remaining time, explicit priority and job ID
+provide fallbacks. Without predictor hints it uses measured remaining runtime.
 Submission time and waiting duration do not override that ordering. Each addition
 must pass scheduling class, backend and pair compatibility, live-admission, batch-option, and
 predicted average-VRAM checks before any concurrent work begins.
 
 `gpu_scheduler.scheduler_decision_mode` selects the trial ordering layer:
 
-- `baseline` (the default) preserves the shortest-anchor and shortest-newcomer
-  behavior described above.
+- `baseline` (the default) uses the indicator ordering described above.
 - `backend_awared` jointly enumerates pairs at an empty-GPU boundary and ranks
   empty-GPU pairs or active-group newcomers with deterministic Pareto fronts.
   The risk vectors are derived from a CPU-only AST fingerprint and differ for
   MPS-client processes and ordinary CUDA processes. Static analysis only orders
   candidates; unknown placements still require the same measured live trial.
+  Student workload hints break ties within this measured-benefit/risk ordering.
 
 Backend-aware mode applies backend compatibility, batch/accuracy, conservative
 VRAM overhead, known-bad exact-profile, and optimistic trial-amortization gates
@@ -458,9 +472,11 @@ the same job back through normal evaluation. Configure this under
 `gpu_scheduler.colocation.decision_replay`; the default observation count is
 three and both change fractions default to `0.25`.
 
-The local ML adapter consumes an epoch-time prediction only when the selected
-artifact explicitly declares the canonical `train_epoch_ms` target. The
-unsupported PerfSeer `train_time` output is not treated as a full-epoch estimate.
+Released-student epoch costs never replace measured epoch timing in drain-time,
+trial-amortization or replay calculations. A job with no measured duration uses
+a cooperative measurement trial, or solo execution if its runner cannot cooperate.
+Legacy artifacts still require the explicit `train_epoch_ms` target; the ambiguous
+`train_time` output is not treated as a full-epoch estimate.
 
 The former throughput controls `makespan_weight`, `flow_time_weight`, and
 `min_aggregate_gain` are no longer accepted. `time_v3_flow_only`,
@@ -567,7 +583,7 @@ The normal pause flow is:
 ## Packed Execution Notes
 
 - `parallel_time_aware` is the only accepted mode; removed fixed-width and VRAM-fill mode names fail configuration validation
-- concurrency is derived incrementally from branch profiles and live GPU telemetry; no fixed job-count cap is configured
+- concurrency is derived incrementally from predicted/measured profiles and live GPU telemetry; no fixed job-count cap is configured
 - the memory ceiling is detected total VRAM times `predicted_budget_fraction` (default `0.90`); `gpu_vram_gib` is an optional explicit capacity override, and the example leaves it unset. Memory can reject an addition but cannot improve its score
 - the packed path is opt-in per job via `packing.eligible: true` and a stable `packing.signature`
 - backend compatibility is tracked per canonical backend, so an MPS-process failure cannot poison a CUDA-process profile
@@ -578,15 +594,14 @@ The normal pause flow is:
 
 Submission timestamps, elapsed waiting time, and queue sequence do not influence
 admission ranking. Static explicit priority selects the bounded candidate window;
-the existing runtime/drain-time objective and measured slowdown checks select
-feasible work. Among candidates tied on time and static priority, validated
-student NVML busy prefers a heavier job on an empty GPU and a lighter newcomer
-when jobs are active. Known busy precedes unknown busy; an unavailable or invalid
-prediction is never interpreted as zero utilization. Stable job IDs break the
-remaining ties. The backend-aware path retains its profile-quality, Pareto-risk,
+workload indicators nominate feasible work. Student busy prefers a heavier idle
+anchor and a lighter joining job; remaining epoch cost breaks ties, followed by
+measured time, explicit priority and stable job ID. Known indicators precede unknown;
+invalid predictions never mean zero work. The backend-aware path retains its profile-quality, Pareto-risk,
 gain, confidence, uncertainty and headroom ordering before this final priority/
-busy/identity tie-break. Busy is an advisory hint, not additive GPU capacity or
-the primary scheduling objective.
+workload/identity tie-break. Busy is an ordering hint, not additive GPU capacity.
+Final acceptance uses live predicted-work throughput (or measured drain gain
+when using the measurement fallback), not the busy score itself.
 
 The historical `PriorityFifoPolicy` name and aging/oldest-window/starvation-time
 configuration fields remain accepted for compatibility, but cannot promote or
@@ -710,15 +725,30 @@ custom sampler or capped epoch. An explicit per-batch map must include every
 requested batch; missing entries trigger fallback rather than silently reverting
 to the full dataset. A bare `steps_per_epoch` applies only to the resolved physical
 batch. Outputs are wall/GPU step **ms**, epoch **ms**, busy **%**, and average/peak
-VRAM **MiB**. Busy is a kernel-active-time proxy, not SM occupancy. The scheduler
-converts epoch milliseconds to seconds and multiplies by remaining epochs.
+VRAM **MiB**. These are nominal model output units. The scheduler treats released
+epoch cost and busy as **ordering indicators**: it multiplies epoch cost by
+remaining epochs for a relative work estimate, and never sums busy or treats it
+as free GPU capacity. Whole-job ETA and co-location gains require measured timing.
+The [training audit and scheduling contract](docs/predictor-indicator-policy.md)
+explain the regression/ranking losses and the single-step label limitation.
+
+For another agent framework, `predict_profile_options(job, batches)` returns one
+explicitly predicted profile with step/epoch cost, busy indicator, rounded memory,
+batch and model/hardware identity. Keep it separate from measured profile tables.
+Use `predict_epoch_cost_options(job, batches)` and
+`predict_busy_indicator_options(job, batches)` for hints. `requires_measured_runtime`
+is true for released students. The older `predict_seconds_per_epoch_options` and
+`predict_busy_percent_options` remain diagnostic compatibility APIs; their names
+do not imply calibrated seconds or capacity. Keep measured runtime evidence separate.
 
 Average and peak VRAM predictions are rounded **up to decimal 100 MB blocks**,
 with a minimum of 100 MB, matching the predictor release: 470 MB becomes 500 MB.
 The API still transports MiB, so the conversion is
 `max(1, ceil(raw_MiB * 1048576 / 100000000)) * 100000000 / 1048576`.
 Raw model outputs remain available in `last_capture_audits[batch]["raw_prediction"]`
-and through `predict_tensors`; measured branch memory and live VRAM are unchanged.
+and through `predict_tensors`. Predicted peak VRAM supplies the initial reservation;
+an exact matching observation supersedes it. Live VRAM and allocator limits remain
+active, and a predicted peak rejection cannot be bypassed by solo fallback.
 Rounding is conservative postprocessing, not evidence of improved model accuracy.
 
 **Time quality uses relative ordering**, as in the
@@ -735,8 +765,9 @@ For an **unmeasured prediction comparison**, display relative time cost as each
 predicted duration divided by the fastest prediction in the named comparison set
 (1.00× is fastest). `prediction.released_outputs.relative_time_costs` computes
 this display ratio; compare like-for-like step, epoch or total-job durations.
-This ratio is not measured ordering accuracy. Physical durations remain in the
-scheduler API because remaining runtime and admission gains need seconds.
+This ratio is not measured ordering accuracy. Raw nominal durations remain
+accessible for diagnostics. The scheduler uses measured durations for remaining
+runtime and admission gains.
 
 The worker uses the scheduler Python environment; install the candidate's import
 dependencies there. It does not automatically install packages.
@@ -780,12 +811,12 @@ and the actual S_A10G student on CPU. Both native forward/loss/backward replay
 and the scheduler time, memory and busy APIs agreed. The recipe is batch 4,
 FP32 AdamW/MSE, with an explicit eight-step epoch cap.
 
-| Draft | Design | Relative predicted wall-step cost | Rounded avg / peak VRAM (decimal MB) | Predicted busy |
+| Draft | Design | Relative predicted epoch cost | Rounded avg / peak VRAM (decimal MB) | Busy ordering |
 | --- | --- | ---: | ---: | ---: |
-| candidate_00 | Three-stage CNN + tabular MLP | 1.00× | 900 / 900 | 15.35% |
-| candidate_01 | Four-stage CNN + tabular MLP | 1.13× | 1000 / 1000 | 17.99% |
+| candidate_00 | Three-stage CNN + tabular MLP | 1.00× | 900 / 900 | Lighter |
+| candidate_01 | Four-stage CNN + tabular MLP | 1.13× | 1000 / 1000 | Heavier |
 
-The reference is candidate_00, the faster wall-step prediction in this two-draft
+The reference is candidate_00, the lower epoch-cost prediction in this two-draft
 comparison. Both use the same eight-step, three-epoch budget, so the full-job
 predicted cost ratio is also 1.13×. Raw time/VRAM outputs and unrounded ratios are
 retained in the receipt. No measured A10G durations are available for these drafts,
@@ -800,6 +831,9 @@ source hashes, and the successful graph/inference checks are retained in the
 [original raw prediction receipt](verification/mlevolve_petfinder_20261027/predictions.json).
 The [updated output receipt](verification/mlevolve_petfinder_20261027/predictions-rounded-100mb.json)
 records the actual repeated CPU predictions, decimal rounding, and relative time costs.
+The [indicator-policy receipt](verification/mlevolve_petfinder_20261027/predictions-indicator-policy.json)
+checks the new ranking APIs against both actual workload predictions from S_A10G:
+candidate_01 is preferred as the heavier anchor, candidate_00 as the lighter joiner.
 
 Reproduce the prediction check from the scheduler's parent directory, with the
 candidate dependencies installed in that Python environment:
@@ -813,7 +847,17 @@ CUDA_VISIBLE_DEVICES='' python \
   --output /tmp/petfinder-predictions.json
 ```
 
-The full CPU suite recorded 382 passed tests, 11 passed subtests and three
+The original integration CPU suite recorded 382 passed tests, 11 passed subtests and three
 intentional skips (two live-GPU tests and the optional input-only TRAIN probe).
 One optional CUDA-document search test fails identically at the untouched base
 revision; it is recorded in the [full verification report](verification/scheduler-integration-20261027.json).
+
+The subsequent [prediction-first workflow review](docs/predictor-indicator-policy.md#full-workflow-replace-exclusive-profiling-retain-online-feedback)
+corrects runtime use of these outputs. The original drafts lack cooperative
+training hooks, so they demonstrate source prediction, not readiness for overlap.
+Use the runner contract above for actual training. CPU state-machine tests verify
+admission with empty profile stores and zero per-job solo-reference phases.
+Latest CPU regression: **428 passed**, 11 subtests passed, three optional/live-GPU
+checks skipped; one previously reproduced unrelated CUDA-document-search test
+was explicitly deselected. See the [workflow verification receipt](verification/prediction-first-workflow-20261027.json).
+For agent-generated training scripts, see the [hook integration recommendations](docs/predictor-indicator-policy.md#recommendation-for-the-petfinder-hooks).
