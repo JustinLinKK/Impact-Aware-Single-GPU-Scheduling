@@ -1,0 +1,264 @@
+{
+  "date_utc": "2026-10-27T19:25:01.937273+00:00",
+  "purpose": "Repair bounded online admission and rank relative work for cooperative GPU scheduling",
+  "prior_replay": {
+    "baseline_completed": 12,
+    "proposal_completed": 11,
+    "pause_resume_cycles": 1667,
+    "valid_speedup_claim": false
+  },
+  "local_gpu_preflight": {
+    "complete": true,
+    "scheduler_commit": "working-tree-review",
+    "scope": "integration/liveness; not performance or predictor accuracy",
+    "student": "S_A10",
+    "student_sha256": "96d31d84d8d809c1ed9a4154f84389a3cb3b673d75445deb650cee4297398e03",
+    "actual_gpu": {
+      "name": "NVIDIA GeForce RTX 5090",
+      "total_mib": 32607.0,
+      "used_mib": 15358.0
+    },
+    "test_only_target_override": true,
+    "cancer_checks": [
+      {
+        "name": "cancer_02",
+        "updates": 16,
+        "source_sha256": "1649bff79026f5b82a086539ddf87c9af647eaa7d21dc795204e46d6807278dc",
+        "frozen_source_sha256": "709813d6514e0c36fbe1458ee5e9a08360faa4ffd587f35065210c36d40162e8",
+        "predicted_profile": {
+          "kind": "predicted_workload",
+          "artifact_sha256": "96d31d84d8d809c1ed9a4154f84389a3cb3b673d75445deb650cee4297398e03",
+          "hardware": "A10",
+          "batch_size": 16,
+          "job_signature": "3ec5bbb8-ab59-4b6e-82b2-24bc26f7639a",
+          "step_cost": 873.5374755859375,
+          "epoch_cost": 13976.599609375,
+          "busy_indicator": 97.5640640258789,
+          "avg_vram_mib": 2765.655517578125,
+          "peak_vram_mib": 2765.655517578125,
+          "calibration": "uncalibrated_prior",
+          "requires_online_validation": true
+        },
+        "elapsed_seconds": 9.256095119053498
+      },
+      {
+        "name": "cancer_01",
+        "updates": 16,
+        "source_sha256": "e5a37d7b64d0537ad8e910ae3a85dbe969f08da7421f41afebfe19c37bf21d2b",
+        "frozen_source_sha256": "4aa803411e4b3e3890ff447152cde26b4113ab82ebd253ba1f178d10a5960088",
+        "predicted_profile": {
+          "kind": "predicted_workload",
+          "artifact_sha256": "96d31d84d8d809c1ed9a4154f84389a3cb3b673d75445deb650cee4297398e03",
+          "hardware": "A10",
+          "batch_size": 16,
+          "job_signature": "491606bd-2c1d-4fa2-b558-4808ab204d82",
+          "step_cost": 419.3199768066406,
+          "epoch_cost": 6709.11962890625,
+          "busy_indicator": 97.50254821777344,
+          "avg_vram_mib": 2384.185791015625,
+          "peak_vram_mib": 2384.185791015625,
+          "calibration": "uncalibrated_prior",
+          "requires_online_validation": true
+        },
+        "elapsed_seconds": 8.038584658992477
+      },
+      {
+        "name": "cancer_00",
+        "updates": 16,
+        "source_sha256": "a2c45f1e9cf2679e823c70a1bd07c82012370180c9df197e4955ca9535c71942",
+        "frozen_source_sha256": "f8cee6f55fdfb9d40e3d22076d1785f8ca94326f3a4c4155d0442fecf9b4bf2d",
+        "predicted_profile": {
+          "kind": "predicted_workload",
+          "artifact_sha256": "96d31d84d8d809c1ed9a4154f84389a3cb3b673d75445deb650cee4297398e03",
+          "hardware": "A10",
+          "batch_size": 32,
+          "job_signature": "af0e3a1d-0b80-43b4-bd45-a7968d63823a",
+          "step_cost": 271.0130920410156,
+          "epoch_cost": 4336.20947265625,
+          "busy_indicator": 96.89247131347656,
+          "avg_vram_mib": 2288.818359375,
+          "peak_vram_mib": 2384.185791015625,
+          "calibration": "uncalibrated_prior",
+          "requires_online_validation": true
+        },
+        "elapsed_seconds": 6.061901039967779
+      }
+    ],
+    "cpu_inference_calls": [
+      {
+        "input_devices": [
+          "cpu"
+        ],
+        "output_devices": [
+          "cpu"
+        ]
+      },
+      {
+        "input_devices": [
+          "cpu"
+        ],
+        "output_devices": [
+          "cpu"
+        ]
+      },
+      {
+        "input_devices": [
+          "cpu"
+        ],
+        "output_devices": [
+          "cpu"
+        ]
+      },
+      {
+        "input_devices": [
+          "cpu"
+        ],
+        "output_devices": [
+          "cpu"
+        ]
+      },
+      {
+        "input_devices": [
+          "cpu"
+        ],
+        "output_devices": [
+          "cpu"
+        ]
+      },
+      {
+        "input_devices": [
+          "cpu"
+        ],
+        "output_devices": [
+          "cpu"
+        ]
+      }
+    ],
+    "jobs": [
+      {
+        "name": "pet_01",
+        "updates": 256,
+        "status": "COMPLETED"
+      },
+      {
+        "name": "pet_06",
+        "updates": 256,
+        "status": "COMPLETED"
+      },
+      {
+        "name": "pet_00",
+        "updates": 256,
+        "status": "COMPLETED"
+      }
+    ],
+    "manual_pause_step": 25,
+    "resumed": true,
+    "trial_count": 2,
+    "completed_measurement_windows": 8,
+    "longest_window_seconds": 4.110552916012239,
+    "pause_count": 1,
+    "exclusive_profile_phases": 0,
+    "elapsed_seconds": 125.05449699197197,
+    "max_observed_running_jobs": 3
+  },
+  "cancer_actual_data_training": [
+    {
+      "name": "cancer_00",
+      "updates": 256,
+      "elapsed_seconds": 38.82667374610901
+    },
+    {
+      "name": "cancer_01",
+      "updates": 256,
+      "elapsed_seconds": 28.8901686668396
+    },
+    {
+      "name": "cancer_02",
+      "updates": 256,
+      "elapsed_seconds": 37.592671155929565
+    }
+  ],
+  "tests": {
+    "full_suite_before_ranking": {
+      "passed": 433,
+      "skipped": 14,
+      "subtests_passed": 11,
+      "existing_failure": "test_general_search_requires_complete_exact_applicability_for_nvidia_records"
+    },
+    "ranking_and_lifecycle_after_final_policy": {
+      "passed": 92
+    },
+    "cancer_cpu_contract": {
+      "passed": 7
+    },
+    "crossover_controller": {
+      "passed": 28
+    }
+  },
+  "policy_limitations": [
+    "Five-point busy groups are a heuristic, not predictive confidence.",
+    "Step cost is relative wall-step work, not occupancy or FLOPs.",
+    "RTX5090 with explicit test-only A10 predictor target does not establish A10 performance.",
+    "No new measured crossover result exists at this verification point."
+  ],
+  "source_sha256": {
+    "scheduler/contention_guard.py": "581d2242780b126ba51c17bd4c69e4fdc6a555ea218db26d679c76bba02b5103",
+    "scheduler/colocation_evidence.py": "664ed00fc0ff0da596416b4a3084fadae2e05370b2e922b507b24073103fc7a4",
+    "scheduler/service_state.py": "e302d12d29a78959ca781d316121d1a4e9d7562aa59d5c7f012b42587322243c",
+    "scheduler/trial_priority.py": "d94764f0a25a27ccec700b5ba12cfc7d2e41c799fa772cdf24a520e79e6e0502",
+    "scheduler/planner_types.py": "960e5734068789780f9002f6e685542e015ac601d774bfa7fadf7b9a784eb8b8",
+    "scheduler/colocation_trials.py": "40836e6ef1c19d4f7a917c18c97acd2fe56c7d4e01d2a5b0515d77780417176b",
+    "scheduler/colocation_decisions.py": "9c0aa1b7fe199683a7f94cd6d384b79992cf6bc3b83bf1b25a49c0dcbf846f49",
+    "scheduler/backend_aware_planner.py": "88f6d5d709bf6545bcd9eeb0d1cbb0486e922d0b769b0529f7b80e81d0e83c70",
+    "scheduler/__init__.py": "c5447af0c8824706ecbd4e439710e6310c56b5bf4a40754a7c62b94830731f05",
+    "scheduler/placement_planner.py": "2b63779eff33f7405f7e364b6fdba1c562766543d0ec7e6ad3c4a5cd67aba012",
+    "scheduler/queue.py": "3c08beb087c551cdf027a6fd5a99ecf40c91e07fc3f5a4b9dab1f7c24bbc893c",
+    "scheduler/supervisor.py": "b9b8b82776d9dcb369ce3d627589dd58fd170295ebba3d19df271f1a57fcb532",
+    "scheduler/compatibility.py": "549617aab160a1414a20e8942a9177cdc5289c656e93775664574fcba9eaea18",
+    "scheduler/planning_repository.py": "a0e4237a20e31536ddbddda2e67edca9b322c72eb273a4d2c03f14c5eb09f8e0",
+    "scheduler/run_tracking.py": "df4deeb0f9082a9fe3bf28a55c9bf2207c2f4fe135c61272781b9e7e278cd1db",
+    "scheduler/cold_start.py": "41ef5e06571a511fa634565097a7b6ae6b54ac39b296cc98d66ac8fd506bc582",
+    "scheduler/placement_replay.py": "e117bb108b50d7e6468b7b7110c18bad46fed85bf56947032b8359ec7125d9f4",
+    "scheduler/trace_simulator.py": "b34c63fbe21c3785f8917e1270f5a9a9b6e79fb83bc883db3dfcc1e1fc8a5407",
+    "scheduler/time_objective.py": "929bc0d9277572084c8d41c30cb6a07942a7e7e6c2085420a138e00a4c2d942d",
+    "scheduler/resource_estimator.py": "4a39b1b56557c6a2c2694798dc18fd07969913b11c066ce41851ca8db3f40a67",
+    "scheduler/telemetry.py": "44000d744f2430838a74b7055592d757130ae944256a303109f5ef1782b0c0fe",
+    "scheduler/dispatching.py": "fe4632b475f50f3732c2a20fe71eacba22df9e089e60a83edfbf74b4306db72d",
+    "scheduler/trial_candidate.py": "f5584b48c4da1333da25562a66433b1cb6788966dc62045c0adae6577f38602b",
+    "scheduler/source_fingerprint.py": "e7e47f0a0a638b5742019440eae751d69dffe832fa4f98f3d6578c9a443a52a5",
+    "scheduler/pareto.py": "a420958a786c2c45876d7de34e83872f148eb8abf0655e3127cdcd9002bd75ad",
+    "scheduler/candidate_generator.py": "3e233e6dbfb6e2581a3d462a5d0f5e503adc167c4705e537e81c9f6a44886489",
+    "scheduler/early_stopping.py": "0a2c6c3255b38025fa3562287479a6245362c1c65b125925286d803d02a1e71a",
+    "scheduler/service.py": "a7fcf2b4f02e2ee02175e9a50b8deb8470b3d34111103c2cc0ac5e6a3529af7e",
+    "scheduler/recovery.py": "a30823aa148455e3be85e0adcd0eb50d3c622dbf0044ce2d39ebddc3017228e5",
+    "scheduler/policies.py": "31c2e22335f3a3230e7775a600aa5edb5fe00b71028f8b9ab091090bf1f53dbe",
+    "scheduler/backend_compatibility.py": "414491b5d66126a2a1af2c92c60397c1348693e8478cf674d09a99cd116e3ff1",
+    "execution/runner_protocol.py": "74f3c71520fe44d275782e2312235181c8a9a40d1ae8c31849ad1e584d6ba157",
+    "execution/backend_registry.py": "56afa72d5a74b198e50d4efa7e2fa1784d734356ef893393b75272a88dfaa6f0",
+    "execution/__init__.py": "9f298253439c24a2a866649313dabe6b575c57199f091677f99db3a3f9b16021",
+    "execution/process_utils.py": "d4ef28e921dee95e610f3b9a4fc6cb9b131508aa52d89587d00211b20cbc105c",
+    "execution/executor.py": "835cb41e66b2414aeb66028e00816def11455039ac9d7a26da1309f97dd7bd6c",
+    "execution/backends.py": "ea519240ef8c11e4f5e5062efd26d8ed01f3e35489a7b220f00992fafe844e1f",
+    "execution/worker_runtime.py": "f151d796a2cf2f652bc810d0ce6e6ab2dce8dcbffe42dd166d37426bfe1767f0",
+    "execution/control.py": "80a73ecc4152be4c7dd1d8d94df8c4b2b0bea2a2a10157d9b15c5cf51b5a3158",
+    "execution/trial_control.py": "8e8229042cec57ca6303c5af9c6e66ecce07937bacfde42e6bf269d4260b3665",
+    "execution/worker_entry.py": "3d2cb2e726a8673e5c9bf4ae03b8890ae0c8115a1d4f98baf836313a8de162eb",
+    "execution/script_context.py": "368b69ef11c67e50d8a10e482bad6d56a468ffe3f91999de29db76ad0ca762b2",
+    "config/__init__.py": "241927d52c9d4994089941104de0e730310ea46ee067099bf8fbf43092b2ae66",
+    "config/models.py": "817690be247a7e38c8e2183caf8a97ad0ececc325e752991471770efa3c95110",
+    "prediction/router.py": "38b84949cdabfdb16ea2f3025470ed37f80d986b2e816e037c5685387ed5b7d6",
+    "prediction/providers.py": "116c1753362886e9b00fec69bac9103446544fc29c287599e213b4d381ee0f65",
+    "prediction/released_artifacts.py": "10d42c3ca9be6de25082b070ad58ab22f8d15f9c7eb8adb68395b125fdd8066d",
+    "prediction/released_outputs.py": "d8e235db735e9cf166c12084d7d9035fd2330ae20d73413c2dcf29b84e8821cc",
+    "prediction/__init__.py": "f9d269d9198e1dcafcb6b5160556291b6326cf637dbe8933bd39a7e40eb27abc",
+    "prediction/ml_predictor.py": "17a44c0b39581982294b5e923c09224c2dc213b6bc69ba68da9d113498291cd0",
+    "prediction/branch_adapter.py": "0c3af91e7b370d92ce2ed8a8812a524577ecb80603b22b3fd9e895c03ba5f5a5",
+    "prediction/source_worker.py": "f5d463c8e56f1065d984d853d917621528383f45dcfe1b79fccafb1caa11430c",
+    "prediction/source_contract.py": "444b98cb6b7d4f8c407b0d65ed744d54cab97ee49035105ce154f80ede4dc5d6",
+    "prediction/ml_adapter.py": "889cbf199642757687ba120e803bf92d63cf6a914075c6e3fc890863d93b9c3b",
+    "prediction/job_contract.py": "8dfdae3fd0390ace2f1cf0cce4a2a43ce24568cda575bf2aa01d3fca7a122b7f",
+    "prediction/request_builder.py": "053d5f7fc6102f6a6ef7a986fa4051593f0f616786b568e28498a2d5f5df7e23",
+    "prediction/released_student.py": "676e060ee0e511680004c8311e2682c4be9914be4b2fecf4e776c91548752286",
+    "prediction/perfseer_runtime.py": "aa1b236f8e8a87d603061070e67999cea85b5554d7f4ab3f5837dff4db21d6b1"
+  }
+}

@@ -77,7 +77,7 @@ class StepTrialControlMixin:
                 break
             at_boundary = (
                 command.get("candidate") and command.get("action") == "measure"
-                and epoch >= int(command.get("target_epoch", epoch + 1))
+                and global_step >= int(command.get("target_step") or 2**63)
             )
             reference_done = command.get("kind") == "reference" and state.get("complete") and state.get("token") == command.get("token")
             if command.get("action") != "yield" and not preparing and not at_boundary and not reference_done:
@@ -96,7 +96,7 @@ class StepTrialControlMixin:
             external = self.control_plane.read_command(self.job.job_id)
             if external.action in {"pause", "cancel"}:
                 break
-            if preparing and time.monotonic() - state["yield_started"] > 30:
+            if preparing and time.monotonic() - state["yield_started"] > self.control_plane.settings.gpu_scheduler.colocation.cold_start_prepare_timeout_seconds:
                 self.store.update_job(self.job.job_id, metadata_updates={"trial_lease_expired": trial.get("trial_id")})
                 break
             time.sleep(0.01)
@@ -109,17 +109,22 @@ class StepTrialControlMixin:
             self.event_logger.emit("trial_worker_released", job_id=self.job.job_id, payload={"token": state.pop("yield_token"), "yield_seconds": duration, "global_step": global_step})
         command = state["command"]
         if state["token"] != command.get("token"):
-            state.update({"token": command.get("token"), "start_step": global_step, "samples": [], "complete": False, "block_step": global_step + 2, "block_started": None})
+            state.update({"token": command.get("token"), "start_step": global_step,
+                          "command_started": time.perf_counter(), "samples": [], "complete": False,
+                          "block_step": global_step + 2, "block_started": None})
         if command.get("action") == "measure" and not state["complete"] and safe_point_type == SafePointType.STEP:
             if global_step >= state["start_step"] + 2 and state["block_started"] is None:
                 self._trial_sync()
                 state["block_started"] = state["measurement_started"] = time.perf_counter()
                 state["block_step"] = global_step
                 state["measurement_step"] = global_step
-            elif state["block_started"] is not None and (
-                global_step - state["block_step"] >= 4
-                or time.perf_counter() - state["measurement_started"] >= 1.0
-            ):
+                state["measurement_started_at"] = time.time()
+                self.store.update_job(self.job.job_id, metadata_updates={"trial_measurement_progress": {
+                    "token": command["token"], "started_at": state["measurement_started_at"],
+                    "global_step": global_step,
+                    "seconds_per_step": (state["measurement_started"] - state["command_started"]) / (global_step - state["start_step"]),
+                }})
+            elif state["block_started"] is not None and global_step - state["block_step"] >= 4:
                 self._trial_sync()
                 finished = time.perf_counter()
                 count = global_step - state["block_step"]
@@ -128,7 +133,14 @@ class StepTrialControlMixin:
                 steps = global_step - state["measurement_step"]
                 elapsed = finished - state["measurement_started"]
                 sufficient = steps >= 8 and len(state["samples"]) >= 2
-                if (sufficient and (elapsed >= 0.1 or steps >= 64)) or elapsed >= 1.0:
+                self.store.update_job(self.job.job_id, metadata_updates={"trial_measurement_progress": {
+                    "token": command["token"], "started_at": state["measurement_started_at"],
+                    "global_step": global_step, "seconds_per_step": max(state["samples"]),
+                }})
+                # A slow step must never permanently finish an incomplete
+                # token. Collect both independent halves; the controller owns
+                # the measured-duration and absolute trial bounds.
+                if sufficient and (elapsed >= float(command.get("window_min_seconds", 1.0)) or steps >= 64):
                     samples = state["samples"]
                     half = len(samples) // 2
                     window = {
@@ -136,6 +148,7 @@ class StepTrialControlMixin:
                         "complete": sufficient, "halves": [sum(samples[:half]) / half, sum(samples[half:]) / (len(samples) - half)] if sufficient else [],
                         "samples": samples, "steps": steps, "start_step": state["measurement_step"],
                         "end_step": global_step, "elapsed_seconds": elapsed, "finished_at": utc_now(),
+                        "started_at": state["measurement_started_at"],
                     }
                     self.store.update_job(self.job.job_id, metadata_updates={"trial_step_window": window})
                     self.event_logger.emit("trial_step_window", job_id=self.job.job_id, payload=window)

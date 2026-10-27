@@ -192,11 +192,14 @@ predicted evidence. Partial/unsupported predictions use the existing measured
 reference fallback; explicitly requested probes and unsupported runners keep
 their existing exclusive path.
 
-`gpu_scheduler.colocation.trial_epochs` defaults to **1**; explicit values and
-persisted targets are retained. Each reference uses two useful warmup updates
-and 8–64 measured updates targeting 100 ms, with a one-second collection limit
-at a safe update boundary. The newcomer may finish the trial early, while
-incumbents supply fresh step windows regardless of their epoch lengths.
+`gpu_scheduler.colocation.trial_epochs` defaults to **1**. A new worker first
+acknowledges its current preparation token, so an old readiness flag cannot
+start a trial. Timing windows collect two warmup updates and two complete halves
+of at least eight measured updates in total, targeting at least one second or
+64 updates. Slow steps do not discard an incomplete window after one second.
+Timeouts use observed step durations, with a separate 300-second absolute trial
+limit; the predictor's relative time indicator never controls a wall-clock timer.
+The candidate's optimizer-step allowance also lets a trial cross an epoch boundary.
 
 In the prediction-first path, the decision compares
 `sum(predicted_step_cost / observed_step_seconds)` after versus before joining,
@@ -214,6 +217,18 @@ inconclusive. Inherited subgroup rates are not a verified completion forecast.
 Only a rejected/inconclusive newcomer checkpoints and requeues; another
 candidate or changed membership may still be tried. Solo references and packed
 windows are stored separately; inconclusive windows do not create bad profiles.
+
+Retries have a 30-second cooldown and finite limits: two failed attempts for one
+group and three for one candidate. A candidate that exhausts these attempts gets
+a solo turn, preventing repeated checkpoint/restart overhead and starvation.
+Workers retain their process handles until they have actually exited; a draining
+worker blocks a new admission. These limits are configurable under
+`gpu_scheduler.colocation.cold_start_*`.
+
+The [October 27 verification receipt](verification/admission-work-ranking-20261027.json)
+records the lifecycle regressions, CPU student inference, real-image cancer
+training and three-job pause/resume/overlap check. These integration checks do
+not establish a scheduling speedup; that requires the matched A10 replay.
 
 Generated PyTorch scripts must call `script_scheduler_context()` inside their
 entrypoint before allocating CUDA memory, restore the returned context's
@@ -594,10 +609,18 @@ The normal pause flow is:
 
 Submission timestamps, elapsed waiting time, and queue sequence do not influence
 admission ranking. Static explicit priority selects the bounded candidate window;
-workload indicators nominate feasible work. Student busy prefers a heavier idle
-anchor and a lighter joining job; remaining epoch cost breaks ties, followed by
-measured time, explicit priority and stable job ID. Known indicators precede unknown;
-invalid predictions never mean zero work. The backend-aware path retains its profile-quality, Pareto-risk,
+workload indicators nominate feasible work. With complete matching student
+profiles, cooperative cold-start admission groups feasible candidates whose busy
+indicators are less than five points from the group's highest value (idle GPU)
+or lowest value (joining). Within each group, higher relative step cost chooses
+the idle anchor and lower relative step cost chooses a joining candidate.
+Remaining epoch cost, measured time, explicit priority and stable ID break ties.
+This five-point grouping is a ranking heuristic, not a calibrated confidence
+interval; step cost is relative wall-step work, not FLOPs or GPU occupancy.
+It avoids letting tiny near-ceiling busy differences outweigh large work-cost
+differences. Missing or incompatible profiles retain the prior busy/remaining-cost
+ordering. Known indicators precede unknown; invalid predictions never mean zero
+work. The backend-aware path retains its profile-quality, Pareto-risk,
 gain, confidence, uncertainty and headroom ordering before this final priority/
 workload/identity tie-break. Busy is an ordering hint, not additive GPU capacity.
 Final acceptance uses live predicted-work throughput (or measured drain gain

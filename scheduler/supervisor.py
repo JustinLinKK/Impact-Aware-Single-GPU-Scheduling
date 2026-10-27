@@ -187,6 +187,20 @@ class WorkerSupervisor:
                 batch_overrides=batch_overrides or {},
                 fallback_order=fallback_order or [],
             )
+        draining = [worker.job_id for group in self._groups.values()
+                    for worker in group.workers.values()
+                    if worker.handle.process.poll() is None and (
+                        worker.job_id in job_ids or (
+                            (job := self.store.get_job(worker.job_id)) is not None
+                            and (job.status in {JobStatus.PAUSING, JobStatus.PAUSED, JobStatus.RECOVERABLE}
+                                 or job.status.is_terminal)))]
+        if draining:
+            return PlacementDecision(
+                can_run=False, reason="worker processes are still exiting: " + ", ".join(draining),
+                gpu_slot=0, mode=plan_mode, backend_name=plan_backend_name,
+                job_ids=job_ids, batch_overrides=batch_overrides or {},
+                fallback_order=fallback_order or [],
+            )
         if not self._groups:
             return PlacementDecision(
                 can_run=True,
@@ -320,6 +334,8 @@ class WorkerSupervisor:
                         JobStatus.CANCELLED,
                         JobStatus.PAUSED,
                     }:
+                        if worker.handle.process.poll() is None:
+                            continue  # Keep the process handle until real exit.
                         snapshots.append(
                             WorkerSnapshot(
                                 job_id=job_id,
@@ -392,7 +408,7 @@ class WorkerSupervisor:
         alive_workers = {
             job_id: worker
             for job_id, worker in group.workers.items()
-            if self._worker_is_alive(worker)
+            if worker.handle.process.poll() is None
         }
         group.workers = alive_workers
         group.fallback_order = [

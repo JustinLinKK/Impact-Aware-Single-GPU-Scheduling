@@ -68,6 +68,7 @@ def test_online_trial_skips_all_solo_reference_phases_and_never_saves_synthetic_
     service.planner.estimator.ml_predictor = planner.estimator.ml_predictor
     plan = planner.choose_plan([jobs[1]], active_jobs=[jobs[0]], backend_available={"cuda_process": True})
     trial = service._prepare_colocation_trial(plan, jobs[1])
+    store.update_job("b", metadata_updates={"trial_yield_ack": store.get_job("b").metadata["trial_step_command"]["token"]})
     def window(name, seconds):
         token = store.get_job(name).metadata["trial_step_command"]["token"]
         store.update_job(name, metadata_updates={"trial_step_window": {

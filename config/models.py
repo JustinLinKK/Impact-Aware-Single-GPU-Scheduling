@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 import hashlib
+import math
 import sys
 import warnings
 
@@ -389,6 +390,14 @@ class ColocationSettings:
     min_gain: float = 1.0
     trial_epochs: int = 1
     cold_start_gain_margin: float = 0.03
+    cold_start_prepare_timeout_seconds: float = 120.0
+    cold_start_window_min_seconds: float = 1.0
+    cold_start_window_timeout_min_seconds: float = 15.0
+    cold_start_window_timeout_max_seconds: float = 120.0
+    cold_start_trial_timeout_seconds: float = 300.0
+    cold_start_retry_cooldown_seconds: float = 30.0
+    cold_start_max_group_attempts: int = 2
+    cold_start_max_attempts: int = 3
     trial_decision_timeout_seconds: float = 30.0
     trial_evidence_timeout_min_seconds: float = 300.0
     trial_evidence_timeout_max_seconds: float = 1800.0
@@ -405,6 +414,26 @@ class ColocationSettings:
         self.cold_start_gain_margin = float(self.cold_start_gain_margin)
         if not 0 <= self.cold_start_gain_margin < 1:
             raise ValueError("colocation.cold_start_gain_margin must be in [0, 1)")
+        for name in (
+            "cold_start_prepare_timeout_seconds", "cold_start_window_min_seconds",
+            "cold_start_window_timeout_min_seconds", "cold_start_window_timeout_max_seconds",
+            "cold_start_trial_timeout_seconds", "cold_start_retry_cooldown_seconds",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"colocation.{name} must be finite and positive")
+            setattr(self, name, value)
+        if self.cold_start_window_timeout_max_seconds < self.cold_start_window_timeout_min_seconds:
+            raise ValueError("colocation cold-start window timeout maximum must be at least the minimum")
+        if self.cold_start_trial_timeout_seconds < max(
+            self.cold_start_prepare_timeout_seconds, self.cold_start_window_timeout_max_seconds
+        ):
+            raise ValueError("colocation cold-start trial timeout must cover preparation and a window")
+        for name in ("cold_start_max_group_attempts", "cold_start_max_attempts"):
+            value = int(getattr(self, name))
+            if value < 1:
+                raise ValueError(f"colocation.{name} must be at least 1")
+            setattr(self, name, value)
         self.trial_decision_timeout_seconds = float(self.trial_decision_timeout_seconds)
         self.trial_evidence_timeout_min_seconds = float(
             self.trial_evidence_timeout_min_seconds
@@ -459,6 +488,12 @@ class ColocationSettings:
             "min_gain": self.min_gain,
             "trial_epochs": self.trial_epochs,
             "cold_start_gain_margin": self.cold_start_gain_margin,
+            **{name: getattr(self, name) for name in (
+                "cold_start_prepare_timeout_seconds", "cold_start_window_min_seconds",
+                "cold_start_window_timeout_min_seconds", "cold_start_window_timeout_max_seconds",
+                "cold_start_trial_timeout_seconds", "cold_start_retry_cooldown_seconds",
+                "cold_start_max_group_attempts", "cold_start_max_attempts",
+            )},
             "trial_decision_timeout_seconds": self.trial_decision_timeout_seconds,
             "trial_evidence_timeout_min_seconds": self.trial_evidence_timeout_min_seconds,
             "trial_evidence_timeout_max_seconds": self.trial_evidence_timeout_max_seconds,

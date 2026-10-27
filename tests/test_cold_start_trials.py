@@ -167,6 +167,7 @@ def test_state_machine_collects_missing_references_and_accepts(tmp_path):
     plan = planner.choose_plan([jobs[1]], active_jobs=[jobs[0]], backend_available={"cuda_process": True})
     trial = service._prepare_colocation_trial(plan, jobs[1])
     assert trial.target_epoch == 1
+    store.update_job("b", metadata_updates={"trial_yield_ack": store.get_job("b").metadata["trial_step_command"]["token"]})
     service._evaluate_colocation_trial()
     assert trial.phase == "pre_add"
 

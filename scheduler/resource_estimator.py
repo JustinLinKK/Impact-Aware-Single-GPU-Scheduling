@@ -19,6 +19,11 @@ from ..prediction import JobPredictionError, MLVramPredictor
 from .planning_repository import PlanningRepository
 
 
+# A ranking heuristic inspired by the release's measured-busy material-change
+# criterion. It is not calibrated predictive confidence or GPU/SM capacity.
+COOPERATIVE_BUSY_GROUP_WIDTH_PP = 5.0
+
+
 @dataclass(frozen=True, slots=True)
 class BatchOptionEstimate:
     job_id: str
@@ -87,8 +92,12 @@ class ResourceEstimator:
         return value if isfinite(value) and value > 0 else None
 
     def predicted_remaining_cost(self, job: TrainingJob, batch_size: int | None = None) -> float | None:
-        from math import isfinite
         epoch_cost = self.predicted_epoch_cost(job, batch_size)
+        return self._remaining_work_cost(job, epoch_cost)
+
+    @staticmethod
+    def _remaining_work_cost(job: TrainingJob, epoch_cost: float | None) -> float | None:
+        from math import isfinite
         if epoch_cost is None:
             return None
         try:
@@ -98,6 +107,41 @@ class ResourceEstimator:
             return None
         value = epoch_cost * remaining
         return value if isfinite(value) else None
+
+    def cooperative_work_ranks(
+        self, jobs: list[TrainingJob], *, prefer_high: bool,
+        required_jobs: list[TrainingJob] | None = None,
+    ) -> dict[str, tuple] | None:
+        """Rank a feasible candidate set using one shared relative-work scale.
+
+        Sort busy hints first, then greedily form groups anchored at the first
+        (maximum for anchors, minimum for additions) busy value in each group.
+        Every member is strictly less than five percentage points from that
+        fixed extreme. This avoids a nontransitive pairwise epsilon comparator.
+        Active members must have matching profiles but do not define candidate
+        groups. Callers must filter memory/compatibility before invoking this.
+        """
+        profiles = {job.job_id: self.predicted_profile(job)
+                    for job in [*(required_jobs or []), *jobs]}
+        if not jobs or not all(profiles.values()):
+            return None
+        if len({(profile["artifact_sha256"], profile["hardware"])
+                for profile in profiles.values()}) != 1:
+            return None
+        ordered = sorted(jobs, key=lambda job: (
+            (-1 if prefer_high else 1) * float(profiles[job.job_id]["busy_indicator"]), job.job_id))
+        ranks, group, extreme = {}, -1, None
+        for job in ordered:
+            profile = profiles[job.job_id]
+            busy = float(profile["busy_indicator"])
+            if extreme is None or abs(busy - extreme) >= COOPERATIVE_BUSY_GROUP_WIDTH_PP:
+                group += 1
+                extreme = busy
+            step_cost = float(profile["step_cost"])
+            remaining = self._remaining_work_cost(job, float(profile["epoch_cost"]))
+            ranks[job.job_id] = (group, -step_cost if prefer_high else step_cost,
+                                 remaining is None, remaining if remaining is not None else 0.0)
+        return ranks
 
     def workload_rank(self, job: TrainingJob, *, prefer_high: bool, batch_size: int | None = None) -> tuple:
         """Heavy idle anchor / light joining job, then shorter remaining work.
@@ -120,8 +164,10 @@ class ResourceEstimator:
         batch = self.resolved_batch_size(job) if batch_size is None else int(batch_size)
         try:
             profile = dict(method(job, [batch])[batch])
-            if (profile["batch_size"] != batch or not profile["artifact_sha256"]
-                    or not profile["hardware"] or profile["kind"] != "predicted_workload"
+            if (profile["batch_size"] != batch
+                    or not isinstance(profile["artifact_sha256"], str) or not profile["artifact_sha256"]
+                    or not isinstance(profile["hardware"], str) or not profile["hardware"]
+                    or profile["kind"] != "predicted_workload"
                     or profile["job_signature"] != (job.packing.signature or job.job_id)):
                 return None
             for name in ("step_cost", "epoch_cost", "avg_vram_mib", "peak_vram_mib"):

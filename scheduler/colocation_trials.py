@@ -213,6 +213,11 @@ class ColocationTrialMixin:
             ),
             phase="prepare" if cold_start else "packed",
             cold_start={"references": {}, "pre_add": {},
+                        "admission_profile_keys": [str(metadata.get("profile_key") or "")],
+                        # Bound actual updates, not the next epoch boundary: a
+                        # checkpoint can resume only two steps before that edge.
+                        "target_step": int(candidate.metadata.get("runtime_global_step", 0)) + max(
+                            256, int(candidate.metadata.get("runtime_steps_per_epoch") or 0)),
                         "predicted_work_profiles": dict(metadata.get("predicted_work_profiles") or {})} if cold_start else {},
         )
         self._colocation_trial = trial
