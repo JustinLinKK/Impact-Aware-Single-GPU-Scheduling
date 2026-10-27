@@ -11,8 +11,23 @@ from hashlib import sha256
 import json
 import math
 import multiprocessing
+import os
 from pathlib import Path
-import re
+import sys
+import time
+from .job_contract import prediction_metadata
+from .released_artifacts import digest, hardware_matches, load_verified_student_files
+
+
+def worker_resident_mib(pid):
+    """Linux child RSS, not virtual address space reserved by PyTorch libraries."""
+    try:
+        resident_pages = int(Path(f"/proc/{pid}/statm").read_text().split()[1])
+        return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except (FileNotFoundError, ProcessLookupError):
+        return 0.0
+    except (OSError, ValueError, IndexError):
+        return None
 
 INPUT_NAMES = ("x_cont", "op_exact_id", "phase_id", "dtype_id", "node_flags", "edge_index",
                "edge_cont", "edge_role_id", "edge_flags", "node_graph", "u_cont", "quality",
@@ -28,29 +43,28 @@ CONTRACT = {
 }
 
 
-def digest(path):
-    with Path(path).open("rb") as stream:
-        import hashlib
-        return hashlib.file_digest(stream, "sha256").hexdigest()
-
-
-def hardware_matches(name, trained):
-    return re.search(r"(?<![A-Za-z0-9])" + re.escape(trained) + r"(?![A-Za-z0-9])", str(name), re.I) is not None
-
 
 def steps_for_job(job, batch_size):
     """Return optimizer steps, recalculated when physical batch size changes."""
     if batch_size <= 0:
         raise ValueError("physical batch_size must be positive")
-    metadata = dict(job.metadata.get("perfseer_model") or {})
+    metadata = prediction_metadata(job)
     explicit = metadata.get("steps_per_epoch_by_batch", {}).get(str(batch_size))
     if explicit is None:
         explicit = metadata.get("steps_per_epoch_by_batch", {}).get(batch_size)
     if explicit is not None:
         value = float(explicit)
+    elif "steps_per_epoch_by_batch" in metadata:
+        raise ValueError(f"steps_per_epoch_by_batch has no entry for physical batch {batch_size}")
+    elif metadata.get("steps_per_epoch") is not None:
+        from ..domain import BatchResolution
+        if batch_size != BatchResolution.resolved_batch_size(job):
+            raise ValueError("steps_per_epoch_by_batch is required for another physical batch when explicit steps_per_epoch is set")
+        value = float(metadata["steps_per_epoch"])
     elif metadata.get("dataset_size") is not None:
         size = int(metadata["dataset_size"])
-        accumulation = int(metadata.get("gradient_accumulation_steps", 1))
+        training = (metadata.get("workload_contract") or {}).get("training") or {}
+        accumulation = int(training.get("gradient_accumulation_steps", metadata.get("gradient_accumulation_steps", 1)))
         if size <= 0 or accumulation <= 0:
             raise ValueError("dataset_size and gradient_accumulation_steps must be positive")
         microsteps = size // batch_size if metadata.get("drop_last", False) else math.ceil(size / batch_size)
@@ -73,42 +87,42 @@ class ReleasedStudentRuntime:
         self.settings = settings
         self.hardware = hardware
         self.release_root = Path(release_path).expanduser().resolve()
-        self.model_root = (Path(settings.student_model_path).expanduser().resolve() if settings.student_model_path
-                           else self.release_root / "extracted/PerfSeer-release-v1/checkpoints/S_A100")
+        self.model_root, selected_id, trained, self.artifact_hash = load_verified_student_files(
+            self.release_root, settings.student_model_path, hardware.gpu_name)
         self.artifact_path = self.model_root / "student.ts"
         self.normalization_path = self.model_root / "normalization.pt"
         self.runtime_src = self.release_root / "portable/runtime/src"
-        self.artifact_hash = digest(self.artifact_path)
-        # This adapter is explicitly for the immutable released D3 S_A100 artifact.
-        if self.artifact_hash != "ff968d0816eba99cc7765c297a3ee9d4e7ee8a4c4b0f40b5e2dcd72e0b2b419f":
-            raise ValueError("released S_A100 student artifact hash mismatch")
-        if not hardware_matches(hardware.gpu_name, "A100"):
-            raise ValueError(f"student is trained for A100, not {hardware.gpu_name}")
         if not self.runtime_src.is_dir() or not (self.runtime_src.parent / "aliases").is_dir():
             raise ValueError("portable graph feature runtime is missing")
         extra = {"student_config.json": ""}
         torch.set_num_threads(settings.cpu_threads)
         self.model = torch.jit.load(str(self.artifact_path), map_location="cpu", _extra_files=extra).eval()
         self.metadata = json.loads(extra["student_config.json"])
-        if (self.metadata.get("version") != "perfseer_a1001_student_v1"
-                or self.metadata.get("candidate") != "D3" or self.metadata.get("hardware") != "A100"):
-            raise ValueError("unsupported released student metadata")
+        version = self.metadata.get("version")
+        if version not in {"perfseer_a1001_student_v1", "release_v1_student"}:
+            raise ValueError("unsupported released student metadata version")
+        if self.metadata.get("hardware") != trained:
+            raise ValueError("student metadata hardware differs from release identity")
         self.normalization_hash = digest(self.normalization_path)
-        provenance = self.metadata["provenance"]
-        if self.normalization_hash != provenance["normalization_sha256"]:
-            raise ValueError("student normalization hash mismatch")
-        if digest(self.model_root / "architecture.pt") != provenance["architecture_sha256"]:
-            raise ValueError("student architecture hash mismatch")
+        provenance = self.metadata.get("provenance", {})
+        for name, path in (("normalization", self.normalization_path),
+                           ("architecture", self.model_root / "architecture.pt")):
+            expected = provenance.get(name + "_sha256")
+            if expected is not None and digest(path) != expected:
+                raise ValueError(f"student {name} provenance hash mismatch")
         names = tuple(item.name for item in self.model.forward.schema.arguments)[1:]
-        if names != INPUT_NAMES or tuple(self.metadata["inputs"]) != INPUT_NAMES:
+        if names != INPUT_NAMES or tuple(self.metadata.get("inputs", INPUT_NAMES)) != INPUT_NAMES:
             raise ValueError("unsupported student tensor interface")
-        self.model_id = "release/S_A100"
+        self.model_id = "release/" + selected_id
+        self.last_capture_audits = {}
+        self.last_conversion_error = None
         self.cache = OrderedDict()
+        self.capture_audit_cache = {}
         self.failures = OrderedDict()
         self.contract = {**CONTRACT, "artifact": str(self.artifact_path), "sha256": self.artifact_hash,
                          "normalization_sha256": self.normalization_hash,
-                         "trained_hardware": "A100", "out_of_distribution": False,
-                         "quality_scope": "A100 training distribution; hardware match alone does not establish workload accuracy"}
+                         "trained_hardware": trained, "out_of_distribution": False,
+                         "quality_scope": f"{trained} training distribution; hardware match alone does not establish workload accuracy"}
 
     def predict_tensors(self, tensors):
         import torch
@@ -129,10 +143,12 @@ class ReleasedStudentRuntime:
         return {"prediction": pred, "memory_upper": upper}
 
     def predict_options(self, job, batch_sizes):
-        from .ml_predictor import model_specification_for_job
+        from .ml_predictor import released_source_request, precision_for_job
+        from .source_contract import fingerprint_source
         from .source_worker import convert_released_source_options_worker
         import torch
-        metadata = dict(job.metadata.get("perfseer_model") or {})
+        metadata = prediction_metadata(job)
+        self.last_conversion_error = None
         values, missing = {}, []
         for batch in dict.fromkeys(int(n) for n in batch_sizes):
             steps = steps_for_job(job, batch)
@@ -140,24 +156,31 @@ class ReleasedStudentRuntime:
             if graph is None and metadata.get("graph_batch_size") == batch:
                 graph = metadata.get("training_graph_path")
             if graph:
-                request = {"graph_path": str(Path(graph).expanduser().resolve())}
+                request = {"graph_path": str(Path(graph).expanduser().resolve()),
+                           "precision": precision_for_job(job)}
                 fingerprint = digest(request["graph_path"])
+                request["cacheable"] = True
             else:
-                spec = model_specification_for_job(job, batch)
-                request = spec.worker_request()
-                fingerprint = digest(spec.source_path)
+                request = released_source_request(job, batch)
+                fingerprint = fingerprint_source(request["source_path"], metadata)
+                request["cacheable"] = fingerprint["complete"]
             request.update({"raw_steps": steps, "batch_size": batch, "metadata": metadata,
                             "hardware": {"name": self.hardware.gpu_name,
                                          "memory_bytes": int((self.hardware.total_vram_mb or 0) * 1024 * 1024) or None,
                                          "compute_capability": self.hardware.compute_capability}})
             key = sha256(json.dumps({"request": request, "source": fingerprint,
-                                     "artifact": self.artifact_hash, "normalization": self.normalization_hash},
+                                     "artifact": self.artifact_hash, "normalization": self.normalization_hash,
+                                     "python": sys.executable, "torch": torch.__version__},
                                     sort_keys=True, default=str).encode()).hexdigest()
             if key in self.failures:
                 self.failures.move_to_end(key)
-                raise ValueError(self.failures[key])
-            if key in self.cache:
+                error, expires = self.failures[key]
+                if time.monotonic() < expires:
+                    raise ValueError(error)
+                del self.failures[key]
+            if request["cacheable"] and key in self.cache:
                 values[batch] = self.cache[key]
+                self.last_capture_audits[batch] = self.capture_audit_cache.get(key, {})
                 self.cache.move_to_end(key)
             else:
                 missing.append((batch, key, request))
@@ -170,10 +193,27 @@ class ReleasedStudentRuntime:
             process.start()
             sender.close()
             try:
-                if not receiver.poll(self.settings.conversion_timeout_seconds * len(missing)):
-                    self._remember_failure(missing, "released student source conversion timed out")
-                    raise ValueError("released student source conversion timed out")
-                response = receiver.recv()
+                deadline = time.monotonic() + self.settings.conversion_timeout_seconds * len(missing)
+                while not receiver.poll(0.05):
+                    rss = worker_resident_mib(process.pid)
+                    if rss is not None and rss > self.settings.conversion_max_rss_mb:
+                        error = (f"source_capture_cpu_memory: worker RSS {rss:.0f} MiB exceeds "
+                                 f"conversion_max_rss_mb={self.settings.conversion_max_rss_mb}")
+                        self._remember_failure(missing, error)
+                        raise ValueError(error)
+                    if time.monotonic() >= deadline:
+                        self._remember_failure(missing, "released student source conversion timed out")
+                        raise ValueError("released student source conversion timed out")
+                    if not process.is_alive():
+                        error = f"source worker exited before a result (exit code {process.exitcode})"
+                        self._remember_failure(missing, error)
+                        raise ValueError(error)
+                try:
+                    response = receiver.recv()
+                except (EOFError, OSError) as exc:
+                    error = f"source worker exited before a result (exit code {process.exitcode}); inspect CPU memory budget and source imports"
+                    self._remember_failure(missing, error)
+                    raise ValueError(error) from exc
             finally:
                 receiver.close()
                 process.join(timeout=0.2)
@@ -184,26 +224,33 @@ class ReleasedStudentRuntime:
                     process.kill()
                     process.join(timeout=2)
             if not response.get("ok"):
+                self.last_conversion_error = response.get("error_detail")
                 self._remember_failure(missing, response.get("error", "released student conversion failed"))
                 raise ValueError(response.get("error", "released student conversion failed"))
             options = response.get("tensors_by_option", [])
             if len(options) != len(missing):
                 raise ValueError("incomplete released student feature set")
-            for (batch, key, _), arrays in zip(missing, options, strict=True):
+            for index, ((batch, key, request), arrays) in enumerate(zip(missing, options, strict=True)):
+                audits = response.get("audits", [])
+                if len(audits) == len(missing):
+                    self.last_capture_audits[batch] = audits[index]
                 outputs = self.predict_tensors(tuple(torch.from_numpy(a) for a in arrays))
                 if len(outputs["prediction"]) != 1:
                     raise ValueError("one graph required per scheduling option")
                 value = outputs["prediction"][0].tolist()
                 values[batch] = value
-                self.cache[key] = value
+                if request["cacheable"]:
+                    self.cache[key] = value
+                    self.capture_audit_cache[key] = self.last_capture_audits.get(batch, {})
                 while len(self.cache) > self.settings.cache_size:
-                    self.cache.popitem(last=False)
+                    evicted, _ = self.cache.popitem(last=False)
+                    self.capture_audit_cache.pop(evicted, None)
         return values
 
     def _remember_failure(self, missing, error):
         # Unchanged unsupported sources must not block every scheduler tick on
         # another subprocess timeout. Source/options/artifact hashes key retries.
-        for _, key, _ in missing:
-            self.failures[key] = str(error)
+        for _, key, request in missing:
+            self.failures[key] = (str(error), time.monotonic() + 60.0)
         while len(self.failures) > self.settings.cache_size:
             self.failures.popitem(last=False)

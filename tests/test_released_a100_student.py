@@ -95,6 +95,7 @@ def test_estimator_uses_actual_epoch_prediction_and_measured_memory(settings, jo
     assert result.source == "branch_profile+ml_predictor"
     assert estimator.estimate_avg_vram_mb(job, 4, "exclusive") == 777
     assert estimator.estimate_peak_vram_mb(job, 4, "exclusive") == 888
+    assert estimator.predicted_busy_percent(job, 4) == estimator.ml_predictor.predict_busy_percent_options(job, [4])[4]
     assert job.metadata["vram_prediction_source"] == "branch_profile"
     assert not torch.cuda.is_initialized()
 

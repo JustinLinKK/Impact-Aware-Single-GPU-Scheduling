@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Iterable
 
-from ..domain import SchedulingClass, TrainingJob, parse_timestamp
+from ..domain import SchedulingClass, TrainingJob
 from ..config import SCHEDULER_DECISION_MODE_BACKEND_AWARED, SchedulerSettings
 from .backend_aware_planner import BackendAwarePlacementPlanner
 from .candidate_generator import CandidateGenerator
@@ -66,50 +66,18 @@ class PlacementPlanner:
         return self.candidate_generator.candidate_batch_sizes(job)
 
     def _effective_priority(self, job: TrainingJob, *, now: datetime) -> int:
-        if not self.settings.enable_priority_aging or self.settings.aging_interval_seconds <= 0:
-            return int(job.priority)
-        submitted = parse_timestamp(job.submitted_at)
-        waited_seconds = max(0.0, (now - submitted).total_seconds()) if submitted is not None else 0.0
-        bonus = int(waited_seconds // self.settings.aging_interval_seconds) * self.settings.aging_priority_increment
-        return int(job.priority) + bonus
+        return int(job.priority)
 
     def _time_aware_window(self, jobs: list[TrainingJob], *, now: datetime) -> tuple[list[TrainingJob], TrainingJob | None]:
+        """Bound candidates by static priority; arrival/wait time never rank jobs."""
         probe_feature_enabled = self.settings.gpu_scheduler.exclusive_probe.enabled
-        normal_jobs = [
-            job
-            for job in jobs
-            if job.scheduling_class == SchedulingClass.NORMAL
-            or (job.scheduling_class == SchedulingClass.EXCLUSIVE_PROBE and not probe_feature_enabled)
-        ]
-        priority = sorted(normal_jobs, key=lambda job: (-self._effective_priority(job, now=now), job.queue_sequence, job.job_id))[
-            : self.settings.gpu_scheduler.priority_window_size
-        ]
-        oldest = sorted(
-            normal_jobs,
-            key=lambda job: (
-                parse_timestamp(job.submitted_at) or now,
-                job.queue_sequence,
-                job.job_id,
-            ),
-        )[: self.settings.gpu_scheduler.oldest_window_size]
-        starving = [
-            job
-            for job in normal_jobs
-            if (now - (parse_timestamp(job.submitted_at) or now)).total_seconds() >= self.settings.gpu_scheduler.starvation_timeout_seconds
-        ]
+        normal_jobs = [job for job in jobs if job.scheduling_class == SchedulingClass.NORMAL
+                       or (job.scheduling_class == SchedulingClass.EXCLUSIVE_PROBE and not probe_feature_enabled)]
+        priority = sorted(normal_jobs, key=lambda job: (-int(job.priority), job.job_id))[
+            : self.settings.gpu_scheduler.priority_window_size]
         probes = [job for job in jobs if probe_feature_enabled and job.scheduling_class == SchedulingClass.EXCLUSIVE_PROBE]
-        by_id = {job.job_id: job for job in [*priority, *oldest, *probes, *starving]}
-        window = sorted(by_id.values(), key=lambda job: (-self._effective_priority(job, now=now), job.queue_sequence, job.job_id))
-        mandatory = min(
-            starving,
-            key=lambda job: (
-                parse_timestamp(job.submitted_at) or now,
-                job.queue_sequence,
-                job.job_id,
-            ),
-            default=None,
-        )
-        return window, mandatory
+        window = sorted([*priority, *probes], key=lambda job: (-int(job.priority), job.job_id))
+        return window, None
 
     def _fastest_time_option(self, job: TrainingJob, backend_name: str):
         try:
@@ -150,7 +118,7 @@ class PlacementPlanner:
         probe_feature_enabled = self.settings.gpu_scheduler.exclusive_probe.enabled
         probes = [job for job in window if probe_feature_enabled and job.scheduling_class == SchedulingClass.EXCLUSIVE_PROBE]
         if probes:
-            probe = sorted(probes, key=lambda job: (-self._effective_priority(job, now=now), job.queue_sequence, job.job_id))[0]
+            probe = sorted(probes, key=lambda job: (-self._effective_priority(job, now=now), job.job_id))[0]
             if active_jobs:
                 return None
             return DispatchPlan(
@@ -178,8 +146,8 @@ class PlacementPlanner:
         if cooperative_plan is not None:
             return cooperative_plan
         if not active_jobs and anchor.metadata.get("cooperative_trial"):
-            budget = min(31 * 1024.0, self.estimator.safe_budget_mb())
-            allowance = budget - active_vram_mb - max(256.0, budget * 0.05)
+            budget = self.estimator.safe_budget_mb()
+            allowance = budget - active_vram_mb
             if allowance <= 0:
                 return None
         if active_jobs:
@@ -220,7 +188,7 @@ class PlacementPlanner:
                     solo_remaining = self._predicted_solo_remaining(job)
                     if option is not None and solo_remaining is not None:
                         anchor_candidates.append(
-                            ((solo_remaining, -self._effective_priority(job, now=now), job.queue_sequence, job.job_id), job, backend_name, option)
+                            ((solo_remaining, -self._effective_priority(job, now=now), self.estimator.busy_rank(job, prefer_high=True, batch_size=option.batch_size), job.job_id), job, backend_name, option)
                         )
             if anchor_candidates:
                 _, selected_job, backend_name, option = min(anchor_candidates, key=lambda item: item[0])
@@ -245,7 +213,7 @@ class PlacementPlanner:
             if exclusive_candidates:
                 option, selected_job = min(
                     exclusive_candidates,
-                    key=lambda item: (item[0].remaining_runtime_seconds, -self._effective_priority(item[1], now=now), item[1].job_id),
+                    key=lambda item: (item[0].remaining_runtime_seconds, -self._effective_priority(item[1], now=now), self.estimator.busy_rank(item[1], prefer_high=True, batch_size=item[0].batch_size), item[1].job_id),
                 )
                 return DispatchPlan(
                     mode="exclusive",
@@ -302,7 +270,7 @@ class PlacementPlanner:
             )
             if solo_remaining is not None and has_backend_option:
                 ordered_candidates.append(
-                    ((solo_remaining, -self._effective_priority(job, now=now), job.queue_sequence, job.job_id), job)
+                    ((solo_remaining, -self._effective_priority(job, now=now), self.estimator.busy_rank(job, prefer_high=False), job.job_id), job)
                 )
         for _, candidate_job in sorted(ordered_candidates, key=lambda item: item[0]):
             evaluations = [

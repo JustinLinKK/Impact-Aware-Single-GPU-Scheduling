@@ -48,7 +48,7 @@ changes here, then record the tested revision in MLEvolve with
 - `examples/`: toy PyTorch training runner and a demo script
 - `adapters/`: thin helpers for wiring job submission from MLEvolve or other systems
 
-## Release integration (`paper`)
+## Release integration (`oct_proposed_v2`)
 
 | Component | Deployment | Integration interface | Overhead controls |
 | --- | --- | --- | --- |
@@ -72,7 +72,7 @@ The endpoint binds to `127.0.0.1:8766` and requires the token on every request.
 It permits local job execution, so share the token only with trusted agents on
 the host. Use one service per runtime root/GPU. Keep that runtime root across
 restarts to retain SQLite queue state, checkpoints, and scheduling evidence.
-The example uses incremental CUDA-process admission and a 31 GiB memory ceiling.
+The example uses incremental CUDA-process admission and a training budget of 90% of detected total VRAM.
 
 An agent submits work once, then waits at the job boundary:
 
@@ -93,6 +93,9 @@ with SchedulerHTTPClient(token=token) as scheduler:
             "input_shapes": [["$batch", 3, 224, 224]],
             "input_dtypes": ["float32"],
             "precision": "fp32_ieee",
+            "loss": "cross_entropy",
+            "optimizer": "adamw",
+            "dataset_size": 10000,  # Actual training split; use your sampler count.
         }},
     ))
     result = scheduler.wait_for_completion(job.job_id, timeout=3600)
@@ -217,8 +220,9 @@ useful measurement time, yields, controller/synchronization time, startup, and
 checkpoint cost. Trial wall time includes useful training and must not be
 charged again as pure overhead.
 
-Admission preserves the 31 GiB ceiling, configured memory margins, live device
-usage and pending reservations. The newcomer receives a PyTorch caching-allocator
+Admission uses 90% of total VRAM by default, accounting for live device usage
+and pending reservations. There is no additional 31 GiB ceiling or fixed 5%
+cold-start deduction. The newcomer receives a PyTorch caching-allocator
 limit before model allocation; this is not isolation for arbitrary CUDA
 extensions. Runners using unsupported allocators must declare
 `trial_allocator_supported=false` and an explicit `estimated_vram_mb` bound.
@@ -350,9 +354,9 @@ exclusive fallback or fails; it never silently changes to packed
 ## Time-aware scheduling
 
 `parallel_time_aware` starts the shortest predicted solo job as an anchor and
-then admits one candidate at a time, shortest remaining runtime first. A
-starving job overrides that ordering. Each addition must pass scheduling class,
-parallel cap, backend and pair compatibility, live-admission, batch-option, and
+then admits one candidate at a time, shortest remaining runtime first.
+Submission time and waiting duration do not override that ordering. Each addition
+must pass scheduling class, backend and pair compatibility, live-admission, batch-option, and
 predicted average-VRAM checks before any concurrent work begins.
 
 `gpu_scheduler.scheduler_decision_mode` selects the trial ordering layer:
@@ -564,11 +568,41 @@ The normal pause flow is:
 
 - `parallel_time_aware` is the only accepted mode; removed fixed-width and VRAM-fill mode names fail configuration validation
 - concurrency is derived incrementally from branch profiles and live GPU telemetry; no fixed job-count cap is configured
-- the memory ceiling is detected/configured total VRAM times `predicted_budget_fraction`; it can reject an addition but cannot improve its score
+- the memory ceiling is detected total VRAM times `predicted_budget_fraction` (default `0.90`); `gpu_vram_gib` is an optional explicit capacity override, and the example leaves it unset. Memory can reject an addition but cannot improve its score
 - the packed path is opt-in per job via `packing.eligible: true` and a stable `packing.signature`
 - backend compatibility is tracked per canonical backend, so an MPS-process failure cannot poison a CUDA-process profile
 - concurrent additions must remain on the active non-exclusive backend
 - raw MLEvolve snippet execution remains conservative by default; without an explicit runtime-probe hook they stay exclusive-only for runtime-aware packing
+
+### Admission ranking and memory boundaries
+
+Submission timestamps, elapsed waiting time, and queue sequence do not influence
+admission ranking. Static explicit priority selects the bounded candidate window;
+the existing runtime/drain-time objective and measured slowdown checks select
+feasible work. Among candidates tied on time and static priority, validated
+student NVML busy prefers a heavier job on an empty GPU and a lighter newcomer
+when jobs are active. Known busy precedes unknown busy; an unavailable or invalid
+prediction is never interpreted as zero utilization. Stable job IDs break the
+remaining ties. The backend-aware path retains its profile-quality, Pareto-risk,
+gain, confidence, uncertainty and headroom ordering before this final priority/
+busy/identity tie-break. Busy is an advisory hint, not additive GPU capacity or
+the primary scheduling objective.
+
+The historical `PriorityFifoPolicy` name and aging/oldest-window/starvation-time
+configuration fields remain accepted for compatibility, but cannot promote or
+reserve an old job. Operational timestamps remain for arrival availability,
+leases, timeouts, progress, and reporting. The original v2 research proposal
+contains historical waiting/fairness ideas; those ideas are not the runtime
+admission rules described here.
+
+The default predicted budget and live stop threshold are both 90% of total VRAM.
+A live sample at or above 90% immediately stops further admission. The 85%
+resume threshold applies only after admission has closed and requires sustained
+low usage; it does not cap an open scheduler at 85%. Cooperative allocation
+rechecks live free memory before model construction and retains the same 10%
+device reserve, instead of subtracting an extra fixed reserve. Existing work is
+not paused by this admission gate. External allocations and unmaterialized
+reservations may reduce the currently available portion of the budget.
 
 ## Limitations In V1
 
@@ -583,9 +617,170 @@ python -m pytest -q localml_scheduler/tests
 python -m pytest -q localml_scheduler/tests/test_ml_stress.py
 ```
 
-### Published A100 student integration
+## Integrate a code agent with the released predictor
 
-The optional 17-input `S_A100` CPU adapter uses an explicit public release code
-path and extracted checkpoint directory. See [configuration and the actual-model
-integration smoke test](docs/a100_student_integration.md). Student timing can
-inform batch options; measured branch memory remains authoritative.
+The CPU runtime supports the released **S_A100, S_A10G and S_A10** students and
+an explicitly selected compatible transfer student. Select the artifact for the
+**deployment GPU**, even when prediction runs on a different CPU host. A10 and
+A10G are distinct targets. No predictor retraining is required for this adapter.
+
+1. Obtain a trusted [PerfSeer `paper-release` checkout](https://github.com/JustinLinKK/PerfSeer-predictor/tree/paper-release),
+   fetch its checkpoint archive with Git LFS, and extract it. Install the release's
+   `portable/requirements-tested.txt` in the scheduler environment.
+2. Configure the scheduler's public release code path and extracted model path:
+
+   ```yaml
+   prediction:
+     mode: ml_predictor
+     ml:
+       student_release_path: /absolute/PerfSeer-paper-release
+       student_model_path: /absolute/extracted/PerfSeer-release-v1/checkpoints/S_A10G
+       source_conversion_timeout_seconds: 90
+       conversion_max_rss_mb: 4096
+       cpu_threads: 1
+   gpu_scheduler:
+     memory:
+       predicted_budget_fraction: 0.90
+       live_admission_stop_fraction: 0.90
+       live_admission_resume_fraction: 0.85
+   ```
+
+   The model directory contains `student.ts`, `normalization.pt`, and
+   `architecture.pt`. Their hashes are checked against `assets/manifest.json`,
+   which is bound by `RELEASE.json`; embedded hardware and the actual 17-tensor
+   TorchScript interface are checked too. The code checkout must be trusted.
+3. Have your code agent emit an importable model factory/class or a
+   `CandidateAdapter`, together with the **actual training recipe**. Attach it as
+   `TrainingJob.metadata["perfseer_model"]`, or write a source-bound JSON sidecar
+   with `write_prediction_sidecar`. The latter works with MLEvolve's existing
+   `baseline_model_path` submission without changing its executor. Regenerate
+   the sidecar after every source mutation.
+4. Submit the normal job through `SchedulerHTTPClient` (example above). Keep your
+   existing runner's progress reporting, checkpoint and pause/resume contract.
+   For a new framework, implement a `run_training_job(context: RunnerContext)`
+   callable following [Custom PyTorch Integration](#custom-pytorch-integration)
+   and the [working runner example](examples/toy_pytorch_runner.py).
+   The predictor describes a training step; it does not execute the full training
+   program or replace the runner. Measured branch memory and live VRAM remain
+   the admission authority.
+
+For example, this explicit module contract describes a factory `build_model()`
+whose forward pass takes `[batch, 4]` floats and returns `[batch, 1]` predictions,
+trained with MSE and AdamW. Replace these declarations with your candidate's
+real input domains, loss, optimizer and dataset size:
+
+```python
+from localml_scheduler.prediction.job_contract import write_prediction_sidecar
+
+recipe = {
+    "dataset_size": 8000,
+    "drop_last": False,
+    "workload_contract": {
+        "version": "mlevolve.perfseer_workload.v1",
+        "mode": "module",
+        "entry": "build_model",
+        "inputs": {
+            "positional": [{"shape": ["$batch", 4], "dtype": "float32", "distribution": "normal"}],
+            "keyword": {},
+        },
+        "loss": {"kind": "mse", "output_path": [],
+                 "target": {"shape": ["$batch", 1], "dtype": "float32", "fill": 0.0}},
+        "training": {
+            "precision": "fp32_ieee", "gradient_accumulation_steps": 1,
+            "optimizer": {"name": "adamw", "lr": 0.001, "weight_decay": 0.01,
+                          "foreach": None, "fused": None},
+            "scheduler": {"name": "none"}, "backend": "cuda_process",
+        },
+    },
+}
+write_prediction_sidecar("/absolute/candidate.py", recipe)
+```
+
+Structured inputs, keyword-only masks, bounded token IDs, tuple/dictionary
+outputs and the candidate's own scalar training loss are covered by the
+[full source contract](docs/source-contract.md). `CandidateAdapter` mode calls
+`build_model`, `build_train_batch`, and `training_step`; it checks a declared batch
+schema and optimizer. It avoids substituting a generic loss for an agent's real
+loss. Explicit `import_roots` support project-local helper modules. The source
+and local dependency hashes participate in cache invalidation.
+
+Epoch time equals predicted wall-step time multiplied by optimizer steps per
+epoch. Supply the actual training row count, or `steps_per_epoch_by_batch` for a
+custom sampler or capped epoch. An explicit per-batch map must include every
+requested batch; missing entries trigger fallback rather than silently reverting
+to the full dataset. A bare `steps_per_epoch` applies only to the resolved physical
+batch. Outputs are wall/GPU step **ms**, epoch **ms**, busy **%**, and average/peak
+VRAM **MiB**. Busy is a kernel-active-time proxy, not SM occupancy. The scheduler
+converts epoch milliseconds to seconds and multiplies by remaining epochs.
+
+The worker uses the scheduler Python environment; install the candidate's import
+dependencies there. It does not automatically install packages.
+
+Source capture currently supports FP32 and accumulation 1. AMP, unsupported
+control flow, non-importable programs, unknown recipes and larger accumulation
+require a matching strict precomputed training graph or measured-profile
+fallback. The worker is CPU-only with a timeout and Linux RSS watchdog; its
+memory budget is separate from the GPU's 90% training budget. Failure details
+identify conversion/recipe problems without marking the training job failed.
+An isolated subprocess is not a security sandbox: use trusted local code or an
+external sandbox for untrusted candidates. Network access is disabled during
+capture; pretrained downloads are not part of prediction.
+
+Run actual artifact integration tests from the parent of `localml_scheduler`:
+
+```bash
+CUDA_VISIBLE_DEVICES='' \
+PERFSEER_RELEASE_ROOT=/absolute/PerfSeer-paper-release \
+PERFSEER_STUDENT_MODEL_DIR=/absolute/extracted/PerfSeer-release-v1/checkpoints/S_A100 \
+PERFSEER_STUDENT_MODELS_ROOT=/absolute/extracted/PerfSeer-release-v1/checkpoints \
+python -m pytest localml_scheduler/tests/test_released_a100_student.py \
+  localml_scheduler/tests/test_released_hardware_students.py \
+  localml_scheduler/tests/test_source_contract.py \
+  localml_scheduler/tests/test_prediction_sidecar.py -q
+```
+
+Extract all four student artifacts for this full matrix; select `-k A10G` in
+`test_released_hardware_students.py` when checking only S_A10G.
+
+These test graph/recipe fidelity, actual CPU student inference, hardware and
+artifact identity, and scheduler consumption. They do not measure prediction
+accuracy or throughput on a newly generated candidate. The PetFinder check below exercises newly generated MLEvolve source.
+
+
+### Local MLEvolve PetFinder integration result
+
+Two fresh raw drafts were generated by the local MLEvolve code-agent path using
+Codex CLI, then passed through the scheduler's source-bound sidecar interface
+and the actual S_A10G student on CPU. Both native forward/loss/backward replay
+and the scheduler time, memory and busy APIs agreed. The recipe is batch 4,
+FP32 AdamW/MSE, with an explicit eight-step epoch cap.
+
+| Draft | Design | Predicted wall ms/step | Predicted avg / peak VRAM (MiB) | Predicted busy |
+| --- | --- | ---: | ---: | ---: |
+| candidate_00 | Three-stage CNN + tabular MLP | 12.12 | 836.9 / 840.4 | 15.35% |
+| candidate_01 | Four-stage CNN + tabular MLP | 13.74 | 871.5 / 874.5 | 17.99% |
+
+These are **predictions**, not measured GPU accuracy or completed training runs.
+The drafts are not presented as accepted MLEvolve training candidates: the first
+encountered existing provider/preflight infrastructure problems, and the second
+was rejected by deterministic training-review checks. Those statuses, exact
+source hashes, and the successful graph/inference checks are retained in the
+[provenance](verification/mlevolve_petfinder_20261027/provenance.json) and
+[prediction receipt](verification/mlevolve_petfinder_20261027/predictions.json).
+
+Reproduce the prediction check from the scheduler's parent directory, with the
+candidate dependencies installed in that Python environment:
+
+```bash
+CUDA_VISIBLE_DEVICES='' python \
+  localml_scheduler/verification/mlevolve_petfinder_20261027/verify_predictions.py \
+  --release-root /absolute/PerfSeer-paper-release \
+  --model-dir /absolute/extracted/PerfSeer-release-v1/checkpoints/S_A10G \
+  --sources localml_scheduler/verification/mlevolve_petfinder_20261027/raw \
+  --output /tmp/petfinder-predictions.json
+```
+
+The full CPU suite recorded 382 passed tests, 11 passed subtests and three
+intentional skips (two live-GPU tests and the optional input-only TRAIN probe).
+One optional CUDA-document search test fails identically at the untouched base
+revision; it is recorded in the [full verification report](verification/scheduler-integration-20261027.json).

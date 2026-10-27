@@ -31,8 +31,8 @@ def cold_start_plan(planner, jobs, active, available, used_mb, *, mandatory, now
         for job in active
     ):
         return None
-    budget = min(31 * 1024.0, planner.estimator.safe_budget_mb())
-    allowance = budget - used_mb - max(256.0, budget * 0.05)
+    budget = planner.estimator.safe_budget_mb()
+    allowance = budget - used_mb
     if allowance <= 0:
         return None
     ordered = []
@@ -63,7 +63,8 @@ def cold_start_plan(planner, jobs, active, available, used_mb, *, mandatory, now
         remaining = planner.predicted_remaining_runtime_seconds(job, backend_name=backend)
         ordered.append(((
             remaining is None, remaining if remaining is not None else 0.0,
-            -planner._effective_priority(job, now=now), job.queue_sequence, job.job_id,
+            -planner._effective_priority(job, now=now),
+            planner.estimator.busy_rank(job, prefer_high=not active, batch_size=batch), job.job_id,
         ), job, key, config))
     if not ordered:
         return None
@@ -239,7 +240,7 @@ class ColdStartTrialMixin:
                 return
             self._finish_cold_start_trial(trial, "accepted" if not remaining and candidate.job_id in {job.job_id for job in jobs} else "inconclusive", "pack membership changed")
             return
-        if self._device_samples and self._device_samples[-1].memory_used_mb > min(31 * 1024, self.planner.estimator.safe_budget_mb()):
+        if self._device_samples and self._device_samples[-1].memory_used_mb > self.planner.estimator.safe_budget_mb():
             self._finish_cold_start_trial(trial, "inconclusive", "live memory budget exceeded")
             return
         if trial.phase == "prepare":

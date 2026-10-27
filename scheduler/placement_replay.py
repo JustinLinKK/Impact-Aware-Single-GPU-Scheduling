@@ -200,7 +200,6 @@ class PlacementReplayMixin:
                     if self._replay_slot(job) is not None
                     else 1_000_000
                 ),
-                job.queue_sequence,
                 job.job_id,
             ),
         )[:target_width]

@@ -32,3 +32,14 @@ Updated the one-page PDF and Word brief (402 extracted PDF words) in outputs;
 page count, text and rendered layout were checked. Runtime/GPU jobs and both
 other scheduler checkouts remain outside this revision. The branch contains a
 reviewable research contract, not measured evidence of scheduler improvement.
+
+
+## October 27 generated-source scheduler integration
+
+User-authorized implementation on oct_proposed_v2: use hardware-matched released CPU students, add explicit source/training contracts for generated candidate programs, remove submission-time/queue-age ranking, and budget GPU training at 90% of detected VRAM. Preserve measured memory and live admission evidence. Verify with controlled failure reproductions, real published A100/A10G/A10 students, and 2–3 newly generated PetFinder nodes through the local MLEvolve Codex code-agent path. Document the interface for other agent frameworks. No active predictor training, paused A100 pilot, immutable checkpoint, or primary checkout change is authorized by this task.
+
+Verification plan: targeted CPU tests for recipe/graph correctness, imports and inputs, artifact/hardware integrity, cache invalidation, temporal-rank invariance and memory boundaries; actual generated-source predictions with recorded provenance; full scheduler test suite; reviewed diff and ordinary branch publication after remote-head verification. Compatibility tests do not establish prediction accuracy or GPU throughput on unseen PetFinder candidates.
+
+Implementation and CPU verification completed: hardware-specific public student selection (A100/A10G/A10 and transferred A10), versioned module/CandidateAdapter contracts, source-bound sidecars, strict native backward replay, declared input domains, local import support, dependency-aware cache invalidation, and bounded CPU capture. Admission now ignores submission/queue age; the existing time objective uses busy as a heavier-idle/lighter-joining tie-break. VRAM budget is 90% with consistent cold-start/live allocation guards. Fixed a fresh-process profiling import cycle.
+
+Two genuine PetFinder source drafts generated through local MLEvolve Codex integration both converted and produced actual S_A10G predictions with native replay at batch4/8steps. They remain raw drafts with documented MLEvolve review/preflight limitations; no full training or GPU benchmarking is claimed. Full CPU validation:382passed,11subtests,3intentional skips; one optional CUDA-doc search failure reproduced on untouched base59f8ed5. Recipes, source hashes, predictions, comparison and reviewer receipts are saved under verification/. Publication uses an ordinary fast-forward push to oct_proposed_v2 after staged-file and remote-head checks.

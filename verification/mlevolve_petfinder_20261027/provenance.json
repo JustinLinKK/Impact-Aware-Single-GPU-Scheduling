@@ -1,0 +1,114 @@
+{
+  "schema": "mlevolve-petfinder-codeonly-provenance-v1",
+  "generated_at_utc": "2026-10-27T04:45:49.171132+00:00",
+  "run_id": "20261026_213827_mlevolve_petfinder_codeonly_20261027T043827Z",
+  "generator": {
+    "framework": "MLEvolve AgentSearch.step",
+    "provider": "codex_cli",
+    "model": "gpt-6-astra",
+    "authenticated_cli": true,
+    "cuda_visible_devices": "",
+    "cloud_or_provisioning": false,
+    "execution_callback_calls": 0,
+    "training_launched": false,
+    "request_log": "codex_requests.redacted.jsonl",
+    "harness": "generate_candidates.py",
+    "production_code_modified": false,
+    "prompt_and_plan_records": [
+      "prompts/",
+      "raw/candidate_00.plan.txt",
+      "raw/candidate_01.plan.txt"
+    ],
+    "local_framework_execution": true,
+    "model_inference": "Authenticated Codex service; not local LLM inference"
+  },
+  "dataset_context": {
+    "dataset": "PetFinder Pawpularity",
+    "local_cached": true,
+    "train_images": 9912,
+    "test_images": 8,
+    "split": "deterministic 90/10 train/validation split, random_state=42",
+    "train_rows": 8920,
+    "validation_rows": 992,
+    "image_adapter_shape": [
+      3,
+      256,
+      256
+    ],
+    "tabular_features": 12,
+    "candidate_steps_per_epoch_at_batch_4": 8
+  },
+  "candidates": [
+    {
+      "id": "candidate_00",
+      "source": "raw/candidate_00.py",
+      "sidecar": "raw/candidate_00.py.perfseer.json",
+      "source_sha256": "ed557d8c075b436e7ad6c5fcad5346d8c883519158a9f4c3417021426ad15e4a",
+      "sidecar_sha256": "9f7c4d25d8774ee6456873719217b94b494882dabc298a7571bf5ba3c934659d",
+      "origin": "Raw MLEvolve-generated draft; source preserved without edits.",
+      "preflight": "unavailable: MLEvolve preflight import failed because model_preflight is not installed in the configured environment",
+      "review": "not completed; the review repair path called MLEvolve llm.generate, whose Codex CLI dispatch is absent and fell through to Gemini; bounded retries produced no review artifact. This is a workflow limitation, not an acceptance result.",
+      "full_training_script": "not run",
+      "cpu_capture": "source import and forward/loss/backward executed for graph conversion"
+    },
+    {
+      "id": "candidate_01",
+      "source": "raw/candidate_01.py",
+      "sidecar": "raw/candidate_01.py.perfseer.json",
+      "source_sha256": "3f0da671fdbc1753f31a4eb1bb06b46a5a2ffa1730730bed7ef79e578b3c5520",
+      "sidecar_sha256": "ed1a9064887ac826bcb028a66135723011ddec35f6941ef89f4eac14419a1e12",
+      "origin": "Raw MLEvolve AgentSearch code-only draft; source preserved without edits.",
+      "preflight": "skipped; dependency unavailable",
+      "review": {
+        "status": "rejected by deterministic static checks; not an accepted training result",
+        "reasons": [
+          "training_contract/precision_numerical_fallback: static detector saw torch.autocast(..., enabled=False) and reported missing finite-loss and unscaled-gradient checks. The source declares FP32 and explicitly disables autocast; this finding appears to be a static false positive, but remains recorded as the rejection reason.",
+          "training_contract/validation_early_stopping: source uses a fixed three-epoch budget and validation-based best-checkpoint selection but has no statically recognizable validation-based early-stopping/patience logic."
+        ]
+      },
+      "full_training_script": "not run",
+      "cpu_capture": "source import and forward/loss/backward executed for graph conversion"
+    }
+  ],
+  "integration_verification": {
+    "evidence": "predictions.json",
+    "student": "release/S_A10G",
+    "student_sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+    "verification_scope": "CPU source capture, native backward replay, scheduler prediction and A10G TorchScript inference path; not a GPU benchmark or model-quality measurement",
+    "cuda_initialized": false,
+    "training_launched": false,
+    "candidates": [
+      {
+        "id": "candidate_00",
+        "batch": 4,
+        "steps_per_epoch": 8,
+        "predicted_wall_step_ms": 12.1176118850708,
+        "predicted_gpu_step_ms": 11.811991691589355,
+        "predicted_avg_vram_mib": 836.9445190429688,
+        "predicted_peak_vram_mib": 840.3673095703125,
+        "predicted_busy_percent": 15.346869468688965,
+        "source_node_count": 131,
+        "backward_node_count": 83,
+        "numeric_parity": true
+      },
+      {
+        "id": "candidate_01",
+        "batch": 4,
+        "steps_per_epoch": 8,
+        "predicted_wall_step_ms": 13.741113662719727,
+        "predicted_gpu_step_ms": 13.439638137817383,
+        "predicted_avg_vram_mib": 871.4730834960938,
+        "predicted_peak_vram_mib": 874.54150390625,
+        "predicted_busy_percent": 17.985794067382812,
+        "source_node_count": 146,
+        "backward_node_count": 91,
+        "numeric_parity": true
+      }
+    ]
+  },
+  "limitations": [
+    "These are generated candidate source drafts and scheduler predictions, not trained models or measured GPU performance.",
+    "No validation metric or independent test result was produced.",
+    "Only these two raw drafts are included; no further candidate generation was performed."
+  ]
+}

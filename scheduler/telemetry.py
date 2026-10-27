@@ -58,7 +58,7 @@ class GpuTelemetrySummary:
 
 @dataclass(slots=True)
 class MemoryAdmissionGate:
-    """Rolling-average admission hysteresis; it never pauses active work."""
+    """Immediate high-water admission stop; rolling hysteresis only for reopening."""
 
     stop_fraction: float = 0.90
     resume_fraction: float = 0.85
@@ -84,7 +84,8 @@ class MemoryAdmissionGate:
         )
         complete_window = (captured - oldest).total_seconds() >= self.window_seconds
         if self.is_open:
-            if complete_window and self.average_fraction >= self.stop_fraction:
+            current_fraction = sample.memory_used_mb / sample.memory_total_mb if sample.memory_total_mb > 0 else 0.0
+            if current_fraction >= self.stop_fraction or (complete_window and self.average_fraction >= self.stop_fraction):
                 self.is_open = False
                 self.below_resume_since = None
                 return "closed"

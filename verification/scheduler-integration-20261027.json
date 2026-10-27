@@ -1,0 +1,88 @@
+{
+  "schema": "scheduler-generated-source-integration-verification-v1",
+  "verified_at_utc": "2026-10-27T04:45:41.661854+00:00",
+  "base_commit": "59f8ed5e1f6c9e33405f16b160cd0afe71918c02",
+  "branch": "oct_proposed_v2",
+  "gpu_visibility": "disabled for all tests",
+  "full_suite": {
+    "passed": 382,
+    "failed": 1,
+    "skipped": 3,
+    "subtests_passed": 11,
+    "seconds": 140.72,
+    "remaining_failure": "test_general_search_requires_complete_exact_applicability_for_nvidia_records",
+    "remaining_failure_reproduced_on_untouched_base": true,
+    "failure_scope": "Optional CUDA-document search; not source conversion, student inference or scheduling admission",
+    "skips": [
+      {
+        "test": "test_scheduler_runs_profiled_time_aware_anchor_on_cuda_process",
+        "reason": "CUDA is required for the live packed GPU scheduler test"
+      },
+      {
+        "test": "test_scheduler_runs_real_toy_model_jobs_on_cuda",
+        "reason": "CUDA is required for the live GPU scheduler full-flow test"
+      },
+      {
+        "test": "test_real_train_probe_tensor_parity",
+        "reason": "optional PERFSEER_A100_PROBE input-only TRAIN fixture is not installed"
+      }
+    ]
+  },
+  "command": "From the scheduler parent: PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES= PYTHONPATH=<scheduler-parent>:<MLEvolve-root> PERFSEER_RELEASE_ROOT=<public-release> PERFSEER_STUDENT_MODEL_DIR=<S_A100-dir> PERFSEER_STUDENT_MODELS_ROOT=<all-student-dirs> <MLEvolve-python> -m pytest localml_scheduler/tests -q --tb=short",
+  "environment": {
+    "python": "MLEvolve .venv (Python 3.11)",
+    "torch": "2.11.0+cu130",
+    "host_fixture_links": [
+      "PerfSeer-predictor",
+      "scheduler_benchmark_test",
+      "schema"
+    ],
+    "host_fixture_links_are_test_setup_only": true
+  },
+  "source_sha256": {
+    "README.md": "35b7e6d952d6756eb96057732cfeae064d822c0974967ddaefe83cb2d306882a",
+    "config/models.py": "69f446562ff5514c541b9d79bc8fe0281801c6973067f697b4425b088413bc54",
+    "docs/a100_student_integration.md": "cbffb71a97b455d8a25bace070770a4732787b03fef3e91d59a2c68379c05560",
+    "examples/scheduler.paper.yaml": "91a14fcf2165ca0f19df85365fddc26f2b43b49acfc00c0c4617b6adde4b264c",
+    "execution/trial_control.py": "26b55af0df571921f4f95d0774203238040bf7eef1bfb6b5a53ea0b2cd951b3a",
+    "prediction/job_contract.py": "8dfdae3fd0390ace2f1cf0cce4a2a43ce24568cda575bf2aa01d3fca7a122b7f",
+    "prediction/ml_predictor.py": "83e916f99f1743b71d922aeff74eb2366d0fee39e8aae30b21c5f8c3d7207d6a",
+    "prediction/released_artifacts.py": "10d42c3ca9be6de25082b070ad58ab22f8d15f9c7eb8adb68395b125fdd8066d",
+    "prediction/released_student.py": "cf3297a86b3b053f7dbda9b28e6d92661ee1c247e4ebca5ac38ec5aa5e9a8159",
+    "prediction/source_contract.py": "444b98cb6b7d4f8c407b0d65ed744d54cab97ee49035105ce154f80ede4dc5d6",
+    "prediction/source_worker.py": "f5d463c8e56f1065d984d853d917621528383f45dcfe1b79fccafb1caa11430c",
+    "profiling/__init__.py": "468859dcb472d71ff6d418f42d7d5c763d4f0b7dcdc70930cc50843e59a2d05e",
+    "scheduler/backend_aware_planner.py": "04c91bd2426433d3ba90aa3547e6c48b93e0c550c18be542b8e7f59aeb1c00f5",
+    "scheduler/candidate_generator.py": "3e233e6dbfb6e2581a3d462a5d0f5e503adc167c4705e537e81c9f6a44886489",
+    "scheduler/cold_start.py": "50fdd7895dc7965edd088be8944957b6c7e54ca7397f8c63be38096487a1f371",
+    "scheduler/placement_planner.py": "48f31906d56f314b5e9de1b2034ff8411638da81e10118a10ea1a150af963575",
+    "scheduler/placement_replay.py": "e117bb108b50d7e6468b7b7110c18bad46fed85bf56947032b8359ec7125d9f4",
+    "scheduler/policies.py": "31c2e22335f3a3230e7775a600aa5edb5fe00b71028f8b9ab091090bf1f53dbe",
+    "scheduler/resource_estimator.py": "05fa8eb2c5071e966542a721b88cdfd3308241405312928cd71eb2cddb451b1f",
+    "scheduler/telemetry.py": "44000d744f2430838a74b7055592d757130ae944256a303109f5ef1782b0c0fe",
+    "scheduler/trace_simulator.py": "b34c63fbe21c3785f8917e1270f5a9a9b6e79fb83bc883db3dfcc1e1fc8a5407",
+    "tests/test_cold_start_trials.py": "c0de551c449e63a20d50f1659ad726cec84ef5d166e5eb147ee2ebab44af94de",
+    "tests/test_gpu_scheduler.py": "4af169996f50b7735adbb3fe65707a8e9d3e5b1564d1632bb20935032594a93e",
+    "tests/test_gpu_scheduler_integration.py": "798056dfefc38e591514934d19d4bf7895ace686c6203b7b2fcd870175a660be",
+    "tests/test_ml_prediction.py": "c49d5ff96cc1f5c4687aa80d8025490884cde7986e6053abe60cf63c7057a802",
+    "tests/test_policy.py": "13ecd064d1ab91a164d44740cd38910840c6f7454ef2eec4c037051cb892ef30",
+    "tests/test_prediction_sidecar.py": "63bd8c9f0ee1d1791d2fc2bfff8a60ea0e9bdb1d9e6bcebd660b6d13c46f02b7",
+    "tests/test_profiling_imports.py": "b721a1c96dda869090383149c61654eb84b0db0a5425b8ca0278b68810a01362",
+    "tests/test_property_only_admission.py": "98e79e779d6120bb1902dfa8e205e760cc22ffb43c270e5bce5965e250b758ce",
+    "tests/test_released_a100_student.py": "d5be6d19d60de2b8a2ad67f742092854015927818daecc51848fcdd701f32c24",
+    "tests/test_released_hardware_students.py": "acc5458d97ee0896d4a8679cface72e64f465f1dc2c1ea7c9621e19109cb7a64",
+    "tests/test_source_contract.py": "109cb223444cd9c4389ea4ca40830680e25d693bac0c06c8f9106a2f7a79a325",
+    "tests/test_time_aware_scheduler.py": "305ea13fafc99e66b657c45d2f4915871e57305f4c5abdfa6c6adf569732a059"
+  },
+  "released_students": {
+    "S_A100": "ff968d0816eba99cc7765c297a3ee9d4e7ee8a4c4b0f40b5e2dcd72e0b2b419f",
+    "S_A10G": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+    "TS_A10_A100": "07ce4fa52b695f2a8e1ea111eec870ebe38dbe35939b6dd411cb5f026e5f0ade",
+    "S_A10": "96d31d84d8d809c1ed9a4154f84389a3cb3b673d75445deb650cee4297398e03"
+  },
+  "readme_example_contract_parsed": true,
+  "cuda_training_or_cloud_launched": false,
+  "generated_candidates": "Two actual PetFinder raw drafts; both successful S_A10G CPU capture/prediction, recorded in mlevolve_petfinder_20261027/provenance.json and predictions.json.",
+  "generated_source_count": 2,
+  "generated_source_prediction_passed": true
+}

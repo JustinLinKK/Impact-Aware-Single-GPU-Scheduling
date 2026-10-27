@@ -62,7 +62,6 @@ class CandidateGenerator:
             key=lambda job: (
                 job.priority,
                 -(self.estimator.predicted_remaining_runtime_seconds(job, backend_name=backend_name) or 0.0),
-                job.queue_sequence,
                 job.job_id,
             ),
         )

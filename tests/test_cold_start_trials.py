@@ -132,9 +132,9 @@ def test_allocator_limit_respects_live_free_memory(tmp_path):
     job.resource_requirements.requires_gpu = True
     job.metadata["trial_memory_limit_mb"] = 2048
     context = Mock(job=job, store=store)
-    with patch("torch.cuda.mem_get_info", return_value=(1024 * 1024**2, 32 * 1024**3)), patch("torch.cuda.set_per_process_memory_fraction") as guard:
+    with patch("torch.cuda.mem_get_info", return_value=(4 * 1024**3, 32 * 1024**3)), patch("torch.cuda.set_per_process_memory_fraction") as guard:
         configure_trial_memory(context)
-    assert guard.call_args.args[0] == 768 / (32 * 1024)
+    assert guard.call_args.args[0] == pytest.approx((4 - 3.2) / 32)
 
 
 @pytest.mark.parametrize("mode,expected", [("origin", True), ("baseline", False)])
@@ -339,7 +339,8 @@ def test_generated_script_submission_rejects_requeues_and_completes(tmp_path, mo
 
     settings = SchedulerSettings(runtime_root=tmp_path / "runtime", scheduler_poll_interval_seconds=0.05,
         graph_db={"enabled": False}, hardware_knowledge_graph={"enabled": False}, hardware_feature_db={"enabled": False},
-        gpu_scheduler={"packing_backend": "cuda_process", "batch_probe_enabled": False})
+        gpu_scheduler={"packing_backend": "cuda_process", "batch_probe_enabled": False,
+                       "memory": {"gpu_vram_gib": 32}})
     client = SchedulerClient(settings)
     baseline = tmp_path / "baseline.pt"
     torch.save({}, baseline)
@@ -356,6 +357,9 @@ def test_generated_script_submission_rejects_requeues_and_completes(tmp_path, mo
             metadata={"cooperative_trial": True, "skip_active_scheduler_probes": True},
         ))
     service = client.create_service()
+    # This CPU lifecycle check supplies a simulated capacity and must not depend
+    # on whether CUDA is hidden or another process occupies the host GPU.
+    monkeypatch.setattr(service.telemetry_sampler, "sample", lambda: None)
     monkeypatch.setattr("localml_scheduler.scheduler.cold_start.normalized_throughput", lambda *args: ("rejected", [0.6, 0.6]))
     monkeypatch.setattr(service.planner.time_objective, "estimate_gain", lambda *args, **kwargs: None)
     service.start(background=True)

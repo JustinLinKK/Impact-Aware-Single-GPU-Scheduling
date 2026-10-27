@@ -143,7 +143,7 @@ class MLPredictionTest(unittest.TestCase):
             predictor.model_id,
             "nvidia_rtx_pro_6000_blackwell_student_v1",
         )
-        self.assertEqual(predictor._runtime.artifact_path, BLACKWELL_ARTIFACT)
+        self.assertEqual(predictor._runtime.artifact_path.resolve(), BLACKWELL_ARTIFACT.resolve())
         value = predictor.predict_avg_vram_mb(model_job(SUPPORTED_SOURCE), 2)
         self.assertGreater(value, 0)
         self.assertEqual(predictor.last_sources["predict-job"], "ml_predictor")

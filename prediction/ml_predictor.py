@@ -12,6 +12,7 @@ from pathlib import Path
 import sys
 from typing import Any, Sequence
 
+from .job_contract import prediction_metadata
 from ..config import PredictionSettings
 from ..domain import TrainingJob
 from ..hardware import HardwareProfile
@@ -86,8 +87,8 @@ def _resolve_shapes(raw_shapes: Sequence[Sequence[Any]], batch_size: int) -> tup
     return tuple(resolved)
 
 
-def model_specification_for_job(job: TrainingJob, batch_size: int) -> ModelSpecification:
-    metadata = dict(job.metadata.get("perfseer_model") or {})
+def source_path_for_job(job: TrainingJob) -> Path:
+    metadata = prediction_metadata(job)
     source_value = (
         metadata.get("source_path")
         or job.metadata.get("architecture_source")
@@ -101,6 +102,30 @@ def model_specification_for_job(job: TrainingJob, batch_size: int) -> ModelSpeci
         source_path = (Path.cwd() / source_path).resolve()
     if not source_path.is_file() or source_path.suffix != ".py":
         raise JobPredictionError(f"model source is not a Python file: {source_path}")
+    return source_path.resolve()
+
+
+def precision_for_job(job: TrainingJob) -> str:
+    metadata = prediction_metadata(job)
+    contract = metadata.get("workload_contract") or {}
+    declared = ((contract.get("training") or {}).get("precision") or contract.get("precision") or metadata.get("precision")
+                or job.metadata.get("precision") or job.metadata.get("precision_mode"))
+    if declared is None and job.metadata.get("uses_amp"):
+        raise JobPredictionError("uses_amp requires an explicit precision_mode (bf16 or fp16)")
+    return _normalize_precision(declared)
+
+
+def released_source_request(job: TrainingJob, batch_size: int) -> dict[str, Any]:
+    """A versioned workload adapter need not masquerade as a tensor factory."""
+    metadata = prediction_metadata(job)
+    if metadata.get("workload_contract"):
+        return {"source_path": str(source_path_for_job(job)), "precision": precision_for_job(job)}
+    return model_specification_for_job(job, batch_size).worker_request()
+
+
+def model_specification_for_job(job: TrainingJob, batch_size: int) -> ModelSpecification:
+    metadata = prediction_metadata(job)
+    source_path = source_path_for_job(job)
 
     raw_shapes = metadata.get("input_shapes")
     if raw_shapes is None:
@@ -122,7 +147,7 @@ def model_specification_for_job(job: TrainingJob, batch_size: int) -> ModelSpeci
         entry=str(metadata.get("entry") or "build_model"),
         input_shapes=input_shapes,
         input_dtypes=input_dtypes,
-        precision=_normalize_precision(metadata.get("precision") or job.metadata.get("precision")),
+        precision=precision_for_job(job),
         constructor_args=tuple(metadata.get("constructor_args") or ()),
         constructor_kwargs=dict(metadata.get("constructor_kwargs") or {}),
     )
@@ -454,5 +479,5 @@ class MLVramPredictor:
 
     def predict_busy_percent_options(self, job, batch_sizes):
         if self._released is None:
-            raise JobPredictionError("released A100 student is unavailable")
+            raise JobPredictionError("released hardware student is unavailable")
         return {batch: values[3] for batch, values in self._released_options(job, batch_sizes).items()}

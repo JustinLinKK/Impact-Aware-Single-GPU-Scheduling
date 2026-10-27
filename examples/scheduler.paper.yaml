@@ -4,9 +4,16 @@ prediction:
   ml:
     cpu_threads: 1
     cache_size: 1024
-    source_conversion_timeout_seconds: 15
+    source_conversion_timeout_seconds: 90
+    conversion_max_rss_mb: 4096
+    # Public release mode: set both to your trusted, extracted student release.
+    # student_release_path: /absolute/PerfSeer-paper-release
+    # student_model_path: /absolute/extracted/PerfSeer-release-v1/checkpoints/S_A10G
 gpu_scheduler:
   mode: parallel_time_aware
   packing_backend: cuda_process
   memory:
-    gpu_vram_gib: 31
+    gpu_vram_gib: null  # Detect physical total VRAM.
+    predicted_budget_fraction: 0.90
+    live_admission_stop_fraction: 0.90
+    live_admission_resume_fraction: 0.85

@@ -344,7 +344,7 @@ def test_time_score_starts_one_anchor_and_ignores_untrusted_pair_slowdown() -> N
         assert plan.objective_breakdown["requires_live_trial"] is False
 
 
-def test_starved_oldest_job_is_mandatory_exclusive_fallback() -> None:
+def test_starved_oldest_job_has_no_mandatory_priority_override() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         settings = _settings(tmpdir, starvation_timeout_seconds=60)
         store = SQLiteStateStore(settings)
@@ -360,8 +360,8 @@ def test_starved_oldest_job_is_mandatory_exclusive_fallback() -> None:
             now=now,
         )
         assert plan is not None
-        assert plan.job_ids == ("old",)
-        assert plan.mandatory_anchor_job_id == "old"
+        assert plan.job_ids == ("young",)
+        assert plan.mandatory_anchor_job_id is None
 
 
 def test_exclusive_probe_is_first_class_and_waits_for_drain() -> None:
@@ -396,13 +396,12 @@ def _sample(second: int, fraction: float) -> GpuTelemetrySample:
     )
 
 
-def test_memory_gate_uses_full_window_hysteresis_without_pausing() -> None:
+def test_memory_gate_stops_immediately_and_uses_hysteresis_only_to_reopen() -> None:
     gate = MemoryAdmissionGate(window_seconds=10, stop_fraction=0.90, resume_fraction=0.85)
-    assert gate.update(_sample(0, 0.99)) is None
-    assert gate.is_open
+    assert gate.update(_sample(0, 0.99)) == "closed"
+    assert not gate.is_open
     for second in range(1, 11):
-        transition = gate.update(_sample(second, 0.91))
-    assert transition == "closed"
+        assert gate.update(_sample(second, 0.91)) is None
     assert not gate.is_open
     for second in range(11, 26):
         assert gate.update(_sample(second, 0.80)) is None

@@ -1,0 +1,44 @@
+{
+  "date": "2026-10-27",
+  "files_sha256": {
+    "docs/source-contract.md": "d7727c1b0bc5ab30cbd1fd3bfdfb6d6289712181c0257c624b05d29df12a6357",
+    "prediction/job_contract.py": "8dfdae3fd0390ace2f1cf0cce4a2a43ce24568cda575bf2aa01d3fca7a122b7f",
+    "prediction/ml_predictor.py": "83e916f99f1743b71d922aeff74eb2366d0fee39e8aae30b21c5f8c3d7207d6a",
+    "prediction/released_artifacts.py": "10d42c3ca9be6de25082b070ad58ab22f8d15f9c7eb8adb68395b125fdd8066d",
+    "prediction/released_student.py": "cf3297a86b3b053f7dbda9b28e6d92661ee1c247e4ebca5ac38ec5aa5e9a8159",
+    "prediction/source_contract.py": "444b98cb6b7d4f8c407b0d65ed744d54cab97ee49035105ce154f80ede4dc5d6",
+    "prediction/source_worker.py": "f5d463c8e56f1065d984d853d917621528383f45dcfe1b79fccafb1caa11430c",
+    "tests/test_released_hardware_students.py": "acc5458d97ee0896d4a8679cface72e64f465f1dc2c1ea7c9621e19109cb7a64",
+    "tests/test_source_contract.py": "109cb223444cd9c4389ea4ca40830680e25d693bac0c06c8f9106a2f7a79a325",
+    "verification/mlevolve_petfinder_20261027/raw/candidate_00.py": "ed557d8c075b436e7ad6c5fcad5346d8c883519158a9f4c3417021426ad15e4a",
+    "verification/mlevolve_petfinder_20261027/raw/candidate_00.py.perfseer.json": "9f7c4d25d8774ee6456873719217b94b494882dabc298a7571bf5ba3c934659d"
+  },
+  "findings_fixed": [
+    "Added versioned module/CandidateAdapter workload contracts, strict structured inputs/outputs, FP32 and accumulation limits, explicit scheduler/backend, input-element bounds, and fail-closed unknown-field handling; legacy explicit input_shapes remain supported.",
+    "CandidateAdapter runs its actual training_step/loss; optimizer verification now exact-matches optimizer type, canonicalized defaults and every parameter group, and requires complete unique coverage of trainable parameters.",
+    "Fixed legacy cross-entropy targets to int64 class-index shape [B,*logits.shape[2:]]; unsupported module-loss options are rejected rather than silently ignored.",
+    "Added package-relative/import-root loading through capture, static dependency SHA receipts and conservative cacheability; helper mutation invalidates cached conversion.",
+    "Precomputed graphs require strict backward capture, validated replay samples, explicit precision and optimizer/scheduler/backend provenance, accumulation and hardware/step agreement; audit reads graph.coverage.replay_validated."
+  ],
+  "review": "No remaining blocking issue found in parent-owned loader/artifact/sidecar/cache integration. Explicit sidecar source hash and release manifest binding are validated; A10, A10G, A100 and TS_A10 hardware selection/inference paths pass. Unsupported workload semantics fail closed and fall back through the predictor error path.",
+  "schema": "mlevolve-source-integration-review-v1",
+  "scope": "Read-only review of released-source worker/contract integration and parent-owned loader, artifact verification, sidecar metadata, and cache paths. No training, GPU, cloud, commit, or publication.",
+  "validation": {
+    "command": "PERFSEER_RELEASE_ROOT=/home/justin/PerfSeer-paper-release PERFSEER_STUDENT_MODELS_ROOT=/tmp/perfseer-scheduler-integration-models/PerfSeer-release-v1/checkpoints PERFSEER_STUDENT_MODEL_DIR=/tmp/perfseer-scheduler-integration-models/PerfSeer-release-v1/checkpoints/S_A100 /home/justin/MLEvolve/.venv/bin/python -m pytest -q tests/test_source_contract.py tests/test_prediction_sidecar.py tests/test_released_hardware_students.py tests/test_released_a100_student.py",
+    "petfinder_sidecar_capture": {
+      "backward_nodes": 83,
+      "batch_size": 4,
+      "cuda_initialized": false,
+      "dependency_closure_complete": true,
+      "graph_nodes": 131,
+      "input_elements": 786484,
+      "native_replay_parity": true,
+      "optimizer": "AdamW; defaults, groups and parameter coverage matched",
+      "optimizer_steps_per_epoch": 8,
+      "result": "CPU source capture and A10G released-student prediction succeeded.",
+      "source_sha256": "ed557d8c075b436e7ad6c5fcad5346d8c883519158a9f4c3417021426ad15e4a"
+    },
+    "post-final-worker-change": "16 passed for source-contract and strict precomputed-graph roundtrip.",
+    "result": "35 passed, 1 skipped (optional TRAIN-only probe); git diff --check clean."
+  }
+}

@@ -25,8 +25,8 @@ prediction:
 If the second path is omitted, it defaults to
 `<student_release_path>/extracted/PerfSeer-release-v1/checkpoints/S_A100`.
 No private study checkout or neighboring `PerfSeer-predictor` submodule is needed.
-The adapter verifies the immutable D3 artifact SHA-256, embedded input/hardware
-metadata, normalization SHA-256, and architecture SHA-256. It requires an A100
+The adapter verifies published member hashes against the release manifest, embedded input/hardware
+metadata, normalization SHA-256, and architecture SHA-256. This selected artifact requires an A100
 hardware identity; CPU inference does not require an installed A100.
 
 For a Python model factory, supply this job metadata alongside the actual batch:
@@ -44,7 +44,7 @@ metadata = {"perfseer_model": {
 ```
 
 Source capture runs a tiny CPU forward/backward trace in a bounded child process;
-it does not launch GPU training. The current converter accepts a single tensor
+it does not launch GPU training. The legacy metadata example above accepts a single tensor
 output, FP32, accumulation 1, declared `mean`/`mse`/`cross_entropy` loss and
 `adam`/`adamw`/`sgd` optimizer. Include constructor arguments, optimizer settings,
 and the actual recipe when applicable. Use `steps_per_epoch_by_batch` instead of
@@ -52,7 +52,12 @@ and the actual recipe when applicable. Use `steps_per_epoch_by_batch` instead of
 job's resolved physical batch. Dataset-derived steps account for `drop_last` and
 gradient accumulation; accumulation greater than one needs a precomputed graph.
 
-Other recipes require a strict backward `training_graph_path` (or
+The versioned [source contract](source-contract.md) additionally supports structured
+inputs/outputs, keyword arguments, bounded integer domains and the actual
+`CandidateAdapter.training_step` loss. The [README integration guide](../README.md#integrate-a-code-agent-with-the-released-predictor)
+covers A10G/A10 artifacts and source-bound JSON sidecars for other frameworks.
+
+Unsupported source recipes require a strict backward `training_graph_path` (or
 `training_graph_paths` keyed by batch), `graph_batch_size`, `graph_hardware_id`,
 and `graph_step_semantics: complete_optimizer_step`. The graph must match the
 requested batch, accumulation and target hardware. Unsupported conversion,
@@ -60,7 +65,7 @@ missing step semantics or invalid artifacts fall back to branch profiles.
 
 The scheduling estimator uses student epoch predictions for batch options, while
 measured branch memory and existing live VRAM gates remain authoritative. The
-student memory and busy values are advisory APIs. The release does not implement
+student memory remains advisory; busy participates in property-based planner tie-breaks. The release does not implement
 the proposed completion-aware/fair-progress policy or validate its performance.
 
 Run the repeatable integration test from the scheduler repository:

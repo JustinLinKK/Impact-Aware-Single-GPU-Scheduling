@@ -95,7 +95,7 @@ class GpuMemorySettings:
     """Memory safety gates for time-aware admission, never placement scores."""
 
     gpu_vram_gib: float | None = None
-    predicted_budget_fraction: float = 0.85
+    predicted_budget_fraction: float = 0.90
     live_admission_stop_fraction: float = 0.90
     live_admission_resume_fraction: float = 0.85
     admission_average_window_seconds: float = 10.0
@@ -634,7 +634,8 @@ class PredictionSettings:
     registry_path: str | None = None
     student_release_path: str | None = None
     student_model_path: str | None = None
-    conversion_timeout_seconds: float = 15.0
+    conversion_timeout_seconds: float = 90.0
+    conversion_max_rss_mb: int = 4096
     cache_size: int = 1024
     cpu_threads: int = 1
     test_override_enabled: bool = False
@@ -647,6 +648,9 @@ class PredictionSettings:
         self.conversion_timeout_seconds = max(
             0.1, float(self.conversion_timeout_seconds)
         )
+        self.conversion_max_rss_mb = int(self.conversion_max_rss_mb)
+        if self.conversion_max_rss_mb <= 0:
+            raise ValueError("conversion_max_rss_mb must be positive")
         self.cache_size = max(1, int(self.cache_size))
         self.cpu_threads = max(1, int(self.cpu_threads))
         if not self.test_override_enabled:
@@ -676,6 +680,7 @@ class PredictionSettings:
                 "student_release_path": self.student_release_path,
                 "student_model_path": self.student_model_path,
                 "source_conversion_timeout_seconds": self.conversion_timeout_seconds,
+                "conversion_max_rss_mb": self.conversion_max_rss_mb,
                 "cache_size": self.cache_size,
                 "cpu_threads": self.cpu_threads,
                 "test_override_enabled": self.test_override_enabled,
@@ -936,8 +941,8 @@ class GpuSchedulerSettings:
     mps_unavailable_policy: str = "exclusive"
     parallel_job_cap: int | None = None
     priority_window_size: int = 8
-    oldest_window_size: int = 4
-    starvation_timeout_seconds: float = 1800.0
+    oldest_window_size: int = 4  # Legacy config compatibility; no age-based candidate window.
+    starvation_timeout_seconds: float = 1800.0  # Reporting threshold only; no admission override.
     device_index: int = 0
     fallback_cooldown_seconds: int = 900
     batch_probe_enabled: bool = True
@@ -1118,7 +1123,7 @@ class SchedulerConfig:
     command_poll_limit: int = 100
     aging_interval_seconds: float = 180.0
     aging_priority_increment: int = 1
-    enable_priority_aging: bool = True
+    enable_priority_aging: bool = False  # Legacy field; admission uses static priority only.
     preempt_check_interval_seconds: float = 0.5
     baseline_cache: BaselineCacheSettings | dict[str, Any] = field(
         default_factory=BaselineCacheSettings

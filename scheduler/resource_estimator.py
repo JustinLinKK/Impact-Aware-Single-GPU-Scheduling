@@ -50,6 +50,25 @@ class ResourceEstimator:
         )
         return total_mb * float(memory.predicted_budget_fraction)
 
+    def predicted_busy_percent(self, job: TrainingJob, batch_size: int | None = None) -> float | None:
+        """Validated student NVML busy is a ranking hint, never GPU capacity."""
+        from math import isfinite
+        predictor = self.ml_predictor
+        method = getattr(predictor, "predict_busy_percent_options", None)
+        if not getattr(predictor, "available", False) or not callable(method):
+            return None
+        batch = self.resolved_batch_size(job) if batch_size is None else int(batch_size)
+        try:
+            value = float(method(job, [batch])[batch])
+        except (JobPredictionError, ValueError, TypeError, KeyError):
+            return None
+        return value if isfinite(value) and 0.0 <= value <= 100.0 else None
+
+    def busy_rank(self, job: TrainingJob, *, prefer_high: bool, batch_size: int | None = None) -> tuple[bool, float]:
+        """Tie-break with known busy before unknown; do not treat missing as idle."""
+        busy = self.predicted_busy_percent(job, batch_size)
+        return (busy is None, (-busy if prefer_high else busy) if busy is not None else 0.0)
+
     def resolved_batch_size(self, job: TrainingJob) -> int:
         return BatchResolution.resolved_batch_size(job)
 

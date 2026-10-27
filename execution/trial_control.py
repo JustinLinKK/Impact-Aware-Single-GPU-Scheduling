@@ -15,7 +15,9 @@ def configure_trial_memory(context):
     if allowance is None or not context.job.resource_requirements.requires_gpu:
         return
     free, total = torch.cuda.mem_get_info()
-    limit = min(float(allowance) * 1024**2, max(0, free - 256 * 1024**2))
+    # Recheck the same 90% device-wide budget after startup; the remaining 10%
+    # is the safety margin, not an additional fixed per-process deduction.
+    limit = min(float(allowance) * 1024**2, max(0, free - 0.10 * total))
     if limit <= 0:
         raise torch.OutOfMemoryError("No live memory allowance for trial allocation")
     torch.cuda.set_per_process_memory_fraction(min(1.0, limit / total))

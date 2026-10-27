@@ -185,7 +185,7 @@ def _admission_open(problem: TraceProblem, now: float) -> bool:
         average = statistics.fmean(item.used_fraction for item in window)
         complete_window = bool(window and sample.at_seconds - window[0].at_seconds >= problem.admission_window_seconds)
         if is_open:
-            if complete_window and average >= problem.admission_stop_fraction:
+            if sample.used_fraction >= problem.admission_stop_fraction or (complete_window and average >= problem.admission_stop_fraction):
                 is_open = False
                 below_resume_since = None
         elif average <= problem.admission_resume_fraction:
@@ -290,19 +290,13 @@ def _weights(problem: TraceProblem, jobs: Iterable[TraceJob]) -> dict[str, float
 
 
 def _time_aware_choice(problem: TraceProblem, ready: tuple[TraceJob, ...], now: float) -> TracePack:
-    starving = [job for job in ready if now - job.release_seconds >= problem.starvation_timeout_seconds]
-    anchor = (
-        min(starving, key=lambda job: (job.release_seconds, job.job_id))
-        if starving
-        else min(
-            ready,
-            key=lambda job: (
-                min(option.solo_seconds for option in job.options if option.memory_mb <= problem.memory_budget_mb),
-                -job.priority,
-                job.release_seconds,
-                job.job_id,
-            ),
-        )
+    anchor = min(
+        ready,
+        key=lambda job: (
+            min(option.solo_seconds for option in job.options if option.memory_mb <= problem.memory_budget_mb),
+            -job.priority,
+            job.job_id,
+        ),
     )
     return min(
         feasible_packs(problem, (anchor,), now=now),
@@ -311,7 +305,7 @@ def _time_aware_choice(problem: TraceProblem, ready: tuple[TraceJob, ...], now: 
 
 
 def _serial_choice(problem: TraceProblem, ready: tuple[TraceJob, ...], now: float) -> TracePack:
-    anchor = sorted(ready, key=lambda job: (-job.priority, job.release_seconds, job.job_id))[0]
+    anchor = sorted(ready, key=lambda job: (-job.priority, job.job_id))[0]
     return min(
         feasible_packs(problem, (anchor,), now=now),
         key=lambda pack: (
@@ -533,8 +527,7 @@ def simulate_recursive_time_aware(
         ]
         if not ready:
             return False
-        starving = [job_id for job_id in ready if now - jobs[job_id].release_seconds >= problem.starvation_timeout_seconds]
-        eligible = starving or ready
+        eligible = ready
         for job_id in eligible:
             selected_options[job_id] = fastest_option(job_id) or jobs[job_id].options[0]
         if backend_aware and len(eligible) >= 2:
@@ -594,9 +587,8 @@ def simulate_recursive_time_aware(
         anchor = min(
             eligible,
             key=lambda job_id: (
-                jobs[job_id].release_seconds if starving else remaining_epochs[job_id] * solo_epoch_seconds(job_id, predicted=True),
+                remaining_epochs[job_id] * solo_epoch_seconds(job_id, predicted=True),
                 -jobs[job_id].priority,
-                jobs[job_id].release_seconds,
                 job_id,
             ),
         )
@@ -616,9 +608,6 @@ def simulate_recursive_time_aware(
             and remaining_epochs[job_id] > epsilon
             and job.release_seconds <= now + epsilon
         ]
-        starving = [job_id for job_id in ready if now - jobs[job_id].release_seconds >= problem.starvation_timeout_seconds]
-        if starving:
-            return [min(starving, key=lambda job_id: (jobs[job_id].release_seconds, job_id))]
         for job_id in ready:
             if job_id not in selected_options:
                 option = fastest_option(job_id)
@@ -652,7 +641,6 @@ def simulate_recursive_time_aware(
                     remaining_epochs[job_id]
                     * solo_epoch_seconds(job_id, predicted=True),
                     -jobs[job_id].priority,
-                    jobs[job_id].release_seconds,
                     job_id,
                 ),
             )
@@ -661,7 +649,6 @@ def simulate_recursive_time_aware(
             key=lambda job_id: (
                 remaining_epochs[job_id] * solo_epoch_seconds(job_id, predicted=True),
                 -jobs[job_id].priority,
-                jobs[job_id].release_seconds,
                 job_id,
             ),
         )

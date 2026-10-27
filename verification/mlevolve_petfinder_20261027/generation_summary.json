@@ -1,0 +1,34 @@
+{
+  "cloud_or_provisioning": false,
+  "codex_cli_login_status_checked": true,
+  "cuda_visible_devices": "",
+  "dataset_root": "/home/justin/MLEvolve/.cache/petfinder-pawpularity-score",
+  "dataset_test_images": 8,
+  "dataset_train_images": 9912,
+  "execution_callback_calls": 0,
+  "generated_at_utc": "2026-10-27T04:45:49.171132+00:00",
+  "mlevolve_log_dir": "/home/justin/MLEvolve/worktrees/oct_proposed_v2/localml_scheduler/verification/mlevolve_petfinder_20261027/logs/20261026_213827_mlevolve_petfinder_codeonly_20261027T043827Z",
+  "model": "gpt-6-astra",
+  "nodes": [
+    {
+      "branch_id": 1,
+      "generated_source_sha256": "3f0da671fdbc1753f31a4eb1bb06b46a5a2ffa1730730bed7ef79e578b3c5520",
+      "id": "dcbd349bfb2b426fa258e47b1cfbb78e",
+      "pending_execution": true,
+      "preflight_admitted": true,
+      "preflight_status": "SKIPPED",
+      "prompt_sha256": "793e81956110179a5bd78d3714b49a769de74e7c3a0578f821d62c63fcd907ff",
+      "review_status": "rejected",
+      "reviewed_source_sha256": null,
+      "stage": "draft"
+    }
+  ],
+  "provider": "codex_cli",
+  "request_log": "/home/justin/MLEvolve/worktrees/oct_proposed_v2/localml_scheduler/verification/mlevolve_petfinder_20261027/codex_requests.redacted.jsonl",
+  "review_status": "candidate_00 raw draft preserved; candidates_01+ completed MLEvolve AgentSearch code-only steps with review/preflight disabled and static checks only",
+  "run_id": "20261026_213827_mlevolve_petfinder_codeonly_20261027T043827Z",
+  "schema": "mlevolve-petfinder-codeonly-generation-v1",
+  "training_launched": false,
+  "generated_source_count": 2,
+  "returned_agentsearch_node_count": 1
+}

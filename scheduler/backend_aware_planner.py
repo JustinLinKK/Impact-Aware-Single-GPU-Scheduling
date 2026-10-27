@@ -292,7 +292,8 @@ class BackendAwarePlacementPlanner:
                                 exact_profile_status=status,
                                 priority_key=(
                                     -max(effective_priority(job) for job in jobs_tuple),
-                                    min(job.queue_sequence for job in jobs_tuple),
+                                    tuple(sorted(self.estimator.busy_rank(job, prefer_high=True, batch_size=option.batch_size)
+                                                 for job, option in zip(jobs_tuple, (left, right), strict=True))),
                                     tuple(sorted(job.job_id for job in jobs_tuple)),
                                 ),
                                 profile_key=profile_key,
@@ -570,7 +571,7 @@ class BackendAwarePlacementPlanner:
                         exact_profile_status=status,
                         priority_key=(
                             -effective_priority(job),
-                            job.queue_sequence,
+                            self.estimator.busy_rank(job, prefer_high=False, batch_size=candidate_option.batch_size),
                             job.job_id,
                         ),
                         profile_key=str(

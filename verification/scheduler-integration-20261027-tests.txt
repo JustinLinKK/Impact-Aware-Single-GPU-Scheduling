@@ -1,0 +1,37 @@
+........................................................................ [ 18%]
+......................................F................................. [ 37%]
+........................................................ss..... [ 53%]
+....................................................s................... [ 72%]
+...................................................................... [ 90%]
+.....................................                                    [100%]
+=================================== FAILURES ===================================
+_ test_general_search_requires_complete_exact_applicability_for_nvidia_records _
+localml_scheduler/tests/test_cuda_docs_schema_roundtrip.py:265: in test_general_search_requires_complete_exact_applicability_for_nvidia_records
+    assert [row["record_id"] for row in rows] == [a10["chunk_id"]]
+E   AssertionError: assert [] == ['nvidia.cuda...1ae7188284b2']
+E
+E     Right contains one more item: 'nvidia.cuda_mcp.5b59d305699d1ae7188284b2'
+E     Use -v to get more diff
+=============================== warnings summary ===============================
+worktrees/oct_proposed_v2/localml_scheduler/tests/test_released_hardware_students.py::test_precomputed_training_graph_roundtrip_uses_strict_17_tensor_schema
+  /home/justin/MLEvolve/.venv/lib/python3.11/site-packages/torch/backends/mkldnn/__init__.py:96: UserWarning: TF32 acceleration on top of oneDNN is available for Intel GPUs. The current Torch version does not have Intel GPU Support. (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:231.)
+    torch._C._set_onednn_allow_tf32(_allow_tf32)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED localml_scheduler/tests/test_cuda_docs_schema_roundtrip.py::test_general_search_requires_complete_exact_applicability_for_nvidia_records
+1 failed, 382 passed, 3 skipped, 1 warning, 11 subtests passed in 140.72s (0:02:20)
+
+BASELINE REPRODUCTION AT 59f8ed5:
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_ test_general_search_requires_complete_exact_applicability_for_nvidia_records _
+/tmp/scheduler-v2-prechange-proof/localml_scheduler/tests/test_cuda_docs_schema_roundtrip.py:265: in test_general_search_requires_complete_exact_applicability_for_nvidia_records
+    assert [row["record_id"] for row in rows] == [a10["chunk_id"]]
+E   AssertionError: assert [] == ['nvidia.cuda...1ae7188284b2']
+E
+E     Right contains one more item: 'nvidia.cuda_mcp.5b59d305699d1ae7188284b2'
+E     Use -v to get more diff
+=========================== short test summary info ============================
+FAILED ../../../../../../tmp/scheduler-v2-prechange-proof/localml_scheduler/tests/test_cuda_docs_schema_roundtrip.py::test_general_search_requires_complete_exact_applicability_for_nvidia_records
+1 failed in 0.16s

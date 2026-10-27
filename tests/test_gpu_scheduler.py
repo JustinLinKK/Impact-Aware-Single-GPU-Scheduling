@@ -197,7 +197,7 @@ class GpuSchedulerUnitTest(unittest.TestCase):
 
             self.assertEqual(plan.mode, "exclusive")
             self.assertEqual(plan.backend_name, "exclusive")
-            self.assertEqual(plan.job_ids, (jobs[0].job_id,))
+            self.assertEqual(plan.job_ids, (min(job.job_id for job in jobs),))
             self.assertIn("runtime estimate unavailable", plan.reason)
 
     def test_measurements_and_time_aware_profiles_are_hardware_scoped(self) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime
 import tempfile
 import time
 import unittest
@@ -121,6 +122,7 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
                     "mode": "parallel_time_aware",
                     "packing_backend": "cuda_process",
                     "exclusive_fallback_enabled": True,
+                    "memory": {"gpu_vram_gib": 32},
                 },
                 graph_db={"enabled": False},
                 hardware_feature_db={"enabled": False},
@@ -128,7 +130,11 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
             api = SchedulerClient(settings)
             service = api.create_service(
                 supervisor=_supervisor(settings, include_cuda_process=True)
-            ).start(background=True)
+            )
+            # The runner is CPU-only; use simulated capacity without depending
+            # on host CUDA visibility or allocations from unrelated workloads.
+            service.telemetry_sampler.sample = lambda: None
+            service.start(background=True)
             try:
                 baseline = create_toy_baseline_checkpoint(
                     runtime_root / "baselines" / "anchor.pt",
@@ -162,6 +168,7 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
                     "mode": "parallel_time_aware",
                     "packing_backend": "cuda_process",
                     "exclusive_fallback_enabled": True,
+                    "memory": {"gpu_vram_gib": 32},
                     "cuda_process": {"enabled": False},
                 },
                 graph_db={"enabled": False},
@@ -170,7 +177,8 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
             api = SchedulerClient(settings)
             service = api.create_service(
                 supervisor=_supervisor(settings, include_cuda_process=False)
-            ).start(background=True)
+            )
+            service.telemetry_sampler.sample = lambda: None
             try:
                 baseline = create_toy_baseline_checkpoint(
                     runtime_root / "baselines" / "exclusive.pt",
@@ -180,12 +188,13 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
                 second = _job(baseline, learning_rate=0.022, max_steps=10)
                 api.submit(first)
                 api.submit(second)
+                service.start(background=True)
 
-                wait_for(lambda: api.inspect(first.job_id).status == JobStatus.RUNNING)
-                self.assertIn(
-                    api.inspect(second.job_id).status,
-                    {JobStatus.PENDING, JobStatus.READY},
-                )
+                job_ids = (first.job_id, second.job_id)
+                wait_for(lambda: any(api.inspect(job_id).status == JobStatus.RUNNING for job_id in job_ids))
+                statuses = [api.inspect(job_id).status for job_id in job_ids]
+                self.assertEqual(statuses.count(JobStatus.RUNNING), 1)
+                self.assertTrue(any(status in {JobStatus.PENDING, JobStatus.READY} for status in statuses))
                 wait_for(
                     lambda: api.inspect(first.job_id).status.is_terminal
                     and api.inspect(second.job_id).status.is_terminal
@@ -193,6 +202,12 @@ class GpuSchedulerIntegrationTest(unittest.TestCase):
                 self.assertEqual(api.inspect(first.job_id).metadata["placement_mode"], "exclusive")
                 self.assertEqual(api.inspect(second.job_id).metadata["placement_mode"], "exclusive")
                 self.assertEqual(api.report()["packed_dispatches"], 0)
+                completed = sorted((api.inspect(job_id) for job_id in job_ids), key=lambda job: job.started_at)
+                self.assertTrue(all(job.status == JobStatus.COMPLETED for job in completed))
+                self.assertLessEqual(
+                    datetime.fromisoformat(completed[0].finished_at),
+                    datetime.fromisoformat(completed[1].started_at),
+                )
             finally:
                 service.stop()
 

@@ -1,0 +1,10 @@
+# Retain local agent traces and dataset links without publishing host state.
+/logs/
+/workspace/
+/prompts/
+/reviewed/
+/effective_config.redacted.json
+/codex_requests.redacted.jsonl
+/attempt-*.json
+/raw/*.plan.txt
+/__pycache__/
