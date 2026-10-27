@@ -390,7 +390,7 @@ class ColocationSettings:
     min_gain: float = 1.0
     trial_epochs: int = 1
     cold_start_gain_margin: float = 0.03
-    cold_start_max_incumbent_slowdown_fraction: float = 0.10
+    cold_start_max_incumbent_slowdown_fraction: float = 0.50
     cold_start_prepare_timeout_seconds: float = 120.0
     cold_start_window_min_seconds: float = 1.0
     cold_start_window_timeout_min_seconds: float = 15.0

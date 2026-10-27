@@ -1,5 +1,11 @@
 # Impact-Aware Single-GPU Scheduling
 
+The `oct_proposed_v3` variant defaults to a **50% incremental incumbent slowdown
+limit**. Its admission implementation matches `oct_proposed_v2`, whose default
+is 10%; the limit is configurable and both values are tested. A step increasing
+from 1.0 to 1.5 seconds reaches the 50% limit. This is an interference tolerance,
+not a promised total-time saving.
+
 Agent-owned NVIDIA CUDA documentation enrichment is documented in
 [`docs/cuda_docs_integration.md`](../docs/cuda_docs_integration.md). It is
 disabled by default and is not part of scheduling, admission, or execution.
@@ -204,7 +210,7 @@ counter. A custom cooperative runner without that evidence can run alone, but
 cannot establish phase-clean add-only admission from ordinary step logs.
 
 The default **add-only bounded-interference** policy requires productive newcomer
-progress and no more than **10% observed step-time slowdown for any incumbent in
+progress and no more than **50% observed step-time slowdown for any incumbent in
 either half**. This tolerance is an experimental protection choice, not a
 mathematical estimate of total-time savings. Missing/noisy evidence cannot become
 a fabricated solo rate. If the addition is rejected or inconclusive, only the
@@ -220,7 +226,7 @@ The scheduler can grow beyond three concurrent jobs when memory and interference
 checks permit; it does not search combinations by pausing the current group.
 
 Without the newcomer's solo timing, these observations cannot prove which
-arrangement minimizes makespan. A 10% limit can reject some beneficial overlaps
+arrangement minimizes makespan. A slowdown limit can reject some beneficial overlaps
 and accept some unhelpful ones. Total completion time is assessed in a separate
 matched replay, including validation, artifacts, checkpoints, and successful
 worker exits. The optional completion-proxy research implementation collects
