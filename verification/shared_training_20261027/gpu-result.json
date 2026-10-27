@@ -1,0 +1,178 @@
+{
+  "passed": true,
+  "utc": "2026-10-27T05:49:10.751687+00:00",
+  "scope": "control/integration smoke only; A10G CPU prediction on a local RTX 5090; external training remained active",
+  "actual_gpu": {
+    "name": "NVIDIA GeForce RTX 5090",
+    "total_mib": 32607.0,
+    "used_mib": 22884.0
+  },
+  "prediction_target": "NVIDIA A10G",
+  "student": "release/S_A10G",
+  "student_sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+  "memory_budget_fraction": 0.9,
+  "peak_device_memory_mib": 24470.0,
+  "initial_measured_profiles": 0,
+  "pause_step": 28,
+  "phases": [
+    "pre_add",
+    "measure_overlap"
+  ],
+  "decisions": [
+    {
+      "decision": "accepted",
+      "half_gains": [
+        3.970385046266915,
+        1.7942425988027886
+      ],
+      "measurement_unit": "seconds_per_optimizer_step",
+      "measurement_windows": {
+        "1ce94e74-068c-4055-9a9a-8d967fe2f7c5": {
+          "complete": true,
+          "elapsed_seconds": 0.34898240701295435,
+          "end_step": 10,
+          "finished_at": "2026-10-27T05:48:54.924687+00:00",
+          "halves": [
+            0.03819816450413782,
+            0.04904743724910077
+          ],
+          "kind": "measure_overlap",
+          "owner": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271",
+          "samples": [
+            0.03819816450413782,
+            0.04904743724910077
+          ],
+          "start_step": 2,
+          "steps": 8,
+          "token": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271-379869170139764"
+        },
+        "d924706d-935b-4a7a-aa2f-d83236567a0f": {
+          "complete": true,
+          "elapsed_seconds": 0.38392692600609735,
+          "end_step": 127,
+          "finished_at": "2026-10-27T05:48:54.002362+00:00",
+          "halves": [
+            0.04021616774844006,
+            0.05576556375308428
+          ],
+          "kind": "measure_overlap",
+          "owner": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271",
+          "samples": [
+            0.04021616774844006,
+            0.05576556375308428
+          ],
+          "start_step": 119,
+          "steps": 8,
+          "token": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271-379869165854244"
+        }
+      },
+      "objective": "predicted_work_throughput",
+      "packed": {
+        "1ce94e74-068c-4055-9a9a-8d967fe2f7c5": [
+          0.03819816450413782,
+          0.04904743724910077
+        ],
+        "d924706d-935b-4a7a-aa2f-d83236567a0f": [
+          0.04021616774844006,
+          0.05576556375308428
+        ]
+      },
+      "pre_add": {
+        "d924706d-935b-4a7a-aa2f-d83236567a0f": [
+          0.08279944823880214,
+          0.04996253275021445
+        ]
+      },
+      "predicted_work_profiles": {
+        "1ce94e74-068c-4055-9a9a-8d967fe2f7c5": {
+          "artifact_sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+          "avg_vram_mib": 858.306884765625,
+          "batch_size": 4,
+          "busy_indicator": 15.346869468688965,
+          "calibration": "uncalibrated_prior",
+          "epoch_cost": 2326.58154296875,
+          "hardware": "A10G",
+          "job_signature": "candidate_00:699387811ddf93b2",
+          "kind": "predicted_workload",
+          "peak_vram_mib": 858.306884765625,
+          "requires_online_validation": true,
+          "step_cost": 12.1176118850708
+        },
+        "d924706d-935b-4a7a-aa2f-d83236567a0f": {
+          "artifact_sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+          "avg_vram_mib": 953.67431640625,
+          "batch_size": 4,
+          "busy_indicator": 17.985794067382812,
+          "calibration": "uncalibrated_prior",
+          "epoch_cost": 2638.2939453125,
+          "hardware": "A10G",
+          "job_signature": "candidate_01:6491163e9ecaf484",
+          "kind": "predicted_workload",
+          "peak_vram_mib": 953.67431640625,
+          "requires_online_validation": true,
+          "step_cost": 13.741113662719727
+        }
+      },
+      "reason": "measured cold-start accepted",
+      "reference_unit": "model_step_cost",
+      "references": {
+        "1ce94e74-068c-4055-9a9a-8d967fe2f7c5": [
+          12.1176118850708,
+          12.1176118850708
+        ],
+        "d924706d-935b-4a7a-aa2f-d83236567a0f": [
+          13.741113662719727,
+          13.741113662719727
+        ]
+      },
+      "solo_profile_measurements": 0,
+      "trial_id": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271",
+      "wall_seconds": 6.267902851104736
+    }
+  ],
+  "jobs": [
+    {
+      "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+      "candidate": "candidate_01",
+      "status": "COMPLETED",
+      "steps": 384,
+      "history": [
+        {
+          "epoch": 1,
+          "global_step": 192,
+          "rmse": 20.50363540649414
+        },
+        {
+          "epoch": 2,
+          "global_step": 384,
+          "rmse": 20.501554489135742
+        }
+      ],
+      "allocator_limit_bytes": 6311483801,
+      "peak_reserved_mib": 106.0
+    },
+    {
+      "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+      "candidate": "candidate_00",
+      "status": "COMPLETED",
+      "steps": 384,
+      "history": [
+        {
+          "epoch": 1,
+          "global_step": 192,
+          "rmse": 20.611082077026367
+        },
+        {
+          "epoch": 2,
+          "global_step": 384,
+          "rmse": 20.53284454345703
+        }
+      ],
+      "allocator_limit_bytes": 4656123801,
+      "peak_reserved_mib": 90.0
+    }
+  ],
+  "concurrent_running_span_seconds": 17.94748366600834,
+  "production_hardware_guard_modified": false,
+  "model_accuracy_measured": false
+}

@@ -340,6 +340,7 @@ class SchedulerService(
             # close groups, and fresh epoch evidence can resolve a live trial.
             self._write_service_heartbeat("running")
             self._poll_active_workers()
+            self._release_deferred_resumes()
             self._evaluate_colocation_trial()
 
             # 2. Apply external intent and refresh cache/resource signals.
@@ -406,6 +407,7 @@ class SchedulerService(
         job = self.store.get_job(job_id)
         if job is None or job.status.is_terminal:
             return
+        self.store.update_job(job_id, metadata_updates={"resume_after_worker_exit": False})
         if self.supervisor.request_pause(
             job_id, reason="manual pause requested", hold=True
         ):
@@ -431,15 +433,30 @@ class SchedulerService(
         if job is None or job.status.is_terminal:
             return
         if job.status in {
+            JobStatus.PAUSING,
             JobStatus.PAUSED,
             JobStatus.RECOVERABLE,
             JobStatus.PENDING,
             JobStatus.READY,
         }:
+            if self.supervisor.has_live_process(job_id):
+                # Child safe points persist PAUSED before the parent runner has
+                # consumed its exit. Keep that acknowledgement visible until
+                # the process exits; READY here would make a pause look failed.
+                self.store.update_job(job_id, metadata_updates={"resume_after_worker_exit": True})
+                self.event_logger.emit("job_resume_deferred", job_id=job_id,
+                                       payload={"reason": "waiting for previous worker exit"})
+                return
+            self.store.update_job(job_id, metadata_updates={"resume_after_worker_exit": False})
             self.store.set_job_status(
                 job_id, JobStatus.READY, reason="resume requested", hold=False
             )
             self.event_logger.emit("job_resume_requested", job_id=job_id, payload={})
+
+    def _release_deferred_resumes(self) -> None:
+        for job in self.store.list_jobs(statuses=[JobStatus.PAUSED, JobStatus.RECOVERABLE]):
+            if job.metadata.get("resume_after_worker_exit") and not self.supervisor.has_live_process(job.job_id):
+                self._handle_resume(job.job_id)
 
     def _handle_cancel(self, job_id: str | None) -> None:
         """Cancel queued or active work and persist the terminal state."""
@@ -448,6 +465,7 @@ class SchedulerService(
         job = self.store.get_job(job_id)
         if job is None or job.status.is_terminal:
             return
+        self.store.update_job(job_id, metadata_updates={"resume_after_worker_exit": False})
         if self.supervisor.request_cancel(job_id, reason="cancel requested"):
             self.store.update_job(job_id, reason="cancel requested", hold=True)
             self.event_logger.emit("cancel_requested", job_id=job_id, payload={})

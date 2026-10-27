@@ -1,0 +1,8 @@
+{
+  "utc": "2026-10-27T05:48:28.098771+00:00",
+  "failed_attempt": "gpu-attempt-2",
+  "diagnosis": "manual resume changed PAUSED to READY before parent consumed cooperative child exit, classifying PauseRequested as failure",
+  "repair": "durable resume_after_worker_exit flag; retain PAUSED until previous process exits; later pause/cancel clears resume intent",
+  "validation": "29 focused tests passed including exact new-process state equality and last-batch validation recovery",
+  "durable_checkpoint": "gpu-attempt-2/runtime/data/checkpoints/c12710bb-5adf-47dc-a1ab-eb3bd989f97d/checkpoint_step_00000025_epoch_0000.pt"
+}

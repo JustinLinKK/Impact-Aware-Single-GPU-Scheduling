@@ -1,0 +1,144 @@
+{
+  "student": "release/S_A10G",
+  "sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+  "profiles": {
+    "1ce94e74-068c-4055-9a9a-8d967fe2f7c5": {
+      "kind": "predicted_workload",
+      "artifact_sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+      "hardware": "A10G",
+      "batch_size": 4,
+      "job_signature": "candidate_00:699387811ddf93b2",
+      "step_cost": 12.1176118850708,
+      "epoch_cost": 2326.58154296875,
+      "busy_indicator": 15.346869468688965,
+      "avg_vram_mib": 858.306884765625,
+      "peak_vram_mib": 858.306884765625,
+      "calibration": "uncalibrated_prior",
+      "requires_online_validation": true
+    },
+    "d924706d-935b-4a7a-aa2f-d83236567a0f": {
+      "kind": "predicted_workload",
+      "artifact_sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+      "hardware": "A10G",
+      "batch_size": 4,
+      "job_signature": "candidate_01:6491163e9ecaf484",
+      "step_cost": 13.741113662719727,
+      "epoch_cost": 2638.2939453125,
+      "busy_indicator": 17.985794067382812,
+      "avg_vram_mib": 953.67431640625,
+      "peak_vram_mib": 953.67431640625,
+      "calibration": "uncalibrated_prior",
+      "requires_online_validation": true
+    }
+  },
+  "capture_audits": {
+    "1ce94e74-068c-4055-9a9a-8d967fe2f7c5": {
+      "mode": "candidate_adapter",
+      "entry": "CandidateAdapter",
+      "node_count": 131,
+      "backward_node_count": 83,
+      "numeric_parity": true,
+      "precision": "fp32_ieee",
+      "optimizer": {
+        "name": "adamw",
+        "lr": 0.001,
+        "weight_decay": 0.0001,
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "eps": 1e-08,
+        "amsgrad": false,
+        "foreach": null,
+        "fused": null
+      },
+      "max_input_numel": 16000000,
+      "materialized_input_numel": 786484,
+      "source_dependency_fingerprint": {
+        "sha256": "2040b4f606caf70f22eeac39ec36b0d7655556b001f041400efc98fbf7880235",
+        "files": [
+          {
+            "path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/candidate_00/candidate_00.py",
+            "sha256": "1939ffe4e0f4c26f8d9b420576a3753e28524b1eb13afb8ee5213e8b01f8c38f"
+          }
+        ],
+        "unresolved_local_imports": [],
+        "dynamic_imports": false,
+        "complete": true,
+        "import_roots": []
+      },
+      "legacy_target_semantics": null,
+      "raw_prediction": [
+        12.1176118850708,
+        11.811991691589355,
+        2326.58154296875,
+        15.346869468688965,
+        836.9445190429688,
+        840.3673095703125
+      ],
+      "vram_postprocessing": {
+        "method": "ceiling",
+        "bucket_bytes": 100000000,
+        "minimum_bytes": 100000000,
+        "transport_unit": "MiB",
+        "scope": "predict_options; predict_tensors retains raw model outputs"
+      }
+    },
+    "d924706d-935b-4a7a-aa2f-d83236567a0f": {
+      "mode": "candidate_adapter",
+      "entry": "CandidateAdapter",
+      "node_count": 146,
+      "backward_node_count": 91,
+      "numeric_parity": true,
+      "precision": "fp32_ieee",
+      "optimizer": {
+        "name": "adamw",
+        "lr": 0.001,
+        "weight_decay": 0.0001,
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "eps": 1e-08,
+        "amsgrad": false,
+        "foreach": null,
+        "fused": null
+      },
+      "max_input_numel": 16000000,
+      "materialized_input_numel": 786484,
+      "source_dependency_fingerprint": {
+        "sha256": "c10a5ca6ebc82275bf8a6938b3c0c9656d70c35a231afe3c3a519d80e88e2dd8",
+        "files": [
+          {
+            "path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/candidate_01/candidate_01.py",
+            "sha256": "f4c49a01a8dd400c570f13dd2ff413202622916a5487d91e91938a92d584e0e3"
+          }
+        ],
+        "unresolved_local_imports": [],
+        "dynamic_imports": false,
+        "complete": true,
+        "import_roots": []
+      },
+      "legacy_target_semantics": null,
+      "raw_prediction": [
+        13.741113662719727,
+        13.439638137817383,
+        2638.2939453125,
+        17.985794067382812,
+        871.4730834960938,
+        874.54150390625
+      ],
+      "vram_postprocessing": {
+        "method": "ceiling",
+        "bucket_bytes": 100000000,
+        "minimum_bytes": 100000000,
+        "transport_unit": "MiB",
+        "scope": "predict_options; predict_tensors retains raw model outputs"
+      }
+    }
+  },
+  "idle_order": [
+    "candidate_01",
+    "candidate_00"
+  ]
+}

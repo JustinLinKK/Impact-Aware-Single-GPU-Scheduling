@@ -1,0 +1,1245 @@
+[
+  {
+    "event_id": 1,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "job_submitted",
+    "payload": {
+      "priority": 0
+    },
+    "created_at": "2026-10-27T05:48:35.326118+00:00"
+  },
+  {
+    "event_id": 2,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "job_ready",
+    "payload": {
+      "priority": 0
+    },
+    "created_at": "2026-10-27T05:48:35.451605+00:00"
+  },
+  {
+    "event_id": 3,
+    "job_id": null,
+    "event_type": "cache_loaded",
+    "payload": {
+      "baseline_model_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/candidate_01/candidate_01.py",
+      "hits": 0,
+      "last_accessed_at": "2026-10-27T05:48:35.463159+00:00",
+      "last_loaded_at": "2026-10-27T05:48:35.463150+00:00",
+      "metadata": {
+        "source": "warming"
+      },
+      "misses": 1,
+      "model_id": "candidate_01",
+      "pinned": false,
+      "size_bytes": 14944,
+      "used_bytes": 14944
+    },
+    "created_at": "2026-10-27T05:48:35.473656+00:00"
+  },
+  {
+    "event_id": 4,
+    "job_id": null,
+    "event_type": "cache_touched",
+    "payload": {
+      "baseline_model_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/candidate_01/candidate_01.py",
+      "hits": 0,
+      "last_accessed_at": "2026-10-27T05:48:35.514343+00:00",
+      "last_loaded_at": "2026-10-27T05:48:35.463150+00:00",
+      "metadata": {
+        "source": "warming"
+      },
+      "misses": 1,
+      "model_id": "candidate_01",
+      "pinned": false,
+      "size_bytes": 14944,
+      "used_bytes": 14944
+    },
+    "created_at": "2026-10-27T05:48:35.516823+00:00"
+  },
+  {
+    "event_id": 5,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "job_dispatched",
+    "payload": {
+      "batch_overrides": {},
+      "group_id": "b1ec94b2f4e9",
+      "job_ids": [
+        "d924706d-935b-4a7a-aa2f-d83236567a0f"
+      ],
+      "mandatory_anchor_job_id": null,
+      "objective_breakdown": {
+        "candidate_memory_mib": 953.67431640625,
+        "cold_start": false,
+        "gain": null,
+        "profile_origin": "predicted_workload"
+      },
+      "objective_version": "time_v6_verified_piecewise_drain",
+      "placement_backend": "cuda_process",
+      "placement_mode": "stack_anchor",
+      "priority": 0,
+      "reason": "cooperative stack anchor",
+      "trial_metadata": {
+        "cold_start": false,
+        "cooperative_trial": true,
+        "memory_limit_mb": 29321.100000000002,
+        "predicted_work_profiles": {
+          "d924706d-935b-4a7a-aa2f-d83236567a0f": {
+            "artifact_sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+            "avg_vram_mib": 953.67431640625,
+            "batch_size": 4,
+            "busy_indicator": 17.985794067382812,
+            "calibration": "uncalibrated_prior",
+            "epoch_cost": 2638.2939453125,
+            "hardware": "A10G",
+            "job_signature": "candidate_01:6491163e9ecaf484",
+            "kind": "predicted_workload",
+            "peak_vram_mib": 953.67431640625,
+            "requires_online_validation": true,
+            "step_cost": 13.741113662719727
+          }
+        },
+        "preexisting_job_ids": [],
+        "profile_key": "6dd04cfbcdd2b76b754c82ac36b1015a1a9463fc",
+        "requires_live_trial": false
+      }
+    },
+    "created_at": "2026-10-27T05:48:35.563919+00:00"
+  },
+  {
+    "event_id": 6,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "job_started",
+    "payload": {
+      "backend_name": "cuda_process",
+      "resume": false
+    },
+    "created_at": "2026-10-27T05:48:36.555305+00:00"
+  },
+  {
+    "event_id": 7,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "trial_runner_ready",
+    "payload": {
+      "global_step": 0
+    },
+    "created_at": "2026-10-27T05:48:39.709121+00:00"
+  },
+  {
+    "event_id": 8,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "pause_requested",
+    "payload": {
+      "hold": true
+    },
+    "created_at": "2026-10-27T05:48:42.004985+00:00"
+  },
+  {
+    "event_id": 9,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/d924706d-935b-4a7a-aa2f-d83236567a0f/checkpoint_step_00000028_epoch_0000.pt",
+      "checkpoint_seconds": 0.04096794099314138,
+      "epoch": 0,
+      "global_step": 28,
+      "reason": "manual pause requested",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:48:42.078264+00:00"
+  },
+  {
+    "event_id": 10,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "job_paused",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/d924706d-935b-4a7a-aa2f-d83236567a0f/checkpoint_step_00000028_epoch_0000.pt",
+      "epoch": 0,
+      "global_step": 28,
+      "hold": true
+    },
+    "created_at": "2026-10-27T05:48:42.091236+00:00"
+  },
+  {
+    "event_id": 11,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "job_resume_deferred",
+    "payload": {
+      "reason": "waiting for previous worker exit"
+    },
+    "created_at": "2026-10-27T05:48:42.181152+00:00"
+  },
+  {
+    "event_id": 12,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "job_resume_requested",
+    "payload": {},
+    "created_at": "2026-10-27T05:48:43.292645+00:00"
+  },
+  {
+    "event_id": 13,
+    "job_id": null,
+    "event_type": "cache_touched",
+    "payload": {
+      "baseline_model_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/candidate_01/candidate_01.py",
+      "hits": 0,
+      "last_accessed_at": "2026-10-27T05:48:43.295730+00:00",
+      "last_loaded_at": "2026-10-27T05:48:35.463150+00:00",
+      "metadata": {
+        "source": "warming"
+      },
+      "misses": 1,
+      "model_id": "candidate_01",
+      "pinned": false,
+      "size_bytes": 14944,
+      "used_bytes": 14944
+    },
+    "created_at": "2026-10-27T05:48:43.297597+00:00"
+  },
+  {
+    "event_id": 14,
+    "job_id": null,
+    "event_type": "cache_touched",
+    "payload": {
+      "baseline_model_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/candidate_01/candidate_01.py",
+      "hits": 0,
+      "last_accessed_at": "2026-10-27T05:48:43.333149+00:00",
+      "last_loaded_at": "2026-10-27T05:48:35.463150+00:00",
+      "metadata": {
+        "source": "warming"
+      },
+      "misses": 1,
+      "model_id": "candidate_01",
+      "pinned": false,
+      "size_bytes": 14944,
+      "used_bytes": 14944
+    },
+    "created_at": "2026-10-27T05:48:43.336935+00:00"
+  },
+  {
+    "event_id": 15,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "job_dispatched",
+    "payload": {
+      "batch_overrides": {},
+      "group_id": "590804bc4aa3",
+      "job_ids": [
+        "d924706d-935b-4a7a-aa2f-d83236567a0f"
+      ],
+      "mandatory_anchor_job_id": null,
+      "objective_breakdown": {
+        "candidate_memory_mib": 953.67431640625,
+        "cold_start": false,
+        "gain": null,
+        "profile_origin": "predicted_workload"
+      },
+      "objective_version": "time_v6_verified_piecewise_drain",
+      "placement_backend": "cuda_process",
+      "placement_mode": "stack_anchor",
+      "priority": 0,
+      "reason": "cooperative stack anchor",
+      "trial_metadata": {
+        "cold_start": false,
+        "cooperative_trial": true,
+        "memory_limit_mb": 6019.100000000002,
+        "predicted_work_profiles": {
+          "d924706d-935b-4a7a-aa2f-d83236567a0f": {
+            "artifact_sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+            "avg_vram_mib": 953.67431640625,
+            "batch_size": 4,
+            "busy_indicator": 17.985794067382812,
+            "calibration": "uncalibrated_prior",
+            "epoch_cost": 2638.2939453125,
+            "hardware": "A10G",
+            "job_signature": "candidate_01:6491163e9ecaf484",
+            "kind": "predicted_workload",
+            "peak_vram_mib": 953.67431640625,
+            "requires_online_validation": true,
+            "step_cost": 13.741113662719727
+          }
+        },
+        "preexisting_job_ids": [],
+        "profile_key": "6dd04cfbcdd2b76b754c82ac36b1015a1a9463fc",
+        "requires_live_trial": false
+      }
+    },
+    "created_at": "2026-10-27T05:48:43.529519+00:00"
+  },
+  {
+    "event_id": 16,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "job_resumed",
+    "payload": {
+      "backend_name": "cuda_process",
+      "resume": true
+    },
+    "created_at": "2026-10-27T05:48:44.432513+00:00"
+  },
+  {
+    "event_id": 17,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "trial_runner_ready",
+    "payload": {
+      "global_step": 28
+    },
+    "created_at": "2026-10-27T05:48:47.692282+00:00"
+  },
+  {
+    "event_id": 18,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "job_submitted",
+    "payload": {
+      "priority": 0
+    },
+    "created_at": "2026-10-27T05:48:48.524776+00:00"
+  },
+  {
+    "event_id": 19,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "job_ready",
+    "payload": {
+      "priority": 0
+    },
+    "created_at": "2026-10-27T05:48:48.579636+00:00"
+  },
+  {
+    "event_id": 20,
+    "job_id": null,
+    "event_type": "cache_loaded",
+    "payload": {
+      "baseline_model_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/candidate_00/candidate_00.py",
+      "hits": 0,
+      "last_accessed_at": "2026-10-27T05:48:48.588117+00:00",
+      "last_loaded_at": "2026-10-27T05:48:48.588105+00:00",
+      "metadata": {
+        "source": "warming"
+      },
+      "misses": 1,
+      "model_id": "candidate_00",
+      "pinned": false,
+      "size_bytes": 12564,
+      "used_bytes": 27508
+    },
+    "created_at": "2026-10-27T05:48:48.590880+00:00"
+  },
+  {
+    "event_id": 21,
+    "job_id": null,
+    "event_type": "cache_touched",
+    "payload": {
+      "baseline_model_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/candidate_00/candidate_00.py",
+      "hits": 0,
+      "last_accessed_at": "2026-10-27T05:48:48.679412+00:00",
+      "last_loaded_at": "2026-10-27T05:48:48.588105+00:00",
+      "metadata": {
+        "source": "warming"
+      },
+      "misses": 1,
+      "model_id": "candidate_00",
+      "pinned": false,
+      "size_bytes": 12564,
+      "used_bytes": 27508
+    },
+    "created_at": "2026-10-27T05:48:48.681776+00:00"
+  },
+  {
+    "event_id": 22,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/d924706d-935b-4a7a-aa2f-d83236567a0f/checkpoint_step_00000032_epoch_0000.pt",
+      "checkpoint_seconds": 0.0964898329693824,
+      "epoch": 0,
+      "global_step": 32,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:48:48.899799+00:00"
+  },
+  {
+    "event_id": 23,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "colocation_trial_started",
+    "payload": {
+      "backend_name": "cuda_process",
+      "candidate_job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+      "candidate_solo_epoch_seconds": 0.0,
+      "cold_start": {
+        "pre_add": {},
+        "predicted_work_profiles": {
+          "1ce94e74-068c-4055-9a9a-8d967fe2f7c5": {
+            "artifact_sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+            "avg_vram_mib": 858.306884765625,
+            "batch_size": 4,
+            "busy_indicator": 15.346869468688965,
+            "calibration": "uncalibrated_prior",
+            "epoch_cost": 2326.58154296875,
+            "hardware": "A10G",
+            "job_signature": "candidate_00:699387811ddf93b2",
+            "kind": "predicted_workload",
+            "peak_vram_mib": 858.306884765625,
+            "requires_online_validation": true,
+            "step_cost": 12.1176118850708
+          },
+          "d924706d-935b-4a7a-aa2f-d83236567a0f": {
+            "artifact_sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+            "avg_vram_mib": 953.67431640625,
+            "batch_size": 4,
+            "busy_indicator": 17.985794067382812,
+            "calibration": "uncalibrated_prior",
+            "epoch_cost": 2638.2939453125,
+            "hardware": "A10G",
+            "job_signature": "candidate_01:6491163e9ecaf484",
+            "kind": "predicted_workload",
+            "peak_vram_mib": 953.67431640625,
+            "requires_online_validation": true,
+            "step_cost": 13.741113662719727
+          }
+        },
+        "references": {}
+      },
+      "estimated_trial_cost_seconds": 0.0,
+      "evidence_deadline_at": "2026-10-27T05:53:48.684971+00:00",
+      "member_start_epochs": {
+        "1ce94e74-068c-4055-9a9a-8d967fe2f7c5": 0,
+        "d924706d-935b-4a7a-aa2f-d83236567a0f": 0
+      },
+      "phase": "prepare",
+      "preexisting_job_ids": [
+        "d924706d-935b-4a7a-aa2f-d83236567a0f"
+      ],
+      "pretrial_epoch_seconds": {},
+      "profile_key": "2c97ecd0baeb84a699140145892489bb16a0d367",
+      "scheduler_decision_mode": "baseline",
+      "setup_cost_seconds": 0.0,
+      "start_epoch": 0,
+      "started_at": "2026-10-27T05:48:48.684971+00:00",
+      "target_epoch": 1,
+      "trial_id": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271"
+    },
+    "created_at": "2026-10-27T05:48:48.860462+00:00"
+  },
+  {
+    "event_id": 24,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "job_dispatched",
+    "payload": {
+      "batch_overrides": {},
+      "group_id": "f8571811f135",
+      "job_ids": [
+        "1ce94e74-068c-4055-9a9a-8d967fe2f7c5"
+      ],
+      "mandatory_anchor_job_id": null,
+      "objective_breakdown": {
+        "candidate_memory_mib": 858.306884765625,
+        "cold_start": true,
+        "gain": null,
+        "profile_origin": "predicted_workload"
+      },
+      "objective_version": "time_v6_verified_piecewise_drain",
+      "placement_backend": "cuda_process",
+      "placement_mode": "concurrent_group",
+      "priority": 0,
+      "reason": "cold-start addition trial",
+      "trial_metadata": {
+        "cold_start": true,
+        "cooperative_trial": true,
+        "memory_limit_mb": 4440.425683593752,
+        "predicted_work_profiles": {
+          "1ce94e74-068c-4055-9a9a-8d967fe2f7c5": {
+            "artifact_sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+            "avg_vram_mib": 858.306884765625,
+            "batch_size": 4,
+            "busy_indicator": 15.346869468688965,
+            "calibration": "uncalibrated_prior",
+            "epoch_cost": 2326.58154296875,
+            "hardware": "A10G",
+            "job_signature": "candidate_00:699387811ddf93b2",
+            "kind": "predicted_workload",
+            "peak_vram_mib": 858.306884765625,
+            "requires_online_validation": true,
+            "step_cost": 12.1176118850708
+          },
+          "d924706d-935b-4a7a-aa2f-d83236567a0f": {
+            "artifact_sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+            "avg_vram_mib": 953.67431640625,
+            "batch_size": 4,
+            "busy_indicator": 17.985794067382812,
+            "calibration": "uncalibrated_prior",
+            "epoch_cost": 2638.2939453125,
+            "hardware": "A10G",
+            "job_signature": "candidate_01:6491163e9ecaf484",
+            "kind": "predicted_workload",
+            "peak_vram_mib": 953.67431640625,
+            "requires_online_validation": true,
+            "step_cost": 13.741113662719727
+          }
+        },
+        "preexisting_job_ids": [
+          "d924706d-935b-4a7a-aa2f-d83236567a0f"
+        ],
+        "profile_key": "2c97ecd0baeb84a699140145892489bb16a0d367",
+        "requires_live_trial": true
+      }
+    },
+    "created_at": "2026-10-27T05:48:48.931445+00:00"
+  },
+  {
+    "event_id": 25,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "job_started",
+    "payload": {
+      "backend_name": "cuda_process",
+      "resume": false
+    },
+    "created_at": "2026-10-27T05:48:49.980658+00:00"
+  },
+  {
+    "event_id": 26,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/d924706d-935b-4a7a-aa2f-d83236567a0f/checkpoint_step_00000064_epoch_0000.pt",
+      "checkpoint_seconds": 0.03664531995309517,
+      "epoch": 0,
+      "global_step": 64,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:48:50.618121+00:00"
+  },
+  {
+    "event_id": 27,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/d924706d-935b-4a7a-aa2f-d83236567a0f/checkpoint_step_00000096_epoch_0000.pt",
+      "checkpoint_seconds": 0.03487224003765732,
+      "epoch": 0,
+      "global_step": 96,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:48:52.383258+00:00"
+  },
+  {
+    "event_id": 28,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "trial_runner_ready",
+    "payload": {
+      "global_step": 0
+    },
+    "created_at": "2026-10-27T05:48:52.710346+00:00"
+  },
+  {
+    "event_id": 29,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "trial_worker_yielded",
+    "payload": {
+      "global_step": 0,
+      "token": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271-379864357248429"
+    },
+    "created_at": "2026-10-27T05:48:52.733970+00:00"
+  },
+  {
+    "event_id": 30,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "cold_start_phase",
+    "payload": {
+      "measuring": null,
+      "member_ids": [
+        "d924706d-935b-4a7a-aa2f-d83236567a0f",
+        "1ce94e74-068c-4055-9a9a-8d967fe2f7c5"
+      ],
+      "phase": "pre_add",
+      "trial_id": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271"
+    },
+    "created_at": "2026-10-27T05:48:52.762746+00:00"
+  },
+  {
+    "event_id": 31,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "trial_worker_released",
+    "payload": {
+      "global_step": 0,
+      "token": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271-379864357248429",
+      "yield_seconds": 0.03748583799460903
+    },
+    "created_at": "2026-10-27T05:48:52.768257+00:00"
+  },
+  {
+    "event_id": 32,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "trial_worker_yielded",
+    "payload": {
+      "global_step": 0,
+      "token": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271-379868426398432"
+    },
+    "created_at": "2026-10-27T05:48:52.772882+00:00"
+  },
+  {
+    "event_id": 33,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "trial_step_window",
+    "payload": {
+      "complete": true,
+      "elapsed_seconds": 0.5310479239560664,
+      "end_step": 116,
+      "finished_at": "2026-10-27T05:48:53.488459+00:00",
+      "halves": [
+        0.08279944823880214,
+        0.04996253275021445
+      ],
+      "kind": "pre_add",
+      "owner": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271",
+      "samples": [
+        0.08279944823880214,
+        0.04996253275021445
+      ],
+      "start_step": 108,
+      "steps": 8,
+      "token": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271-379868422334100"
+    },
+    "created_at": "2026-10-27T05:48:53.491165+00:00"
+  },
+  {
+    "event_id": 34,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "cold_start_phase",
+    "payload": {
+      "measuring": null,
+      "member_ids": [
+        "d924706d-935b-4a7a-aa2f-d83236567a0f",
+        "1ce94e74-068c-4055-9a9a-8d967fe2f7c5"
+      ],
+      "phase": "measure_overlap",
+      "trial_id": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271"
+    },
+    "created_at": "2026-10-27T05:48:53.508035+00:00"
+  },
+  {
+    "event_id": 35,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "trial_worker_released",
+    "payload": {
+      "global_step": 0,
+      "token": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271-379868426398432",
+      "yield_seconds": 0.7423800600226969
+    },
+    "created_at": "2026-10-27T05:48:53.512579+00:00"
+  },
+  {
+    "event_id": 36,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "trial_step_window",
+    "payload": {
+      "complete": true,
+      "elapsed_seconds": 0.38392692600609735,
+      "end_step": 127,
+      "finished_at": "2026-10-27T05:48:54.002362+00:00",
+      "halves": [
+        0.04021616774844006,
+        0.05576556375308428
+      ],
+      "kind": "measure_overlap",
+      "owner": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271",
+      "samples": [
+        0.04021616774844006,
+        0.05576556375308428
+      ],
+      "start_step": 119,
+      "steps": 8,
+      "token": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271-379869165854244"
+    },
+    "created_at": "2026-10-27T05:48:54.005512+00:00"
+  },
+  {
+    "event_id": 37,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/d924706d-935b-4a7a-aa2f-d83236567a0f/checkpoint_step_00000128_epoch_0000.pt",
+      "checkpoint_seconds": 0.048501359997317195,
+      "epoch": 0,
+      "global_step": 128,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:48:54.117566+00:00"
+  },
+  {
+    "event_id": 38,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "trial_step_window",
+    "payload": {
+      "complete": true,
+      "elapsed_seconds": 0.34898240701295435,
+      "end_step": 10,
+      "finished_at": "2026-10-27T05:48:54.924687+00:00",
+      "halves": [
+        0.03819816450413782,
+        0.04904743724910077
+      ],
+      "kind": "measure_overlap",
+      "owner": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271",
+      "samples": [
+        0.03819816450413782,
+        0.04904743724910077
+      ],
+      "start_step": 2,
+      "steps": 8,
+      "token": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271-379869170139764"
+    },
+    "created_at": "2026-10-27T05:48:54.928701+00:00"
+  },
+  {
+    "event_id": 39,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "cold_start_trial_decided",
+    "payload": {
+      "decision": "accepted",
+      "half_gains": [
+        3.970385046266915,
+        1.7942425988027886
+      ],
+      "measurement_unit": "seconds_per_optimizer_step",
+      "measurement_windows": {
+        "1ce94e74-068c-4055-9a9a-8d967fe2f7c5": {
+          "complete": true,
+          "elapsed_seconds": 0.34898240701295435,
+          "end_step": 10,
+          "finished_at": "2026-10-27T05:48:54.924687+00:00",
+          "halves": [
+            0.03819816450413782,
+            0.04904743724910077
+          ],
+          "kind": "measure_overlap",
+          "owner": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271",
+          "samples": [
+            0.03819816450413782,
+            0.04904743724910077
+          ],
+          "start_step": 2,
+          "steps": 8,
+          "token": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271-379869170139764"
+        },
+        "d924706d-935b-4a7a-aa2f-d83236567a0f": {
+          "complete": true,
+          "elapsed_seconds": 0.38392692600609735,
+          "end_step": 127,
+          "finished_at": "2026-10-27T05:48:54.002362+00:00",
+          "halves": [
+            0.04021616774844006,
+            0.05576556375308428
+          ],
+          "kind": "measure_overlap",
+          "owner": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271",
+          "samples": [
+            0.04021616774844006,
+            0.05576556375308428
+          ],
+          "start_step": 119,
+          "steps": 8,
+          "token": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271-379869165854244"
+        }
+      },
+      "objective": "predicted_work_throughput",
+      "packed": {
+        "1ce94e74-068c-4055-9a9a-8d967fe2f7c5": [
+          0.03819816450413782,
+          0.04904743724910077
+        ],
+        "d924706d-935b-4a7a-aa2f-d83236567a0f": [
+          0.04021616774844006,
+          0.05576556375308428
+        ]
+      },
+      "pre_add": {
+        "d924706d-935b-4a7a-aa2f-d83236567a0f": [
+          0.08279944823880214,
+          0.04996253275021445
+        ]
+      },
+      "predicted_work_profiles": {
+        "1ce94e74-068c-4055-9a9a-8d967fe2f7c5": {
+          "artifact_sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+          "avg_vram_mib": 858.306884765625,
+          "batch_size": 4,
+          "busy_indicator": 15.346869468688965,
+          "calibration": "uncalibrated_prior",
+          "epoch_cost": 2326.58154296875,
+          "hardware": "A10G",
+          "job_signature": "candidate_00:699387811ddf93b2",
+          "kind": "predicted_workload",
+          "peak_vram_mib": 858.306884765625,
+          "requires_online_validation": true,
+          "step_cost": 12.1176118850708
+        },
+        "d924706d-935b-4a7a-aa2f-d83236567a0f": {
+          "artifact_sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+          "avg_vram_mib": 953.67431640625,
+          "batch_size": 4,
+          "busy_indicator": 17.985794067382812,
+          "calibration": "uncalibrated_prior",
+          "epoch_cost": 2638.2939453125,
+          "hardware": "A10G",
+          "job_signature": "candidate_01:6491163e9ecaf484",
+          "kind": "predicted_workload",
+          "peak_vram_mib": 953.67431640625,
+          "requires_online_validation": true,
+          "step_cost": 13.741113662719727
+        }
+      },
+      "reason": "measured cold-start accepted",
+      "reference_unit": "model_step_cost",
+      "references": {
+        "1ce94e74-068c-4055-9a9a-8d967fe2f7c5": [
+          12.1176118850708,
+          12.1176118850708
+        ],
+        "d924706d-935b-4a7a-aa2f-d83236567a0f": [
+          13.741113662719727,
+          13.741113662719727
+        ]
+      },
+      "solo_profile_measurements": 0,
+      "trial_id": "trial-1ce94e74-068c-4055-9a9a-8d967fe2f7c5-379864355311271",
+      "wall_seconds": 6.267902851104736
+    },
+    "created_at": "2026-10-27T05:48:54.953083+00:00"
+  },
+  {
+    "event_id": 40,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/d924706d-935b-4a7a-aa2f-d83236567a0f/checkpoint_step_00000160_epoch_0000.pt",
+      "checkpoint_seconds": 0.023300915025174618,
+      "epoch": 0,
+      "global_step": 160,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:48:55.687197+00:00"
+  },
+  {
+    "event_id": 41,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/1ce94e74-068c-4055-9a9a-8d967fe2f7c5/checkpoint_step_00000032_epoch_0000.pt",
+      "checkpoint_seconds": 0.016088529024273157,
+      "epoch": 0,
+      "global_step": 32,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:48:55.821986+00:00"
+  },
+  {
+    "event_id": 42,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/1ce94e74-068c-4055-9a9a-8d967fe2f7c5/checkpoint_step_00000064_epoch_0000.pt",
+      "checkpoint_seconds": 0.02379617898259312,
+      "epoch": 0,
+      "global_step": 64,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:48:57.091611+00:00"
+  },
+  {
+    "event_id": 43,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/d924706d-935b-4a7a-aa2f-d83236567a0f/checkpoint_step_00000192_epoch_0000.pt",
+      "checkpoint_seconds": 0.03471941704628989,
+      "epoch": 0,
+      "global_step": 192,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:48:57.165737+00:00"
+  },
+  {
+    "event_id": 44,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/d924706d-935b-4a7a-aa2f-d83236567a0f/checkpoint_step_00000192_epoch_0001.pt",
+      "checkpoint_seconds": 0.037211064947769046,
+      "epoch": 1,
+      "global_step": 192,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "epoch"
+    },
+    "created_at": "2026-10-27T05:48:57.410475+00:00"
+  },
+  {
+    "event_id": 45,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/1ce94e74-068c-4055-9a9a-8d967fe2f7c5/checkpoint_step_00000096_epoch_0000.pt",
+      "checkpoint_seconds": 0.027769659005571157,
+      "epoch": 0,
+      "global_step": 96,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:48:58.384257+00:00"
+  },
+  {
+    "event_id": 46,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/d924706d-935b-4a7a-aa2f-d83236567a0f/checkpoint_step_00000224_epoch_0001.pt",
+      "checkpoint_seconds": 0.029488049971405417,
+      "epoch": 1,
+      "global_step": 224,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:48:58.858130+00:00"
+  },
+  {
+    "event_id": 47,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/1ce94e74-068c-4055-9a9a-8d967fe2f7c5/checkpoint_step_00000128_epoch_0000.pt",
+      "checkpoint_seconds": 0.02202819095691666,
+      "epoch": 0,
+      "global_step": 128,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:48:59.559998+00:00"
+  },
+  {
+    "event_id": 48,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/d924706d-935b-4a7a-aa2f-d83236567a0f/checkpoint_step_00000256_epoch_0001.pt",
+      "checkpoint_seconds": 0.016622407012619078,
+      "epoch": 1,
+      "global_step": 256,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:49:00.219502+00:00"
+  },
+  {
+    "event_id": 49,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/1ce94e74-068c-4055-9a9a-8d967fe2f7c5/checkpoint_step_00000160_epoch_0000.pt",
+      "checkpoint_seconds": 0.01893238298362121,
+      "epoch": 0,
+      "global_step": 160,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:49:00.684034+00:00"
+  },
+  {
+    "event_id": 50,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/d924706d-935b-4a7a-aa2f-d83236567a0f/checkpoint_step_00000288_epoch_0001.pt",
+      "checkpoint_seconds": 0.03476041997782886,
+      "epoch": 1,
+      "global_step": 288,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:49:01.542894+00:00"
+  },
+  {
+    "event_id": 51,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/1ce94e74-068c-4055-9a9a-8d967fe2f7c5/checkpoint_step_00000192_epoch_0000.pt",
+      "checkpoint_seconds": 0.03351382596883923,
+      "epoch": 0,
+      "global_step": 192,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:49:01.817585+00:00"
+  },
+  {
+    "event_id": 52,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/1ce94e74-068c-4055-9a9a-8d967fe2f7c5/checkpoint_step_00000192_epoch_0001.pt",
+      "checkpoint_seconds": 0.01710391603410244,
+      "epoch": 1,
+      "global_step": 192,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "epoch"
+    },
+    "created_at": "2026-10-27T05:49:02.008001+00:00"
+  },
+  {
+    "event_id": 53,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/d924706d-935b-4a7a-aa2f-d83236567a0f/checkpoint_step_00000320_epoch_0001.pt",
+      "checkpoint_seconds": 0.01975986099569127,
+      "epoch": 1,
+      "global_step": 320,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:49:02.845476+00:00"
+  },
+  {
+    "event_id": 54,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/1ce94e74-068c-4055-9a9a-8d967fe2f7c5/checkpoint_step_00000224_epoch_0001.pt",
+      "checkpoint_seconds": 0.03265213401755318,
+      "epoch": 1,
+      "global_step": 224,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:49:03.138044+00:00"
+  },
+  {
+    "event_id": 55,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/d924706d-935b-4a7a-aa2f-d83236567a0f/checkpoint_step_00000352_epoch_0001.pt",
+      "checkpoint_seconds": 0.02556597802322358,
+      "epoch": 1,
+      "global_step": 352,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:49:04.141129+00:00"
+  },
+  {
+    "event_id": 56,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/1ce94e74-068c-4055-9a9a-8d967fe2f7c5/checkpoint_step_00000256_epoch_0001.pt",
+      "checkpoint_seconds": 0.05182035703910515,
+      "epoch": 1,
+      "global_step": 256,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:49:04.343213+00:00"
+  },
+  {
+    "event_id": 57,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/d924706d-935b-4a7a-aa2f-d83236567a0f/checkpoint_step_00000384_epoch_0001.pt",
+      "checkpoint_seconds": 0.014696053985971957,
+      "epoch": 1,
+      "global_step": 384,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:49:05.708082+00:00"
+  },
+  {
+    "event_id": 58,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/1ce94e74-068c-4055-9a9a-8d967fe2f7c5/checkpoint_step_00000288_epoch_0001.pt",
+      "checkpoint_seconds": 0.021534533007070422,
+      "epoch": 1,
+      "global_step": 288,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:49:05.802316+00:00"
+  },
+  {
+    "event_id": 59,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/d924706d-935b-4a7a-aa2f-d83236567a0f/checkpoint_step_00000384_epoch_0002.pt",
+      "checkpoint_seconds": 0.013611351954750717,
+      "epoch": 2,
+      "global_step": 384,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "epoch"
+    },
+    "created_at": "2026-10-27T05:49:05.928347+00:00"
+  },
+  {
+    "event_id": 60,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/d924706d-935b-4a7a-aa2f-d83236567a0f/checkpoint_step_00000384_epoch_0002.pt",
+      "checkpoint_seconds": 0.01988259796053171,
+      "epoch": 2,
+      "global_step": 384,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "explicit"
+    },
+    "created_at": "2026-10-27T05:49:05.955754+00:00"
+  },
+  {
+    "event_id": 61,
+    "job_id": "d924706d-935b-4a7a-aa2f-d83236567a0f",
+    "event_type": "job_completed",
+    "payload": {
+      "backend_name": "cuda_process",
+      "batch_size_override": null,
+      "candidate_exc_type": null,
+      "candidate_returncode": 0,
+      "execution_result_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/candidate_01/execution.json",
+      "reason": "mlevolve script executed",
+      "training_parameter_resolution": {},
+      "training_summary": {
+        "best_epoch": 2,
+        "best_metric": 20.501554489135742,
+        "completed_epochs": 2,
+        "convergence_curve": [
+          {
+            "epoch": 1,
+            "metric": 20.50363540649414,
+            "metric_name": "rmse"
+          },
+          {
+            "epoch": 2,
+            "metric": 20.501554489135742,
+            "metric_name": "rmse"
+          }
+        ],
+        "metric_maximize": true,
+        "metric_name": "Final Validation Score",
+        "planned_epochs": 2
+      }
+    },
+    "created_at": "2026-10-27T05:49:06.927620+00:00"
+  },
+  {
+    "event_id": 62,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/1ce94e74-068c-4055-9a9a-8d967fe2f7c5/checkpoint_step_00000320_epoch_0001.pt",
+      "checkpoint_seconds": 0.08885763899888843,
+      "epoch": 1,
+      "global_step": 320,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:49:07.055445+00:00"
+  },
+  {
+    "event_id": 63,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/1ce94e74-068c-4055-9a9a-8d967fe2f7c5/checkpoint_step_00000352_epoch_0001.pt",
+      "checkpoint_seconds": 0.03479769499972463,
+      "epoch": 1,
+      "global_step": 352,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:49:08.156873+00:00"
+  },
+  {
+    "event_id": 64,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/1ce94e74-068c-4055-9a9a-8d967fe2f7c5/checkpoint_step_00000384_epoch_0001.pt",
+      "checkpoint_seconds": 0.047183717018924654,
+      "epoch": 1,
+      "global_step": 384,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "step"
+    },
+    "created_at": "2026-10-27T05:49:09.343385+00:00"
+  },
+  {
+    "event_id": 65,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/1ce94e74-068c-4055-9a9a-8d967fe2f7c5/checkpoint_step_00000384_epoch_0002.pt",
+      "checkpoint_seconds": 0.023773673980031163,
+      "epoch": 2,
+      "global_step": 384,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "epoch"
+    },
+    "created_at": "2026-10-27T05:49:09.538964+00:00"
+  },
+  {
+    "event_id": 66,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "checkpoint_saved",
+    "payload": {
+      "checkpoint_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/runtime/data/checkpoints/1ce94e74-068c-4055-9a9a-8d967fe2f7c5/checkpoint_step_00000384_epoch_0002.pt",
+      "checkpoint_seconds": 0.01293766003800556,
+      "epoch": 2,
+      "global_step": 384,
+      "reason": "scheduled checkpoint",
+      "safe_point_type": "explicit"
+    },
+    "created_at": "2026-10-27T05:49:09.560731+00:00"
+  },
+  {
+    "event_id": 67,
+    "job_id": "1ce94e74-068c-4055-9a9a-8d967fe2f7c5",
+    "event_type": "job_completed",
+    "payload": {
+      "backend_name": "cuda_process",
+      "batch_size_override": null,
+      "candidate_exc_type": null,
+      "candidate_returncode": 0,
+      "execution_result_path": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-3/candidate_00/execution.json",
+      "reason": "mlevolve script executed",
+      "training_parameter_resolution": {},
+      "training_summary": {
+        "best_epoch": 2,
+        "best_metric": 20.53284454345703,
+        "completed_epochs": 2,
+        "convergence_curve": [
+          {
+            "epoch": 1,
+            "metric": 20.611082077026367,
+            "metric_name": "rmse"
+          },
+          {
+            "epoch": 2,
+            "metric": 20.53284454345703,
+            "metric_name": "rmse"
+          }
+        ],
+        "metric_maximize": true,
+        "metric_name": "Final Validation Score",
+        "planned_epochs": 2
+      }
+    },
+    "created_at": "2026-10-27T05:49:10.532616+00:00"
+  }
+]

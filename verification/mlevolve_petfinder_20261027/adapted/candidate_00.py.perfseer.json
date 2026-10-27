@@ -1,0 +1,100 @@
+{
+  "schema": "perfseer-source-job-v1",
+  "source_sha256": "b101fff14a38d2e4b18ddd25be7a2b8fed18cfdd406664063dc06f67c940ddd7",
+  "perfseer_model": {
+    "workload_contract": {
+      "version": "mlevolve.perfseer_workload.v1",
+      "mode": "candidate_adapter",
+      "entry": "CandidateAdapter",
+      "import_roots": [],
+      "constructor_args": [],
+      "constructor_kwargs": {},
+      "max_input_numel": 16000000,
+      "adapter": {
+        "context": {
+          "lr": 0.001,
+          "weight_decay": 0.0001,
+          "initial_target_mean": 38.05056053811659
+        },
+        "scenario": {
+          "batch_size": 4,
+          "fixture": {
+            "image": {
+              "shape": [
+                3,
+                256,
+                256
+              ],
+              "dtype": "float32"
+            },
+            "tabular": {
+              "shape": [
+                12
+              ],
+              "dtype": "float32"
+            },
+            "target": {
+              "shape": [],
+              "dtype": "float32"
+            }
+          }
+        },
+        "batch_spec": {
+          "image": {
+            "shape": [
+              "$batch",
+              3,
+              256,
+              256
+            ],
+            "dtype": "float32"
+          },
+          "tabular": {
+            "shape": [
+              "$batch",
+              12
+            ],
+            "dtype": "float32"
+          },
+          "target": {
+            "shape": [
+              "$batch"
+            ],
+            "dtype": "float32"
+          }
+        }
+      },
+      "loss": {
+        "kind": "candidate_adapter_training_step"
+      },
+      "training": {
+        "precision": "fp32_ieee",
+        "gradient_accumulation_steps": 1,
+        "optimizer": {
+          "name": "adamw",
+          "lr": 0.001,
+          "weight_decay": 0.0001,
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "eps": 1e-08,
+          "amsgrad": false,
+          "foreach": null,
+          "fused": null
+        },
+        "scheduler": {
+          "name": "none"
+        },
+        "backend": "cuda_if_available"
+      }
+    },
+    "dataset_size": 8920,
+    "validation_rows": 992,
+    "epochs": 3,
+    "steps_per_epoch_by_batch": {
+      "4": 8
+    },
+    "source_path": "/home/justin/MLEvolve/worktrees/oct_proposed_v2/localml_scheduler/verification/mlevolve_petfinder_20261027/adapted/candidate_00.py"
+  }
+}

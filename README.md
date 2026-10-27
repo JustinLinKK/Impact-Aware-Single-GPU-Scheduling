@@ -860,4 +860,9 @@ admission with empty profile stores and zero per-job solo-reference phases.
 Latest CPU regression: **428 passed**, 11 subtests passed, three optional/live-GPU
 checks skipped; one previously reproduced unrelated CUDA-document-search test
 was explicitly deselected. See the [workflow verification receipt](verification/prediction-first-workflow-20261027.json).
-For agent-generated training scripts, see the [hook integration recommendations](docs/predictor-indicator-policy.md#recommendation-for-the-petfinder-hooks).
+For agent-generated training scripts, use the [shared training wrapper](docs/shared-training-wrapper.md).
+It owns checkpoint recovery, data position and optimizer-step safe points while
+the agent supplies its model, loss and dataset. The two PetFinder drafts now have
+adapted runnable copies under `verification/mlevolve_petfinder_20261027/adapted/`;
+the original drafts remain preserved. MLEvolve detects the canonical wrapper
+entry, and runtime checks reject a recipe that differs from the predictor sidecar.

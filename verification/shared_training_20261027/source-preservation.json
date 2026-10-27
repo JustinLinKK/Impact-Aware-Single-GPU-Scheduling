@@ -1,0 +1,16 @@
+[
+  {
+    "draft": "00",
+    "raw_sha256": "ed557d8c075b436e7ad6c5fcad5346d8c883519158a9f4c3417021426ad15e4a",
+    "adapted_sha256": "b101fff14a38d2e4b18ddd25be7a2b8fed18cfdd406664063dc06f67c940ddd7",
+    "all_original_model_adapter_dataset_helpers_ast_equal": true,
+    "sidecar_hash_verified": true
+  },
+  {
+    "draft": "01",
+    "raw_sha256": "3f0da671fdbc1753f31a4eb1bb06b46a5a2ffa1730730bed7ef79e578b3c5520",
+    "adapted_sha256": "2b312ddbd9deb830a8620c7f34a22204c37345dd5dfa5ecb489418331f8a9cac",
+    "all_original_model_adapter_dataset_helpers_ast_equal": true,
+    "sidecar_hash_verified": true
+  }
+]

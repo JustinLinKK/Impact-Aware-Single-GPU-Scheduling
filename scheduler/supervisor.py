@@ -150,6 +150,11 @@ class WorkerSupervisor:
         job_ids = self.active_job_ids()
         return job_ids[0] if job_ids else None
 
+    def has_live_process(self, job_id: str) -> bool:
+        """Include a paused child's parent while it is still unwinding."""
+        return any(worker.handle.process.poll() is None for group in self._groups.values()
+                   for name, worker in group.workers.items() if name == job_id)
+
     def placement_for(
         self,
         plan_mode: str,

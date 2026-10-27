@@ -1,0 +1,22 @@
+{
+  "passed": true,
+  "job_id": "c12710bb-5adf-47dc-a1ab-eb3bd989f97d",
+  "checkpoint": "/home/justin/MLEvolve/record/shared-wrapper-20261027/gpu-attempt-2/runtime/data/checkpoints/c12710bb-5adf-47dc-a1ab-eb3bd989f97d/checkpoint_step_00000025_epoch_0000.pt",
+  "resumed_step": 25,
+  "final_step": 384,
+  "started_unix": 1793080299.4488132,
+  "finished_unix": 1793080316.0339365,
+  "history": [
+    {
+      "epoch": 1,
+      "global_step": 192,
+      "rmse": 20.50363540649414
+    },
+    {
+      "epoch": 2,
+      "global_step": 384,
+      "rmse": 20.501554489135742
+    }
+  ],
+  "source_or_recipe_changed": false
+}

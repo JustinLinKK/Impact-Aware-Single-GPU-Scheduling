@@ -1,0 +1,31 @@
+{
+  "verified_utc": "2026-10-27T05:54:08.365787+00:00",
+  "status": "verified",
+  "tests": {
+    "passed": 433,
+    "subtests": 11,
+    "skipped": 3,
+    "deselected_known_preexisting_failure": 1
+  },
+  "gpu_result": "gpu-result.json",
+  "prediction_model": "S_A10G",
+  "actual_gpu": "NVIDIA GeForce RTX 5090",
+  "production_hardware_guard_changed": false,
+  "no_exclusive_profile_measurements": true,
+  "paused_at_step": 28,
+  "completed_optimizer_steps_per_candidate": 384,
+  "recovered_previous_checkpoint_step": 25,
+  "recipe_runtime_checked": true,
+  "model_prediction_accuracy_measured": false,
+  "existing_training_left_running": true,
+  "files_sha256": {
+    "adapters/shared_training.py": "cb3fe1d326085580582320de7fadc3e90f8e3a6ea20e68166aa9d0d64d441d38",
+    "adapters/shared_training_contract.py": "b5c242a5ab08cd995ee7458502928fb9192fb3d28198c17d53c6f2908ecf0082",
+    "examples/petfinder_workload.py": "abb165ee077ff40ba78652717eacf18396d66baab66c4190c6900aa20dfb3781",
+    "examples/verify_petfinder_shared_training.py": "6fc09f181e34e0e6ccdd60a51cf2663451dab8e0c34a46b5f6e75215776cdaa0",
+    "scheduler/service.py": "a7fcf2b4f02e2ee02175e9a50b8deb8470b3d34111103c2cc0ac5e6a3529af7e",
+    "scheduler/supervisor.py": "be15b2a991020f37224b80bc8738a883741dad3f15eace852b0c78a833db2a97",
+    "tests/test_shared_training.py": "58a8e793fd4e7565b1bd1ead84ecf216862202aaf5d9095ee57b4376e845ca63"
+  },
+  "host_integration_sha256": "e988d2d42bb74d3d53a8dddbaddda5698bf7404dc13f6a86849c2811da7cb490"
+}

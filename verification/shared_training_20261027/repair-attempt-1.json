@@ -1,0 +1,8 @@
+{
+  "utc": "2026-10-27T05:43:03.676776+00:00",
+  "failed_attempt": "gpu-attempt-1",
+  "diagnosis": "strict deterministic CUDA adaptive_avg_pool2d backward unsupported; failed before first optimizer update",
+  "repair": "explicit best_effort determinism recipe, retain original operator; strict mode still available; CPU bitwise resume remains tested; improve harness error reporting",
+  "source_weights_modified": false,
+  "other_training_interrupted": false
+}

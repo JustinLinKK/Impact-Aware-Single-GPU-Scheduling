@@ -1,0 +1,28 @@
+diff --git a/engine/script_introspection.py b/engine/script_introspection.py
+index c70fd2a..ba60aaa 100644
+--- a/engine/script_introspection.py
++++ b/engine/script_introspection.py
+@@ -683,12 +683,23 @@ def analyze_training_batch_contract(code: str) -> TrainingBatchContract:
+     )
+
+
++def _uses_shared_training_entry(tree: ast.Module) -> bool:
++    # Keep old scheduler checkouts usable; only v2 provides the shared runner.
++    try:
++        from localml_scheduler.adapters.shared_training_contract import _uses_shared_training_entry as recognize
++    except ImportError:
++        return False
++    return recognize(tree)
++
++
+ def supports_cooperative_trial(code: str) -> bool:
+     """Recognize the explicit script-side safe-step/checkpoint integration."""
+     try:
+         tree = ast.parse(code)
+     except SyntaxError:
+         return False
++    if _uses_shared_training_entry(tree):
++        return True
+     calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+     attributes = [call.func.attr for call in calls if isinstance(call.func, ast.Attribute)]
+     state_writers = {ast.dump(call.func.value) for call in calls if isinstance(call.func, ast.Attribute) and call.func.attr == "state_dict"}
