@@ -43,3 +43,22 @@ Verification plan: targeted CPU tests for recipe/graph correctness, imports and 
 Implementation and CPU verification completed: hardware-specific public student selection (A100/A10G/A10 and transferred A10), versioned module/CandidateAdapter contracts, source-bound sidecars, strict native backward replay, declared input domains, local import support, dependency-aware cache invalidation, and bounded CPU capture. Admission now ignores submission/queue age; the existing time objective uses busy as a heavier-idle/lighter-joining tie-break. VRAM budget is 90% with consistent cold-start/live allocation guards. Fixed a fresh-process profiling import cycle.
 
 Two genuine PetFinder source drafts generated through local MLEvolve Codex integration both converted and produced actual S_A10G predictions with native replay at batch4/8steps. They remain raw drafts with documented MLEvolve review/preflight limitations; no full training or GPU benchmarking is claimed. Full CPU validation:382passed,11subtests,3intentional skips; one optional CUDA-doc search failure reproduced on untouched base59f8ed5. Recipes, source hashes, predictions, comparison and reviewer receipts are saved under verification/. Publication uses an ordinary fast-forward push to oct_proposed_v2 after staged-file and remote-head checks.
+
+## October 26 local time: release output and metric alignment
+
+User follow-up: ceil released average/peak VRAM predictions to decimal 100 MB,
+retaining MiB transport and raw outputs for audit. Align time-quality definitions
+with release pair ordering (measured ratios >=1.10; close pairs <1.25), and show
+relative predicted costs in the PetFinder comparison. Preserve physical time for
+runtime estimates, measured memory admission, model artifacts and prior receipts.
+Verify decimal boundaries against portable/v5_objectives.py, actual CPU students,
+cache/audit parity, and both saved PetFinder sources before ordinary publication.
+
+Completed verification: 38 targeted tests passed, with one optional input-only
+A100 TRAIN fixture skipped. All four actual released students ran on CPU; measured
+branch-memory admission stayed unchanged. Both PetFinder sources reproduced all
+six raw values exactly; deployment memory is 900/900 and 1000/1000 decimal MB,
+and relative wall-time cost is 1.00x versus 1.13398x. Release metric boundary/tie
+checks passed. Evidence is in verification/release-output-alignment-20261027.json;
+the original raw prediction receipt remains intact. No measured accuracy or GPU
+throughput improvement is claimed.

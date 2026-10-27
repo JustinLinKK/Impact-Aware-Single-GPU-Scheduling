@@ -713,6 +713,31 @@ batch. Outputs are wall/GPU step **ms**, epoch **ms**, busy **%**, and average/p
 VRAM **MiB**. Busy is a kernel-active-time proxy, not SM occupancy. The scheduler
 converts epoch milliseconds to seconds and multiplies by remaining epochs.
 
+Average and peak VRAM predictions are rounded **up to decimal 100 MB blocks**,
+with a minimum of 100 MB, matching the predictor release: 470 MB becomes 500 MB.
+The API still transports MiB, so the conversion is
+`max(1, ceil(raw_MiB * 1048576 / 100000000)) * 100000000 / 1048576`.
+Raw model outputs remain available in `last_capture_audits[batch]["raw_prediction"]`
+and through `predict_tensors`; measured branch memory and live VRAM are unchanged.
+Rounding is conservative postprocessing, not evidence of improved model accuracy.
+
+**Time quality uses relative ordering**, as in the
+[predictor release](https://github.com/JustinLinKK/PerfSeer-predictor/tree/paper-release#model-overview).
+For measured durations `a` and `b`, material pairs have
+`max(a, b) / min(a, b) >= 1.10`; close material pairs have ratios from 1.10
+through less than 1.25. Report wall-step and GPU-step ordering accuracy separately;
+correct order receives one credit, a predicted tie half credit, and reversed order
+zero. An empty eligible-pair set has no accuracy value. These are relative
+comparison criteria, not a fixed 100 ms error allowance. Duration-error diagnostics
+can additionally report median and p90 `abs(predicted - measured) / measured`.
+
+For an **unmeasured prediction comparison**, display relative time cost as each
+predicted duration divided by the fastest prediction in the named comparison set
+(1.00× is fastest). `prediction.released_outputs.relative_time_costs` computes
+this display ratio; compare like-for-like step, epoch or total-job durations.
+This ratio is not measured ordering accuracy. Physical durations remain in the
+scheduler API because remaining runtime and admission gains need seconds.
+
 The worker uses the scheduler Python environment; install the candidate's import
 dependencies there. It does not automatically install packages.
 
@@ -755,10 +780,16 @@ and the actual S_A10G student on CPU. Both native forward/loss/backward replay
 and the scheduler time, memory and busy APIs agreed. The recipe is batch 4,
 FP32 AdamW/MSE, with an explicit eight-step epoch cap.
 
-| Draft | Design | Predicted wall ms/step | Predicted avg / peak VRAM (MiB) | Predicted busy |
+| Draft | Design | Relative predicted wall-step cost | Rounded avg / peak VRAM (decimal MB) | Predicted busy |
 | --- | --- | ---: | ---: | ---: |
-| candidate_00 | Three-stage CNN + tabular MLP | 12.12 | 836.9 / 840.4 | 15.35% |
-| candidate_01 | Four-stage CNN + tabular MLP | 13.74 | 871.5 / 874.5 | 17.99% |
+| candidate_00 | Three-stage CNN + tabular MLP | 1.00× | 900 / 900 | 15.35% |
+| candidate_01 | Four-stage CNN + tabular MLP | 1.13× | 1000 / 1000 | 17.99% |
+
+The reference is candidate_00, the faster wall-step prediction in this two-draft
+comparison. Both use the same eight-step, three-epoch budget, so the full-job
+predicted cost ratio is also 1.13×. Raw time/VRAM outputs and unrounded ratios are
+retained in the receipt. No measured A10G durations are available for these drafts,
+so their time-ordering accuracy is unmeasured.
 
 These are **predictions**, not measured GPU accuracy or completed training runs.
 The drafts are not presented as accepted MLEvolve training candidates: the first
@@ -766,7 +797,9 @@ encountered existing provider/preflight infrastructure problems, and the second
 was rejected by deterministic training-review checks. Those statuses, exact
 source hashes, and the successful graph/inference checks are retained in the
 [provenance](verification/mlevolve_petfinder_20261027/provenance.json) and
-[prediction receipt](verification/mlevolve_petfinder_20261027/predictions.json).
+[original raw prediction receipt](verification/mlevolve_petfinder_20261027/predictions.json).
+The [updated output receipt](verification/mlevolve_petfinder_20261027/predictions-rounded-100mb.json)
+records the actual repeated CPU predictions, decimal rounding, and relative time costs.
 
 Reproduce the prediction check from the scheduler's parent directory, with the
 candidate dependencies installed in that Python environment:

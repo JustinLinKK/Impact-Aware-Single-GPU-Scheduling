@@ -24,6 +24,7 @@ from localml_scheduler.hardware import HardwareProfile
 from localml_scheduler.prediction.ml_predictor import MLVramPredictor
 from localml_scheduler.prediction.job_contract import prediction_metadata
 from localml_scheduler.prediction.released_artifacts import digest
+from localml_scheduler.prediction.released_outputs import MIB_BYTES, relative_time_costs
 
 
 def main():
@@ -64,19 +65,36 @@ def main():
         assert predictor.predict_seconds_per_epoch_options(job, [4])[4] == values[2] / 1000
         assert predictor.predict_avg_vram_options(job, [4])[4] == values[4]
         assert predictor.last_sources[job.job_id] == "ml_predictor"
+        assert values[:4] == audit["raw_prediction"][:4]
         rows.append({"candidate": source.stem, "source": source.name,
             "source_sha256": digest(source), "sidecar_sha256": digest(source.with_suffix(".py.perfseer.json")),
             "physical_batch": 4, "optimizer_steps_per_epoch": 8, "max_epochs": 3,
             "predicted_wall_step_ms": values[0], "predicted_gpu_step_ms": values[1],
             "predicted_epoch_ms": values[2], "predicted_busy_percent": values[3],
             "predicted_avg_vram_mib": values[4], "predicted_peak_vram_mib": values[5],
+            "predicted_avg_vram_decimal_mb": values[4] * MIB_BYTES / 1e6,
+            "predicted_peak_vram_decimal_mb": values[5] * MIB_BYTES / 1e6,
             "predicted_training_seconds": values[2] * 3 / 1000,
             "cpu_capture_and_prediction_seconds": elapsed, "capture_audit": audit})
-    result = {"schema": "mlevolve-petfinder-a10g-integration-v1",
+    timing_comparison = {}
+    for metric in ("wall_step", "gpu_step", "training"):
+        field = "predicted_training_seconds" if metric == "training" else f"predicted_{metric}_ms"
+        durations = {row["candidate"]: row[field] for row in rows}
+        ratios = relative_time_costs(durations)
+        timing_comparison[metric] = {"reference_candidate": min(durations, key=durations.get),
+                                     "ratio_to_fastest": ratios}
+        for row in rows:
+            row[f"predicted_{metric}_relative_cost"] = ratios[row["candidate"]]
+    result = {"schema": "mlevolve-petfinder-a10g-integration-v2",
         "verified_at_utc": datetime.now(timezone.utc).isoformat(), "passed": True,
         "student": predictor.model_id, "student_sha256": predictor.artifact_hash,
         "torch": torch.__version__, "target_gpu": "NVIDIA A10G", "cuda_initialized": False,
         "training_launched": False, "measured_accuracy": None,
+        "vram_postprocessing": predictor._released.contract["vram_postprocessing"],
+        "time_evaluation": {**predictor._released.contract["time_evaluation"],
+                            "status": "not_measured", "material_ordering_accuracy": None,
+                            "close_material_ordering_accuracy": None},
+        "relative_time_comparison": timing_comparison,
         "scope": "Actual generated source, native backward replay, CPU A10G TorchScript inference and scheduler APIs; not a GPU performance benchmark",
         "busy_order_low_to_high": [row["candidate"] for row in sorted(rows, key=lambda row: row["predicted_busy_percent"])],
         "candidates": rows}

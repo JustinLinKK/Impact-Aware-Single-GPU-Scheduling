@@ -17,6 +17,7 @@ import sys
 import time
 from .job_contract import prediction_metadata
 from .released_artifacts import digest, hardware_matches, load_verified_student_files
+from .released_outputs import deployment_prediction, VRAM_BUCKET_BYTES
 
 
 def worker_resident_mib(pid):
@@ -40,6 +41,13 @@ CONTRACT = {
     "epoch_semantics": "wall step milliseconds multiplied by explicit optimizer steps per epoch",
     "busy_semantics": "NVML kernel-active-time workload proxy; not true SM occupancy",
     "memory_semantics": "advisory predictions only; branch profiles and live VRAM gate admission",
+    "vram_postprocessing": {"method": "ceiling", "bucket_bytes": VRAM_BUCKET_BYTES,
+                            "minimum_bytes": VRAM_BUCKET_BYTES, "transport_unit": "MiB",
+                            "scope": "predict_options; predict_tensors retains raw model outputs"},
+    "time_evaluation": {"metric": "pairwise ordering accuracy",
+                        "material_measured_ratio_min": 1.10,
+                        "close_material_measured_ratio_max_exclusive": 1.25,
+                        "prediction_tie_credit": 0.5, "requires_measured_durations": True},
 }
 
 
@@ -232,12 +240,15 @@ class ReleasedStudentRuntime:
                 raise ValueError("incomplete released student feature set")
             for index, ((batch, key, request), arrays) in enumerate(zip(missing, options, strict=True)):
                 audits = response.get("audits", [])
-                if len(audits) == len(missing):
-                    self.last_capture_audits[batch] = audits[index]
+                audit = dict(audits[index]) if len(audits) == len(missing) else {}
                 outputs = self.predict_tensors(tuple(torch.from_numpy(a) for a in arrays))
                 if len(outputs["prediction"]) != 1:
                     raise ValueError("one graph required per scheduling option")
-                value = outputs["prediction"][0].tolist()
+                raw = outputs["prediction"][0].tolist()
+                value = deployment_prediction(raw)
+                audit["raw_prediction"] = raw
+                audit["vram_postprocessing"] = dict(CONTRACT["vram_postprocessing"])
+                self.last_capture_audits[batch] = audit
                 values[batch] = value
                 if request["cacheable"]:
                     self.cache[key] = value

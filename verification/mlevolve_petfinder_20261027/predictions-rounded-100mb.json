@@ -1,0 +1,207 @@
+{
+  "schema": "mlevolve-petfinder-a10g-integration-v2",
+  "verified_at_utc": "2026-10-27T04:58:31.498579+00:00",
+  "passed": true,
+  "student": "release/S_A10G",
+  "student_sha256": "933802738f7236f64e1309414b7fac1f15d8983365c994d678740183314bf267",
+  "torch": "2.11.0+cu130",
+  "target_gpu": "NVIDIA A10G",
+  "cuda_initialized": false,
+  "training_launched": false,
+  "measured_accuracy": null,
+  "vram_postprocessing": {
+    "method": "ceiling",
+    "bucket_bytes": 100000000,
+    "minimum_bytes": 100000000,
+    "transport_unit": "MiB",
+    "scope": "predict_options; predict_tensors retains raw model outputs"
+  },
+  "time_evaluation": {
+    "metric": "pairwise ordering accuracy",
+    "material_measured_ratio_min": 1.1,
+    "close_material_measured_ratio_max_exclusive": 1.25,
+    "prediction_tie_credit": 0.5,
+    "requires_measured_durations": true,
+    "status": "not_measured",
+    "material_ordering_accuracy": null,
+    "close_material_ordering_accuracy": null
+  },
+  "relative_time_comparison": {
+    "wall_step": {
+      "reference_candidate": "candidate_00",
+      "ratio_to_fastest": {
+        "candidate_00": 1.0,
+        "candidate_01": 1.133978690937372
+      }
+    },
+    "gpu_step": {
+      "reference_candidate": "candidate_00",
+      "ratio_to_fastest": {
+        "candidate_00": 1.0,
+        "candidate_01": 1.137796104901342
+      }
+    },
+    "training": {
+      "reference_candidate": "candidate_00",
+      "ratio_to_fastest": {
+        "candidate_00": 1.0,
+        "candidate_01": 1.1339786909373717
+      }
+    }
+  },
+  "scope": "Actual generated source, native backward replay, CPU A10G TorchScript inference and scheduler APIs; not a GPU performance benchmark",
+  "busy_order_low_to_high": [
+    "candidate_00",
+    "candidate_01"
+  ],
+  "candidates": [
+    {
+      "candidate": "candidate_00",
+      "source": "candidate_00.py",
+      "source_sha256": "ed557d8c075b436e7ad6c5fcad5346d8c883519158a9f4c3417021426ad15e4a",
+      "sidecar_sha256": "9f7c4d25d8774ee6456873719217b94b494882dabc298a7571bf5ba3c934659d",
+      "physical_batch": 4,
+      "optimizer_steps_per_epoch": 8,
+      "max_epochs": 3,
+      "predicted_wall_step_ms": 12.1176118850708,
+      "predicted_gpu_step_ms": 11.811991691589355,
+      "predicted_epoch_ms": 96.9408950805664,
+      "predicted_busy_percent": 15.346869468688965,
+      "predicted_avg_vram_mib": 858.306884765625,
+      "predicted_peak_vram_mib": 858.306884765625,
+      "predicted_avg_vram_decimal_mb": 900.0,
+      "predicted_peak_vram_decimal_mb": 900.0,
+      "predicted_training_seconds": 0.29082268524169924,
+      "cpu_capture_and_prediction_seconds": 2.989042603003327,
+      "capture_audit": {
+        "mode": "candidate_adapter",
+        "entry": "CandidateAdapter",
+        "node_count": 131,
+        "backward_node_count": 83,
+        "numeric_parity": true,
+        "precision": "fp32_ieee",
+        "optimizer": {
+          "name": "adamw",
+          "lr": 0.001,
+          "weight_decay": 0.0001,
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "eps": 1e-08,
+          "amsgrad": false,
+          "foreach": null,
+          "fused": null
+        },
+        "max_input_numel": 16000000,
+        "materialized_input_numel": 786484,
+        "source_dependency_fingerprint": {
+          "sha256": "2ae13898ee6ff3554f9bb02bcfd11ff07f405a4bd05e17419931c441c368a210",
+          "files": [
+            {
+              "path": "/home/justin/MLEvolve/worktrees/oct_proposed_v2/localml_scheduler/verification/mlevolve_petfinder_20261027/raw/candidate_00.py",
+              "sha256": "ed557d8c075b436e7ad6c5fcad5346d8c883519158a9f4c3417021426ad15e4a"
+            }
+          ],
+          "unresolved_local_imports": [],
+          "dynamic_imports": false,
+          "complete": true,
+          "import_roots": []
+        },
+        "legacy_target_semantics": null,
+        "raw_prediction": [
+          12.1176118850708,
+          11.811991691589355,
+          96.9408950805664,
+          15.346869468688965,
+          836.9445190429688,
+          840.3673095703125
+        ],
+        "vram_postprocessing": {
+          "method": "ceiling",
+          "bucket_bytes": 100000000,
+          "minimum_bytes": 100000000,
+          "transport_unit": "MiB",
+          "scope": "predict_options; predict_tensors retains raw model outputs"
+        }
+      },
+      "predicted_wall_step_relative_cost": 1.0,
+      "predicted_gpu_step_relative_cost": 1.0,
+      "predicted_training_relative_cost": 1.0
+    },
+    {
+      "candidate": "candidate_01",
+      "source": "candidate_01.py",
+      "source_sha256": "3f0da671fdbc1753f31a4eb1bb06b46a5a2ffa1730730bed7ef79e578b3c5520",
+      "sidecar_sha256": "ed1a9064887ac826bcb028a66135723011ddec35f6941ef89f4eac14419a1e12",
+      "physical_batch": 4,
+      "optimizer_steps_per_epoch": 8,
+      "max_epochs": 3,
+      "predicted_wall_step_ms": 13.741113662719727,
+      "predicted_gpu_step_ms": 13.439638137817383,
+      "predicted_epoch_ms": 109.92890930175781,
+      "predicted_busy_percent": 17.985794067382812,
+      "predicted_avg_vram_mib": 953.67431640625,
+      "predicted_peak_vram_mib": 953.67431640625,
+      "predicted_avg_vram_decimal_mb": 1000.0,
+      "predicted_peak_vram_decimal_mb": 1000.0,
+      "predicted_training_seconds": 0.3297867279052734,
+      "cpu_capture_and_prediction_seconds": 2.765019416983705,
+      "capture_audit": {
+        "mode": "candidate_adapter",
+        "entry": "CandidateAdapter",
+        "node_count": 146,
+        "backward_node_count": 91,
+        "numeric_parity": true,
+        "precision": "fp32_ieee",
+        "optimizer": {
+          "name": "adamw",
+          "lr": 0.001,
+          "weight_decay": 0.0001,
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "eps": 1e-08,
+          "amsgrad": false,
+          "foreach": null,
+          "fused": null
+        },
+        "max_input_numel": 16000000,
+        "materialized_input_numel": 786484,
+        "source_dependency_fingerprint": {
+          "sha256": "27ae7565148491e18895a58bc40e91f6a644b49424fa69f22f41fac000aaae4f",
+          "files": [
+            {
+              "path": "/home/justin/MLEvolve/worktrees/oct_proposed_v2/localml_scheduler/verification/mlevolve_petfinder_20261027/raw/candidate_01.py",
+              "sha256": "3f0da671fdbc1753f31a4eb1bb06b46a5a2ffa1730730bed7ef79e578b3c5520"
+            }
+          ],
+          "unresolved_local_imports": [],
+          "dynamic_imports": false,
+          "complete": true,
+          "import_roots": []
+        },
+        "legacy_target_semantics": null,
+        "raw_prediction": [
+          13.741113662719727,
+          13.439638137817383,
+          109.92890930175781,
+          17.985794067382812,
+          871.4730834960938,
+          874.54150390625
+        ],
+        "vram_postprocessing": {
+          "method": "ceiling",
+          "bucket_bytes": 100000000,
+          "minimum_bytes": 100000000,
+          "transport_unit": "MiB",
+          "scope": "predict_options; predict_tensors retains raw model outputs"
+        }
+      },
+      "predicted_wall_step_relative_cost": 1.133978690937372,
+      "predicted_gpu_step_relative_cost": 1.137796104901342,
+      "predicted_training_relative_cost": 1.1339786909373717
+    }
+  ]
+}

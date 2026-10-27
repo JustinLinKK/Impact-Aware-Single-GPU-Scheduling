@@ -59,7 +59,7 @@ def test_source_conversion_actual_model_units_cache_and_steps(predictor, job):
     memory = predictor.predict_avg_vram_options(job, [4, 8])
     for batch in (4, 8):
         assert 0 <= busy[batch] <= 100 and memory[batch] > 0
-        assert memory[batch] == values[batch][4]  # MiB, no decimal-MB conversion.
+        assert memory[batch] == values[batch][4]  # Rounded decimal 100 MB, transported in MiB.
         assert seconds[batch] == values[batch][2] / 1000
         assert math.isclose(values[batch][2], values[batch][0] * (80 // batch), rel_tol=1e-5)
     count = len(predictor._released.cache)

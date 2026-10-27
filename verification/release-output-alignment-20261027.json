@@ -1,0 +1,87 @@
+{
+  "schema": "release-output-alignment-v1",
+  "verified_at_utc": "2026-10-27T04:59:36.995173+00:00",
+  "base_commit": "f1abac380ac2dd2014926ee892a63d97836111f2",
+  "branch": "oct_proposed_v2",
+  "passed": true,
+  "targeted_cpu_tests": {
+    "passed": 38,
+    "skipped": 1,
+    "skip_reason": "Optional input-only A100 TRAIN parity fixture not installed; actual four-student source tests ran.",
+    "files": [
+      "tests/test_released_outputs.py",
+      "tests/test_released_a100_student.py",
+      "tests/test_released_hardware_students.py"
+    ]
+  },
+  "release_objectives_sha256": "a8415f44c1727a52faf3250af1ea4a3a8e16b20fcef42461859a0313b17beae1",
+  "release_readme_sha256": "31463539dd205b485f8939f8a49d31918b84a2f302b73d735c786d2a0f2af517",
+  "rounding": {
+    "method": "ceiling",
+    "bucket_bytes": 100000000,
+    "minimum_bytes": 100000000,
+    "transport_unit": "MiB",
+    "scope": "predict_options; predict_tensors retains raw model outputs"
+  },
+  "time_evaluation": {
+    "metric": "pairwise ordering accuracy",
+    "material_measured_ratio_min": 1.1,
+    "close_material_measured_ratio_max_exclusive": 1.25,
+    "prediction_tie_credit": 0.5,
+    "requires_measured_durations": true
+  },
+  "time_metric_boundary_checks_against_release": [
+    {
+      "measured_ratio": 1.099,
+      "material_pairs": 0,
+      "close_material_pairs": 0
+    },
+    {
+      "measured_ratio": 1.1,
+      "material_pairs": 1,
+      "close_material_pairs": 1
+    },
+    {
+      "measured_ratio": 1.249,
+      "material_pairs": 1,
+      "close_material_pairs": 1
+    },
+    {
+      "measured_ratio": 1.25,
+      "material_pairs": 1,
+      "close_material_pairs": 0
+    }
+  ],
+  "prediction_comparison": [
+    {
+      "candidate": "candidate_00",
+      "predicted_wall_step_relative_cost": 1.0,
+      "predicted_training_relative_cost": 1.0,
+      "predicted_avg_vram_decimal_mb": 900.0,
+      "predicted_peak_vram_decimal_mb": 900.0
+    },
+    {
+      "candidate": "candidate_01",
+      "predicted_wall_step_relative_cost": 1.133978690937372,
+      "predicted_training_relative_cost": 1.1339786909373717,
+      "predicted_avg_vram_decimal_mb": 1000.0,
+      "predicted_peak_vram_decimal_mb": 1000.0
+    }
+  ],
+  "unchanged_raw_predictions_and_source_hashes": true,
+  "measured_memory_admission_preserved": true,
+  "time_ratios_are_display_only": true,
+  "no_gpu_measurement_or_training": true,
+  "source_sha256": {
+    "prediction/released_outputs.py": "d8e235db735e9cf166c12084d7d9035fd2330ae20d73413c2dcf29b84e8821cc",
+    "prediction/released_student.py": "ab8c661661912a2127ad99035672233cb615bf35568d02e77a9b31ed4fae01cb",
+    "verification/mlevolve_petfinder_20261027/verify_predictions.py": "732c49a277a87da6aef0ffecf5ef503d222091f5a51f35b9b8a87cd121ba736b",
+    "tests/test_released_outputs.py": "52143cb33569fb6e07189e8cbb9c8c7f61f9cc62b79e37cd07bb3e71dbe67532"
+  },
+  "prediction_receipt_sha256": "22bfebb902b8c67337c320e2df838e1d4ebc19372ca135ccb9e657aa874111f7",
+  "limitations": [
+    "Relative predicted costs are not measured accuracy.",
+    "No new A10G measured durations are available for these generated drafts.",
+    "Published model weights and historical reports were not changed."
+  ]
+}

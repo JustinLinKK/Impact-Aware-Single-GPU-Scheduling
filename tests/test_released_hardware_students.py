@@ -15,6 +15,7 @@ from localml_scheduler.domain import TrainingJob
 from localml_scheduler.hardware import HardwareProfile
 from localml_scheduler.prediction.ml_predictor import MLVramPredictor, precision_for_job, JobPredictionError
 from localml_scheduler.prediction.released_artifacts import hardware_matches
+from localml_scheduler.prediction.released_outputs import VRAM_BUCKET_MIB
 
 
 @pytest.fixture
@@ -51,6 +52,15 @@ def test_actual_hardware_student_source_capture(public_paths, source_job, device
     for batch, row in values.items():
         assert len(row) == 6 and 0 <= row[3] <= 100 and min(row[4:]) > 0
         assert row[2] == pytest.approx(row[0] * (40 // batch), rel=1e-5)
+        raw = predictor._released.last_capture_audits[batch]["raw_prediction"]
+        assert row[:4] == raw[:4]
+        for value, original in zip(row[4:], raw[4:]):
+            assert value / VRAM_BUCKET_MIB == int(value / VRAM_BUCKET_MIB)
+            assert original <= value < original + VRAM_BUCKET_MIB
+    audits = dict(predictor._released.last_capture_audits)
+    predictor._released.last_capture_audits.clear()
+    assert predictor._released.predict_options(source_job, [4, 8]) == values
+    assert predictor._released.last_capture_audits == audits
     assert predictor.requires_branch_memory
     assert not torch.cuda.is_initialized()
 
