@@ -21,6 +21,14 @@ a prediction to an observation, or call an extrapolated epoch a measured epoch.
 The word "solo" requires a supported isolation check, not merely absent group
 metadata in a file.
 
+The revised scheduler objective is **mean submission-to-successful-completion
+JCT**, with tail latency, queued age, and coverage reported alongside makespan.
+This does not change the solo-slope training target into an end-to-end JCT label.
+Queueing and policy decisions determine much of JCT; they are not intrinsic to
+one model graph. Keep runtime slope/overhead labels separate from scheduler
+outcome records to avoid learning a particular historical queue policy as model
+compute cost.
+
 ## Stage 1: derive the available label
 
 For each canonical example with positive finite measured
@@ -185,8 +193,17 @@ Report median and tail slope-ratio/log errors, systematic bias by hardware and
 workload family, and uncertainty coverage if intervals are introduced. Preserve
 ranking metrics, but do not use them alone to establish ratio or ETA accuracy.
 Evaluate full traces with unchanged scientific work against v3 and fixed-three
-FIFO, including actual trial, checkpoint, and finalization costs. Complete job
-and worker termination remains the makespan endpoint.
+FIFO, including actual trial, checkpoint, and finalization costs. Rank by mean
+time from original submission to successful completion; report median/p95/max
+JCT, queued age, completion coverage, and makespan alongside it. Completion
+includes required outputs, the final checkpoint, and successful worker exit.
+
+Keep a separate scheduler event record for each logical job: original submission,
+first dispatch, queue/pause intervals, trial and retry events, final artifact
+completion, and worker exit. Preserve the original submission across retries.
+Do not feed observed queue delay, final JCT, or future completion events into
+the solo-slope predictor or its labels. These records evaluate scheduling policy;
+the isolated training windows evaluate the runtime model.
 
 Co-location is a separate labeling extension. Learning s_i(S) or a slowdown
 factor requires labels with group membership, allocation/backend context, and
@@ -209,6 +226,8 @@ Until sufficient group evidence exists, keep live measured admission trials.
    windows with explicit reasons. Compare pooled counters/time against the label.
 7. Require observed calibration and complete-trace evidence before making a
    sustained-slope accuracy or scheduling-benefit claim.
+8. Keep scheduling outcome records separate from runtime targets; validate
+   immutable submission timestamps and complete-cohort JCT reporting.
 
 ## Inspected source snapshot
 

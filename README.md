@@ -4,9 +4,13 @@
 
 This branch records the [derived solo-slope admission design](docs/oct-proposed-v4-design.md)
 and the [dataset-labeling development proposal](docs/solo-slope-labeling.md).
-The proposed v4 rule uses reciprocal predicted wall-step time and measured
-optimizer progress in place of the 50% incumbent-slowdown gate. It starts with
-derived, uncalibrated slope estimates; sustained solo measurements are future work.
+The revised v4 objective is mean submission-to-successful-completion latency
+(job completion time, JCT), with p95/max latency and queue age reported alongside
+makespan. Admission compares predicted completion times for the outstanding queue;
+aggregate normalized progress is a diagnostic, not the admission gate. The design
+uses reciprocal predicted wall-step time and measured optimizer progress, with
+short-remaining-job ordering and an explicit queued-age safeguard. Derived slopes
+remain uncalibrated estimates; sustained solo measurements are future work.
 The executable scheduler, configuration defaults, datasets, and model artifacts
 remain the v3 implementation below. These documents do not enable v4 admission.
 
