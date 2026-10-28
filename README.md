@@ -1,5 +1,15 @@
 # Impact-Aware Single-GPU Scheduling
 
+## Proposed v4 design — documentation only
+
+This branch records the [derived solo-slope admission design](docs/oct-proposed-v4-design.md)
+and the [dataset-labeling development proposal](docs/solo-slope-labeling.md).
+The proposed v4 rule uses reciprocal predicted wall-step time and measured
+optimizer progress in place of the 50% incumbent-slowdown gate. It starts with
+derived, uncalibrated slope estimates; sustained solo measurements are future work.
+The executable scheduler, configuration defaults, datasets, and model artifacts
+remain the v3 implementation below. These documents do not enable v4 admission.
+
 The `oct_proposed_v3` variant defaults to a **50% incremental incumbent slowdown
 limit**. Its admission implementation matches `oct_proposed_v2`, whose default
 is 10%; the limit is configurable and both values are tested. A step increasing
