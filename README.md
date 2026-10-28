@@ -1,18 +1,46 @@
 # Impact-Aware Single-GPU Scheduling
 
-## Proposed v4 design — documentation only
+## V4: opt-in request feedback latency
 
-This branch records the [derived solo-slope admission design](docs/oct-proposed-v4-design.md)
-and the [dataset-labeling development proposal](docs/solo-slope-labeling.md).
-The revised v4 objective is mean submission-to-successful-completion latency
-(job completion time, JCT), with p95/max latency and queue age reported alongside
-makespan. Admission compares predicted completion times for the outstanding queue;
-aggregate normalized progress is a diagnostic, not the admission gate. The design
-uses reciprocal predicted wall-step time and measured optimizer progress, with
-short-remaining-job ordering and an explicit queued-age safeguard. Derived slopes
-remain uncalibrated estimates; sustained solo measurements are future work.
-The executable scheduler, configuration defaults, datasets, and model artifacts
-remain the v3 implementation below. These documents do not enable v4 admission.
+This branch implements a shared admission scorer with two per-request policies:
+`individual` for one candidate's usable result, and `group` for all declared
+required results. Mixed requests share the same queue; each group counts once.
+V4 uses FIFO plus queued-age protection, derived solo slopes, and v3's live
+add-only trial/checkpoint lifecycle. The default remains v3.
+
+- [Design, formulas, request metadata and configuration](docs/oct-proposed-v4-design.md)
+- [Derived-label-first dataset proposal](docs/solo-slope-labeling.md)
+- [Main experiment: batch versus sequential submission](benchmarks/feedback_v4/submission_results/report.md)
+- [Combined Gantt, optimizer progress and feedback chart](benchmarks/feedback_v4/submission_results/comparison.png)
+- [Historical five-job comparison and counterexamples](benchmarks/feedback_v4/results/report.md)
+
+Set `gpu_scheduler.feedback_latency.enabled: true` to select v4 on the cooperative
+trial path. Its defaults require matching `feedback_phase_model` metadata for
+future overhead; the collector/calibrator is future work. The explicit research
+setting `allow_zero_overhead: true` enables the synthetic zero-overhead assumption.
+Missing predictions, request membership or phase evidence make packing
+inconclusive; feasible solo execution remains available. The six-output model,
+artifacts and datasets are unchanged; a reciprocal slope field is additive.
+
+Reproduce the simulation from the MLEvolve parent using its Python environment:
+
+```bash
+python -m localml_scheduler.benchmarks.feedback_v4.submission_scenarios --plot
+```
+
+The headline metric is **average request feedback time**, with each request
+counting once. Average and arithmetic mean are identical; the change is from
+counting jobs to counting the result events that unblock the agent. Report
+request p95/max and whole-workflow time alongside that average.
+
+The main mock compares fixed-three FIFO with v4 under two feedback-dependent
+submission scenarios: MLMaster 2-style batch barriers and MLEvolve-style sequential
+submissions with multiple jobs outstanding. It removes v3 from the main table and
+chart. All 12 runs plus two single-outstanding controls complete all ten jobs.
+These are synthetic workloads, not captured framework traces; future release
+times depend on prior results. Bad slope predictions can still worsen batch
+latency, tail latency and workflow time. Earlier five-job/v3 traces are retained
+as historical evidence, separate from the new presentation.
 
 The `oct_proposed_v3` variant defaults to a **50% incremental incumbent slowdown
 limit**. Its admission implementation matches `oct_proposed_v2`, whose default

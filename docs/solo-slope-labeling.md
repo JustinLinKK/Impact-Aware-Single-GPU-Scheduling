@@ -1,6 +1,6 @@
 # Solo-slope labeling: derived labels first, sustained measurements later
 
-Status: development proposal, 2026-10-27. This document changes no dataset,
+Status: development proposal, revised 2026-10-28 (dataset audit: 2026-10-27). This document changes no dataset,
 training objective, neural-network head, or deployed artifact. The companion
 [v4 scheduler design](oct-proposed-v4-design.md) uses an initially uncalibrated
 reciprocal of predicted wall-step time. It replaces the proposed admission
@@ -21,8 +21,10 @@ a prediction to an observation, or call an extrapolated epoch a measured epoch.
 The word "solo" requires a supported isolation check, not merely absent group
 metadata in a file.
 
-The revised scheduler objective is **mean submission-to-successful-completion
-JCT**, with tail latency, queued age, and coverage reported alongside makespan.
+The revised scheduler objective is **average request feedback latency** (one
+vote per request by default; optional explicit weights): an
+individual result or the last required result of a declared group. Job/request
+tail latency, queued age and coverage are reported alongside makespan.
 This does not change the solo-slope training target into an end-to-end JCT label.
 Queueing and policy decisions determine much of JCT; they are not intrinsic to
 one model graph. Keep runtime slope/overhead labels separate from scheduler
@@ -117,7 +119,7 @@ information or inherent accuracy improvement. Throughput-relative errors should
 still be evaluated directly; they are not numerically identical to latency
 percentage errors after reciprocal conversion.
 
-In the scheduler's proposed profile field, retain source/artifact identity,
+In the scheduler's additive profile field, retain source/artifact identity,
 `calibration: uncalibrated_prior`, and `requires_online_validation: true`.
 Use only declared compatible hardware and workload semantics. Do not treat
 successful schema conversion or a high ranking score as validation of a new

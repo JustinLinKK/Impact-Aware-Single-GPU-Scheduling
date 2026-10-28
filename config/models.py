@@ -967,8 +967,31 @@ class SchedulerSubmissionDefaults:
 
 
 @dataclass(slots=True)
+class FeedbackLatencySettings:
+    """Opt-in v4 research policy; request semantics live on job metadata."""
+    enabled: bool = False
+    min_gain_seconds: float = 1.0
+    max_queued_age_seconds: float = 1800.0
+    allow_zero_overhead: bool = False
+    phase_model_ttl_seconds: float = 3600.0
+
+    def __post_init__(self):
+        for name in ("enabled", "allow_zero_overhead"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"feedback_latency.{name} must be boolean")
+        for name in ("min_gain_seconds", "max_queued_age_seconds", "phase_model_ttl_seconds"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not math.isfinite(float(value)) or float(value) <= 0:
+                raise ValueError(f"feedback_latency.{name} must be positive and finite")
+            setattr(self, name, float(value))
+
+    def to_dict(self):
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+
+@dataclass(slots=True)
 class GpuSchedulerSettings:
-    """The single production policy: incremental, slowdown-verified placement.
+    """Incremental placement, with opt-in v4 request-latency admission.
 
     The scheduler starts one anchor, considers one newcomer at a time, and
     keeps an addition only when measured/predicted drain-time gain passes
@@ -1001,6 +1024,7 @@ class GpuSchedulerSettings:
         default_factory=SourceTrialRankingSettings
     )
     colocation: ColocationSettings = field(default_factory=ColocationSettings)
+    feedback_latency: FeedbackLatencySettings = field(default_factory=FeedbackLatencySettings)
     exclusive_probe: ExclusiveProbeSettings = field(
         default_factory=ExclusiveProbeSettings
     )
@@ -1063,6 +1087,10 @@ class GpuSchedulerSettings:
             self.colocation = ColocationSettings()
         if isinstance(self.colocation, dict):
             self.colocation = ColocationSettings.from_dict(self.colocation)
+        if self.feedback_latency is None:
+            self.feedback_latency = FeedbackLatencySettings()
+        if isinstance(self.feedback_latency, dict):
+            self.feedback_latency = FeedbackLatencySettings(**self.feedback_latency)
         if self.exclusive_probe is None:
             self.exclusive_probe = ExclusiveProbeSettings()
         if isinstance(self.exclusive_probe, dict):
@@ -1151,6 +1179,7 @@ class GpuSchedulerSettings:
             "batch_options": self.batch_options.to_dict(),
             "source_trial_ranking": self.source_trial_ranking.to_dict(),
             "colocation": self.colocation.to_dict(),
+            "feedback_latency": self.feedback_latency.to_dict(),
             "exclusive_probe": self.exclusive_probe.to_dict(),
             "submission_defaults": self.submission_defaults.to_dict(),
             "mps": self.mps.to_dict(),

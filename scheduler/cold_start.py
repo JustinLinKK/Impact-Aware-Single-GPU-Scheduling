@@ -42,7 +42,17 @@ def cold_start_plan(planner, jobs, active, available, used_mb, *, mandatory, now
     if allowance <= 0:
         return None
     candidates = []
+    feedback = settings.feedback_latency
+    protected = None
+    if feedback.enabled and active:
+        overdue = [job for job in jobs if job.metadata.get("cooperative_trial")
+                   and now.timestamp() - original_submission_rank(job) >= feedback.max_queued_age_seconds
+                   and planner.compatibility.pack_eligible(job, backend_name=backend)
+                   and planner.estimator.estimate_peak_vram_mb(job, BatchResolution.resolved_batch_size(job), backend) <= budget]
+        protected = min(overdue, key=lambda job: (original_submission_rank(job), job.job_id), default=None)
     for job in jobs:
+        if protected is not None and job.job_id != protected.job_id:
+            continue  # Let residents drain if the overdue job cannot join.
         if not job.metadata.get("cooperative_trial"):
             continue
         if not planner.compatibility.pack_eligible(job, backend_name=backend):
@@ -69,8 +79,8 @@ def cold_start_plan(planner, jobs, active, available, used_mb, *, mandatory, now
         candidates.append((job, key, config, batch))
     if not candidates:
         return None
-    busy_ranks = planner.estimator.cooperative_busy_ranks(
-        [item[0] for item in candidates], prefer_high=not active, required_jobs=active)
+    busy_ranks = (None if feedback.enabled else planner.estimator.cooperative_busy_ranks(
+        [item[0] for item in candidates], prefer_high=not active, required_jobs=active))
     ordered = []
     for job, key, config, batch in candidates:
         rank = busy_ranks[job.job_id] if busy_ranks is not None else (0,)
@@ -82,6 +92,9 @@ def cold_start_plan(planner, jobs, active, available, used_mb, *, mandatory, now
     if (not all(profiles.values()) or
             len({(p["artifact_sha256"], p["hardware"]) for p in profiles.values() if p}) != 1):
         profiles = {}  # Never mix measured seconds and predicted work units.
+    if feedback.enabled and active and not profiles:
+        return None  # Solo execution remains available; no v3 fallback.
+    from .feedback_objective import FEEDBACK_POLICY
     return DispatchPlan(
         mode="concurrent_group" if active else "stack_anchor",
         backend_name=backend,
@@ -90,7 +103,7 @@ def cold_start_plan(planner, jobs, active, available, used_mb, *, mandatory, now
         backend_config=config,
         trial_metadata={
             "cooperative_trial": True,
-            "admission_policy": ADD_ONLY_POLICY,
+            "admission_policy": FEEDBACK_POLICY if feedback.enabled else ADD_ONLY_POLICY,
             "cold_start": bool(active),
             "requires_live_trial": bool(active),
             "preexisting_job_ids": [member.job_id for member in active],
@@ -100,7 +113,8 @@ def cold_start_plan(planner, jobs, active, available, used_mb, *, mandatory, now
         },
         objective_breakdown={"cold_start": bool(active), "gain": None,
                              "profile_origin": "predicted_workload" if profiles else "measurement_fallback",
-                             "candidate_ranking_policy": "cooperative_busy_band_fifo_v1" if busy_ranks is not None else "fifo_missing_consistent_busy_profiles",
+                             "candidate_ranking_policy": "feedback_fifo_age_v4" if feedback.enabled else ("cooperative_busy_band_fifo_v1" if busy_ranks is not None else "fifo_missing_consistent_busy_profiles"),
+                             "protected_overdue_job_id": protected.job_id if protected else None,
                              **({"busy_group_width_pp": COOPERATIVE_BUSY_GROUP_WIDTH_PP,
                                  "busy_group_basis": "heuristic; not predictive confidence or capacity",
                                  "eligible_busy_ranks": {name: list(rank) for name, rank in busy_ranks.items()}}

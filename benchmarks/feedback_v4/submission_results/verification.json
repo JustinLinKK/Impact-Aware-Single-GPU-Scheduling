@@ -1,0 +1,16 @@
+{
+  "main_runs": 12,
+  "control_runs": 2,
+  "jobs_finished_per_run": 10,
+  "passed": true,
+  "checks": [
+    "all work conserved including interrupted trials",
+    "VRAM respected",
+    "no work before submission",
+    "batch barriers respected",
+    "pipeline dependency and issuer gaps respected",
+    "all requests weight one",
+    "all jobs complete",
+    "single-outstanding policies identical"
+  ]
+}

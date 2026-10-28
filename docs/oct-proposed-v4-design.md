@@ -1,88 +1,87 @@
-# Submission-to-completion latency: oct_proposed_v4 design
+# Request feedback latency: oct_proposed_v4
 
-Status: design only, 2026-10-27. Base: `oct_proposed_v3`, commit
-`4a27bcff00ac6021f4605a8f5f186b2db1a07233`. No scheduler behavior, configuration,
-dataset, or model artifact is changed by this document.
+Status: opt-in research implementation, 2026-10-28. Branch `oct_proposed_v4`
+began at `oct_proposed_v3` commit `4a27bcf`; this refactor follows the JCT design
+at `58e69ea`. The default remains v3. No model training, dataset rewriting,
+GPU experiment or deployment is part of this change.
 
-This revision makes mean job completion time (JCT), measured from submission to
-successful completion, the primary objective. It supersedes the initial v4
-normalized-progress admission gate as well as v3's 50% slowdown criterion.
-It uses the existing predictor's wall-step output to derive a nominal solo slope,
-without requiring a new neural head or a mandatory exclusive profile for every
-arriving job. The accompanying
-[labeling proposal](solo-slope-labeling.md) distinguishes this initial estimate
-from future sustained, successful-update measurements.
+One shared forecast engine supports two **per-request** completion policies:
 
-## Primary metric and completion contract
+| Policy | Agent waits for | Request completion |
+|---|---|---|
+| `individual` | one candidate's usable result | that job's result-ready time |
+| `group` | every required candidate in a declared batch | last required result-ready time |
 
-For logical job i, let a_i be its original durable submission time, recorded when
-the service accepts the job, before predictor/source processing, profiling,
-preparation, or queueing. Let C_i be the time its required outputs and final
-checkpoint are complete and the worker has exited successfully. Define
+The policies can coexist in the same queue. A workflow identifier alone does
+not establish a barrier. A group counts once, and its children are not counted
+again as independent requests. This supersedes both the original normalized-
+progress gate and the earlier v4 shortest-remaining ordering. Candidate order is
+now FIFO with age protection, shared by both completion policies.
 
-\[
-F_i=C_i-a_i,\qquad
-\overline F=\frac1n\sum_{i=1}^n F_i,\qquad
-\min_\pi\overline F(\pi).
-\]
+The [labeling proposal](solo-slope-labeling.md) still uses derived labels first.
+A reciprocal wall-step prediction supplies an uncalibrated solo-slope prior,
+not an interference model or an accuracy improvement.
 
-F_i is JCT, flow time, or turnaround time. It includes queueing, preparation,
-execution, trials, paused/requeued periods, data loading, validation, checkpointing,
-and finalization. It does not start at first dispatch or end at the last optimizer
-update. Original submission identity and time survive retries and resumes;
-automatic retries of the same logical request are not new low-latency jobs.
-Use the server's durable timestamps consistently; use monotonic clocks for local
-interval measurement and flag invalid ordering rather than clamp negative JCT.
+## Average feedback metric and completion contract
 
-For an identical finite cohort, minimizing mean JCT is equivalent to minimizing
-total flow time. It is also the area under the number of submitted unfinished
-jobs, N_unfinished(t):
+Let q denote a logical feedback request, a_q its original accepted submission
+and G_q its finalized set of required job IDs. Let C_i include required outputs,
+validation, checkpoint/finalization, successful worker exit and result delivery.
+For individual requests |G_q|=1; for an all-required group:
 
 \[
-\sum_i F_i=\int N_{\mathrm{unfinished}}(t)\,dt.
+C_q=\max_{i\in G_q} C_i,\qquad F_q=C_q-a_q,\qquad
+J=\frac{\sum_q w_q F_q}{\sum_q w_q}.
 \]
 
-This rewards earlier job completions, not simply more optimizer work per second.
-Every job has weight one by default. Predicted workload size is not a user-priority
-weight. Any future service-class weighting must be named as a different objective.
+The headline experiment metric is the **average request feedback time**:
 
-Report mean JCT as primary, plus median, nearest-rank p95, maximum JCT,
-cumulative queued time, current/maximum queued age, completion coverage, failures,
-and cancellations. Retain makespan max(C_i)-min(a_i), throughput, and normalized
-work rate as secondary diagnostics. An empty completed cohort has no mean or p95.
-Preserve existing report fields `mean_flow_time_seconds`, `median_flow_time_seconds`,
-`p95_flow_time_seconds`, `total_flow_time_seconds`, and `trace_makespan_seconds`;
-document the endpoint contract and add explicit coverage/max-JCT/queue-age data
-where absent rather than ambiguously renaming existing metrics.
-The existing trace wait statistic measures submission to first dispatch;
-cumulative queued time additionally includes later paused/requeued intervals.
-Queued age here is current time minus original submission for a currently queued
-job, not cumulative queue residence. Keep these quantities separately named.
+\[
+\overline F_{\mathrm{request}}=\frac{1}{|Q|}\sum_{q\in Q}(C_q-a_q).
+\]
 
-On an incomplete evaluation, report each unfinished job's age as a lower bound
-on its JCT and label completed-only aggregates as censored diagnostics. Do not
-rank policies by completed-only mean: discarding a long unfinished job can make a
-bad scheduler look fast. Failed/cancelled outcomes are reported separately, not
-credited as successful completions. Compare the same arrival cohort and drain
-it completely for the primary experiment; never use job construction timestamps
-in place of actual trace submission times.
+“Average” here means the arithmetic mean. Mean job JCT already gives each job
+one equal vote; counting one group once instead changes the unit of observation.
+All mock experiments use weight one per request. The general weighted formula
+above remains an optional API capability, not an implicit job-size weighting.
+The default weight is one **per request**, not per job or per predicted FLOP.
+Explicit positive request weights are supported; report weighted and unweighted
+results separately when they differ. Group completion is a local barrier, not
+necessarily the end of the entire agent workflow. Minimizing one group's latency
+is equivalent to minimizing that group's last completion; it is not generally
+equivalent to global makespan when several requests arrive at different times.
 
-## Limits of the objective and initial predictions
+The request clock starts before queueing and preparation, and survives retry,
+partial execution, checkpoint and resume. Include all trial time in measured
+latency. Do not end the clock at the last optimizer update. The existing durable
+job `finished_at` is a scheduler-side endpoint; actual agent-consumption latency
+requires a caller-provided `feedback_ready_at` receipt and application tracing.
+This change does not add a transport-acknowledgment service or rewrite the
+existing live metrics API. Synthetic results explicitly assume instant delivery.
 
-Mean JCT can improve while one user's latency becomes much worse. Tail metrics
-and an explicit queued-age safeguard are therefore part of the design. No business
-deadline or latency SLO has been supplied; this document does not invent one.
-Production latency targets must be agreed before deployment, and any mean/tail
-tradeoff must be reported against those targets.
+For a fixed set of successful requests, weighted total latency is the area under
+the weighted number of unfinished requests. Completed requests add a constant to
+both actions and are omitted from the admission cohort. A partly completed group
+stays outstanding; already completed member timestamps are retained in its max.
 
-The initial slope is an **uncalibrated prior**. Correct job ordering does not
-establish correct cost ratios. Changing units from latency to its reciprocal
-does not improve prediction accuracy or identify co-location interference.
-Live trials remain necessary. Forecasting completion times now depends on absolute
-solo-rate calibration as well as cross-job ratios; the old gain ratio's common-scale
-invariance no longer establishes the validity of the new decision. The initial
-derived-slope path is a research prior, not a production SLA or guaranteed latency
-improvement. No claim of improved GPU performance accompanies this branch.
+Default completion condition is `successful`. Explicit `terminal` means the
+caller can proceed with a failure/cancellation result as feedback; it does not
+turn failure into a successful training result. A failed required member makes
+an outstanding success-only group infeasible, so its comparison is inconclusive.
+Fully terminal historical requests are omitted from new decisions, but failed
+requests must still appear in evaluation coverage and failure reporting.
+
+Report request mean/median/p95/max, job mean/median/p95/max JCT, queued age,
+completion coverage, failure/cancellation and makespan. An incomplete run is
+censored: report unfinished ages and do not rank completed-only averages. Preserve
+existing `mean_flow_time_seconds`, `p95_flow_time_seconds` and related job fields;
+request metrics are separately named in the simulator. With n=5 and simultaneous
+submissions, nearest-rank p95 job JCT equals maximum JCT and makespan.
+
+Mean latency can improve while an individual waits longer. The age guard limits
+repeated bypass but is not a tail SLO, deadline guarantee or optimality proof.
+Admission uses only arrived jobs; endogenous agent arrivals depend on previous
+results and should not automatically be modeled as an independent Poisson stream.
 
 ## Inputs, update budgets, and predicted profile
 
@@ -127,7 +126,7 @@ Do not use GPU-event time, per-sample time, epoch time, or a display-normalized
 cost ratio in this conversion. Check both the input and reciprocal for finite,
 strictly positive values. Do not clamp invalid outputs into plausible slopes.
 
-The proposed additive field on `predict_profile_options` is shown below for an
+The additive field on `predict_profile_options` is shown below for an
 illustrative t_hat_i of 28.097898000851274 ms; this is not a recorded model run:
 
 ```json
@@ -136,7 +135,9 @@ illustrative t_hat_i of 28.097898000851274 ms; this is not a recorded model run:
     "value": 35.58985088385271,
     "unit": "updates_per_second",
     "source": "reciprocal_wall_step_prediction",
-    "step_semantics": "nominal_optimizer_update"
+    "step_semantics": "nominal_optimizer_update",
+    "artifact_sha256": "<predictor artifact hash>",
+    "calibration": "uncalibrated_prior"
   }
 }
 ```
@@ -144,15 +145,15 @@ illustrative t_hat_i of 28.097898000851274 ms; this is not a recorded model run:
 The enclosing profile retains `kind: predicted_workload`, `step_cost` in nominal
 milliseconds, `artifact_sha256`, `hardware`, `batch_size`, `job_signature`,
 `calibration: uncalibrated_prior`, and `requires_online_validation: true`.
-The new field is specified here only; it is not implemented on this branch.
+This field is implemented in `predict_profile_options`; measured records are unchanged.
 The six-output teacher/student tensor interface and existing fields remain intact.
 Neither the estimate nor its derived ETA may be written to measured-profile
 tables or passed off as a verified drain-time estimate.
 
-All members must have valid profiles from the same artifact and trained-hardware
+All outstanding jobs in the forecast cohort must have valid profiles from the same artifact and trained-hardware
 scale, matching their current workload, resolved batch, precision, optimizer,
 accumulation semantics, and supported runtime context. Freeze the full profile
-identity and slope for the trial. A changed signature, batch, artifact, hardware,
+identity and slope for the trial, including queued jobs. A changed signature, batch, artifact, hardware,
 backend configuration, or membership invalidates the comparison.
 
 If a valid compatible prediction is unavailable for any member, do not authorize
@@ -161,191 +162,253 @@ candidate eligible for a future compatible group or solo execution under the
 existing memory and execution checks. Do not substitute zero work, mix measured
 and uncalibrated cost scales, or silently switch to the 50% policy.
 
-## Candidate ordering and queued-age protection
+## Request metadata and configuration
 
-The new latency objective also changes nomination: the old heavy-anchor/light-
-joiner busy ordering is no longer the primary rank. Among eligible jobs with a
-valid estimate, nominate the smallest predicted remaining solo training time
-R_i/s_hat_i^0, then oldest original submission, then stable job ID. Use the same
-order at an empty-GPU dispatch boundary and for one-at-a-time trial candidates.
-This is a non-preemptive shortest-remaining-work heuristic, not a claim of optimal
-SRPT scheduling with interference. Keep hard scheduling compatibility and any
-explicit deployment service-class restrictions. Busy remains a diagnostic.
+Enable the existing cooperative add-only path explicitly:
 
-Introduce a proposed `max_queued_age_seconds=1800` research default for queued
-jobs, measured from original submission even after partial execution/requeue.
-Once a feasible queued job crosses that age, nominate the oldest overdue job
-first and stop adding ordinary backfill until it receives service. It may join
-through a valid latency-benefit trial; otherwise let incumbents drain and give
-it the next feasible empty-GPU solo dispatch. Do not evict incumbents or bypass
-memory/compatibility checks. Retry cooldowns and budgets still apply to trials;
-they must not eliminate the natural solo opportunity. Unknown-prediction jobs
-remain eligible for oldest-first solo dispatch and this protection.
-For this safeguard, service means committed packed admission or solo dispatch;
-a rejected/inconclusive trial does not clear the overdue job's protection.
+```yaml
+gpu_scheduler:
+  feedback_latency:
+    enabled: true
+    min_gain_seconds: 1.0
+    max_queued_age_seconds: 1800.0
+    allow_zero_overhead: false
+    phase_model_ttl_seconds: 3600.0
+```
 
-The existing `starvation_timeout_seconds` is reporting-only in v3; it is not an
-existing admission override. The new queued-age behavior is explicitly proposed,
-with a distinct setting. It limits repeated bypass, but cannot guarantee a hard
-wait bound while a non-preemptible incumbent runs, under overload, or when no
-feasible execution environment exists. Report those reasons and current ages.
+These are provisional research settings. Existing backend, cooperative runner,
+memory and live-trial prerequisites still apply. Leaving `enabled: false` keeps
+v3's candidate ordering and 50% criterion. V4 does not silently fall back to v3
+when information is missing, and changing policy/settings during a measurement
+invalidates that trial. Natural solo execution remains available.
 
-## Admission calculation: compare remaining completion times
+Without `metadata.feedback_request`, a job is explicitly treated as one
+individual successful request, keyed by workflow and job ID. For a group, repeat
+the same canonical declaration on **every** required member:
 
-Let S be the incumbent group and j the candidate. Measure optimizer updates per
-second before and during overlap. For each independent timing half h in {1,2},
-use r^-_{i,h} for incumbents before joining and r^+_{i,h} for all members during
-overlap. The runner's mean seconds/update can be inverted after validity checks;
-equivalently, use completed updates divided by the corresponding elapsed time.
+```json
+{
+  "feedback_request": {
+    "workflow_id": "agent-session-1",
+    "request_id": "round-7",
+    "completion_policy": "group",
+    "completion_condition": "successful",
+    "required_job_ids": ["candidate-7a", "candidate-7b"],
+    "membership_finalized": true,
+    "submitted_at": "2026-10-28T12:00:00+00:00",
+    "weight": 1.0
+  }
+}
+```
 
-Use fresh, phase-clean windows with matching runtime identity and real temporal
-overlap across members. Preserve v3's warm-up, minimum-progress, non-update-phase,
-and disjoint-window checks. Pre-add windows describe the **current pack**, which
-need not be a solo configuration. Reusing stale solo timings as live evidence is
-not allowed.
+Explicit individual requests use `completion_policy: individual` and one required
+ID. Request time must be no later than any member's original submission. Request
+keys are `(workflow_id, request_id)`; one job belongs to exactly one request.
+Missing members, unsealed/dynamic groups, conflicting declarations, unsupported
+policies and overlapping ownership invalidate packed comparison. Submit the
+complete group before it can participate in packed admission. Until then its
+members remain eligible for feasible solo execution. No group is inferred from
+same-workflow or coincident arrival alone.
 
-At the decision snapshot t, let O be all arrived, unfinished scheduler-owned
-jobs, including the candidate and other waiting jobs. The two actions start from
-the same post-trial counters and queue ages:
+Reserved future semantics include first acceptable result, k-of-n results,
+dependencies/critical paths, speculative cancellation and deadlines. They are
+not accepted policy values today. These require explicit utility/completion
+contracts, including who may cancel work and which result unblocks the agent.
 
-- `admit`: retain j in S union {j} using the measured overlap rates.
-- `defer`: checkpoint/requeue j and continue S using its measured pre-add rates.
+## Candidate ordering and age protection
 
-Do not compare an after-trial state with a before-trial state: useful trial
-updates have already happened under both continuation choices. The candidate's
-prior submission age is retained under either action.
+Eligible cooperative jobs are nominated by original submission time and stable
+job ID, both at idle dispatch and for packed trials. Predicted busy and shortest
+remaining time do not determine v4 rank. Compatibility, memory and backend
+checks still apply. Retain v3's incumbent continuity, clean measurement windows,
+checkpoint preservation, retry limits and per-group cooldowns.
 
-For each measurement half h, forecast remaining time to successful completion
-D_hat_{i,h}(a) for every i in O under action a. Score the same complete cohort:
+Once a feasible waiting job reaches `max_queued_age_seconds`, nominate the oldest
+overdue job and suppress fresh backfill. If it cannot join safely or its trial is
+rejected, let residents drain toward its next feasible solo opportunity. A trial
+alone does not reset its age/protection. Do not evict incumbents or override
+memory checks. Unknown-prediction jobs keep solo eligibility. This is not a hard
+waiting-time bound under overload, long non-preemptible jobs or incompatible
+resources. Existing v3 `starvation_timeout_seconds` remains reporting-only.
+
+This implementation covers the cooperative add-only path. Noncooperative jobs
+still follow existing solo compatibility paths; v4 prevents legacy packed
+fallback while workers are active. There is no v4 fixed concurrency cap.
+
+## Shared admission forecast
+
+For candidate j and incumbent set S, use fresh phase-clean pre-add and overlap
+windows, split into two independent halves h. Convert measured seconds/update
+into rates r^- and r^+ in updates/s. A pre-add slope is the current pack's rate;
+it is not necessarily a solo slope. Both alternatives start from the same latest
+post-trial remaining updates, including progress since measurement windows ended:
+
+- `admit`: keep j in S union {j} using measured overlap rates.
+- `defer`: checkpoint/requeue j and continue S using measured pre-add rates.
+
+For every outstanding request, forecast member completion timestamps
+C_hat_i,h(a), then score
 
 \[
-\widehat J_h(a)=\sum_{i\in O}\left[(t-a_i)+\widehat D_{i,h}(a)\right],
+\widehat J_h(a)=\sum_{q\in Q_t} w_q
+\left[\max_{i\in G_q}\widehat C_{i,h}(a)-a_q\right],
 \qquad
 \Delta_h=\frac{\widehat J_h(\mathrm{defer})-
-\widehat J_h(\mathrm{admit})}{|O|}.
+\widehat J_h(\mathrm{admit})}{\sum_{q\in Q_t} w_q}.
 \]
 
-The common elapsed ages cancel in Delta. Adding age to an otherwise identical
-cost does not itself prevent starvation; the queued-age rule above supplies that
-separate protection. Waiting jobs cannot be omitted: an admission can delay
-their access to the GPU even when it benefits the current pack.
+Completed companions of outstanding groups use their observed timestamp. Every
+unfinished arrived job, including waiting jobs, must belong to the scored cohort.
+Otherwise the comparison is inconclusive. Request ages cancel between actions;
+adding ages to a score does not itself prevent starvation.
 
-### Explicit initial forecast model
+Both halves must have Delta_h >= `min_gain_seconds` (initially 1 second) to accept.
+Both failures reject; disagreement or invalid evidence is inconclusive. Equality
+passes. There is no additional 50% slowdown or normalized-progress gate. The
+margin is a research default, not a confidence bound or promised time saving.
 
-Use a deterministic **drain-current-pack, then serial-tail** approximation for
-both actions, with no lookahead to unarrived jobs:
+The deterministic rollout in `scheduler/feedback_objective.py`:
 
-1. Snapshot the full queue, remaining budgets, frozen predicted solo slopes,
-   measured rate vector for each half, and available overhead/phase estimates.
-   Freeze one queue order using the nomination rule above; the admit action
-   removes j from that order, while the defer action retains it there.
-2. Advance the initial active group to the next member's completion boundary.
-   Use the action's measured rate vector while that membership is unchanged.
-   For a surviving multi-job subset, use fresh exact matching subgroup evidence
-   if available; otherwise retain its parent rates as an explicitly assumed
-   fallback. This fallback is not a measurement or a proven bound on either
-   action's latency. When a membership change leaves a singleton, use its frozen
-   predicted solo slope. An initial singleton with valid measured pre-add rates
-   keeps those rates while its initial membership is unchanged.
-3. Account for required validation, finalization, checkpoint and worker-exit
-   phases, including their GPU residency. An exhausted optimizer budget is not
-   a completed job or a necessarily freed GPU. Record each forecast completion.
-4. After the current group has drained, execute remaining queued jobs serially
-   in the frozen order using their remaining updates / predicted solo slope,
-   plus their required setup and completion phases. Record every completion.
-   Do not optimize queue order separately for the two actions or assume an
-   unobserved future packed configuration is fast.
+1. Freeze the full outstanding request cohort, profiles, settings, current active
+   membership and one FIFO tail. A new arrival or changed request/profile/cohort
+   requires fresh evidence. Current counters supply both alternatives' R_i.
+2. Drain each action's initial group to its next training-completion boundary.
+   Keep measured rates while membership is unchanged. Use current exact subgroup
+   evidence if available; otherwise inherit parent rates with explicit assumed
+   provenance. On transition to a singleton use its predicted solo slope. An
+   initial singleton keeps its measured rate until membership changes.
+3. Reserve required remaining finish phases serially on the GPU. During this
+   approximate reserve other jobs make no training progress. Add nonresident
+   delivery time to each result timestamp without holding the GPU for delivery.
+4. After residents drain, execute the same frozen serial tail using R_i/s_hat_i^0,
+   plus startup/resume, finish and delivery estimates. Defer includes the
+   candidate's pause cost before the continuation and resume cost in its tail.
+   Admit removes the candidate from that same tail.
 
-This restricted rollout is a feasible scheduling template once its rate/phase
-assumptions hold, not a prediction of every future decision. Real scheduling
-reconsiders after completions, new arrivals, or material rate changes. Its
-restricted serial tail and inherited subset rates can mis-rank actions and must
-be tested; the heuristic does not claim globally minimal mean JCT.
-The old 1800-second local gain-projection horizon is superseded by this completion
-rollout; it is distinct from the new queued-age threshold. Forecasting an entire
-long job extends beyond the observed windows. Log that extrapolation and test
-rate drift and solo-calibration sensitivity rather than treating it as fresh
-measurement evidence.
+This is a restricted continuation model, not a prediction of all future
+rescheduling or a bound. Only the current trial's measured groups are available;
+unknown future interference is not read from the simulator. Real scheduling
+reconsiders after completions. The serial tail and inherited subset rates can
+mis-rank actions, even with accurate solo slopes.
 
-All forecast-required budgets and rates must be valid. If a waiting job has no
-usable estimate, do not silently drop it or assign zero duration: the full-queue
-score is inconclusive. Incumbents continue, and unknown jobs retain solo-dispatch
-eligibility. A future bounded-uncertainty extension can relax this restriction.
+Absolute prediction scale now matters because measured and predicted seconds
+coexist in the forecast. Scaling all reciprocal costs leaves the historical P/g
+ratio invariant, but does **not** generally leave this JCT gate invariant.
+Multiplying all request weights by a common factor does preserve the decision.
+The former H=min(1800 s, next-completion times) and g>=1.05/H(g-1)>=5 s gates are
+superseded. The new 1800-second age setting has a different purpose.
 
-Include future action-dependent pause, checkpoint, reload, startup, and finish
-costs using matching measured estimates, without counting them twice. Missing
-material costs or unknown GPU-occupancy phases make a production-use forecast
-inconclusive. An explicitly flagged zero-overhead assumption is permitted only
-for research/synthetic evaluation, with no production latency claim. Trial time
-already paid is sunk for this continuation decision but remains in actual JCT.
-Consequently a positive continuation gain does not prove that initiating the
-trial paid for itself. Keep bounded trial/retry controls and evaluate their total
-latency cost against policies that never initiated that trial.
+Keep normalized progress P^- = sum(r^-_i/s_hat_i^0), P^+ = sum(r^+_i/s_hat_i^0),
+g=P^+/P^- and incumbent slowdown ratios as diagnostics. The scorer records them,
+the complete cohort/order, per-job and per-request forecasts, both deltas,
+phase assumptions, prediction provenance, threshold and reasons. Policy ID is
+`derived_solo_slope_feedback_v4`.
 
-### Decision and diagnostics
+### Completion-phase contract
 
-The proposed replacement gate is Delta_h >= 1.0 second for each of the two
-independent measurement halves: at least one second of predicted mean remaining
-JCT saved across O. Name the setting `min_mean_jct_gain_seconds`; this is a
-provisional research margin, not a business SLO or a statistical confidence bound.
-Both halves passing accepts, both failing rejects, and disagreement or invalid
-evidence is inconclusive. Threshold equality passes. Retain memory and trial
-validity safeguards. Do not additionally require the old 50% slowdown cap.
+Production-use comparison requires a complete matching estimate on every
+outstanding job. The adapter accepts `metadata.feedback_phase_model` with:
 
-Continue recording
+```json
+{
+  "source": "measured_phase_model_v1",
+  "covers_required_phases": true,
+  "job_signature": "<current packing signature, or job ID>",
+  "batch_size": 32,
+  "hardware_key": "<store hardware key>",
+  "backend": "cuda_process",
+  "observed_at": "2026-10-28T12:00:00+00:00",
+  "startup_seconds": 2.0,
+  "finish_seconds": 5.0,
+  "delivery_seconds": 0.1,
+  "pause_seconds": 1.0,
+  "resume_seconds": 2.0
+}
+```
 
-\[
-P_h^-=\sum_{i\in S}r^-_{i,h}/\widehat s_i^0,\qquad
-P_h^+=\sum_{i\in S\cup\{j\}}r^+_{i,h}/\widehat s_i^0,\qquad
-g_{j,h}=P_h^+/P_h^-.
-\]
+Numbers above are illustrative. Values must be finite and nonnegative, identity
+must match, and age must be within `phase_model_ttl_seconds`. `finish` covers all
+remaining required non-training work, including validation/checkpoint/finalization
+and worker release; recurring future non-training phases must be represented,
+not dropped. `delivery` is the additional nonresident result-return delay.
+Queued jobs with prior progress/checkpoints use resume instead of fresh startup.
+This serialized phase proxy is an approximation, not a bound.
 
-These are throughput diagnostics. The former g >= 1.05 and H(g-1) >= 5 seconds
-thresholds are **superseded**, not extra gates: requiring them could reject an
-overlap that improves JCT. Raw update counts and busy percentages are still not
-interchangeable with normalized work. Absolute slope calibration now affects
-singleton and queued-tail forecasts; preserve predicted/measured provenance.
+**An automatic collector/calibrator for this phase model is not implemented.**
+Callers must supply matching observations through the metadata contract. Missing,
+stale, malformed or incomplete phase evidence makes packed comparison inconclusive.
+Only explicit `allow_zero_overhead: true` permits the labeled research assumption
+used in the synthetic example. Trial setup already paid is sunk for continuation
+scoring but remains in actual request latency. Positive continuation gain does
+not prove that initiating the trial paid for itself.
 
-### Why the objective changes the decision
+### The policies really can disagree
 
-Consider a running A with 100 updates left and a queued B with one update left,
-both submitted at time zero with solo slope 1 update/s. Deferring B gives
-C_A=100, C_B=101, mean JCT=100.5 seconds, and makespan=101 seconds.
+With A=100 and B=1 remaining updates, solo rates 1/s, and zero phase costs,
+defer predicts A=100 s, B=101 s. Overlap at .5/.4 updates/s predicts B=2.5 s and
+A=101.25 s after solo completion. For two individual requests, mean latency falls
+from 100.5 to 51.875 s, a 48.625 s gain: accept. For one group AB, feedback grows
+from 101 to 101.25 s: reject. Both use identical job forecasts and the same
+one-second margin. This behavior is tested in the shared scorer.
 
-Suppose overlap gives r_A=0.5 and r_B=0.4. B finishes at 2.5 seconds; A has 98.75
-updates left and finishes alone at 101.25 seconds. Mean JCT is 51.875 seconds,
-although makespan grows to 101.25 seconds and normalized throughput during
-overlap falls from 1 to 0.9. With exact rates and zero overhead, the revised
-criterion saves 48.625 seconds of mean JCT and accepts. This illustrates the
-objective, not a universal justification for tail-latency regression.
+## Lifecycle and limitations
 
-## Lifecycle, safety, and evidence
+The v3 controller still owns warm-up, overlapping clean windows, minimum measured
+progress, runtime identity, update limits, teardown, retries and checkpoints.
+Only the continuation objective and candidate ordering change when enabled.
+Incumbents continue through preparation and rejection; rejected/inconclusive
+newcomer progress remains saved. Exhausted budgets, interrupted trials, changed
+membership or stale tokens require reconciliation/fresh windows. Missing valid
+predictions for any forecast job do not become zero-duration jobs or invoke v3.
+An idle GPU can still execute a feasible solo job without a gain calculation.
 
-- Preserve v3's feasibility checks, original submission time, scheduling
-  compatibility, memory reservations, live VRAM gate, and backend constraints.
-  Replace busy-first ordering with the latency-oriented nomination and explicit
-  queued-age protection above; this is an intentional design change.
-- Do not impose a fixed concurrency cap on v4. The fixed-three policy below is
-  the explicitly requested evaluation comparator, not a v4 setting.
-- Keep incumbents executing through preparation, measurement, and rejection.
-  A rejected or inconclusive newcomer checkpoints and requeues alone; all its
-  completed updates remain credited. An idle GPU can dispatch a feasible solo
-  job without an admission-gain calculation.
-- Retain existing trial deadlines, optimizer-update limits, cooldowns, attempt
-  limits, teardown checks, and natural-solo opportunity. Membership or budget
-  completion during a trial requires fresh evidence for the remaining group.
-  Resumption after scheduler restart must validate identity and fresh windows;
-  persisted counters do not authorize reuse of stale rates.
-- Record the revised proposed policy identifier `derived_solo_slope_jct_v1`,
-  original submission timestamps, frozen predicted profiles, remaining updates,
-  before/after rates, the entire forecast cohort/order, per-action per-job
-  completion forecasts, assumed versus measured subgroup/overhead sources,
-  both mean-JCT deltas, threshold, decision, and reason. Record P/g and incumbent
-  slowdown diagnostically. A forecast is never persisted as observed JCT.
-- Keep trial time already paid separate from the continuation decision: its
-  productive updates are in R_i. Future action-dependent overhead enters the
-  rollout; actual end-to-end reporting includes all costs regardless of whether
-  an estimate was available during the decision.
+The request registry is currently validated metadata, not a new server API.
+There is no planner for first-result utility, dynamic DAGs, cancellations or
+unknown future arrivals. Both policies optimize forecasts, not guaranteed actual
+JCT, and neither claims to optimize final scientific quality. A future agent-level
+metric can track time-to-acceptable-model or iteration utility separately.
+
+## Main experiment: two submission scenarios
+
+The [main report](../benchmarks/feedback_v4/submission_results/report.md) and
+[combined figure](../benchmarks/feedback_v4/submission_results/comparison.png)
+compare fixed-three FIFO with request-aware v4. V3 is omitted from the new table
+and chart at the user's request; prior traces below remain historical evidence.
+The same five job types are run for two cycles, ten jobs per run:
+
+- MLMaster 2-style batch barriers submit A1–E1 together, then A2–E2 ten seconds
+  after the last first-batch result. Each batch is one group request.
+- MLEvolve-style sequential/pipelined submission starts A1–E1 ten seconds apart.
+  Each returned result enables its corresponding successor after ten seconds;
+  one issuer spaces submissions by at least ten seconds. Multiple jobs may be
+  outstanding; every job is one individual feedback request.
+
+The user confirmed the pipelined interpretation. These are synthetic contracts,
+not exact framework reproductions or framework-default parallelism. Source links
+and assumptions are recorded in the report. Both policies use identical jobs
+and dependency/think-time rules, but their resulting arrival timestamps differ.
+Thus this is a closed-loop evaluation, not identical exogenous arrival traces.
+
+| Reference scenario | Policy | Average feedback (min) | p95/max feedback (min) | Workflow makespan (min) |
+|---|---|---:|---:|---:|
+| Batch barrier | Fixed-three FIFO | 97.22 | 97.22 | 194.61 |
+| Batch barrier | V4 group | 78.87 | 78.87 | 157.92 |
+| Sequential pipeline | Fixed-three FIFO | 89.36 | 104.65 | 196.14 |
+| Sequential pipeline | V4 individual | 55.75 | 91.17 | 159.17 |
+
+All 12 main runs and two strict-single-outstanding controls complete ten jobs,
+conserve productive trial updates and respect VRAM. Stale-C prediction worsens
+batch feedback to 148.39 minutes and pipeline p95 to 172.20 minutes. Corrected
+slopes reduce those to 97.75 and 101.33 minutes, respectively. This remains a
+zero-phase-overhead, noiseless synthetic model; prediction and phase calibration
+are required before production conclusions.
+
+A strict single-outstanding control has identical outcomes under both policies
+and no packing opportunity. It also has lower individual latency but longer
+workflow time than the pipeline, demonstrating why the main averages must be
+compared within one submission contract. Keep workflow completion time alongside
+request feedback: delaying submission can make a request average look better
+without making an agent's work finish earlier.
 
 ## Historical five-job example and latency reanalysis
 
@@ -469,75 +532,78 @@ With only five jobs, nearest-rank p95 equals the maximum, so this is not a usefu
 statistical tail estimate. The formerly failing 148.39-minute schedule has a
 lower mean than the 50% schedule, because it finishes several other jobs earlier.
 That is precisely why average latency, worst waiting/latency, and coverage must
-be reported together. None of these rows demonstrates the new JCT policy's
-performance; that requires a new matched evaluation after implementation.
+be reported together. These historical rows are not evidence for the request-policy refactor. The
+new executable rerun is reported separately below.
 
-## Future implementation and evaluation checks
+## Historical five-job rerun
 
-- Confirm reciprocal units, positive finite validation, consistent model identity,
-  unchanged six-column model output, and separation of predicted/measured records.
-- Check consistent milliseconds/seconds conversion. The P/g diagnostic remains
-  invariant to common cost scaling, but the JCT forecast need not: test shared
-  absolute calibration bias and job-specific slope errors explicitly.
-- Cover exact threshold equality, pass/pass, fail/fail, disagreement, invalid
-  evidence, empty GPU, unavailable prediction, unknown/inconsistent update budget,
-  R_i=0, and exhausted trial-update budgets. Cover missing queued-job forecasts,
-  singleton/subgroup transitions, inherited-rate provenance, future overhead,
-  and the same post-trial state/order under both actions.
-- Cover non-overlapping windows, validation/checkpoint contamination, stale
-  tokens, interrupted trials, restart, changed membership, and updated source,
-  batch, or backend. Verify incumbents continue and rejected progress survives.
-- Reproduce the synthetic cases using their full rate law and accounting for
-  every required update. Treat the example's one-pass retry simplification
-  separately from tests of the actual v3 lifecycle.
-- Test that throughput gain can disagree with JCT gain using the 100-update A /
-  one-update B example. Test staggered submissions, retry/resume timestamp
-  preservation, finalization after the last update, pending-job inclusion,
-  failed/cancelled jobs, and censored-run reporting. Verify the area-under-
-  unfinished-jobs identity against summed JCT.
-- Test a continuous stream of short jobs against a long queued job and an
-  unknown-prediction job. Verify oldest-overdue nomination, suppression of fresh
-  backfill, preserved memory safety, and eventual feasible solo dispatch; do not
-  claim a hard waiting-time bound while incumbents cannot be preempted.
-- Evaluate v4, unchanged v3, and the explicitly requested fixed-three FIFO
-  comparator on identical arrival traces, source jobs, scientific update budgets,
-  batches, seeds, hardware, and backend. Freeze policy parameters before evaluation.
-  Include all trial, preparation, checkpoint, restart, and finalization costs.
-  Separate admission-only and ordering/queued-age changes in an ablation so their
-  effects are not attributed to the predictor alone.
-- Require every job to finish and its worker to exit successfully for the main
-  cohort comparison. Rank primarily by mean submit-to-completion JCT, report
-  median/p95/max JCT and queued-age/coverage alongside makespan, and disclose
-  regressions. Timed-out runs are incomplete, not faster completed-only results.
-  Use repeated paired traces and uncertainty estimates, rather than promoting a
-  policy from one toy trace. Production promotion also requires agreed service
-  latency targets and validation of slope/overhead calibration.
-  Include per-job timelines and a combined Gantt/progress/latency figure; never
-  tune thresholds on held-out evaluation.
+The [historical report](../benchmarks/feedback_v4/results/report.md) and
+[combined chart](../benchmarks/feedback_v4/results/comparison.png) cover 15 runs:
+fixed-three FIFO, v3 50%, v4 individual, v4 group and v4 mixed, each under reference,
+slow-C/stale and slow-C/accurate solo predictions. Every run completes all jobs,
+retains trial progress and stays within the example's 12 GiB budget. This is a
+synthetic CPU experiment, not a production benchmark. All arrivals are at zero;
+startup/checkpoint/finalization/delivery cost zero; trials cost one productive
+minute, and the sample/retry lifecycle is simplified explicitly.
 
-## Source references at the v3 base
+| Scenario | Policy | Mean job JCT (min) | p95/max and makespan (min) |
+|---|---|---:|---:|
+| Reference | Fixed-three FIFO | 84.39 | 97.22 |
+| Reference | V3 | 70.16 | 93.17 |
+| Reference | V4, each partition | 53.54 | 78.87 |
+| Slow C, stale prediction | V3 | 74.39 | 98.56 |
+| Slow C, stale prediction | V4, each partition | 67.44 | 148.39 |
+| Slow C, accurate prediction | V3 | 74.39 | 98.56 |
+| Slow C, accurate prediction | V4, each partition | 65.80 | 97.00 |
 
-- [Predicted profile fields and nominal step cost](../prediction/ml_predictor.py),
-  `predict_profile_options` and `predict_epoch_cost_options`.
-- [Live add-only admission](../scheduler/add_only_trials.py),
-  `_evaluate_admission_phase`; [identity/retry lifecycle](../scheduler/cold_start.py).
-- [Validated remaining-update calculation](../scheduler/completion_objective.py),
-  `remaining_optimizer_updates`; [budget derivation](../prediction/released_student.py),
-  `steps_for_job`.
-- [Current candidate ordering](../scheduler/placement_planner.py) and
-  [current configuration defaults](../config/models.py).
-- [Existing flow-time report fields](../domain/profiles.py),
-  [trace flow-time and nearest-rank p95 calculation](../scheduler/trace_simulator.py),
-  and [job timestamps](../domain/jobs.py).
+All three v4 partitions happen to choose the same schedule here. This supports
+neither a claim that group mode dominates individual nor that every request
+metric improves. In the accurate slow-C case, mixed AB/CD/E feedback worsens
+from v3's 66.12 to 74.33 minutes even though job mean and makespan improve. These
+counterexamples are retained in regression tests. The two-job test above
+establishes that the implemented policies can differ; broader workloads are
+needed to evaluate which is useful for a real agent's dependency pattern.
 
-The older [predictor policy note](predictor-indicator-policy.md) describes a
-related weighted-progress proposal. It is historical design context, not proof
-that the v3 default implements that proposal. The executable v3 decision is the
-bounded-interference calculation in `add_only_trials.py`.
+## Verification and future evaluation
 
-Related research supports the distinction in objectives, not this particular
-implementation: [Tiresias](https://www.usenix.org/conference/nsdi19/presentation/gu)
-targets average JCT with partial/missing job-size knowledge, while
-[Themis](https://www.usenix.org/conference/nsdi20/presentation/mahajan) treats
-finish-time fairness explicitly. Neither establishes the performance of this
-single-GPU, add-only, derived-slope proposal.
+Implemented checks cover positive finite predictions and unchanged tensor shape;
+exact threshold, pass/pass, fail/fail and disagreement; partial group completion,
+failed required members and duplicate membership; missing/full queue evidence;
+post-trial remaining work; phase costs; delivery without GPU occupancy; changed
+settings/profiles/cohort; retained newcomer updates and incumbent continuity;
+FIFO/age nomination and missing-prediction solo eligibility; common-weight
+invariance versus absolute-slope sensitivity; batch barriers, pipelined dependency
+releases and no-work-before-submission accounting. Simulation tests
+verify all updates, VRAM, finish coverage and historical reference values.
+The existing lifecycle suites cover interrupted windows and budget exhaustion.
+
+Future evaluation must test absolute/common calibration bias, job-specific slope
+errors, unit consistency, rate drift/noise, nonzero phase overhead, staggered and
+feedback-dependent arrivals, starvation under a continuing short-job stream,
+restarts, output transport/acknowledgments, failures and censored runs. Compare
+unchanged v3 and fixed-three FIFO on identical workloads, recipes, seeds,
+backend/hardware and request partitions; require every job to finish. Report
+request and job mean/p95/max, queue ages, failures/coverage, all trial/checkpoint/
+resume overhead and makespan. Use multiple paired traces and uncertainty, plus
+separate admission/ordering ablations. Do not tune margins on held-out evaluation
+or promote this feature based on one favorable toy workload.
+
+## Source references
+
+- [Shared request/forecast engine](../scheduler/feedback_objective.py) and
+  [controller adapter](../scheduler/feedback_trials.py).
+- [Live trial gate](../scheduler/add_only_trials.py),
+  [FIFO/age and lifecycle](../scheduler/cold_start.py),
+  [placement fallback guard](../scheduler/placement_planner.py).
+- [Settings](../config/models.py), [predicted-profile field](../prediction/ml_predictor.py).
+- [Validated update budget](../scheduler/completion_objective.py),
+  [step derivation](../prediction/released_student.py), [job timestamps](../domain/jobs.py).
+- [Submission scenarios](../benchmarks/feedback_v4/submission_scenarios.py),
+  [historical five-job simulation](../benchmarks/feedback_v4/simulate.py),
+  [scorer tests](../tests/test_feedback_objective.py),
+  [live controller tests](../tests/test_feedback_trials.py),
+  [simulation regressions](../tests/test_feedback_simulation.py).
+
+The [older predictor note](predictor-indicator-policy.md) is historical context.
+The v3 default remains bounded incumbent interference; it is not the gain or
+request-latency policy. Dataset measurements and runtime estimates remain separate.

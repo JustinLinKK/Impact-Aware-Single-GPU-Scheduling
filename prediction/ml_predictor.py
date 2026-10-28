@@ -497,6 +497,7 @@ class MLVramPredictor:
 
     def predict_profile_options(self, job, batch_sizes):
         """Input-only virtual profiles; never recorded as measured observations."""
+        from ..scheduler.feedback_objective import derived_solo_slope
         if self._released is None:
             raise JobPredictionError("released hardware student is unavailable")
         return {batch: {
@@ -506,6 +507,12 @@ class MLVramPredictor:
             "step_cost": values[0], "epoch_cost": values[2], "busy_indicator": values[3],
             "avg_vram_mib": values[4], "peak_vram_mib": max(values[4:6]),
             "calibration": "uncalibrated_prior", "requires_online_validation": True,
+            "derived_solo_slope": {
+                "value": derived_solo_slope(values[0]), "unit": "updates_per_second",
+                "source": "reciprocal_wall_step_prediction",
+                "step_semantics": "nominal_optimizer_update",
+                "artifact_sha256": self.artifact_hash, "calibration": "uncalibrated_prior",
+            },
         } for batch, values in self._released_options(job, batch_sizes).items()}
 
     def predict_busy_indicator_options(self, job, batch_sizes):

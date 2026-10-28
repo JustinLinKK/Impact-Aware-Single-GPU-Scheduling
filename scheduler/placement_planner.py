@@ -1,7 +1,7 @@
 """Incremental time-aware GPU placement planning.
 
-VRAM is a feasibility constraint. Cooperative admission orders feasible jobs by
-predicted busy bands and FIFO, then validates live incumbent interference.
+VRAM is a feasibility constraint. Cooperative v3 uses predicted busy bands/FIFO
+and live incumbent interference; opt-in v4 uses FIFO/age and request latency.
 Legacy measured-profile placement retains its projected drain-time objective.
 """
 
@@ -145,8 +145,10 @@ class PlacementPlanner:
             if allowance <= 0:
                 return None
             backend = self.settings.gpu_scheduler.packing_backend
+            fit_allowance = (self.estimator.safe_budget_mb()
+                             if self.settings.gpu_scheduler.feedback_latency.enabled else allowance)
             normal_window = [job for job in normal_window if
-                self.estimator.estimate_peak_vram_mb(job, self.estimator.resolved_batch_size(job), backend) <= allowance]
+                self.estimator.estimate_peak_vram_mb(job, self.estimator.resolved_batch_size(job), backend) <= fit_allowance]
             if not normal_window:
                 return None  # Do not bypass a predicted peak rejection via solo fallback.
         backend_aware_window = list(normal_window)
@@ -159,6 +161,8 @@ class PlacementPlanner:
         )
         if cooperative_plan is not None:
             return cooperative_plan
+        if active_jobs and self.settings.gpu_scheduler.feedback_latency.enabled:
+            return None  # V4 cannot bypass missing evidence via a legacy packing path.
         if not active_jobs and anchor.metadata.get("cooperative_trial"):
             budget = self.estimator.safe_budget_mb()
             allowance = budget - active_vram_mb
@@ -175,6 +179,7 @@ class PlacementPlanner:
             if (
                 self.settings.gpu_scheduler.scheduler_decision_mode
                 == SCHEDULER_DECISION_MODE_BACKEND_AWARED
+                and not self.settings.gpu_scheduler.feedback_latency.enabled
             ):
                 pair_plan = self.backend_aware.choose_empty(
                     backend_aware_window,

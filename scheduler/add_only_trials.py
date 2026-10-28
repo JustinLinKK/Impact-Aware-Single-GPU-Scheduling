@@ -109,7 +109,7 @@ class AddOnlyTrialMixin:
             state["overlap_window_refreshes"] = state.get("overlap_window_refreshes", 0) + len(refresh)
             self._persist_scheduler_decision_state()
             self.event_logger.emit("add_only_overlap_windows_refreshed", job_id=trial.candidate_job_id, payload={
-                "trial_id": trial.trial_id, "admission_policy": ADD_ONLY_POLICY,
+                "trial_id": trial.trial_id, "admission_policy": trial.cold_start.get("admission_policy", ADD_ONLY_POLICY),
                 "job_ids": [job.job_id for job in refresh], "latest_measurement_start": latest_start,
                 "reason": "completed windows ended before another member's measured updates began",
             })
@@ -145,6 +145,15 @@ class AddOnlyTrialMixin:
             "candidate_start_step": start,
             "warmup_start_steps": {job.job_id: int(job.metadata.get("runtime_global_step", 0)) for job in jobs},
         }
+        if self.settings.gpu_scheduler.feedback_latency.enabled:
+            from .feedback_objective import FEEDBACK_POLICY
+            from .feedback_trials import freeze_feedback_trial
+            trial.cold_start["admission_policy"] = FEEDBACK_POLICY
+            try:
+                trial.cold_start["add_only"]["feedback"] = freeze_feedback_trial(self, trial)
+            except (ValueError, KeyError, TypeError, OverflowError) as exc:
+                self._finish_cold_start_trial(trial, "inconclusive", "v4 forecast unavailable: " + str(exc))
+                return
         # Candidate release is the only behavior change. Incumbents have been
         # running throughout prepare/pre_add and continue while measuring.
         self._cold_phase(trial, "overlap_warmup", jobs)
@@ -155,6 +164,10 @@ class AddOnlyTrialMixin:
         state = trial.cold_start.get("add_only")
         if not state or state.get("identity") != self._add_only_identity(jobs):
             self._finish_cold_start_trial(trial, "inconclusive", "add-only measurement identity changed or is missing")
+            return True
+        if bool(state.get("feedback")) != self.settings.gpu_scheduler.feedback_latency.enabled:
+            self._finish_cold_start_trial(trial, "inconclusive", "admission policy changed; fresh trial required",
+                                          {"error": "admission policy changed; fresh trial required"})
             return True
         candidate = next(job for job in jobs if job.job_id == trial.candidate_job_id)
         if int(candidate.metadata.get("runtime_global_step", 0)) >= int(trial.cold_start["target_step"]):
@@ -203,6 +216,15 @@ class AddOnlyTrialMixin:
         candidate_progress = int(windows[candidate.job_id]["end_step"]) - state["candidate_start_step"]
         if candidate_progress < 8:
             self._finish_cold_start_trial(trial, "inconclusive", "newcomer did not make enough optimizer progress")
+            return True
+        if state.get("feedback"):
+            from .feedback_trials import evaluate_feedback_trial
+            result = evaluate_feedback_trial(self, trial, jobs, windows)
+            result.update(candidate_optimizer_progress=candidate_progress,
+                          measurement_windows=windows,
+                          common_measurement_interval={"started_at": common_start, "finished_at": common_end})
+            self._finish_cold_start_trial(trial, result["decision"],
+                result.get("error") or ("v4 feedback latency " + result["decision"]), result)
             return True
         old = [job for job in jobs if job.job_id != candidate.job_id]
         ratios = {job.job_id: [float(windows[job.job_id]["halves"][half]) / state["pre_add"][job.job_id][half]
