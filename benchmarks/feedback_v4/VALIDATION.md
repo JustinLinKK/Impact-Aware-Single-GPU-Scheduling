@@ -3,7 +3,31 @@
 The live scheduler feature is opt-in. Tests and simulations used CPU execution;
 no GPU workload, dataset rewrite, model training, push or deployment was performed.
 
-## Checks completed
+## Bracket optimization update
+
+- **355 regression tests and four subtests passed**, covering the new recovery
+  regret scorer, configuration, live trial adapter, invalid evidence and policy
+  changes, complete submission scenarios, memory/placement, cold-start lifecycle
+  and recovery. Predictor integration is unchanged from the earlier checked phase.
+- Main comparison: 18 runs plus three single-outstanding controls. Optimized and
+  previous v4 have identical pipeline schedules in all main cases.
+- All seven development variants (21 runs) and twelve prespecified sensitivity
+  fixtures (24 paired runs) are retained. Combined with the main/control runs,
+  **66 runs each finish all ten jobs** with work, trial-progress, submission
+  dependency and memory checks passing.
+- Mean bracket time falls from 108.34 to 93.87 minutes across the original three
+  fixtures, and 109.94 to 104.58 across the additional fixtures. The reference
+  case regresses; five of twelve sensitivity fixtures regress. These outcomes
+  are disclosed, not filtered. All share the same synthetic interference law.
+- The margin and selected gate were fixed before the sensitivity run. Default
+  `recovery_regret` is inside opt-in v4; `nominal` restores the previous gate.
+  The underlying group objective remains last required completion, and the
+  alternative packed-rate scenario is never recorded as a solo measurement.
+
+Reproduce with `python -m localml_scheduler.benchmarks.feedback_v4.bracket_optimization --plot`.
+See `optimization_results/report.md`, the full trace JSON and combined plot.
+
+## Earlier implementation checks
 
 - Broad regression run: **361 passed, 1 skipped, 6 subtests passed**. This covered
   the scorer/adapter/simulation, add-only trial controller, cold-start lifecycle

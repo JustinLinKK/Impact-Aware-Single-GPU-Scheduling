@@ -974,8 +974,11 @@ class FeedbackLatencySettings:
     max_queued_age_seconds: float = 1800.0
     allow_zero_overhead: bool = False
     phase_model_ttl_seconds: float = 3600.0
+    bracket_admission_mode: str = "recovery_regret"
 
     def __post_init__(self):
+        if self.bracket_admission_mode not in {"nominal", "recovery_regret"}:
+            raise ValueError("feedback_latency.bracket_admission_mode must be nominal or recovery_regret")
         for name in ("enabled", "allow_zero_overhead"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"feedback_latency.{name} must be boolean")
@@ -993,9 +996,9 @@ class FeedbackLatencySettings:
 class GpuSchedulerSettings:
     """Incremental placement, with opt-in v4 request-latency admission.
 
-    The scheduler starts one anchor, considers one newcomer at a time, and
-    keeps an addition only when measured/predicted drain-time gain passes
-    ``colocation.min_gain``. VRAM is solely a hard admission constraint.
+    Cooperative admission starts one anchor and considers one newcomer at a
+    time. V3 bounds incumbent slowdown; opt-in v4 scores request completion
+    with an uncertainty-aware gate for a single bracket. VRAM is a hard limit.
     """
 
     enabled: bool = True

@@ -43,7 +43,7 @@ def test_live_controller_uses_feedback_not_fifty_percent_and_retains_incumbent(t
     assert not service.supervisor.request_pause.called
 
 
-@pytest.mark.parametrize('change', ['artifact','request','arrival','phase','missing_prediction','counter','disabled','threshold'])
+@pytest.mark.parametrize('change', ['artifact','request','arrival','phase','missing_prediction','counter','disabled','threshold','bracket_mode'])
 def test_changes_or_missing_evidence_are_inconclusive_without_v3_fallback(tmp_path, change):
     settings, store, planner, service, trial = enabled(tmp_path)
     overlap(store, service, trial)
@@ -66,6 +66,8 @@ def test_changes_or_missing_evidence_are_inconclusive_without_v3_fallback(tmp_pa
         settings.gpu_scheduler.feedback_latency.enabled=False
     elif change == 'threshold':
         settings.gpu_scheduler.feedback_latency.min_gain_seconds=1000
+    elif change == 'bracket_mode':
+        settings.gpu_scheduler.feedback_latency.bracket_admission_mode='nominal'
     else:
         store.update_job('c',metadata_updates={'runtime_global_step':301})
     r=finish(store,service,trial,a=1,b=1)
@@ -86,6 +88,7 @@ def test_group_request_flows_through_real_trial_controller(tmp_path):
     r=finish(store,service,trial)
     assert r['decision']=='accepted',r
     assert len(r['result']['halves'][0]['admit']['requests'])==1
+    assert r['result']['decision_basis']=='bracket_recovery_regret_v1'
 
 
 def test_fifo_ignores_busy_and_overdue_cooldown_blocks_backfill_until_solo(tmp_path):

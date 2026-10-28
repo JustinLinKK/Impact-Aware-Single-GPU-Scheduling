@@ -1,0 +1,18 @@
+{
+  "runs": 66,
+  "main_runs": 18,
+  "controls": 3,
+  "development_runs": 21,
+  "sensitivity_runs": 24,
+  "jobs_finished_per_run": 10,
+  "checks_passed": [
+    "work conservation",
+    "retained trial progress",
+    "VRAM",
+    "submission dependencies",
+    "complete cohorts",
+    "all jobs finish"
+  ],
+  "seed": 20261028,
+  "synthetic": true
+}

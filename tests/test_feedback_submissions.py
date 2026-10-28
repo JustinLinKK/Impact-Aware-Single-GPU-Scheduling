@@ -30,15 +30,16 @@ def test_closed_loop_completes_identical_work_and_obeys_feedback_dependencies(ca
 
 
 def test_strictly_single_outstanding_has_no_packing_benefit():
-    fifo,v4=[simulate('sequential_pipeline',p,strict_single=True) for p in POLICIES]
-    assert fifo['arrivals']==v4['arrivals']
-    assert fifo['completion']==v4['completion']
-    assert fifo['metrics']==v4['metrics']
-    assert v4['metrics']['trial_elapsed_minutes']==0
+    runs=[simulate('sequential_pipeline',p,strict_single=True) for p in POLICIES]
+    for r in runs:
+        assert r['arrivals']==runs[0]['arrivals']
+        assert r['completion']==runs[0]['completion']
+        assert r['metrics']==runs[0]['metrics']
+        assert r['metrics']['trial_elapsed_minutes']==0
 
 
 def test_stale_prediction_can_improve_individual_average_but_worsen_tail_and_workflow():
-    fifo,v4=[simulate('sequential_pipeline',p,'slow_C_stale_prediction')['metrics'] for p in POLICIES]
+    fifo,v4=[simulate('sequential_pipeline',p,'slow_C_stale_prediction')['metrics'] for p in ('fixed_three_fifo','v4_request_feedback')]
     assert v4['average_request_feedback_minutes']<fifo['average_request_feedback_minutes']
     assert v4['p95_request_feedback_minutes']>fifo['p95_request_feedback_minutes']
     assert v4['workflow_makespan_minutes']>fifo['workflow_makespan_minutes']
@@ -47,3 +48,10 @@ def test_stale_prediction_can_improve_individual_average_but_worsen_tail_and_wor
 def test_request_average_is_not_job_average_under_a_batch_barrier():
     r=simulate('batch_barrier','v4_request_feedback')
     assert r['metrics']['average_request_feedback_minutes']>r['metrics']['average_job_jct_minutes']
+
+
+@pytest.mark.parametrize('case', CASES)
+def test_bracket_optimization_leaves_pipeline_schedules_identical(case):
+    old,new=[simulate('sequential_pipeline',p,case) for p in ('v4_previous','v4_request_feedback')]
+    for key in ('completion','arrivals','metrics','segments','progress','events'):
+        assert old[key]==new[key]

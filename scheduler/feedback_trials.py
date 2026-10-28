@@ -117,7 +117,8 @@ def evaluate_feedback_trial(service, trial, jobs, windows):
             packed_halves={j: [1 / number(s, positive=True) for s in w["halves"]] for j, w in windows.items()},
             requests=requests, completed=completed, now=now,
             costs={j: values[0] for j, values in phase_models.items()},
-            min_gain_seconds=service.settings.gpu_scheduler.feedback_latency.min_gain_seconds)
+            min_gain_seconds=service.settings.gpu_scheduler.feedback_latency.min_gain_seconds,
+            bracket_admission_mode=service.settings.gpu_scheduler.feedback_latency.bracket_admission_mode)
         result.update(remaining_updates=remaining, predicted_solo_updates_per_second=solo,
                       queue_order=queue, frozen_profiles=profiles,
                       phase_cost_sources={j: v[1] for j, v in phase_models.items()},

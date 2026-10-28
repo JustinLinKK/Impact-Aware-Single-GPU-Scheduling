@@ -10,6 +10,7 @@ add-only trial/checkpoint lifecycle. The default remains v3.
 
 - [Design, formulas, request metadata and configuration](docs/oct-proposed-v4-design.md)
 - [Derived-label-first dataset proposal](docs/solo-slope-labeling.md)
+- [Bracket optimization, regressions and sensitivity checks](benchmarks/feedback_v4/optimization_results/report.md)
 - [Main experiment: batch versus sequential submission](benchmarks/feedback_v4/submission_results/report.md)
 - [Combined Gantt, optimizer progress and feedback chart](benchmarks/feedback_v4/submission_results/comparison.png)
 - [Historical five-job comparison and counterexamples](benchmarks/feedback_v4/results/report.md)
@@ -26,6 +27,7 @@ Reproduce the simulation from the MLEvolve parent using its Python environment:
 
 ```bash
 python -m localml_scheduler.benchmarks.feedback_v4.submission_scenarios --plot
+python -m localml_scheduler.benchmarks.feedback_v4.bracket_optimization --plot
 ```
 
 The primary metric is **bracket makespan** for MLMaster's all-results barrier,
@@ -34,10 +36,23 @@ the last required result's time, not average member-job time. When several
 brackets are reported together, average bracket makespan averages those bracket
 durations. Report tail latency and whole-workflow time alongside both metrics.
 
-The main mock compares fixed-three FIFO with v4 under two feedback-dependent
+Within opt-in v4, `bracket_admission_mode: recovery_regret` now compares nominal
+and no-recovery candidate solo-rate hypotheses for a single outstanding bracket.
+It chooses the admission with lower maximum regret across those hypotheses;
+`nominal` restores the previous gate. Individual/mixed/multi-bracket cohorts keep
+their previous policy. Predicted profiles and measured labels are not changed.
+
+The three-case mock average bracket makespan improves **108.34 → 93.87 minutes**,
+but the accurate reference case regresses **78.87 → 86.10**. Twelve prespecified
+sensitivity cases average **109.94 → 104.58**, with four improvements, five
+regressions and three ties. This handles a costly prediction ambiguity; it does
+not guarantee shorter brackets. See the complete report before drawing production
+conclusions.
+
+The main mock compares fixed-three FIFO, previous v4 and optimized v4 under two feedback-dependent
 submission scenarios: MLMaster 2-style batch barriers and MLEvolve-style sequential
 submissions with multiple jobs outstanding. It removes v3 from the main table and
-chart. All 12 runs plus two single-outstanding controls complete all ten jobs.
+chart. All 18 main runs plus three single-outstanding controls complete all ten jobs.
 These are synthetic workloads, not captured framework traces; future release
 times depend on prior results. Bad slope predictions can still worsen batch
 latency, tail latency and workflow time. Earlier five-job/v3 traces are retained

@@ -14,7 +14,9 @@ One shared forecast engine supports two **per-request** completion policies:
 
 The policies can coexist in the same queue. A workflow identifier alone does
 not establish a barrier. A group counts once, and its children are not counted
-again as independent requests. This supersedes both the original normalized-
+again as independent requests. A single outstanding bracket now uses the
+recovery-regret admission gate described below; individual, mixed and multi-bracket
+cohorts retain nominal latency scoring. This supersedes both the original normalized-
 progress gate and the earlier v4 shortest-remaining ordering. Candidate order is
 now FIFO with age protection, shared by both completion policies.
 
@@ -64,7 +66,7 @@ M_b=\max_{i\in B_b}C_i-A_b,\qquad \min_\pi M_b(\pi).
 The clock includes waiting after submission and all required result-return work.
 It does not start at the first GPU dispatch. For one outstanding bracket, v4's
 group score is exactly M_b, not the average completion time of its member jobs.
-The two-half admission test reduces to
+The original nominal two-half admission test reduces to
 
 \[
 \Delta_{b,h}=\max_{i\in B_b}\widehat C_{i,h}(\mathrm{defer})-
@@ -75,8 +77,8 @@ An early member completion has value only if it helps the last required result
 arrive sooner. Reducing average member JCT while delaying that last result does
 not improve this objective. The existing `group` implementation already takes
 this maximum, and the simulator already releases the next bracket only after
-the current bracket finishes. This clarification changes presentation, not the
-admission algorithm or its numerical results.
+the current bracket finishes. The bracket completion metric is unchanged. The optimization below changes
+how admission handles uncertainty about the candidate's future solo speed.
 
 Across a fixed sequence of m brackets, report M_b for each bracket, sum(M_b),
 and average bracket makespan sum(M_b)/m. This last average is **across brackets**,
@@ -214,6 +216,7 @@ gpu_scheduler:
     max_queued_age_seconds: 1800.0
     allow_zero_overhead: false
     phase_model_ttl_seconds: 3600.0
+    bracket_admission_mode: recovery_regret
 ```
 
 These are provisional research settings. Existing backend, cooperative runner,
@@ -302,7 +305,9 @@ unfinished arrived job, including waiting jobs, must belong to the scored cohort
 Otherwise the comparison is inconclusive. Request ages cancel between actions;
 adding ages to a score does not itself prevent starvation.
 
-Both halves must have Delta_h >= `min_gain_seconds` (initially 1 second) to accept.
+In the nominal policy, both halves must have Delta_h >= `min_gain_seconds`
+(initially 1 second) to accept. This remains the individual/mixed/multi-bracket
+policy and is available explicitly with `bracket_admission_mode: nominal`.
 Both failures reject; disagreement or invalid evidence is inconclusive. Equality
 passes. There is no additional 50% slowdown or normalized-progress gate. The
 margin is a research default, not a confidence bound or promised time saving.
@@ -344,6 +349,56 @@ the complete cohort/order, per-job and per-request forecasts, both deltas,
 phase assumptions, prediction provenance, threshold and reasons. Policy ID is
 `derived_solo_slope_feedback_v4`.
 
+### Bracket optimization: candidate recovery regret
+
+With one outstanding all-required bracket, the new default inside opt-in v4 is
+`bracket_admission_mode: recovery_regret`. Keep the same remaining updates,
+FIFO tail, incumbent measurements, finish costs and result maximum. For each
+measurement half h, forecast both actions under two candidate-only hypotheses:
+
+\[
+s_j^{\mathrm{nom}}=\widehat s_j^0,\qquad
+s_{j,h}^{\mathrm{nr}}=\min(\widehat s_j^0,r^+_{j,h}).
+\]
+
+The second scenario assumes no solo-rate recovery beyond the candidate's
+observed packed rate. It is an explicit hypothesis about prediction/interference
+ambiguity, **not a measured solo label, calibrated prediction or confidence
+interval**. Incumbent predictions and all current pack measurements remain the
+same in both scenarios. Neither model predictions nor timing labels are updated.
+
+For x in {nom,nr}, let d_h(x) be predicted defer bracket completion minus predicted
+admit bracket completion. Maximum regret over these two hypotheses is
+
+\[
+\mathcal R_{\mathrm{admit},h}=\max(0,-d_h(\mathrm{nom}),-d_h(\mathrm{nr})),
+\quad
+\mathcal R_{\mathrm{defer},h}=\max(0,d_h(\mathrm{nom}),d_h(\mathrm{nr})).
+\]
+
+Admit when R_defer,h - R_admit,h >= `min_gain_seconds` in **both** halves.
+Two failures reject; disagreement/invalid evidence is inconclusive. This minimizes
+maximum regret over the two tested continuations with an admission margin. It is
+not a worst-case bound over all possible solo rates or a guarantee of actual gain.
+A negative nominal gain may be accepted when deferral has a larger potential loss
+under the no-recovery hypothesis. It deliberately trades some accurately predicted
+brackets for less exposure to a large optimistic-prediction error.
+
+The full nominal forecasts and `gain_seconds` remain in each half's result.
+`no_recovery_scenario` contains the alternative forecasts and slope provenance;
+`admit_max_regret_seconds`, `defer_max_regret_seconds`, and
+`decision_score_seconds` expose the actual gate. `decision_basis` is
+`bracket_recovery_regret_v1`. Both rates come from the existing predictor/current
+trial; the scheduler never sees simulator truth or future submitted jobs.
+
+Apply this only when the complete outstanding cohort is one group request.
+Individual, mixed and multiple outstanding bracket cohorts retain the nominal
+policy. No candidate-order changes, preemption, fixed job cap, neural-network
+change or new probing phase are introduced. `nominal` restores the previous gate;
+changing the mode during a trial invalidates frozen evidence. Reliable solo-rate
+measurements can make nominal scoring preferable; automatically choosing a mode
+from calibrated uncertainty is future work.
+
 ### Completion-phase contract
 
 Production-use comparison requires a complete matching estimate on every
@@ -382,14 +437,16 @@ used in the synthetic example. Trial setup already paid is sunk for continuation
 scoring but remains in actual request latency. Positive continuation gain does
 not prove that initiating the trial paid for itself.
 
-### The policies really can disagree
+### Nominal policies can disagree when solo rates are treated as reliable
 
 With A=100 and B=1 remaining updates, solo rates 1/s, and zero phase costs,
 defer predicts A=100 s, B=101 s. Overlap at .5/.4 updates/s predicts B=2.5 s and
 A=101.25 s after solo completion. For two individual requests, mean latency falls
 from 100.5 to 51.875 s, a 48.625 s gain: accept. For one group AB, feedback grows
 from 101 to 101.25 s: reject. Both use identical job forecasts and the same
-one-second margin. This behavior is tested in the shared scorer.
+one-second margin. This nominal behavior is tested in the shared scorer.
+Recovery-regret mode may choose differently because it also evaluates the
+candidate's no-recovery hypothesis; its separate tests expose that tradeoff.
 
 ## Lifecycle and limitations
 
@@ -408,47 +465,51 @@ unknown future arrivals. Both policies optimize forecasts, not guaranteed actual
 JCT, and neither claims to optimize final scientific quality. A future agent-level
 metric can track time-to-acceptable-model or iteration utility separately.
 
-## Main experiment: two submission scenarios
+## Main experiment and bracket optimization results
 
-The [main report](../benchmarks/feedback_v4/submission_results/report.md) and
-[combined figure](../benchmarks/feedback_v4/submission_results/comparison.png)
-compare fixed-three FIFO with request-aware v4. V3 is omitted from the new table
-and chart at the user's request; prior traces below remain historical evidence.
-The same five job types are run for two cycles, ten jobs per run:
+The [main comparison](../benchmarks/feedback_v4/submission_results/report.md)
+now includes fixed-three FIFO, **previous v4**, and optimized v4. V3 remains
+omitted from the main chart. The [optimization report](../benchmarks/feedback_v4/optimization_results/report.md)
+retains all development alternatives, counterexamples and sensitivity results;
+[every run is plotted](../benchmarks/feedback_v4/optimization_results/all-experiments.png).
 
-- MLMaster 2-style batch barriers submit A1–E1 together, then A2–E2 ten seconds
-  after the last first-batch result. Each batch is one group request.
-- MLEvolve-style sequential/pipelined submission starts A1–E1 ten seconds apart.
-  Each returned result enables its corresponding successor after ten seconds;
-  one issuer spaces submissions by at least ten seconds. Multiple jobs may be
-  outstanding; every job is one individual feedback request.
+The same five job types run for two cycles, ten jobs per run. Batch mode submits
+A1–E1 together and A2–E2 ten seconds after the last first-bracket result. Pipeline
+mode starts A1–E1 ten seconds apart and enables each same-type successor after
+its predecessor returns, with ten-second generation/issuer gaps. Multiple jobs
+may be outstanding. Both policies receive identical jobs and dependency rules;
+closed-loop submission times depend on completion and therefore differ by policy.
+These are synthetic patterns, not measured framework arrival traffic.
 
-The user confirmed the pipelined interpretation. These are synthetic contracts,
-not exact framework reproductions or framework-default parallelism. Source links
-and assumptions are recorded in the report. Both policies use identical jobs
-and dependency/think-time rules, but their resulting arrival timestamps differ.
-Thus this is a closed-loop evaluation, not identical exogenous arrival traces.
+| Average bracket makespan (min) | Fixed-three FIFO | Previous v4 | Optimized v4 |
+|---|---:|---:|---:|
+| Reference | 97.22 | 78.87 | 86.10 |
+| Slow C, stale prediction | 98.70 | 148.39 | 97.75 |
+| Slow C, accurate prediction | 98.70 | 97.75 | 97.75 |
+| Equal-weight three-case average | 98.21 | 108.34 | 93.87 |
 
-| Reference scenario | Policy | Average feedback (min) | p95/max feedback (min) | Workflow makespan (min) |
-|---|---|---:|---:|---:|
-| Batch barrier | Fixed-three FIFO | 97.22 | 97.22 | 194.61 |
-| Batch barrier | V4 group | 78.87 | 78.87 | 157.92 |
-| Sequential pipeline | Fixed-three FIFO | 89.36 | 104.65 | 196.14 |
-| Sequential pipeline | V4 individual | 55.75 | 91.17 | 159.17 |
+The three-case average improves 13.36%, but the reference case regresses by
+7.23 minutes. This is not a claim of improvement on every bracket. The twelve
+additional prespecified sensitivity fixtures average 109.94 → 104.58 minutes:
+four improve, five regress, three are unchanged. Those fixtures use varied
+budgets, rate/prediction errors and trial durations but the same invented
+interference law; they are not independent evidence of production performance.
+The gate/margin was frozen before those fixtures were evaluated.
 
-All 12 main runs and two strict-single-outstanding controls complete ten jobs,
-conserve productive trial updates and respect VRAM. Stale-C prediction worsens
-batch feedback to 148.39 minutes and pipeline p95 to 172.20 minutes. Corrected
-slopes reduce those to 97.75 and 101.33 minutes, respectively. This remains a
-zero-phase-overhead, noiseless synthetic model; prediction and phase calibration
-are required before production conclusions.
+Pipeline schedules remain exactly unchanged between previous and optimized v4
+in all three main cases. Reference average individual JCT remains 55.75 minutes,
+versus fixed-three FIFO's 89.36. Strict single-outstanding controls also match
+across all policies and have no packing opportunity. Keep workflow makespan
+alongside latency; delaying submission can lower a request average without
+finishing the agent's work earlier.
 
-A strict single-outstanding control has identical outcomes under both policies
-and no packing opportunity. It also has lower individual latency but longer
-workflow time than the pipeline, demonstrating why the main averages must be
-compared within one submission contract. Keep workflow completion time alongside
-request feedback: delaying submission can make a request average look better
-without making an agent's work finish earlier.
+The saved audit includes 18 main runs, three controls, 21 development ablation
+runs and 24 sensitivity runs. All 66 runs complete all ten jobs, retain every
+productive trial update and obey the 12 GiB memory constraint. Trial time is
+counted; startup/checkpoint/finalization/delivery overhead is zero, rates are
+noiseless, and the full controller's sample/retry timing is simplified. Do not
+promote these mock gains as deployed performance. All actual controller safety
+and validity guards remain active.
 
 ## Historical five-job example and latency reanalysis
 
@@ -630,6 +691,8 @@ or promote this feature based on one favorable toy workload.
 
 ## Source references
 
+- [Bracket regret tests](../tests/test_bracket_recovery.py) and
+  [optimization experiment](../benchmarks/feedback_v4/bracket_optimization.py).
 - [Shared request/forecast engine](../scheduler/feedback_objective.py) and
   [controller adapter](../scheduler/feedback_trials.py).
 - [Live trial gate](../scheduler/add_only_trials.py),

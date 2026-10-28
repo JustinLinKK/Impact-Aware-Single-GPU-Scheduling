@@ -17,22 +17,35 @@ from .simulate import BUDGET, CASES, EPS, JOBS, MEMORY, SOLO, VRAM, hidden_rates
 from ...scheduler.feedback_objective import FeedbackRequest, compare_feedback_admission, score_requests
 
 SCENARIOS = ('batch_barrier', 'sequential_pipeline')
-POLICIES = ('fixed_three_fifo', 'v4_request_feedback')
+POLICIES = ('fixed_three_fifo', 'v4_previous', 'v4_request_feedback')
 JOB_IDS = tuple(j + str(round_) for round_ in (1, 2) for j in JOBS)
 THINK_MINUTES = 10 / 60
 LABELS = {'batch_barrier': 'MLMaster 2-style batch barrier',
           'sequential_pipeline': 'MLEvolve-style sequential pipeline',
-          'fixed_three_fifo': 'Fixed-three FIFO', 'v4_request_feedback': 'V4 request feedback'}
+          'fixed_three_fifo': 'Fixed-three FIFO', 'v4_previous': 'V4 previous',
+          'v4_request_feedback': 'V4 optimized bracket'}
 
 
-def simulate(scenario, policy, case='reference', *, strict_single=False):
+def simulate(scenario, policy, case='reference', *, strict_single=False, workload=None):
     if scenario not in SCENARIOS or policy not in POLICIES or case not in CASES:
         raise ValueError('unknown experiment')
     if strict_single and scenario != 'sequential_pipeline':
         raise ValueError('single-outstanding control applies to the pipeline only')
     actual_solo = dict(SOLO, **({'C': 2.5} if case != 'reference' else {}))
     predicted_solo = dict(actual_solo if case == 'slow_C_accurate_prediction' else SOLO)
-    left = {j: BUDGET[j[0]] for j in JOB_IDS}
+    workload = workload or {}
+    budget = dict(workload.get('budget', BUDGET))
+    actual_solo = dict(workload.get('actual_solo', actual_solo))
+    predicted_solo = dict(workload.get('predicted_solo', predicted_solo))
+    trial_minutes = float(workload.get('trial_minutes', 1.))
+    from ...scheduler.feedback_objective import number
+    for values in (budget, actual_solo, predicted_solo):
+        if set(values) != set(JOBS):
+            raise ValueError('workload must cover exactly the five job types')
+        for value in values.values():
+            number(value, positive=True)
+    number(trial_minutes, positive=True)
+    left = {j: budget[j[0]] for j in JOB_IDS}
     arrivals, done, requests = {}, {}, []
     active, pending, attempted = set(), [], set()
     events, decisions, segments = [], [], []
@@ -88,7 +101,7 @@ def simulate(scenario, policy, case='reference', *, strict_single=False):
         segments.append(dict(start=time, end=time + duration, members=sorted(members),
                              rates=vector, phase=phase, before=before, after=dict(left)))
         time += duration
-        points.append((time, {j: BUDGET[j[0]] - left[j] for j in JOB_IDS}))
+        points.append((time, {j: budget[j[0]] - left[j] for j in JOB_IDS}))
         finished = sorted(j for j in members if left[j] < EPS)
         for j in finished:
             done[j] = time
@@ -140,7 +153,7 @@ def simulate(scenario, policy, case='reference', *, strict_single=False):
                 incumbents = set(active)
                 proposed = incumbents | {candidate}
                 pre, post = rates(incumbents), rates(proposed)
-                deadline = time + 1.
+                deadline = time + trial_minutes
                 next_arrival = releases[0][0] if releases else float('inf')
                 boundary = min(deadline, next_arrival, time + min(left[j] / post[j] for j in proposed))
                 finished = advance(boundary - time, proposed, 'trial')
@@ -159,7 +172,8 @@ def simulate(scenario, policy, case='reference', *, strict_single=False):
                     pre_halves={j: [pre[j] / 60] * 2 for j in sorted(incumbents)},
                     packed_halves={j: [post[j] / 60] * 2 for j in sorted(proposed)},
                     requests=current_requests, completed={j: done[j] * 60 for j in sorted(done) if j in required},
-                    now=time * 60, min_gain_seconds=1.)
+                    now=time * 60, min_gain_seconds=1.,
+                    bracket_admission_mode='recovery_regret' if policy == 'v4_request_feedback' else 'nominal')
                 assert evidence['error'] is None, evidence
                 decisions.append(dict(time=time, job=candidate, decision=evidence['decision'], evidence=evidence))
                 attempted.add(candidate)
@@ -184,6 +198,7 @@ def simulate(scenario, policy, case='reference', *, strict_single=False):
         trial_elapsed_minutes=sum(s['end'] - s['start'] for s in segments if s['phase'] == 'trial'),
         finished_jobs=len(done))
     result = dict(scenario=scenario, policy=policy, case=case, strict_single=strict_single,
+        budget=budget, trial_minutes=trial_minutes,
         actual_solo=actual_solo, predicted_solo=predicted_solo, arrivals=arrivals, completion=done,
         requests=scores['requests'], metrics=metrics, decisions=decisions, events=events,
         segments=segments, progress=points)
@@ -204,7 +219,7 @@ def verify(result):
         last = s['end']
     assert set(result['completion']) == set(JOB_IDS)
     for j in JOB_IDS:
-        assert abs(processed[j] - BUDGET[j[0]]) < 1e-6
+        assert abs(processed[j] - result.get('budget', BUDGET)[j[0]]) < 1e-6
         assert result['completion'][j] >= result['arrivals'][j]
     assert abs(last - max(result['completion'].values())) < EPS
     assert all(r['weight'] == 1 for r in result['requests'])
@@ -220,81 +235,64 @@ def verify(result):
 
 
 def report(results, controls):
-    text = '''# MLMaster bracket makespan and MLEvolve individual job JCT
+    text = """# Bracket optimization: previous v4, optimized v4 and fixed-three FIFO
 
-Synthetic experiment, 2026-10-28. “Average” here is the arithmetic mean: each
-feedback request has weight one. Mean job JCT already weights jobs equally;
-changing the word would not change the metric. The substantive change is the
-unit being averaged: one batch barrier or one individual returned result.
+Synthetic experiment, 2026-10-28. MLMaster-style group mode minimizes bracket
+makespan, max(required completion timestamps) minus bracket submission time.
+Averages below are across two brackets, never across member jobs. MLEvolve-style
+individual mode minimizes average submission-to-result JCT. Compare policies
+within a submission scenario; those averages count different result events.
 
-For Q requests, average feedback = sum(C_q - a_q)/Q. For a batch, C_q is the
-last required member's result; for an individual request it is that job's result.
-There are two batch requests or ten individual requests in the scenarios below.
-Compare policies **within** each scenario; the two averages count different events.
+## What changed
 
-**MLMaster's admission objective is bracket makespan, not average member-job
-time.** For bracket b submitted at A_b, M_b = max(C_i for i in bracket b) - A_b.
-One outstanding group request makes the shared scorer exactly this maximum.
-The admission gain is predicted defer-last-completion minus predicted
-admit-last-completion; both measurement halves must pass the one-second margin.
-“Average bracket makespan” in the tables averages the two bracket durations.
-The next bracket is generated only after the preceding bracket returns all results.
-Total workflow time is the sum of bracket makespans plus the inter-bracket think
-delay. For MLEvolve's pipeline, average individual job JCT is the primary metric.
-This naming clarification leaves the already-correct group scoring unchanged.
+Previous v4 used a single predicted solo rate for a deferred candidate. If that
+rate was optimistic, it postponed a real straggler and lengthened the bracket.
+The optimized gate retains the nominal rollout and adds one explicit candidate
+recovery scenario: future candidate solo rate = min(prediction, measured packed
+rate). This is a hypothesis, **not a measured solo label or a confidence bound**.
 
-The main comparison contains only fixed-three FIFO and v4. V3 is removed from
-these tables and the chart; earlier five-job results remain a historical appendix.
-V4 selects group/individual completion from the request metadata; it is one engine.
+For each scenario, regret is an action's predicted bracket duration minus the
+better of admit/defer in that same scenario. Choose admit when its maximum regret
+is at least one second below defer's maximum regret, in both measurement halves.
+This is minimax regret over two discrete scenarios; it is not a guaranteed gain
+in actual makespan or a worst-case bound over every possible solo speed.
 
-## Submission contracts
+The change applies only to one outstanding all-required bracket. Individual,
+mixed and multi-bracket cohorts retain the nominal objective. FIFO and age
+protection are unchanged. Config `feedback_latency.bracket_admission_mode` is
+`recovery_regret` by default inside opt-in v4; `nominal` restores previous v4.
+The scorer preserves nominal gains and records alternative forecasts and regrets.
 
-- **MLMaster 2-style batch barrier:** submit A1–E1 together at time zero. After
-  every result in that batch returns, wait 10 seconds, then submit A2–E2 together.
-  Each batch is one all-required feedback request.
-- **MLEvolve-style sequential pipeline:** submit A1–E1 one at a time, 10 seconds
-  apart. Each returned result enables its same-type successor A2–E2 after a
-  10-second think delay. A single issuer spaces submissions by at least 10 seconds.
-  Multiple jobs can remain outstanding; each is an individual feedback request.
+## Submission contracts and assumptions
 
-These are illustrative arrival models, not captured framework traffic. The
+- Batch barrier: A1–E1 arrive together; A2–E2 arrive ten seconds after the last
+  first-bracket result. Two group requests, ten jobs total.
+- Sequential pipeline: A1–E1 arrive ten seconds apart. Each result enables its
+  same-type successor after ten seconds; a single issuer also spaces submissions
+  by ten seconds. Ten individual requests; multiple jobs may remain outstanding.
+
+These are illustrative patterns, informed by the
 [MLMaster 2 orchestrator](https://github.com/sjtu-sai-agents/EvoMaster/blob/main/playground/ml_master_2/core/playground.py)
-collects parallel improvement results before processing the direction. The
-[MLEvolve loop](https://github.com/InternScience/MLEvolve/blob/main/run.py)
-staggers draft dispatch and replenishes work on individual completions. “MLMaster”
-does not universally imply a batch barrier, and sequential submission does not
-imply a single outstanding job. We choose five initial lineages and two cycles
-for this mock; these are not claims about framework defaults or a GPU job cap.
+and [MLEvolve loop](https://github.com/InternScience/MLEvolve/blob/main/run.py),
+not captured framework traffic or claims about default parallelism. Both policies
+receive identical jobs and feedback rules; closed-loop arrival timestamps depend
+on prior completions, so they are not identical exogenous arrival traces.
 
-Each policy receives the same ten jobs, recipes and feedback/dependency rules.
-Future release timestamps differ because completions differ: this is a closed-loop
-comparison, **not an identical fixed arrival trace**. Both real end-to-end workflow
-time and request latency are reported. Code generation/learning quality are not
-simulated; think time is a fixed assumption. No independent Poisson arrival model
-is used.
+Each cycle uses A/B/C/D/E budgets 600/600/200/100/200 updates; memory
+4/4/2/2/2 GiB under a 12 GiB budget. Reference solo rates are 12/12/24/6/12
+updates/min. Slow-C changes actual C to 2.5; stale predictions still say 24.
+The original synthetic interference law is unchanged: all multi-job rates ×5/6,
+A/B further multiply .8/.6/.9 with C/D/E, C caps at 2 with A/B, D/E multiply .9
+when together. The scheduler never sees this hidden law or future unsubmitted jobs.
 
-## Work and measurement assumptions
-
-Each cycle uses the original five-job budgets (600/600/200/100/200 updates),
-4/4/2/2/2 GiB memory and a 12 GiB GPU. Reference solo rates are 12/12/24/6/12
-updates/min. Slow-C changes true C to 2.5; its stale predictor still says 24.
-The same synthetic multi-job interference law is retained: solo ×5/6, A/B
-multiply .8/.6/.9 with C/D/E, C capped at 2 beside A/B, and D/E multiply .9
-when together. Both cycles finish every required update.
-
-V4 uses the production scorer with FIFO/30-minute age protection, a one-second
-average-feedback improvement margin in both measured halves, and no concurrency
-cap. Trials consume up to one productive minute; arrivals or completions interrupt
-them and require fresh evidence. All trial progress and time are counted. Steady
-rates are noise-free, so both half-rates are identical. Pre-add rates are assumed
-observable from current execution. Retry and sample-count rules are simplified.
-No future unsubmitted job or hidden group rate is exposed to the scorer.
-
-Startup, checkpoint, finalization and delivery costs are explicitly zero. These
-are policy illustrations, not GPU or production results. The fixed-three cap is
-the requested comparator only. Nearest-rank p95 with just two or ten requests
-equals the maximum; there is too little data for a reliable tail estimate.
-'''
+Trials last up to one productive minute and are interrupted by arrivals or
+completions. All trial updates/time are counted. Rates are noiseless, half-rates
+are equal, pre-add rates are observable, and retry/sample-count rules are simplified.
+Startup, checkpoint, finalization and delivery cost zero. Fixed-three is the
+requested comparator; v4 has no fixed concurrency cap. All runs finish all jobs.
+Nearest-rank p95 with two or ten requests equals the maximum, not a reliable
+population-tail estimate. These are research illustrations, not production gains.
+"""
     for case in CASES:
         text += '\n## ' + case.replace('_', ' ') + '\n\n'
         for scenario in SCENARIOS:
@@ -307,44 +305,33 @@ equals the maximum; there is too little data for a reliable tail estimate.
                 m = r['metrics']
                 text += f"| {LABELS[r['policy']]} | {m['average_request_feedback_minutes']:.2f} | {m['p95_request_feedback_minutes']:.2f} | {m['workflow_makespan_minutes']:.2f} |\n"
             text += '\n'
-    text += '\nAll table values are minutes. Per-job arrivals, completions and per-request feedback are in `results.json`.\n'
-    text += '\n## Reading the comparison\n\n'
-    for scenario in SCENARIOS:
-        for case in CASES:
-            base = next(r for r in results if r['scenario'] == scenario and r['case'] == case and r['policy'] == POLICIES[0])
-            v4 = next(r for r in results if r['scenario'] == scenario and r['case'] == case and r['policy'] == POLICIES[1])
-            change = v4['metrics']['average_request_feedback_minutes'] - base['metrics']['average_request_feedback_minutes']
-            metric_name = 'average bracket makespan' if scenario == 'batch_barrier' else 'average job JCT'
-            text += f"- {LABELS[scenario]}, {case.replace('_', ' ')}: v4 {metric_name} is {abs(change):.2f} minutes {'lower' if change < 0 else 'higher'} than fixed-three FIFO.\n"
-    text += f'''
-The strictly-one-outstanding control produces the same schedule under both
-policies: {controls[0]['metrics']['average_request_feedback_minutes']:.2f} minutes
-average feedback and {controls[0]['metrics']['workflow_makespan_minutes']:.2f}
-minutes workflow time, with no packing trials. This control is not the requested
-pipelined scenario; it verifies the absence of concurrency opportunity.
-Its lower per-request average also illustrates why averages across different
-submission contracts are not directly comparable: delaying submissions can lower
-observed request latency while increasing total workflow time. Keep both metrics.
+    text += """
+All values are minutes. The uncertainty-aware gate improves the severe stale-C
+case but regresses the accurate reference case. This tradeoff is explicit;
+it does not establish improvement on every bracket. The pipeline schedule is
+unchanged between previous and optimized v4 in every case. Strictly one-outstanding
+controls also have identical schedules and no packing opportunity.
 
-A lower job average does not imply a lower batch feedback average. Predictor bias
-can still cause poor choices, and a local continuation score does not guarantee
-the best future closed-loop schedule. The chart shows all 12 main runs: submission
-markers and Gantt segments, optimizer progress, and request/job/workflow metrics.
-Require longer, noisy, overhead-inclusive paired workloads before deployment.
+See [optimization analysis](../optimization_results/report.md) for all development
+ablations, the equal-weight three-case average, and twelve prespecified sensitivity
+workloads evaluated without further parameter tuning. The same synthetic rate
+law limits all these results. Sustained solo calibration and nonzero phase costs
+remain necessary for production evaluation.
 
 ## Reproduction
 
 ```bash
 python -m localml_scheduler.benchmarks.feedback_v4.submission_scenarios --plot
+python -m localml_scheduler.benchmarks.feedback_v4.bracket_optimization --plot
 ```
 
 Use the scheduler environment; plotting additionally requires matplotlib.
-`results.json` retains every arrival, result, trial, forecast and productive
-segment. Simulation units are minutes and updates/min; internal scorer evidence
-uses seconds and updates/s. `summary.csv`, `verification.json`, and `comparison.png`
-provide the compact metrics, checks and combined figure. `single_outstanding_controls`
-in the JSON holds the two control traces, also shown in the chart.
-'''
+`results.json` retains every arrival, result, trial, forecast and productive segment.
+Simulation units are minutes and updates/min; scorer evidence uses seconds and
+updates/s. `summary.csv`, `verification.json`, and `comparison.png` contain metrics,
+checks, and the combined Gantt/progress/latency figure. Model artifacts and
+prediction records are not changed by this scheduler policy.
+"""
     return text
 
 
@@ -353,11 +340,11 @@ def plot(results, controls, output):
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     colors = dict(zip(JOBS, ['#2563eb', '#e34b55', '#d49a10', '#9b59b6', '#19a785']))
-    fig, axes = plt.subplots(12, 4, figsize=(24, 30), gridspec_kw={'height_ratios': [1.2, .9, .7] * 4})
+    fig, axes = plt.subplots(12, 6, figsize=(34, 30), gridspec_kw={'height_ratios': [1.2, .9, .7] * 4})
     panels = [(row, col, next(r for r in results if r['case'] == case and r['scenario'] == scenario and r['policy'] == policy))
         for row, case in enumerate(CASES) for si, scenario in enumerate(SCENARIOS)
-        for pi, policy in enumerate(POLICIES) for col in [si * 2 + pi]]
-    panels += [(3, 2 + i, r) for i, r in enumerate(controls)]
+        for pi, policy in enumerate(POLICIES) for col in [si * len(POLICIES) + pi]]
+    panels += [(3, 3 + i, r) for i, r in enumerate(controls)]
     for row, col, r in panels:
         top, progress, metric = axes[row * 3:row * 3 + 3, col]
         for segment in r['segments']:
@@ -387,7 +374,7 @@ def plot(results, controls, output):
             metric.text(value + 2, bar.get_y() + .32, f'{value:.2f}', va='center', fontsize=8)
         metric.set_xlabel('Minutes')
     for row in range(9, 12):
-        for col in (0, 1):
+        for col in (0, 1, 2):
             axes[row, col].axis('off')
     axes[9, 0].text(0, .8, 'MLMaster: minimize bracket makespan\nAverage is across 2 brackets\nMLEvolve: average individual JCT\nAverage is across 10 jobs\n\nBlack ticks = submission\nHatched = productive trial\nSolid/dashed = first/second cycle', fontsize=13, va='top')
     fig.suptitle('MLMaster: bracket makespan | MLEvolve: average individual job JCT\nSynthetic; identical jobs and feedback rules; all finish; zero checkpoint/delivery overhead', fontsize=16)
@@ -404,7 +391,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     results = [simulate(scenario, policy, case) for case in CASES for scenario in SCENARIOS for policy in POLICIES]
     controls = [simulate('sequential_pipeline', policy, strict_single=True) for policy in POLICIES]
-    assert controls[0]['completion'] == controls[1]['completion']
+    assert all(r['completion'] == controls[0]['completion'] for r in controls)
     payload = dict(description='Synthetic closed-loop submission scenarios', schema_version=1,
         think_and_issuance_gap_seconds=10, results=results, single_outstanding_controls=controls)
     (args.output / 'results.json').write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n')

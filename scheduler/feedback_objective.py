@@ -205,13 +205,18 @@ def score_requests(requests, completion):
 
 def compare_feedback_admission(*, remaining, solo, incumbents, candidate, queue,
                                pre_halves, packed_halves, requests, completed, now,
-                               costs=None, min_gain_seconds=1.0):
+                               costs=None, min_gain_seconds=1.0, bracket_admission_mode="nominal"):
     """Same post-trial state and complete cohort in both alternatives/halves."""
     result = {"admission_policy": FEEDBACK_POLICY, "objective": "request_feedback_latency",
               "decision": "inconclusive", "halves": [], "error": None}
     try:
         now = number(now)
         number(min_gain_seconds, positive=True)
+        if bracket_admission_mode not in {"nominal", "recovery_regret"}:
+            raise ValueError("unsupported bracket admission mode")
+        robust_bracket = (bracket_admission_mode == "recovery_regret"
+                          and len(requests) == 1 and requests[0].completion_policy == "group")
+        result["decision_basis"] = "bracket_recovery_regret_v1" if robust_bracket else "nominal_request_latency"
         incumbents = tuple(sorted(incumbents))
         queue = tuple(queue)
         if (not incumbents or len(set(incumbents)) != len(incumbents)
@@ -267,7 +272,41 @@ def compare_feedback_admission(*, remaining, solo, incumbents, candidate, queue,
                                      "normalized_progress_ratio": pplus / pminus,
                                      "incumbent_slowdown_ratios": {j: pre[j] / packed[j] for j in incumbents},
                                      "defer_phases": defer_phases, "admit_phases": admit_phases})
-        passes = [h["gain_seconds"] >= min_gain_seconds for h in result["halves"]]
+            half_result = result["halves"][-1]
+            half_result["decision_score_seconds"] = gain
+            if robust_bracket:
+                # A slow packed observation cannot distinguish interference from
+                # an optimistic solo prediction. Keep both possibilities explicit;
+                # do not relabel a packed measurement as a measured solo rate.
+                cautious_solo = dict(solo)
+                cautious_solo[candidate] = min(solo[candidate], packed[candidate])
+                cautious_defer, cautious_defer_phases = project_completions(
+                    remaining, incumbents, pre, cautious_solo, queue, evidence, costs,
+                    initial_delay=costs[candidate].pause, resumed_candidate=candidate)
+                cautious_admit, cautious_admit_phases = project_completions(
+                    remaining, proposed, packed, cautious_solo,
+                    [j for j in queue if j != candidate], evidence, costs)
+                cautious_scores = {}
+                for name, projection in [("defer", cautious_defer), ("admit", cautious_admit)]:
+                    absolute = {**completed, **{j: now + seconds for j, seconds in projection.items()}}
+                    cautious_scores[name] = {**score_requests(requests, absolute), "job_completions": absolute}
+                cautious_gain = ((cautious_scores["defer"]["weighted_latency_seconds"]
+                                  - cautious_scores["admit"]["weighted_latency_seconds"])
+                                 / cautious_scores["defer"]["weight_sum"])
+                if not isfinite(cautious_gain):
+                    raise ValueError("nonfinite bracket recovery gain")
+                admit_regret = max(0.0, -gain, -cautious_gain)
+                defer_regret = max(0.0, gain, cautious_gain)
+                half_result.update(
+                    decision_score_seconds=defer_regret - admit_regret,
+                    admit_max_regret_seconds=admit_regret,
+                    defer_max_regret_seconds=defer_regret,
+                    no_recovery_scenario={
+                        "candidate_solo_updates_per_second": cautious_solo[candidate],
+                        "source": "hypothesis_from_current_packed_rate_not_a_solo_measurement",
+                        "gain_seconds": cautious_gain, **cautious_scores,
+                        "defer_phases": cautious_defer_phases, "admit_phases": cautious_admit_phases})
+        passes = [h["decision_score_seconds"] >= min_gain_seconds for h in result["halves"]]
         result["decision"] = "accepted" if all(passes) else "rejected" if not any(passes) else "inconclusive"
     except (ValueError, TypeError, KeyError, IndexError, OverflowError, ZeroDivisionError) as exc:
         result["error"] = str(exc)
