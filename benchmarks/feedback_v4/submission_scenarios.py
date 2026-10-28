@@ -220,7 +220,7 @@ def verify(result):
 
 
 def report(results, controls):
-    text = '''# Average feedback latency under two submission scenarios
+    text = '''# MLMaster bracket makespan and MLEvolve individual job JCT
 
 Synthetic experiment, 2026-10-28. “Average” here is the arithmetic mean: each
 feedback request has weight one. Mean job JCT already weights jobs equally;
@@ -231,6 +231,17 @@ For Q requests, average feedback = sum(C_q - a_q)/Q. For a batch, C_q is the
 last required member's result; for an individual request it is that job's result.
 There are two batch requests or ten individual requests in the scenarios below.
 Compare policies **within** each scenario; the two averages count different events.
+
+**MLMaster's admission objective is bracket makespan, not average member-job
+time.** For bracket b submitted at A_b, M_b = max(C_i for i in bracket b) - A_b.
+One outstanding group request makes the shared scorer exactly this maximum.
+The admission gain is predicted defer-last-completion minus predicted
+admit-last-completion; both measurement halves must pass the one-second margin.
+“Average bracket makespan” in the tables averages the two bracket durations.
+The next bracket is generated only after the preceding bracket returns all results.
+Total workflow time is the sum of bracket makespans plus the inter-bracket think
+delay. For MLEvolve's pipeline, average individual job JCT is the primary metric.
+This naming clarification leaves the already-correct group scoring unchanged.
 
 The main comparison contains only fixed-three FIFO and v4. V3 is removed from
 these tables and the chart; earlier five-job results remain a historical appendix.
@@ -286,12 +297,16 @@ equals the maximum; there is too little data for a reliable tail estimate.
 '''
     for case in CASES:
         text += '\n## ' + case.replace('_', ' ') + '\n\n'
-        text += '| Submission scenario | Policy | Average feedback | p95/max feedback | Average job JCT | Workflow makespan |\n|---|---|---:|---:|---:|---:|\n'
-        for r in results:
-            if r['case'] != case:
-                continue
-            m = r['metrics']
-            text += f"| {LABELS[r['scenario']]} | {LABELS[r['policy']]} | {m['average_request_feedback_minutes']:.2f} | {m['p95_request_feedback_minutes']:.2f} | {m['average_job_jct_minutes']:.2f} | {m['workflow_makespan_minutes']:.2f} |\n"
+        for scenario in SCENARIOS:
+            label = 'bracket makespan' if scenario == 'batch_barrier' else 'job JCT'
+            text += f'### {LABELS[scenario]}\n\n'
+            text += f'| Policy | Average {label} | p95/max {label} | Workflow makespan |\n|---|---:|---:|---:|\n'
+            for r in results:
+                if r['case'] != case or r['scenario'] != scenario:
+                    continue
+                m = r['metrics']
+                text += f"| {LABELS[r['policy']]} | {m['average_request_feedback_minutes']:.2f} | {m['p95_request_feedback_minutes']:.2f} | {m['workflow_makespan_minutes']:.2f} |\n"
+            text += '\n'
     text += '\nAll table values are minutes. Per-job arrivals, completions and per-request feedback are in `results.json`.\n'
     text += '\n## Reading the comparison\n\n'
     for scenario in SCENARIOS:
@@ -299,7 +314,8 @@ equals the maximum; there is too little data for a reliable tail estimate.
             base = next(r for r in results if r['scenario'] == scenario and r['case'] == case and r['policy'] == POLICIES[0])
             v4 = next(r for r in results if r['scenario'] == scenario and r['case'] == case and r['policy'] == POLICIES[1])
             change = v4['metrics']['average_request_feedback_minutes'] - base['metrics']['average_request_feedback_minutes']
-            text += f"- {LABELS[scenario]}, {case.replace('_', ' ')}: v4 average feedback is {abs(change):.2f} minutes {'lower' if change < 0 else 'higher'} than fixed-three FIFO.\n"
+            metric_name = 'average bracket makespan' if scenario == 'batch_barrier' else 'average job JCT'
+            text += f"- {LABELS[scenario]}, {case.replace('_', ' ')}: v4 {metric_name} is {abs(change):.2f} minutes {'lower' if change < 0 else 'higher'} than fixed-three FIFO.\n"
     text += f'''
 The strictly-one-outstanding control produces the same schedule under both
 policies: {controls[0]['metrics']['average_request_feedback_minutes']:.2f} minutes
@@ -364,7 +380,8 @@ def plot(results, controls, output):
         keys = ('average_request_feedback_minutes', 'p95_request_feedback_minutes', 'workflow_makespan_minutes')
         values = [r['metrics'][key] for key in keys]
         bars = metric.barh([2, 1, 0], values, color=['#2878a8', '#be7144', '#597b60'], height=.65)
-        metric.set_yticks([2, 1, 0], ['Average feedback', 'p95 / max feedback', 'Workflow time'], fontsize=8)
+        latency_name = 'bracket makespan' if r['scenario'] == 'batch_barrier' else 'job JCT'
+        metric.set_yticks([2, 1, 0], ['Avg ' + latency_name, 'p95 ' + latency_name, 'Workflow time'], fontsize=8)
         metric.set_xlim(0, max(z['metrics']['workflow_makespan_minutes'] for z in results + controls) * 1.12)
         for bar, value in zip(bars, values):
             metric.text(value + 2, bar.get_y() + .32, f'{value:.2f}', va='center', fontsize=8)
@@ -372,8 +389,8 @@ def plot(results, controls, output):
     for row in range(9, 12):
         for col in (0, 1):
             axes[row, col].axis('off')
-    axes[9, 0].text(0, .8, 'Average = arithmetic mean\nEach request counts once\nBatch: 2 feedback requests\nPipeline: 10 feedback requests\n\nBlack ticks = submission\nHatched = productive trial\nSolid/dashed = first/second cycle', fontsize=13, va='top')
-    fig.suptitle('Two submission scenarios: average request feedback latency\nSynthetic; identical jobs and feedback rules; all finish; zero checkpoint/delivery overhead', fontsize=16)
+    axes[9, 0].text(0, .8, 'MLMaster: minimize bracket makespan\nAverage is across 2 brackets\nMLEvolve: average individual JCT\nAverage is across 10 jobs\n\nBlack ticks = submission\nHatched = productive trial\nSolid/dashed = first/second cycle', fontsize=13, va='top')
+    fig.suptitle('MLMaster: bracket makespan | MLEvolve: average individual job JCT\nSynthetic; identical jobs and feedback rules; all finish; zero checkpoint/delivery overhead', fontsize=16)
     fig.tight_layout(rect=[0, 0, 1, .975])
     fig.savefig(output, dpi=130)
     plt.close(fig)

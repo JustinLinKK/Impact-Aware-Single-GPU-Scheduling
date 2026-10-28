@@ -28,6 +28,11 @@ no GPU workload, dataset rewrite, model training, push or deployment was perform
 - Historical five-job rerun: **15 runs**, five jobs completed per run; original
   baseline values and the stale-slope counterexample reproduce numerically.
 - Both combined plots were visually inspected. Whitespace/diff checks passed.
+- Bracket-metric clarification: the MLMaster group path already minimizes the
+  last required completion. Report/chart labels now explicitly distinguish
+  bracket makespan from individual job JCT. Sixteen existing objective/submission
+  tests passed, and regenerating all 12 main runs plus two controls produced
+  exactly unchanged traces, decisions and metrics.
 
 ## Commands
 

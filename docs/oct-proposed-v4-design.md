@@ -51,6 +51,46 @@ necessarily the end of the entire agent workflow. Minimizing one group's latency
 is equivalent to minimizing that group's last completion; it is not generally
 equivalent to global makespan when several requests arrive at different times.
 
+### MLMaster bracket makespan versus MLEvolve job JCT
+
+For the specified MLMaster workflow, bracket b is submitted together at A_b and
+no further generation starts until every required job in B_b returns. Its
+scheduling objective is therefore the **bracket makespan**:
+
+\[
+M_b=\max_{i\in B_b}C_i-A_b,\qquad \min_\pi M_b(\pi).
+\]
+
+The clock includes waiting after submission and all required result-return work.
+It does not start at the first GPU dispatch. For one outstanding bracket, v4's
+group score is exactly M_b, not the average completion time of its member jobs.
+The two-half admission test reduces to
+
+\[
+\Delta_{b,h}=\max_{i\in B_b}\widehat C_{i,h}(\mathrm{defer})-
+\max_{i\in B_b}\widehat C_{i,h}(\mathrm{admit})\ge\varepsilon.
+\]
+
+An early member completion has value only if it helps the last required result
+arrive sooner. Reducing average member JCT while delaying that last result does
+not improve this objective. The existing `group` implementation already takes
+this maximum, and the simulator already releases the next bracket only after
+the current bracket finishes. This clarification changes presentation, not the
+admission algorithm or its numerical results.
+
+Across a fixed sequence of m brackets, report M_b for each bracket, sum(M_b),
+and average bracket makespan sum(M_b)/m. This last average is **across brackets**,
+never across their member jobs. From the first bracket's submission to the last
+result, total workflow time is sum(M_b) plus inter-bracket generation delays.
+With fixed brackets and fixed generation delays, reducing the sum of bracket
+makespans reduces workflow time; adaptive changes in future jobs require a
+broader evaluation.
+
+For the specified MLEvolve pipeline, each job's result independently enables
+further work, so the primary latency objective remains average individual JCT,
+sum_i(C_i-a_i)/n. Keep tail JCT and total workflow time alongside it. The report
+and chart now name these two primary metrics separately.
+
 The request clock starts before queueing and preparation, and survives retry,
 partial execution, checkpoint and resume. Include all trial time in measured
 latency. Do not end the clock at the last optimizer update. The existing durable

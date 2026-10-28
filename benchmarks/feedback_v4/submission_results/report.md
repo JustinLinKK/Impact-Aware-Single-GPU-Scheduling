@@ -1,4 +1,4 @@
-# Average feedback latency under two submission scenarios
+# MLMaster bracket makespan and MLEvolve individual job JCT
 
 Synthetic experiment, 2026-10-28. “Average” here is the arithmetic mean: each
 feedback request has weight one. Mean job JCT already weights jobs equally;
@@ -9,6 +9,17 @@ For Q requests, average feedback = sum(C_q - a_q)/Q. For a batch, C_q is the
 last required member's result; for an individual request it is that job's result.
 There are two batch requests or ten individual requests in the scenarios below.
 Compare policies **within** each scenario; the two averages count different events.
+
+**MLMaster's admission objective is bracket makespan, not average member-job
+time.** For bracket b submitted at A_b, M_b = max(C_i for i in bracket b) - A_b.
+One outstanding group request makes the shared scorer exactly this maximum.
+The admission gain is predicted defer-last-completion minus predicted
+admit-last-completion; both measurement halves must pass the one-second margin.
+“Average bracket makespan” in the tables averages the two bracket durations.
+The next bracket is generated only after the preceding bracket returns all results.
+Total workflow time is the sum of bracket makespans plus the inter-bracket think
+delay. For MLEvolve's pipeline, average individual job JCT is the primary metric.
+This naming clarification leaves the already-correct group scoring unchanged.
 
 The main comparison contains only fixed-three FIFO and v4. V3 is removed from
 these tables and the chart; earlier five-job results remain a historical appendix.
@@ -64,41 +75,65 @@ equals the maximum; there is too little data for a reliable tail estimate.
 
 ## reference
 
-| Submission scenario | Policy | Average feedback | p95/max feedback | Average job JCT | Workflow makespan |
-|---|---|---:|---:|---:|---:|
-| MLMaster 2-style batch barrier | Fixed-three FIFO | 97.22 | 97.22 | 84.39 | 194.61 |
-| MLMaster 2-style batch barrier | V4 request feedback | 78.87 | 78.87 | 53.94 | 157.92 |
-| MLEvolve-style sequential pipeline | Fixed-three FIFO | 89.36 | 104.65 | 89.36 | 196.14 |
-| MLEvolve-style sequential pipeline | V4 request feedback | 55.75 | 91.17 | 55.75 | 159.17 |
+### MLMaster 2-style batch barrier
+
+| Policy | Average bracket makespan | p95/max bracket makespan | Workflow makespan |
+|---|---:|---:|---:|
+| Fixed-three FIFO | 97.22 | 97.22 | 194.61 |
+| V4 request feedback | 78.87 | 78.87 | 157.92 |
+
+### MLEvolve-style sequential pipeline
+
+| Policy | Average job JCT | p95/max job JCT | Workflow makespan |
+|---|---:|---:|---:|
+| Fixed-three FIFO | 89.36 | 104.65 | 196.14 |
+| V4 request feedback | 55.75 | 91.17 | 159.17 |
+
 
 ## slow C stale prediction
 
-| Submission scenario | Policy | Average feedback | p95/max feedback | Average job JCT | Workflow makespan |
-|---|---|---:|---:|---:|---:|
-| MLMaster 2-style batch barrier | Fixed-three FIFO | 98.70 | 98.70 | 88.63 | 197.57 |
-| MLMaster 2-style batch barrier | V4 request feedback | 148.39 | 148.39 | 67.84 | 296.95 |
-| MLEvolve-style sequential pipeline | Fixed-three FIFO | 83.24 | 126.94 | 83.24 | 226.53 |
-| MLEvolve-style sequential pipeline | V4 request feedback | 66.37 | 172.20 | 66.37 | 252.70 |
+### MLMaster 2-style batch barrier
+
+| Policy | Average bracket makespan | p95/max bracket makespan | Workflow makespan |
+|---|---:|---:|---:|
+| Fixed-three FIFO | 98.70 | 98.70 | 197.57 |
+| V4 request feedback | 148.39 | 148.39 | 296.95 |
+
+### MLEvolve-style sequential pipeline
+
+| Policy | Average job JCT | p95/max job JCT | Workflow makespan |
+|---|---:|---:|---:|
+| Fixed-three FIFO | 83.24 | 126.94 | 226.53 |
+| V4 request feedback | 66.37 | 172.20 | 252.70 |
+
 
 ## slow C accurate prediction
 
-| Submission scenario | Policy | Average feedback | p95/max feedback | Average job JCT | Workflow makespan |
-|---|---|---:|---:|---:|---:|
-| MLMaster 2-style batch barrier | Fixed-three FIFO | 98.70 | 98.70 | 88.63 | 197.57 |
-| MLMaster 2-style batch barrier | V4 request feedback | 97.75 | 97.75 | 66.25 | 195.67 |
-| MLEvolve-style sequential pipeline | Fixed-three FIFO | 83.24 | 126.94 | 83.24 | 226.53 |
-| MLEvolve-style sequential pipeline | V4 request feedback | 67.91 | 101.33 | 67.91 | 195.65 |
+### MLMaster 2-style batch barrier
+
+| Policy | Average bracket makespan | p95/max bracket makespan | Workflow makespan |
+|---|---:|---:|---:|
+| Fixed-three FIFO | 98.70 | 98.70 | 197.57 |
+| V4 request feedback | 97.75 | 97.75 | 195.67 |
+
+### MLEvolve-style sequential pipeline
+
+| Policy | Average job JCT | p95/max job JCT | Workflow makespan |
+|---|---:|---:|---:|
+| Fixed-three FIFO | 83.24 | 126.94 | 226.53 |
+| V4 request feedback | 67.91 | 101.33 | 195.65 |
+
 
 All table values are minutes. Per-job arrivals, completions and per-request feedback are in `results.json`.
 
 ## Reading the comparison
 
-- MLMaster 2-style batch barrier, reference: v4 average feedback is 18.35 minutes lower than fixed-three FIFO.
-- MLMaster 2-style batch barrier, slow C stale prediction: v4 average feedback is 49.69 minutes higher than fixed-three FIFO.
-- MLMaster 2-style batch barrier, slow C accurate prediction: v4 average feedback is 0.95 minutes lower than fixed-three FIFO.
-- MLEvolve-style sequential pipeline, reference: v4 average feedback is 33.61 minutes lower than fixed-three FIFO.
-- MLEvolve-style sequential pipeline, slow C stale prediction: v4 average feedback is 16.87 minutes lower than fixed-three FIFO.
-- MLEvolve-style sequential pipeline, slow C accurate prediction: v4 average feedback is 15.34 minutes lower than fixed-three FIFO.
+- MLMaster 2-style batch barrier, reference: v4 average bracket makespan is 18.35 minutes lower than fixed-three FIFO.
+- MLMaster 2-style batch barrier, slow C stale prediction: v4 average bracket makespan is 49.69 minutes higher than fixed-three FIFO.
+- MLMaster 2-style batch barrier, slow C accurate prediction: v4 average bracket makespan is 0.95 minutes lower than fixed-three FIFO.
+- MLEvolve-style sequential pipeline, reference: v4 average job JCT is 33.61 minutes lower than fixed-three FIFO.
+- MLEvolve-style sequential pipeline, slow C stale prediction: v4 average job JCT is 16.87 minutes lower than fixed-three FIFO.
+- MLEvolve-style sequential pipeline, slow C accurate prediction: v4 average job JCT is 15.34 minutes lower than fixed-three FIFO.
 
 The strictly-one-outstanding control produces the same schedule under both
 policies: 28.33 minutes

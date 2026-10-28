@@ -28,10 +28,11 @@ Reproduce the simulation from the MLEvolve parent using its Python environment:
 python -m localml_scheduler.benchmarks.feedback_v4.submission_scenarios --plot
 ```
 
-The headline metric is **average request feedback time**, with each request
-counting once. Average and arithmetic mean are identical; the change is from
-counting jobs to counting the result events that unblock the agent. Report
-request p95/max and whole-workflow time alongside that average.
+The primary metric is **bracket makespan** for MLMaster's all-results barrier,
+and **average individual job JCT** for MLEvolve's pipeline. Group mode minimizes
+the last required result's time, not average member-job time. When several
+brackets are reported together, average bracket makespan averages those bracket
+durations. Report tail latency and whole-workflow time alongside both metrics.
 
 The main mock compares fixed-three FIFO with v4 under two feedback-dependent
 submission scenarios: MLMaster 2-style batch barriers and MLEvolve-style sequential
