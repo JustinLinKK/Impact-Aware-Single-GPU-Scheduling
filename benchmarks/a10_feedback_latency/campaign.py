@@ -83,7 +83,7 @@ def main(argv=None):
         results.append({**episode, "output": name, "exit_code": child.returncode, "result": row})
         atomic_json(root / "campaign-results.json", results)
         comparison_plot(root)
-        if child.returncode or not row.get("complete"):
+        if child.returncode or not row.get("complete") or row.get("predictor_comparison_eligible") is not True:
             raise RuntimeError("incomplete required episode; campaign stopped without completed-only ranking")
     after = source_snapshot(manifest, manifest_path)
     if after != before: raise ValueError("source changed during final episode")

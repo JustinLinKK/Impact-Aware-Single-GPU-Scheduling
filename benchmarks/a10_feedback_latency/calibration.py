@@ -133,14 +133,31 @@ class RecordingPredictor:
     """Record profiles from actual preparation calls; never perform extra inference."""
     def __init__(self, predictor, on_profile):
         self.predictor, self.on_profile, self.records = predictor, on_profile, {}
+        self.failures, self.preparations_finished = {}, set()
 
     def __getattr__(self, name):
         return getattr(self.predictor, name)
 
     def predict_profile_options(self, job, batch_sizes):
-        outputs = self.predictor.predict_profile_options(job, batch_sizes)
-        previous = self.records.setdefault(job.job_id, {})
-        if any(previous.get(batch) != value for batch, value in outputs.items()):
-            previous.update(deepcopy(outputs))
-            self.on_profile(job.job_id, deepcopy(previous))
-        return outputs
+        try:
+            outputs = self.predictor.predict_profile_options(job, batch_sizes)
+            for batch in batch_sizes:
+                profile = outputs.get(batch)
+                if (not isinstance(profile, dict) or profile.get("kind") != "predicted_workload"
+                        or profile.get("hardware") != "A10"
+                        or profile.get("job_signature") != (job.packing.signature or job.job_id)
+                        or profile.get("batch_size") != batch or not profile.get("artifact_sha256")):
+                    raise ValueError("missing or incompatible prepared A10 profile")
+                for field in ("step_cost", "epoch_cost", "avg_vram_mib", "peak_vram_mib"):
+                    if not math.isfinite(float(profile[field])) or profile[field] <= 0:
+                        raise ValueError("invalid prepared numeric profile:" + field)
+            previous = self.records.setdefault(job.job_id, {})
+            if any(previous.get(batch) != value for batch, value in outputs.items()):
+                previous.update(deepcopy(outputs))
+                self.on_profile(job.job_id, deepcopy(previous))
+            return outputs
+        except Exception as exc:
+            self.failures[job.job_id] = {"type": type(exc).__name__, "error": str(exc)}
+            raise
+        finally:
+            self.preparations_finished.add(job.job_id)

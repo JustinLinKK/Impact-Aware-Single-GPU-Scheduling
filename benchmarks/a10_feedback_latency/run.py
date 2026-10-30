@@ -172,10 +172,61 @@ def submission(spec, job, work, accepted_mono, accepted_unix):
         spec["expected_runtime_signature"], digest(spec), spec.get("validation_size", 256))
 
 
+def accept_job(client, job, accepted_unix):
+    """Bind the member timestamp to actual acceptance, after all eager building."""
+    if isinstance(accepted_unix, bool) or not math.isfinite(accepted_unix):
+        raise ValueError("finite accepted request timestamp required")
+    job.submitted_at = datetime.fromtimestamp(accepted_unix, timezone.utc).isoformat()
+    return client.submit(job)
+
+
+def require_predictor_exposure(predictor, jobs, specs, *, require_all=False):
+    """A failed or missing prior aborts diagnostically; never continue a comparator."""
+    failures = dict(getattr(predictor, "failures", {}))
+    sources, errors = dict(predictor.last_sources), dict(predictor.last_errors)
+    finished = getattr(predictor, "preparations_finished", set())
+    for name, job in jobs.items():
+        if job.job_id in failures or job.job_id in errors or sources.get(job.job_id) not in (None, "ml_predictor"):
+            raise RuntimeError("predictor exposure failed for " + name + ":" + str(
+                failures.get(job.job_id) or errors.get(job.job_id) or sources.get(job.job_id)))
+        if (require_all or job.job_id in finished) and (
+                sources.get(job.job_id) != "ml_predictor"
+                or specs[name]["batch"] not in predictor.records.get(job.job_id, {})):
+            raise RuntimeError("missing required numeric predictor exposure for " + name)
+
+
 def events_for(path, job_id):
     if not path.exists(): return []
     return [event for line in path.read_text().splitlines() if line.strip()
             for event in [json.loads(line)] if event.get("job_id") == job_id]
+
+
+def policy_activation(events):
+    """Count observed policy decisions separately from successful predictor exposure."""
+    summary = {"accepted_forecasts": 0, "rejected_forecasts": 0,
+               "actionable_forecasts": 0, "inconclusive_or_invalid": 0,
+               "inconclusive_reasons": {}, "amortization_skips": 0, "skip_reasons": {}}
+    for event in events:
+        payload = event.get("payload") or {}
+        if event.get("event_type") == "pilot_trial_skipped":
+            summary["amortization_skips"] += 1
+            reason = str(payload.get("reason"))
+            summary["skip_reasons"][reason] = summary["skip_reasons"].get(reason, 0) + 1
+        if event.get("event_type") != "cold_start_trial_decided": continue
+        decision, halves = payload.get("decision"), payload.get("halves")
+        has_both_halves = isinstance(halves, list) and len(halves) == 2
+        if not has_both_halves and isinstance(payload.get("scenarios"), list) and payload["scenarios"]:
+            has_both_halves = all(scenario.get("forecast", {}).get("error") is None
+                and len(scenario.get("forecast", {}).get("halves", [])) == 2
+                for scenario in payload["scenarios"])
+        if payload.get("error") is None and decision in {"accepted", "rejected"} and has_both_halves:
+            summary[decision + "_forecasts"] += 1
+            summary["actionable_forecasts"] += 1
+        else:
+            summary["inconclusive_or_invalid"] += 1
+            reason = str(payload.get("error") or payload.get("reason") or decision)
+            summary["inconclusive_reasons"][reason] = summary["inconclusive_reasons"].get(reason, 0) + 1
+    return summary
 
 
 def timestamp(text):
@@ -259,7 +310,7 @@ def calibrate(manifest, manifest_path, raw_settings, output, max_seconds):
             "kind": "calibration", "token": uuid.uuid4().hex, "window_min_seconds": .2,
             "expires_at": time.time() + max_seconds}
         accepted_mono, accepted_unix = time.monotonic(), time.time()
-        job = client.submit(job)
+        job = accept_job(client, job, accepted_unix)
         frozen = submission(spec, job, work, accepted_mono, accepted_unix)
         predicted = service.planner.estimator.predicted_profile(job, spec["batch"])
         if not predicted or predicted["hardware"] != "A10": raise ValueError("A10 prediction missing")
@@ -400,6 +451,7 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
         while len(receipts) != len(jobs):
             elapsed = time.monotonic() - start
             check_deadline(manifest, elapsed, max_seconds)
+            require_predictor_exposure(recording, jobs, specs)
             if mode == "group" and group_child_release is None and all(jobs[n].job_id in receipts for n in parents.values()):
                 group_child_release = max(receipts[jobs[n].job_id]["feedback_ready_monotonic"] for n in parents.values()) + 2.
             for name, spec in specs.items():
@@ -423,7 +475,7 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
                     "workflow_id": "a10-feedback-pilot", "completion_policy": mode,
                     "required_job_ids": required, "membership_finalized": True,
                     "submitted_at": datetime.fromtimestamp(request["submitted_unix"], timezone.utc).isoformat()}
-                job = client.submit(job)
+                job = accept_job(client, job, accepted_unix)
                 submitted[name] = submission(spec, job, works[name], accepted_mono, accepted_unix)
                 if prediction_pool is not None:
                     prediction_futures[name] = prediction_pool.submit(service.planner.estimator.predicted_profile,
@@ -474,10 +526,14 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
                 atomic_json(output / "status.json", {"elapsed_seconds": elapsed, "submitted": len(submitted), "receipts": len(receipts)})
                 next_sample = elapsed + 1.
             time.sleep(.02)
+        require_predictor_exposure(recording, jobs, specs, require_all=True)
     finally:
         if arm != "fixed_three": service.stop()
         for handle in handles.values(): terminate_process_tree(handle.process)
         if prediction_pool is not None: prediction_pool.shutdown(wait=False, cancel_futures=True)
+        atomic_json(output / "predictor-exposure.json", {"failures": recording.failures,
+            "prediction_sources": dict(recording.last_sources), "prediction_errors": dict(recording.last_errors),
+            "prepared_numeric_profiles": recording.records})
     end = time.monotonic()
     result_ready = max(row["feedback_ready_monotonic"] for row in receipts.values())
     for name, spec in specs.items():
@@ -507,10 +563,17 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
         "hardware": hardware, "peak_device_used_mib": max(x["gpu"]["used_mib"] for x in timeline)}
     result["prediction_sources"] = dict(service.planner.estimator.ml_predictor.last_sources)
     result["prediction_errors"] = dict(service.planner.estimator.ml_predictor.last_errors)
+    result["policy_activation"] = policy_activation(client.store.list_events())
+    result["admission_policy_comparison_eligible"] = (arm == "fixed_three"
+        or result["policy_activation"]["actionable_forecasts"] > 0
+        or (arm == "calibrated_revised" and result["policy_activation"]["amortization_skips"] > 0))
+    result["policy_activation_note"] = "zero actionable v4 forecasts are not evidence of a measured admission-policy comparison; legitimate revised skips are separate observable decisions"
     result["predictor_comparison_eligible"] = all(
         result["prediction_sources"].get(job.job_id) == "ml_predictor"
         and specs[name]["batch"] in recording.records.get(job.job_id, {})
         for name, job in jobs.items())
+    if not result["predictor_comparison_eligible"]:
+        raise RuntimeError("incomplete predictor exposure; episode is diagnostic, not a comparison")
     if manifest.get("prune_completed_weights", True): prune_owned_weights(output)
     return result
 

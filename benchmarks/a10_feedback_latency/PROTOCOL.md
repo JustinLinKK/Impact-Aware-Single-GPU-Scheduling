@@ -1,5 +1,10 @@
 # Measured A10 result-return pilot
 
+Campaign v1 is invalidated. Read [REPAIR-V2.md](REPAIR-V2.md) for the confirmed
+capture-limit and submission-clock defects, CPU-only repair, and proof. Preserve
+its original artifacts as diagnostics; no replacement GPU run is authorized by
+this document or repair commit.
+
 Reference scheduler: `95b651d2e2a89599138c790ab4f9c1363f29e65f`.
 Initial workload manifest SHA256:
 `91c24a3256e10baf34078e893a45ae34535642efc1a571b7cdb9eb9f70e6524b`.
