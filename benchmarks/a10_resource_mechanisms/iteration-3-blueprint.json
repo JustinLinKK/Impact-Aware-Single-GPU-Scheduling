@@ -1,0 +1,108 @@
+{
+  "schema": "a10_iteration3_heldout_blueprint_v1",
+  "status": "predeclared_inputs_not_executable_policy_pending_iteration2",
+  "declared_utc": "2026-10-30T10:14:14.775619+00:00",
+  "iteration": 3,
+  "configurations": {
+    "tiny": {
+      "input_features": 128,
+      "precision": "fp32_ieee",
+      "pool_size": 4096,
+      "validation_size": 256,
+      "width": 192,
+      "repetitions": 3,
+      "batch": 48,
+      "ballast_mib": 0
+    },
+    "resident": {
+      "input_features": 128,
+      "precision": "fp32_ieee",
+      "pool_size": 4096,
+      "validation_size": 256,
+      "width": 192,
+      "repetitions": 3,
+      "batch": 48,
+      "ballast_mib": 6144
+    },
+    "compute": {
+      "input_features": 128,
+      "precision": "fp32_ieee",
+      "pool_size": 4096,
+      "validation_size": 256,
+      "width": 1536,
+      "repetitions": 12,
+      "batch": 192,
+      "ballast_mib": 0
+    },
+    "both": {
+      "input_features": 128,
+      "precision": "fp32_ieee",
+      "pool_size": 4096,
+      "validation_size": 256,
+      "width": 1536,
+      "repetitions": 12,
+      "batch": 192,
+      "ballast_mib": 6144
+    }
+  },
+  "conditions": [
+    {
+      "name": "memory-pair-short",
+      "classes": [
+        "resident",
+        "resident",
+        "compute"
+      ],
+      "target_training_seconds": 18
+    },
+    {
+      "name": "memory-pair-long",
+      "classes": [
+        "resident",
+        "resident",
+        "compute"
+      ],
+      "target_training_seconds": 55
+    },
+    {
+      "name": "mixed-compute-short",
+      "classes": [
+        "tiny",
+        "compute",
+        "both"
+      ],
+      "target_training_seconds": 18
+    },
+    {
+      "name": "mixed-compute-long",
+      "classes": [
+        "tiny",
+        "compute",
+        "both"
+      ],
+      "target_training_seconds": 55
+    }
+  ],
+  "seed_base": 91000,
+  "modes": [
+    "individual",
+    "group"
+  ],
+  "repeats": 2,
+  "planned_arms": [
+    "asynchronous_v4",
+    "selected_revised_policy",
+    "asynchronous_fixed_three"
+  ],
+  "planned_cohorts": 48,
+  "planned_evaluation_jobs": 288,
+  "calibration_replicas": 2,
+  "calibration_steps_per_epoch": 2048,
+  "maximum_updates": 65536,
+  "epochs": 2,
+  "policy_selection": "After iteration2 full audited analysis, freeze one revised policy with an explicit mechanism-based rationale; any further implementation changes must be documented and tested before iteration3 evaluation. Retain v4/fixed-three comparisons and report losses. No policy or condition adjustment from iteration3 evaluation results.",
+  "budget_rule": "Use dedicated same-host solo rate times declared duration, round to a two-epoch multiple-of-eight update budget with65536bound before evaluation. Report clipping. No evaluation fitting.",
+  "scope": "Held-out scheduler configurations/durations/mixtures and disjoint initialization/data seeds. Same-configuration dedicated measured profiles remain research controls, not held-out neural predictor accuracy.",
+  "dispatch": "Not executable. Requires completed reviewed iteration2, exact source/runtime and new frozen plan, current owned GPU/lease/budget reconciliation, CPUpreflight and dedicated calibration, finite operational bounds and collector. No new rental or launch is authorized by this file alone.",
+  "policy_note_clarified_utc": "2026-10-30T10:17:42.125634+00:00"
+}

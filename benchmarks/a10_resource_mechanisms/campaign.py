@@ -38,14 +38,19 @@ def sealed_bundle(directory, settings, calibration):
     if plan.get('status')!='frozen': raise ValueError('candidate plan cannot launch; sealed plan.status must be frozen')
     if protocol.get('frozen_before_evaluation') is not True or protocol.get('plan')!=plan or protocol.get('plan_sha256')!=file_hash(plan_path):
         raise ValueError('sealed plan bytes/protocol identity mismatch')
-    if len(plan['conditions'])!=4 or set(plan['arms'])!=set(RESOURCE_ARMS) or len(plan['arms'])!=4:
-        raise ValueError('iteration two requires exactly four conditions and four resource arms')
+    expected_cohorts = 48 if plan['iteration'] == 3 else 64
+    if len(plan['conditions'])!=4:
+        raise ValueError('exactly four predeclared conditions required')
+    if plan['iteration'] == 2 and (set(plan['arms'])!=set(RESOURCE_ARMS) or len(plan['arms'])!=4):
+        raise ValueError('iteration two requires exactly four resource arms')
     for key in ('episode_max_seconds','campaign_max_seconds','job_timeout_seconds'):
         if type(plan.get(key))is not int or not 0<plan[key]<=14400: raise ValueError('finite positive plan bounds of at most four hours required')
     if plan['episode_max_seconds']>plan['campaign_max_seconds']: raise ValueError('episode bound exceeds campaign bound')
     order=episode_order(plan)
-    if len(order)!=64 or protocol.get('order')!=order or protocol.get('expected_cohorts')!=64 or protocol.get('expected_jobs')!=384:
-        raise ValueError('sealed balanced order requires 64 cohorts / 384 jobs')
+    if (len(order)!=expected_cohorts or protocol.get('order')!=order
+            or protocol.get('expected_cohorts')!=expected_cohorts
+            or protocol.get('expected_jobs')!=6*expected_cohorts):
+        raise ValueError('sealed balanced order has wrong full campaign denominator')
     names={c['name'] for c in plan['conditions']}
     if set(protocol.get('manifests',{}))!=names: raise ValueError('condition manifest coverage mismatch')
     if {p.name for p in directory.glob('*.json')}!={name+'.json' for name in names}|{'plan.json','protocol-before.json'}:
@@ -78,7 +83,7 @@ def sealed_bundle(directory, settings, calibration):
 
 
 def verify_bundle(bundle):
-    check_deadline(bundle['plan'])
+    validate_plan(bundle['plan'])
     for path,expected in bundle['hashes'].items():
         if file_hash(path)!=expected: raise ValueError('frozen plan/protocol/manifest/settings/calibration changed: '+path)
     for name,item in bundle['manifests'].items():
@@ -252,13 +257,21 @@ def planned_records(order):
         'status':'unattempted','exit_code':None,'usable_receipts':0} for i,episode in enumerate(order)]
 
 
-def coverage(records):
+def coverage(records, order):
+    # These records are created from the full validated sealed order, including
+    # every failed and unattempted cell; never pass a completed-only subset.
+    identity=lambda row:tuple(row[key] for key in ('condition','repeat','mode','arm'))
+    expected={identity(row) for row in order}
+    if (len(order) not in (48,64) or len(expected)!=len(order)
+            or len(records)!=len(order) or {identity(row) for row in records}!=expected):
+        raise ValueError('coverage requires every cell of the full sealed order')
+    planned=len(records)
     counts=Counter(r['status'] for r in records)
-    return {'planned_cohorts':64,'planned_jobs':384,'completed_valid_cohorts':counts['completed'],
+    return {'planned_cohorts':planned,'planned_jobs':6*planned,'completed_valid_cohorts':counts['completed'],
         'failed_cohorts':counts['failed'],'running_cohorts':counts['running'],'unattempted_cohorts':counts['unattempted'],
         'usable_receipts':sum(r.get('usable_receipts',0) for r in records),
-        'attempted_planned_jobs':6*(64-counts['unattempted']), 'unattempted_jobs':6*counts['unattempted'],
-        'denominator_note':'All 64 planned cells / 384 planned jobs remain; a failed cohort is never removed or replaced.'}
+        'attempted_planned_jobs':6*(planned-counts['unattempted']), 'unattempted_jobs':6*counts['unattempted'],
+        'denominator_note':f'All {planned} planned cells / {6*planned} planned jobs remain; a failed cohort is never removed or replaced.'}
 
 
 def comparisons(records,plan):
@@ -325,12 +338,12 @@ def final_plots(root, records, plan):
                 thumb=ImageOps.contain(image.convert('RGB'),(600,500));canvas.paste(thumb,(0,25))
         else:draw.text((10,50),'Per-episode plot unavailable; saved episode data retained.',fill='black')
         thumbnails.append(canvas)
-    sheet=Image.new('RGB',(8*600,8*530),'white')
+    sheet=Image.new('RGB',(8*600,math.ceil(len(thumbnails)/8)*530),'white')
     for index,thumbnail in enumerate(thumbnails):sheet.paste(thumbnail,((index%8)*600,(index//8)*530))
     sheet.save(root/'combined-cohort-gantt-metrics.png')
     for condition in plan['conditions']:
         condition_records=[(r,t) for r,t in zip(records,thumbnails) if r['condition']==condition['name']]
-        page=Image.new('RGB',(4*600,4*530),'white')
+        page=Image.new('RGB',(4*600,math.ceil(len(condition_records)/4)*530),'white')
         for index,(_,thumbnail) in enumerate(condition_records):page.paste(thumbnail,((index%4)*600,(index//4)*530))
         page.save(root/(condition['name']+'-cohort-gantt-metrics.png'))
 
@@ -346,16 +359,16 @@ def execute(bundle, root):
         started=time.monotonic();records=planned_records(bundle['order']);plan=bundle['plan'];profiles={};active=None
         frozen={'order':bundle['order'],'input_sha256':bundle['hashes'],'source_pins':bundle['snapshots'],
             'episode_max_seconds':plan['episode_max_seconds'],'campaign_max_seconds':plan['campaign_max_seconds'],'deadline_utc':plan['deadline_utc'],
-            'planned_cohorts':64,'planned_jobs':384,'settings':str(bundle['settings']),'calibration':str(bundle['calibration']),
+            'planned_cohorts':len(records),'planned_jobs':6*len(records),'settings':str(bundle['settings']),'calibration':str(bundle['calibration']),
             'cache_policy':'fresh scheduler/predictor process and runtime per episode; charged dedicated calibration shared OS/data caches',
             'scope':'dedicated measured-template mechanism study; no neural-predictor accuracy or cross-condition mean claim'}
         atomic_json(root/'campaign-protocol-before.json',frozen)
         def save(status,error=None):
             atomic_json(root/'campaign-results.json',records)
-            atomic_json(root/'coverage.json',coverage(records))
+            atomic_json(root/'coverage.json',coverage(records,bundle['order']))
             atomic_json(root/'comparisons.json',comparisons(records,plan))
             atomic_json(root/'status.json',{'status':status,'elapsed_seconds':time.monotonic()-started,'active_output':active['output'] if active else None,
-                'error':error,'coverage':coverage(records)})
+                'error':error,'coverage':coverage(records,bundle['order'])})
         def deadline():
             check_deadline(plan,time.monotonic()-started,plan['campaign_max_seconds'])
         def interrupted(signum,frame): raise InterruptedError('resource campaign signal '+str(signum)+'; terminating only owned episode child')
@@ -400,7 +413,7 @@ def execute(bundle, root):
                         'status':'failed','exit_code':record['exit_code'],'output':record['output'],'error':repr(exc)})
                     raise
             deadline();verify_bundle(bundle)
-            if coverage(records)['completed_valid_cohorts']!=64 or coverage(records)['usable_receipts']!=384:raise ValueError('required complete campaign coverage absent')
+            if coverage(records,bundle['order'])['completed_valid_cohorts']!=len(records) or coverage(records,bundle['order'])['usable_receipts']!=6*len(records):raise ValueError('required complete campaign coverage absent')
             atomic_json(root/'campaign-source-pins-after.json',bundle['snapshots'])
             # Final-only comparisons: no partial completed-only rankings or mixed-condition means.
             try:
@@ -409,14 +422,14 @@ def execute(bundle, root):
                 atomic_json(root/'plot-error.json',{'error':repr(exc),'note':'completed scientific records retained; charts can be regenerated offline'})
             deadline();verify_bundle(bundle)
             save('complete')
-            atomic_json(root/'campaign-complete.json',{'complete':True,'episodes':64,'receipts':384,'elapsed_seconds':time.monotonic()-started,
-                'source_pins_after':bundle['snapshots'],'coverage':coverage(records)})
+            atomic_json(root/'campaign-complete.json',{'complete':True,'episodes':len(records),'receipts':6*len(records),'elapsed_seconds':time.monotonic()-started,
+                'source_pins_after':bundle['snapshots'],'coverage':coverage(records,bundle['order'])})
             return records
         except BaseException as exc:
             if active is not None and active['status']=='running':active.update(status='failed',error=repr(exc))
             save('failed',repr(exc))
             atomic_json(root/'campaign-aborted.json',{'complete':False,'error':repr(exc),'elapsed_seconds':time.monotonic()-started,
-                'coverage':coverage(records),'failed_output':active['output'] if active else None})
+                'coverage':coverage(records,bundle['order']),'failed_output':active['output'] if active else None})
             raise
         finally:
             for sig,handler in previous.items():signal.signal(sig,handler)

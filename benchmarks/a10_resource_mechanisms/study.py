@@ -19,6 +19,11 @@ from .profiles import SOURCE, SCHEMA, duration_matched_budget
 def validate_plan(plan):
     if plan.get('schema') != 'a10_resource_study_v1':
         raise ValueError('explicit resource study schema required')
+    if plan.get('iteration') == 3:
+        from .heldout import validate_heldout_plan
+        validate_heldout_plan(plan)
+    elif plan.get('iteration') != 2:
+        raise ValueError('only declared resource iterations two and three are supported')
     check_deadline(plan)
     configs, conditions = plan['configurations'], plan['conditions']
     if not configs or not conditions or len({c['name'] for c in conditions}) != len(conditions):
@@ -53,7 +58,9 @@ def _spec(plan, config, *, name, role, chain, steps_per_epoch, index, calibratio
 def calibration_manifest(plan):
     validate_plan(plan)
     rows = []
-    for label, config in plan['configurations'].items():
+    labels = plan.get('configuration_order', list(plan['configurations']))
+    for label in labels:
+        config = plan['configurations'][label]
         for replica in range(plan['calibration_replicas']):
             rows.append(_spec(plan, config, name=f'{label}-cal-{replica}', role='calibration',
                 chain=None, steps_per_epoch=plan['calibration_steps_per_epoch'],
