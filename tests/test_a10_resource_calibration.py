@@ -253,13 +253,16 @@ def test_interrupt_cleans_up_owned_handle_and_writes_failure_without_real_dispat
     monkeypatch.setattr(module.lifecycle, "gpu_sample", lambda: gpu)
     monkeypatch.setattr(module.lifecycle, "make_settings", lambda *_: object())
     monkeypatch.setattr(module, "SchedulerClient", lambda _: SimpleNamespace(store=store))
-    def fake_start(_):
+    def fake_start(_, **kwargs):
         launches.append(True)
         return handle
     monkeypatch.setattr(module, "SubprocessExecutor", lambda _: SimpleNamespace(start=fake_start))
     monkeypatch.setattr(module, "ControlPlane", lambda _: object())
     monkeypatch.setattr(module, "process_snapshot", lambda: [{"pid": 12345, "start_ticks": 111}])
-    monkeypatch.setattr(module, "terminate_process_tree", lambda process: cleaned.append(process))
+    monkeypatch.setattr(module.context_isolation, "cleanup_owned", lambda handle, **kw: cleaned.append(handle.process))
+    monkeypatch.setattr(module.context_isolation, "qualification_gate", lambda *a, **kw: {})
+    monkeypatch.setattr(module.context_isolation, "prepare", lambda *a, **kw: ({}, {}))
+    monkeypatch.setattr(module.context_isolation, "associate", lambda *a, **kw: {})
     def fake_build(*a, **kwargs):
         work = kwargs["output"] / "fake-work"
         work.mkdir()
@@ -273,7 +276,7 @@ def test_interrupt_cleans_up_owned_handle_and_writes_failure_without_real_dispat
         return {"compute_apps": [], "gpu": gpu}
     monkeypatch.setattr(module, "collect_sample", fake_collect)
     with pytest.raises(InterruptedError):
-        module.calibrate(manifest, tmp_path / "manifest.json", {}, tmp_path / "output", 30.)
+        module.calibrate(manifest, tmp_path / "manifest.json", {}, tmp_path / "output", 30., visibility_qualification={})
     assert launches == [True] and cleaned == [handle.process]
     assert json.loads((tmp_path / "output/result.json").read_text())["exception"] == "InterruptedError"
 
@@ -285,7 +288,7 @@ def test_cli_refuses_existing_output_without_calling_calibration(tmp_path, monke
     output.mkdir()
     with pytest.raises(FileExistsError):
         module.main(["--manifest", str(tmp_path / "none"), "--settings", str(tmp_path / "none"),
-                     "--output", str(output), "--max-seconds", "1"])
+                     "--output", str(output), "--max-seconds", "1", "--visibility-qualification", str(tmp_path / "none")])
 
 
 def test_expired_deadline_aborts_before_any_gpu_probe(tmp_path, monkeypatch):

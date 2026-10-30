@@ -27,7 +27,7 @@ from ..a10_feedback_latency import run as lifecycle
 from ..a10_feedback_latency.receipts import receive
 from .manifest import RESOURCE_CLASSES, make_spec, resource_config
 from .profiles import fit_templates, positive
-from . import workloads
+from . import workloads, context_isolation
 
 GPU_LOCK_PATH = "/tmp/localml-a10-feedback-pilot.lock"
 
@@ -84,7 +84,7 @@ def process_snapshot(proc_root=Path("/proc")):
             # PID reuse can be inspected from the retained kernel start tick.
             stat = (directory / "stat").read_text().rsplit(")", 1)[1].split()
             records.append({"pid": pid, "ppid": parent, "nspid": aliases,
-                            "start_ticks": int(stat[19]), "name": fields.get("Name", "")})
+                            "start_ticks": int(stat[19]), "name": fields.get("Name", ""), "state": fields.get("State", "").split()[0]})
         except (FileNotFoundError, ProcessLookupError):
             continue  # A vanished task cannot still be an owned descendant.
         except (PermissionError, KeyError, ValueError, IndexError) as exc:
@@ -108,10 +108,12 @@ def compute_apps(gpu_uuid):
     return apps
 
 
-def verify_isolation(sample, *, gpu_uuid, root_pid=None):
+def verify_isolation(sample, *, gpu_uuid, root_pid=None, association=None):
     """Derive ownership from retained ancestry/NSpid; unknown GPU PIDs fail."""
     if sample["gpu"]["gpu_uuid"] != gpu_uuid:
         raise ValueError("GPU UUID changed during calibration")
+    if association is not None:
+        return context_isolation.audit_sample(sample, association)
     records = sample["process_snapshot"]
     by_pid = {row["pid"]: row for row in records}
     if len(by_pid) != len(records):
@@ -137,10 +139,10 @@ def verify_isolation(sample, *, gpu_uuid, root_pid=None):
 
 
 def collect_sample(gpu_uuid, *, root_pid=None, launch=None, latest=None, hardware_key=None,
-                   evidence_path=None):
+                   evidence_path=None, association=None, qualified_visibility=False):
     started = time.time()
     metadata = latest.metadata if latest is not None else {}
-    sample = {"sample_started_unix": started,
+    sample = {"sample_started_unix": started, "sample_started_monotonic": time.monotonic(),
         "root_pid": root_pid, "launch": launch, "hardware_key": hardware_key,
         "worker": {key: metadata.get(key) for key in (
             "runtime_global_step", "runtime_completion_identity", "trial_allocated_mb",
@@ -148,9 +150,22 @@ def collect_sample(gpu_uuid, *, root_pid=None, launch=None, latest=None, hardwar
         "worker_observed_unix": metadata.get("trial_memory_sampled_at")}
     try:
         sample["gpu"] = lifecycle.gpu_sample()
-        sample["compute_apps"] = compute_apps(gpu_uuid)
+        if association is None and not qualified_visibility:
+            sample["compute_apps"] = compute_apps(gpu_uuid)
+        else:
+            sample["process_snapshot_before"] = process_snapshot()
+            raw_query = context_isolation.visibility.query(gpu_uuid, time.monotonic() + 5)
+            sample["nvml_process_query"] = raw_query
+            sample["compute_apps"] = [{"gpu_uuid": gpu_uuid, "pid": pid} for pid in raw_query["compute_pids"]]
+            sample["mps_identity"] = context_isolation.visibility.mps_identity(association["mps_identity"]["path"]) if association is not None else None
+            if association is not None:
+                sample["context_association_sha256"] = context_isolation.canonical(association)
+                sample["window_eligible"] = bool(raw_query["compute_pids"])
+                if not sample["window_eligible"]:
+                    sample["drain_classification"] = "terminal_context_absent_or_zombie"
         sample["process_snapshot"] = process_snapshot()
-        sample["isolation_audit"] = verify_isolation(sample, gpu_uuid=gpu_uuid, root_pid=root_pid)
+        sample["sample_finished_monotonic"] = time.monotonic()
+        sample["isolation_audit"] = verify_isolation(sample, gpu_uuid=gpu_uuid, root_pid=root_pid, association=association)
         if sample["gpu"]["used_mib"] > sample["gpu"]["total_mib"] * .94:
             raise RuntimeError("calibration live GPU memory emergency cutoff")
         return sample
@@ -159,6 +174,7 @@ def collect_sample(gpu_uuid, *, root_pid=None, launch=None, latest=None, hardwar
         raise
     finally:
         sample["sample_finished_unix"] = time.time()
+        sample["sample_finished_monotonic"] = time.monotonic()
         if evidence_path is not None:
             with Path(evidence_path).open("a") as stream:
                 stream.write(json.dumps(sample, allow_nan=False) + "\n")
@@ -198,8 +214,10 @@ def _phase_costs(phase_history, signature, hardware_key):
 
 
 def extract_row(spec, *, hardware_key, gpu_uuid, samples, windows, launches,
-                events, phase_history, receipt, final_audit, pause, resources):
+                events, phase_history, receipt, final_audit, pause, resources, visibility_qualification=None):
     """Fail closed while turning retained raw evidence into fit_templates input."""
+    if "calibration_context_sentinel_bytes" in resources and visibility_qualification is None:
+        raise ValueError("instrumented calibration requires retained visibility qualification")
     signature = workloads.expected_signature(spec)
     if signature != spec["expected_runtime_signature"] or spec["template_key"] != workloads.template_key(spec):
         raise ValueError("frozen source/spec/signature mismatch")
@@ -233,6 +251,25 @@ def extract_row(spec, *, hardware_key, gpu_uuid, samples, windows, launches,
     phase_costs.update(startup=positive(lifecycle.timestamp(ready[0]["created_at"]) - launches[0]["launched_unix"]),
         resume=positive(lifecycle.timestamp(ready[1]["created_at"]) - launches[1]["launched_unix"]),
         pause=pause_seconds, delivery=positive(receipt["feedback_ready_unix"] - pause["job_finished_unix"], zero=True))
+    diagnostic_timing = []
+    if visibility_qualification is not None:
+        for index, event in enumerate(ready):
+            association = launches[index]["context_association"]
+            offset = association["request"]["issued_unix"] - association["request"]["issued_monotonic"]
+            begin = association["ready"]["ready_monotonic"] + offset
+            end = association["finished"]["released_monotonic"] + offset
+            launch_time = launches[index]["launched_unix"]
+            runner_ready = lifecycle.timestamp(event["created_at"])
+            if not launch_time <= begin <= end <= runner_ready:
+                raise ValueError("diagnostic wait is not contained in raw startup/resume")
+            raw = positive(runner_ready - launch_time)
+            wait = positive(end - begin, zero=True)
+            corrected = positive(raw - wait, zero=True)
+            phase_costs["startup" if index == 0 else "resume"] = corrected
+            diagnostic_timing.append({"launch": index, "launched_unix": launch_time, "runner_ready_unix": runner_ready,
+                "cuda_proof_ready_unix": begin, "worker_observed_release_unix": end,
+                "raw_seconds": raw, "diagnostic_wait_seconds": wait, "corrected_seconds": corrected,
+                "note": "Only synchronized CUDA-proof-ready to worker-observed release wait subtracted; CUDA init/nonce work retained conservatively."})
     for index, event in enumerate(ready):
         if event.get("payload", {}).get("global_step") != launches[index]["resume_step"]:
             raise ValueError("runner readiness does not match launch checkpoint position")
@@ -240,6 +277,17 @@ def extract_row(spec, *, hardware_key, gpu_uuid, samples, windows, launches,
         raise ValueError("validation phase count does not match frozen epochs")
     if not samples:
         raise ValueError("raw GPU process and allocator samples required")
+    if visibility_qualification is not None:
+        context_isolation.qualification_gate(visibility_qualification, gpu_uuid)
+        if resources.get("calibration_context_sentinel_bytes") != 8:
+            raise ValueError("retained calibration-only CUDA sentinel accounting missing")
+        if len({entry["context_association"]["request"]["nonce"] for entry in launches}) != 2:
+            raise ValueError("fresh context nonce required for each launch/resume")
+        for entry in launches:
+            association = entry["context_association"]
+            if association["root"] != {"pid": entry["pid"], "start_ticks": entry["pid_start_ticks"]}:
+                raise ValueError("context proof belongs to a different calibration launch")
+            context_isolation.audit_association(association, visibility_qualification, spec=spec, gpu_uuid=gpu_uuid)
     device_total = positive(samples[0]["gpu"]["total_mib"])
     for sample in samples:
         index = sample["launch"]
@@ -252,7 +300,8 @@ def extract_row(spec, *, hardware_key, gpu_uuid, samples, windows, launches,
             raise ValueError("owned worker PID was reused")
         if not launches[index]["launched_unix"] <= sample["sample_started_unix"] <= sample["sample_finished_unix"] <= launches[index]["exited_unix"]:
             raise ValueError("sample lies outside owning launch observation")
-        verify_isolation(sample, gpu_uuid=gpu_uuid, root_pid=sample["root_pid"])
+        verify_isolation(sample, gpu_uuid=gpu_uuid, root_pid=sample["root_pid"],
+            association=launches[index]["context_association"] if visibility_qualification is not None else None)
         if sample["gpu"]["name"] != "NVIDIA A10":
             raise ValueError("calibration hardware changed")
         if (sample["gpu"]["total_mib"] != device_total
@@ -268,6 +317,11 @@ def extract_row(spec, *, hardware_key, gpu_uuid, samples, windows, launches,
         if type(launch_index) is not int or launch_index not in (0, 1):
             raise ValueError("window launch identity invalid")
         launch = launches[launch_index]
+        if visibility_qualification is not None:
+            association = launch["context_association"]
+            offset = association["request"]["issued_unix"] - association["request"]["issued_monotonic"]
+            if window["started_at"] < association["eligible_after_monotonic"] + offset:
+                raise ValueError("update window overlaps context challenge or unacknowledged startup")
         start, end = window["start_step"], window["end_step"]
         begin, finish = positive(window["started_at"]), lifecycle.timestamp(window["finished_at"])
         if (window.get("complete") is not True or window.get("excludes_nonupdate_phases") is not True
@@ -309,7 +363,7 @@ def extract_row(spec, *, hardware_key, gpu_uuid, samples, windows, launches,
     if used_launches != {0, 1}:
         raise ValueError("fresh and resumed clean update windows required")
     def peak(field):
-        values = [sample["worker"].get(field) for sample in samples if sample["worker"].get(field) is not None]
+        values = [sample["worker"].get(field) for sample in samples if sample.get("window_eligible", True) and sample["worker"].get(field) is not None]
         if not values:
             raise ValueError("missing allocator peak evidence: " + field)
         return positive(max(positive(value, zero=True) for value in values))
@@ -323,17 +377,21 @@ def extract_row(spec, *, hardware_key, gpu_uuid, samples, windows, launches,
         "runtime_completion_identity": signature, "template_key": workloads.template_key(spec),
         "successful_updates": total, "windows": deepcopy(windows),
         "solo_process_isolation_verified": True,
-        "isolation_derivation": "every raw compute PID resolved to the sampled owned process tree or NSpid alias",
+        "isolation_derivation": ("empirical sampled association under NVML completeness; no kernel PID mapping" if visibility_qualification is not None
+                                 else "every raw compute PID resolved to the sampled owned process tree or NSpid alias"),
+        "context_instrumentation": ({"calibration_only_sentinel_bytes": 8, "allocator_overhead": "conservative measured allocated/reserved/device values retained without subtraction",
+            "challenge_outside_update_windows": True} if visibility_qualification is not None else None),
         "peak_allocated_mib": peak_allocated, "peak_reserved_mib": peak_reserved,
-        "peak_device_used_mib": positive(max(positive(s["gpu"]["used_mib"], zero=True) for s in samples)),
+        "peak_device_used_mib": positive(max(positive(s["gpu"]["used_mib"], zero=True) for s in samples if s.get("window_eligible", True))),
         "steady_allocated_mib": allocated, "steady_gpu_busy_percent": busy,
-        "phase_seconds": phase_costs,
+        "phase_seconds": phase_costs, "calibration_diagnostic_timing": diagnostic_timing,
         # Bind observation time to retained evidence so later replay is exact.
         "observed_at": datetime.fromtimestamp(receipt["feedback_ready_unix"], timezone.utc).isoformat(),
         "steady_sample_indices": selected, "raw_evidence_sha256": workloads.digest({
             "samples": samples, "windows": windows, "launches": launches, "events": events,
             "phase_history": phase_history, "pause": pause, "receipt": receipt,
-            "final_audit": final_audit, "resources": resources}),
+            "final_audit": final_audit, "resources": resources,
+            **({"visibility_qualification": visibility_qualification} if visibility_qualification is not None else {})}),
         "resource_accounting": deepcopy(resources),
         "source_identity": {"spec_sha256": spec["spec_sha256"], "source_sha256": spec["source_sha256"],
                             "source": workloads.source_metadata()}}
@@ -374,7 +432,7 @@ def _check_sources(snapshot, manifest, manifest_path):
     return after
 
 
-def calibrate(manifest, manifest_path, raw_settings, output, max_seconds):
+def calibrate(manifest, manifest_path, raw_settings, output, max_seconds, *, visibility_qualification=None):
     """Run dedicated workers only; retain diagnostics even when evidence fails."""
     positive(max_seconds)
     output, manifest_path = Path(output), Path(manifest_path)
@@ -406,7 +464,11 @@ def calibrate(manifest, manifest_path, raw_settings, output, max_seconds):
         hardware = lifecycle.gpu_sample()
         if hardware["used_mib"] > 512:
             raise RuntimeError("dedicated calibration requires initially idle GPU")
-        initial = collect_sample(hardware["gpu_uuid"], evidence_path=output / "idle-samples.jsonl")
+        if visibility_qualification is None:
+            raise ValueError("passing actual-host visibility qualification is required before calibration")
+        context_isolation.qualification_gate(visibility_qualification, hardware["gpu_uuid"], runtime=workloads.source_metadata(), live=True)
+        lifecycle.atomic_json(output / "visibility-qualification.json", visibility_qualification)
+        initial = collect_sample(hardware["gpu_uuid"], evidence_path=output / "idle-samples.jsonl", qualified_visibility=True)
         lifecycle.atomic_json(output / "initial-idle-evidence.json", initial)
         if initial["compute_apps"]:
             raise ValueError("GPU has compute applications before calibration")
@@ -433,13 +495,23 @@ def calibrate(manifest, manifest_path, raw_settings, output, max_seconds):
                 if time.monotonic() - job_started >= job_timeout:
                     raise TimeoutError("predeclared dedicated calibration job timeout before launch")
                 entry = {"launched_unix": time.time(), "resume_step": resume_step}
-                handle = executor.start(latest)
+                context_directory = work / ("context-launch-" + str(len(launches)))
+                context_deadline = context_isolation.bounded_context_deadline(started=started, job_started=job_started,
+                    max_seconds=max_seconds, job_timeout=job_timeout, absolute_unix=lifecycle.timestamp(manifest["deadline_utc"]))
+                context_evidence, context_env = context_isolation.prepare(context_directory, gpu_uuid=hardware["gpu_uuid"],
+                    spec=spec, qualification=visibility_qualification, deadline=context_deadline)
+                entry["launched_unix"] = time.time()
+                handle = executor.start(latest, extra_env=context_env)
                 try:
                     entry["pid"] = handle.process.pid
                     entry["pid_start_ticks"] = next(record["start_ticks"] for record in process_snapshot()
                                                       if record["pid"] == handle.process.pid)
-                except Exception:
-                    terminate_process_tree(handle.process)
+                    entry["context_association"] = context_isolation.associate(context_evidence, context_directory,
+                        handle=handle, root={"pid": entry["pid"], "start_ticks": entry["pid_start_ticks"]}, snapshot=process_snapshot,
+                        qualification=visibility_qualification, spec=spec, gpu_uuid=hardware["gpu_uuid"], deadline=context_deadline)
+                except BaseException:
+                    context_isolation.cleanup_owned(handle, snapshot=process_snapshot,
+                        root={"pid": entry.get("pid", handle.process.pid), "start_ticks": entry.get("pid_start_ticks", -1)}, association=context_evidence)
                     raise
                 launches.append(entry)
                 return handle
@@ -453,7 +525,7 @@ def calibrate(manifest, manifest_path, raw_settings, output, max_seconds):
                     latest = client.store.get_job(job.job_id)
                     sample = collect_sample(hardware["gpu_uuid"], root_pid=active.process.pid,
                         launch=len(launches) - 1, latest=latest, hardware_key=hardware_key,
-                        evidence_path=work / "samples.jsonl")
+                        evidence_path=work / "samples.jsonl", association=launches[-1]["context_association"])
                     samples.append(sample)
                     if sample["gpu"]["total_mib"] != hardware["total_mib"]:
                         raise ValueError("GPU device memory identity changed")
@@ -488,7 +560,8 @@ def calibrate(manifest, manifest_path, raw_settings, output, max_seconds):
                         break
                     time.sleep(.01)
             finally:
-                terminate_process_tree(active.process)
+                context_isolation.cleanup_owned(active, snapshot=process_snapshot,
+                    association=launches[-1].get("context_association") if launches else None)
                 active = None
                 lifecycle.atomic_json(work / "launches.json", launches)
                 lifecycle.atomic_json(work / "windows.json", windows)
@@ -499,7 +572,8 @@ def calibrate(manifest, manifest_path, raw_settings, output, max_seconds):
             audits[spec["name"]] = lifecycle.audit_checkpoint(spec, work, latest)
             evidence = {"samples": samples, "windows": windows, "launches": launches, "events": events,
                 "phase_history": phases, "pause": pause, "receipt": receipt, "final_audit": audits[spec["name"]],
-                "resources": json.loads((work / "working/shared_training/workload_resources.json").read_text())}
+                "resources": json.loads((work / "working/shared_training/workload_resources.json").read_text()),
+                "visibility_qualification": visibility_qualification}
             lifecycle.atomic_json(work / "raw-calibration-evidence.json", evidence)
             lifecycle.atomic_json(work / "receipt.json", receipt)
             lifecycle.atomic_json(work / "job-final.json", latest.to_dict())
@@ -509,7 +583,7 @@ def calibrate(manifest, manifest_path, raw_settings, output, max_seconds):
             lifecycle.atomic_json(output / "calibration-rows.json", rows)
             lifecycle.atomic_json(output / "validity-audits.json", audits)
             # The preceding worker has exited; require a clean idle process list before the next replica.
-            idle = collect_sample(hardware["gpu_uuid"], evidence_path=output / "idle-samples.jsonl")
+            idle = collect_sample(hardware["gpu_uuid"], evidence_path=output / "idle-samples.jsonl", qualified_visibility=True)
             lifecycle.atomic_json(work / "post-exit-idle-evidence.json", idle)
             if idle["compute_apps"]:
                 raise ValueError("compute process remains after dedicated worker exit")
@@ -526,7 +600,8 @@ def calibrate(manifest, manifest_path, raw_settings, output, max_seconds):
         return result
     except BaseException as exc:
         if active is not None:
-            terminate_process_tree(active.process)
+            context_isolation.cleanup_owned(active, snapshot=process_snapshot,
+                association=launches[-1].get("context_association") if launches else None)
         lifecycle.atomic_json(output / "result.json", {"complete": False, "kind": "dedicated_resource_calibration",
             "error": str(exc), "exception": type(exc).__name__, "traceback": traceback.format_exc(),
             "elapsed_seconds": time.monotonic() - started, "calibration_rows": rows})
@@ -539,12 +614,13 @@ def main(argv=None):
     parser.add_argument("--settings", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-seconds", type=float, required=True)
+    parser.add_argument("--visibility-qualification", type=Path, required=True)
     args = parser.parse_args(argv)
     positive(args.max_seconds)
     with controller_guard():
         args.output.mkdir(parents=True, exist_ok=False)
         calibrate(json.loads(args.manifest.read_text()), args.manifest, json.loads(args.settings.read_text()),
-                  args.output, args.max_seconds)
+                  args.output, args.max_seconds, visibility_qualification=json.loads(args.visibility_qualification.read_text()))
 
 
 if __name__ == "__main__":

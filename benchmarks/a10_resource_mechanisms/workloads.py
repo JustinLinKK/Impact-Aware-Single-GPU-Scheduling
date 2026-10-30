@@ -43,7 +43,7 @@ def file_hash(path):
 def source_metadata():
     return {"workload_version": VERSION,
             "package_pins": {name: file_hash(HERE / name) for name in
-                             ("__init__.py", "workloads.py", "candidate.py")},
+                             ("__init__.py", "workloads.py", "candidate.py", "context_isolation.py", "visibility_qualification.py")},
             "runner_sha256": file_hash(shared_training.__file__),
             "torch_version": torch.__version__}
 
@@ -302,7 +302,10 @@ def make_workload(spec, output_dir, context=None):
 
     def finalize(model, device):
         output_dir.mkdir(parents=True, exist_ok=True)
+        from .context_isolation import _SENTINEL
+        sentinel_bytes = _SENTINEL.numel() * _SENTINEL.element_size() if _SENTINEL is not None else 0
         report = {**model.resource_accounting(), "device": str(device),
+                  "calibration_context_sentinel_bytes": sentinel_bytes,
                   "data": cfg, "virtual_training_length": len(train),
                   "precision": training.precision, "workload_version": VERSION,
                   "spec_sha256": spec_digest(spec), "signature": expected_signature(spec)}

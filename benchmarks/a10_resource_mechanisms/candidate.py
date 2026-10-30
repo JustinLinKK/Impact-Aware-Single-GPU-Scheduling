@@ -13,7 +13,10 @@ def prepare_training():
     output = os.environ.get("A10_DESIGNED_OUTPUT", os.environ.get("A10_PILOT_OUTPUT"))
     if output is None:
         raise ValueError("A10_DESIGNED_OUTPUT or A10_PILOT_OUTPUT is required")
-    return make_workload(read_spec_env(), Path(output))
+    spec = read_spec_env()
+    from localml_scheduler.benchmarks.a10_resource_mechanisms.context_isolation import worker_challenge
+    worker_challenge(spec)
+    return make_workload(spec, Path(output))
 
 
 if __name__ == "__main__":
