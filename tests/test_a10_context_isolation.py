@@ -222,3 +222,37 @@ def test_saved_actual_pause_query_race_replays_without_rewriting_raw_evidence():
     result=c.audit_sample(x,a)
     assert result['window_eligible']is False and result['observed_compute_pids']==[3578593]
     assert fixture==original
+
+
+@pytest.mark.parametrize('case',['root_disappears','both_absent','root_reused','live_orphan','duplicate_root'])
+def test_wrapper_teardown_requires_terminal_worker_or_live_owned_ancestry(case):
+    a,q,s,records=association();x=sample(a,deepcopy(records));x['process_snapshot']=deepcopy(records)
+    x['process_snapshot'][1]['state']='Z'
+    if case=='root_disappears':x['process_snapshot']=x['process_snapshot'][1:]
+    elif case=='both_absent':x['process_snapshot']=[];x['process_snapshot_before']=[]
+    elif case=='root_reused':x['process_snapshot'][0]['start_ticks']+=1
+    elif case=='live_orphan':x['process_snapshot']=x['process_snapshot'][1:];x['process_snapshot'][0]['state']='R'
+    else:x['process_snapshot'].append(deepcopy(x['process_snapshot'][0]))
+    if case in ('root_reused','live_orphan','duplicate_root'):
+        with pytest.raises(ValueError):c.sample_lifecycle(x,a)
+    else:
+        x.update(window_eligible=False,drain_classification=c.sample_lifecycle(x,a))
+        assert c.audit_sample(x,a)['window_eligible']is False
+
+
+@pytest.mark.parametrize('visibility_pids',[[],[5001]])
+@pytest.mark.parametrize('before_terminal,after_terminal',[(False,False),(False,True),(True,True),(True,False)])
+def test_query_lifecycle_visibility_matrix(visibility_pids,before_terminal,after_terminal):
+    a,q,s,records=association();x=sample(a,deepcopy(records));x['process_snapshot']=deepcopy(records)
+    x['compute_apps']=[{'gpu_uuid':GPU,'pid':pid} for pid in visibility_pids]
+    x['nvml_process_query'].update(compute_pids=visibility_pids,raw_xml=xml(visibility_pids))
+    if before_terminal:x['process_snapshot_before']=[]
+    if after_terminal:x['process_snapshot']=[]
+    if (before_terminal and not after_terminal) or (not before_terminal and not after_terminal and not visibility_pids):
+        with pytest.raises(ValueError):c.sample_lifecycle(x,a)
+    else:
+        classification=c.sample_lifecycle(x,a)
+        x['window_eligible']=classification=='live'
+        if classification!='live':x['drain_classification']=classification
+        result=c.audit_sample(x,a)
+        assert (result.get('window_eligible',True))is (not after_terminal)

@@ -47,3 +47,12 @@ The actual saved query/association are retained unmodified in
 `tests/fixtures/a10_teardown_race.json`, with source-file SHA provenance. Focused
 CPU replay also injects excessive in-window terminal memory/busy values to ensure
 they cannot affect fitted sample indices, means or allocator/device peaks.
+
+The same pure collection/replay classifier handles wrapper exit and empty-query
+teardown: live/live plus the bound singleton is eligible; live/live plus empty
+visibility rejects. Live/terminal and terminal/terminal are ineligible whether
+NVML still reports the bound singleton or is already empty. Terminal/live always
+rejects. A root may be missing only on a terminal-worker side; every present root
+and worker must retain its birth identity, duplicate PID records reject, and every
+live worker must still satisfy full owned ancestry. Thus live orphan contexts
+cannot become drains merely because their wrapper disappeared.

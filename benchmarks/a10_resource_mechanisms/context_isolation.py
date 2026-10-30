@@ -89,12 +89,14 @@ def audit_association(value,qualification,*,spec,gpu_uuid,require_finished=True)
 def sample_lifecycle(sample,association):
     """Classify only the already-associated singleton; teardown never measures."""
     pids=[app['pid'] for app in sample['compute_apps']]
-    if not pids:return 'terminal_context_absent_or_zombie'
-    if pids!=[association['compute_pid']]:raise ValueError('unknown/extra GPU context during eligible calibration')
+    if pids not in ([],[association['compute_pid']]):raise ValueError('unknown/extra GPU context during eligible calibration')
     root,worker=association['root'],association['ready']
     states=[]
     for key in ('process_snapshot_before','process_snapshot'):
-        by,_=owned(sample[key],root)
+        by={row['pid']:row for row in sample[key]}
+        if len(by)!=len(sample[key]):raise ValueError('duplicate process identity during context teardown')
+        if root['pid'] in by and by[root['pid']]['start_ticks']!=root['start_ticks']:
+            raise ValueError('context launch root PID reused during query')
         row=by.get(worker['pid'])
         if row is not None and any(row[k]!=worker[k] for k in ('pid','ppid','start_ticks')):
             raise ValueError('context worker reused or ancestry changed during query')
@@ -102,6 +104,8 @@ def sample_lifecycle(sample,association):
         if not terminal:check_live(sample[key],root,worker)
         states.append(terminal)
     if states==[True,False]:raise ValueError('terminal context resurrected during query')
+    if states==[False,False] and not pids:raise ValueError('empty NVML while retained-sentinel worker still live')
+    if states==[True,True] and not pids:return 'terminal_context_absent_or_zombie'
     return ('known_context_terminal_transition' if states==[False,True] else
             'known_context_terminal_drain' if states==[True,True] else 'live')
 
@@ -113,15 +117,6 @@ def audit_sample(sample,association):
             or not sample['sample_started_monotonic']<=query['started_monotonic']<=query['finished_monotonic']<=sample['sample_finished_monotonic']
             or sample.get('mps_identity')!=association['mps_identity']):raise ValueError('raw eligible context query/MPS/clock mismatch')
     if any(app['gpu_uuid']!=sample['gpu']['gpu_uuid'] for app in sample['compute_apps']):raise ValueError('sample process GPU UUID mismatch')
-    if not pids:
-        if sample.get('window_eligible')is not False or sample.get('drain_classification')!='terminal_context_absent_or_zombie':
-            raise ValueError('empty visibility cannot be a live eligible sample')
-        for key in ('process_snapshot_before','process_snapshot'):
-            matches=[r for r in sample[key] if r['pid']==association['ready']['pid']]
-            if len(matches)>1 or any(r['start_ticks']!=association['ready']['start_ticks'] or r.get('state')!='Z' for r in matches):
-                raise ValueError('retained-sentinel worker still live or reused while NVML is empty')
-        if sample.get('context_association_sha256')!=canonical(association):raise ValueError('unbound terminal drain')
-        return {'observed_compute_pids':[],'window_eligible':False,'classification':'terminal_context_absent_or_zombie'}
     classification=sample_lifecycle(sample,association)
     if classification!='live':
         if (sample.get('window_eligible')is not False or sample.get('drain_classification')!=classification
