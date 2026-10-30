@@ -1,0 +1,18 @@
+{
+  "prediction": {
+    "mode": "ml_predictor",
+    "student_release_path": "/workspace/a10_feedback_pilot/predictor-release",
+    "student_model_path": "/workspace/a10_feedback_pilot/predictor-release/checkpoints/S_A10",
+    "conversion_timeout_seconds": 180,
+    "conversion_max_rss_mb": 8192,
+    "cpu_threads": 1
+  },
+  "gpu_scheduler": {
+    "mode": "parallel_time_aware",
+    "colocation": {
+      "cold_start_window_min_seconds": 1.0,
+      "cold_start_max_group_attempts": 2,
+      "cold_start_max_attempts": 3
+    }
+  }
+}

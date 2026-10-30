@@ -91,7 +91,7 @@ def phase_costs(service, job, now):
     return CompletionCosts(**values), "measured_serialized_phase_proxy"
 
 
-def evaluate_feedback_trial(service, trial, jobs, windows):
+def evaluate_feedback_trial(service, trial, jobs, windows, *, compare=compare_feedback_admission):
     result = {"admission_policy": FEEDBACK_POLICY, "decision": "inconclusive", "error": None}
     try:
         frozen = trial.cold_start["add_only"]["feedback"]
@@ -110,7 +110,7 @@ def evaluate_feedback_trial(service, trial, jobs, windows):
         queue = [j.job_id for j in sorted(cohort, key=lambda j: (timestamp(j.submitted_at), j.job_id))
                  if j.job_id not in trial.preexisting_job_ids]
         pre = trial.cold_start["add_only"]["pre_add"]
-        result = compare_feedback_admission(
+        result = compare(
             remaining=remaining, solo=solo, incumbents=trial.preexisting_job_ids,
             candidate=trial.candidate_job_id, queue=queue,
             pre_halves={j: [1 / number(s, positive=True) for s in halves] for j, halves in pre.items()},

@@ -12,6 +12,11 @@ ADD_ONLY_POLICY = "add_only_bounded_interference_v1"
 
 
 class AddOnlyTrialMixin:
+    def _score_feedback_admission(self, trial, jobs, windows):
+        """Explicit extension hook; default is the unchanged frozen v4 scorer."""
+        from .feedback_trials import evaluate_feedback_trial
+        return evaluate_feedback_trial(self, trial, jobs, windows)
+
     def _admission_phase_supported(self, trial):
         return trial.phase in {"prepare", "pre_add", "overlap_warmup", "measure_overlap"}
 
@@ -218,8 +223,7 @@ class AddOnlyTrialMixin:
             self._finish_cold_start_trial(trial, "inconclusive", "newcomer did not make enough optimizer progress")
             return True
         if state.get("feedback"):
-            from .feedback_trials import evaluate_feedback_trial
-            result = evaluate_feedback_trial(self, trial, jobs, windows)
+            result = self._score_feedback_admission(trial, jobs, windows)
             result.update(candidate_optimizer_progress=candidate_progress,
                           measurement_windows=windows,
                           common_measurement_interval={"started_at": common_start, "finished_at": common_end})
