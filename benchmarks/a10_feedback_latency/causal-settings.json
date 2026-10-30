@@ -1,0 +1,18 @@
+{
+  "gpu_scheduler": {
+    "colocation": {
+      "cold_start_max_attempts": 3,
+      "cold_start_max_group_attempts": 2,
+      "cold_start_window_min_seconds": 1.0
+    },
+    "mode": "parallel_time_aware"
+  },
+  "prediction": {
+    "conversion_max_rss_mb": 16384,
+    "conversion_timeout_seconds": 180,
+    "cpu_threads": 4,
+    "mode": "ml_predictor",
+    "student_model_path": "/workspace/a10_causal_iterations/predictor-release/checkpoints/S_A10",
+    "student_release_path": "/workspace/a10_causal_iterations/predictor-release"
+  }
+}

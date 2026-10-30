@@ -39,6 +39,8 @@ from .service import RevisedPilotService
 
 
 ARMS = ("reference_v4", "calibrated_v4", "calibrated_revised", "fixed_three")
+CAUSAL_ARMS = ("causal_v4_sync", "causal_v4_async", "causal_revised_sync",
+               "causal_revised_async", "causal_fixed_three")
 REFERENCE_COMMIT = "95b651d2e2a89599138c790ab4f9c1363f29e65f"
 STUDENT_SHA256 = "96d31d84d8d809c1ed9a4154f84389a3cb3b673d75445deb650cee4297398e03"
 
@@ -414,12 +416,29 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
     if hardware["used_mib"] > 512: raise RuntimeError("episode requires an otherwise idle A10")
     settings = make_settings(raw_settings, output, hardware)
     client = SchedulerClient(settings)
-    service = (RevisedPilotService(settings, store=client.store) if arm == "calibrated_revised"
-               else client.create_service())
+    causal = arm in CAUSAL_ARMS
+    fixed_three = arm in {"fixed_three", "causal_fixed_three"}
+    revised = arm in {"calibrated_revised", "causal_revised_sync", "causal_revised_async"}
+    asynchronous = arm in {"causal_v4_async", "causal_revised_async", "causal_fixed_three"}
+    if causal and asynchronous and not fixed_three:
+        from .async_preparation import AsyncRevisedService, AsyncV4Service
+        service = (AsyncRevisedService if revised else AsyncV4Service)(settings, store=client.store)
+    else:
+        service = (RevisedPilotService(settings, store=client.store) if revised else client.create_service())
+    supervisor_exit_observations, harness_exit_observations = [], {}
+    if causal:
+        original_record_exit = service.supervisor._record_process_exit
+        def record_exit(job_id, returncode):
+            observed = time.monotonic()
+            original_record_exit(job_id, returncode)
+            supervisor_exit_observations.append({"job_id": job_id, "returncode": returncode,
+                "observed_monotonic": observed,
+                "source": "supervisor_record_process_exit_entry_after_process_poll"})
+        service.supervisor._record_process_exit = record_exit
     predictor = service.planner.estimator.ml_predictor
     if not predictor or not predictor.available: raise ValueError("published A10 predictor unavailable")
     if predictor.artifact_hash != STUDENT_SHA256: raise ValueError("published S_A10 student hash mismatch")
-    if arm in {"calibrated_v4", "calibrated_revised"}:
+    if causal or arm in {"calibrated_v4", "calibrated_revised"}:
         service.planner.estimator.ml_predictor = CalibratedPredictor(predictor, calibration, client.store.hardware_key())
     elif predictor.artifact_hash != calibration["predictor_artifact_sha256"]:
         raise ValueError("reference artifact differs from dedicated calibration")
@@ -435,6 +454,14 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
     recording = RecordingPredictor(service.planner.estimator.ml_predictor,
         lambda job_id, profiles: atomic_json(works[names_by_id[job_id]] / "predicted-profiles.json", profiles))
     service.planner.estimator.ml_predictor = recording
+    preparation = None
+    if causal:
+        from .async_preparation import PreparedPredictor
+        preparation = PreparedPredictor(recording, asynchronous=asynchronous,
+            prepare_on_read=not asynchronous, hardware="A10")
+        service.planner.estimator.ml_predictor = preparation
+        if asynchronous and not fixed_three:
+            service.predictor_preparation = preparation
     if len(jobs) != 6: raise ValueError("frozen pilot requires exactly six evaluation jobs")
     parents = {s["chain"]: s["name"] for s in manifest["jobs"] if s["role"] == "parent"}
     children = {s["chain"]: s["name"] for s in manifest["jobs"] if s["role"] == "child"}
@@ -445,13 +472,15 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
     executor = SubprocessExecutor(settings)
     prediction_pool = ThreadPoolExecutor(max_workers=1) if arm == "fixed_three" else None
     prediction_futures, fixed_profiles = {}, {}
-    if arm != "fixed_three": service.start(background=True)
+    if not fixed_three: service.start(background=True)
     next_sample, group_child_release = 0., None
     try:
         while len(receipts) != len(jobs):
             elapsed = time.monotonic() - start
             check_deadline(manifest, elapsed, max_seconds)
             require_predictor_exposure(recording, jobs, specs)
+            if preparation is not None and preparation.failures:
+                raise RuntimeError("prediction preparation failed: " + str(preparation.failures))
             if mode == "group" and group_child_release is None and all(jobs[n].job_id in receipts for n in parents.values()):
                 group_child_release = max(receipts[jobs[n].job_id]["feedback_ready_monotonic"] for n in parents.values()) + 2.
             for name, spec in specs.items():
@@ -477,13 +506,15 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
                     "submitted_at": datetime.fromtimestamp(request["submitted_unix"], timezone.utc).isoformat()}
                 job = accept_job(client, job, accepted_unix)
                 submitted[name] = submission(spec, job, works[name], accepted_mono, accepted_unix)
+                if preparation is not None and asynchronous:
+                    preparation.enqueue(job, spec["batch"])
                 if prediction_pool is not None:
                     prediction_futures[name] = prediction_pool.submit(service.planner.estimator.predicted_profile,
                                                                       job, spec["batch"])
                 arrivals.append({"name": name, "due_seconds": due - start,
                                  "accepted_seconds": accepted_mono - start})
             current = {n: client.store.get_job(jobs[n].job_id) for n in submitted}
-            if arm == "fixed_three":
+            if fixed_three:
                 for name, handle in list(handles.items()):
                     code = handle.process.poll()
                     if code is not None:
@@ -491,9 +522,13 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
                         del handles[name]
                 pending = [n for n in submitted if n not in handles and n not in exit_codes]
                 for name in pending[:max(0, 3 - len(handles))]:
-                    future = prediction_futures[name]
-                    if not future.done(): break  # Strict FIFO head remains pending during charged conversion.
-                    fixed_profiles[name] = future.result()
+                    if preparation is not None:
+                        if not preparation.ready(jobs[name], specs[name]["batch"]): break
+                        fixed_profiles[name] = service.planner.estimator.predicted_profile(jobs[name], specs[name]["batch"])
+                    else:
+                        future = prediction_futures[name]
+                        if not future.done(): break  # Strict FIFO head remains pending during charged conversion.
+                        fixed_profiles[name] = future.result()
                     sample = gpu_sample()
                     running = {n: client.store.get_job(jobs[n].job_id) for n in handles}
                     if not fixed_fifo_fits(fixed_profiles[name], running, fixed_profiles,
@@ -510,7 +545,11 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
                     if name not in last_progress or step > last_progress[name]["step"]:
                         last_progress[name] = {"observed_seconds": elapsed, "step": step}
                 if latest.job_id in receipts: continue
-                code = exit_codes.get(name) if arm == "fixed_three" else service.supervisor.observed_exit_code(latest.job_id)
+                code = exit_codes.get(name) if fixed_three else service.supervisor.observed_exit_code(latest.job_id)
+                if code is not None and latest.status == JobStatus.COMPLETED:
+                    harness_exit_observations.setdefault(latest.job_id, {
+                        "observed_monotonic": time.monotonic(), "returncode": code,
+                        "source": "harness_observation_before_receipt_parse"})
                 receipt = receive(submitted[name], latest, code)
                 if receipt is not None:
                     receipts[latest.job_id] = receipt
@@ -528,9 +567,21 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
             time.sleep(.02)
         require_predictor_exposure(recording, jobs, specs, require_all=True)
     finally:
-        if arm != "fixed_three": service.stop()
+        if not fixed_three: service.stop()
         for handle in handles.values(): terminate_process_tree(handle.process)
         if prediction_pool is not None: prediction_pool.shutdown(wait=False, cancel_futures=True)
+        if causal:
+            atomic_json(output / "exit-observations.json", {
+                "episode_started_monotonic": start,
+                "supervisor_events_including_pause_exits": supervisor_exit_observations,
+                "completed_job_harness_observations": harness_exit_observations,
+                "note": "observations bound process exit from above; worker finished_at precedes OS exit"})
+        if preparation is not None:
+            stopped = preparation.stop(timeout=3.)
+            atomic_json(output / "preparation-timeline.json", {
+                "episode_started_monotonic": start, "asynchronous": asynchronous,
+                "worker_stopped": stopped, "events": preparation.events,
+                "failures": preparation.failures})
         atomic_json(output / "predictor-exposure.json", {"failures": recording.failures,
             "prediction_sources": dict(recording.last_sources), "prediction_errors": dict(recording.last_errors),
             "prepared_numeric_profiles": recording.records})
@@ -547,6 +598,11 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
     chains = {str(chain): receipts[jobs[children[chain]].job_id]["feedback_ready_monotonic"]
               - submitted[parents[chain]].accepted_monotonic for chain in range(3)}
     result = {"complete": True, "arm": arm, "mode": mode, "requestor": "colocated_python_controller",
+        "common_calibrated_profile_access": causal,
+        "harness_exit_observations": harness_exit_observations,
+        "preparation_treatment": ("acceptance_enqueued_serial_async" if asynchronous else
+            "first_demand_sync") if causal else "legacy_pilot",
+        "episode_started_monotonic": start,
         "transport": "local filesystem JSON read+parse+sha256 after actual successful worker exit",
         "episode_started_unix": start_unix, "episode_duration_seconds": result_ready - start,
         "pre_request_setup_seconds": start - setup_started,
@@ -564,9 +620,9 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
     result["prediction_sources"] = dict(service.planner.estimator.ml_predictor.last_sources)
     result["prediction_errors"] = dict(service.planner.estimator.ml_predictor.last_errors)
     result["policy_activation"] = policy_activation(client.store.list_events())
-    result["admission_policy_comparison_eligible"] = (arm == "fixed_three"
+    result["admission_policy_comparison_eligible"] = (fixed_three
         or result["policy_activation"]["actionable_forecasts"] > 0
-        or (arm == "calibrated_revised" and result["policy_activation"]["amortization_skips"] > 0))
+        or (revised and result["policy_activation"]["amortization_skips"] > 0))
     result["policy_activation_note"] = "zero actionable v4 forecasts are not evidence of a measured admission-policy comparison; legitimate revised skips are separate observable decisions"
     result["predictor_comparison_eligible"] = all(
         result["prediction_sources"].get(job.job_id) == "ml_predictor"
@@ -585,7 +641,7 @@ def main(argv=None):
     parser.add_argument("--settings", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--calibration", type=Path)
-    parser.add_argument("--arm", choices=ARMS, default="reference_v4")
+    parser.add_argument("--arm", choices=ARMS + CAUSAL_ARMS, default="reference_v4")
     parser.add_argument("--mode", choices=["individual", "group"], default="individual")
     parser.add_argument("--max-seconds", type=int, default=600)
     parser.add_argument("--deadline-utc", default="2026-10-30T03:10:00Z")

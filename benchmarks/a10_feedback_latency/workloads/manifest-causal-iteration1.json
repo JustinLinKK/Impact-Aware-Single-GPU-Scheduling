@@ -1,0 +1,1544 @@
+{
+  "additional_pins": [
+    {
+      "path": "core.py",
+      "sha256": "f2cd6b79d1583f79348e5703b5060cfa9fba4044e28702325d21466bbe2f387a"
+    },
+    {
+      "path": "candidate.py",
+      "sha256": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394"
+    },
+    {
+      "path": "__init__.py",
+      "sha256": "7afa16707e9e4693e599d3d9927fbcb75db3584031a3ae4aaf1b720e5ff55783"
+    },
+    {
+      "path": "split.json",
+      "sha256": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4"
+    },
+    {
+      "path": "archived_sources/runfile_8_3d50f893c4cf43028f9af38c37765b57_466bb1f3281f415c94b99bd12c940e95.py",
+      "sha256": "21d8a0ad9325e59a9e6d1b874fecb4729d7fb85d50d3727bdc4f08a3db99b680"
+    },
+    {
+      "path": "archived_sources/runfile_12_906d21c2c3d94fd9b9548d9e347f81bf_a5205b7432914787a48ff979e56e9238.py",
+      "sha256": "24e25318d5d5a8a0da6f17a29b3fac337b2b07fdf6c07c260e0f407e1e7c5765"
+    },
+    {
+      "path": "archived_sources/runfile_14_f9b8ac767dbc4aabbfec7c4c605c3f01_9fa58f88abcc44ac80bb4fc64924c03c.py",
+      "sha256": "fe01548d5030c583ad6b53fbdcdb9cfc456699ddda52abe9e6c12ad7c84e6b78"
+    },
+    {
+      "path": "archived_sources/runfile_16_1972bb9074714b178e006f9ac49b4e4a_2e743d8dca6d4c2ca8481fccee9aaafe.py",
+      "sha256": "b0bf0b804c672ceaf1aa74edc0674b26926f7b27fa1995baa34a45839c779348"
+    },
+    {
+      "path": "archived_sources/runfile_17_fa1e328d9d444f1495ace2c9e06d025d_0ea2b1e27f164ab6b9e5067d4485652a.py",
+      "sha256": "d66b131bea8029bcd0351d04109a55a349bfadd3bcb2e37a1fb83bc8cb4a9196"
+    },
+    {
+      "path": "archived_sources/runfile_18_d3592689440f405db83569d1aac13b1e_05899e6183be4b29ae9201fabadaa9f2.py",
+      "sha256": "831fe34887daa6a3edb753155c41082a8cb63a4143fca41c35ac098755473c85"
+    },
+    {
+      "path": "archived_sources/runfile_20_bff5e62dfbd34e049905945ed1527727_33a49f39328148faa1d95988406f1cc1.py",
+      "sha256": "23d3e2a858e9a78be9203625dcde05166968fd6c872b4c978e883ead66b439ae"
+    },
+    {
+      "path": "archived_sources/runfile_22_28041cb6f1ba409b949c6ba85dff301c_7019a04e6aea40c1ae0b14723af6ddaa.py",
+      "sha256": "1fc9bb2617098137eb2a36a192f5e1e72552a6ac75a7efc41d4871e5f05470ae"
+    }
+  ],
+  "budget_policy": "64 updates provisional; calibration-only shortening requires a NEW frozen manifest before evaluation",
+  "calibration": [
+    {
+      "batch": 16,
+      "chain": null,
+      "data_identity": {
+        "heldout_rows": 8192,
+        "images_manifest_sha256": "bcc17b68bd8c7723eb14f97b8a1aed32e2a8546b6804048fcce6fd92e3a71994",
+        "labels_sha256": "be333a83020cbdf12a6d6ba2e33abff25a18840603cc96be97c8adf2a712d6e3",
+        "schema": "histopathologic-cancer-data-v1",
+        "source_dataset": "Kaggle histopathologic-cancer-detection real 40960-image stratified subset",
+        "split_sha256": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4",
+        "subset_provenance_sha256": "68c8afafb6f2733d70ed7a0efb58143914367bf68856abd3a8346e3f5025b1f4",
+        "total_rows": 40960,
+        "training_rows": 32768,
+        "validation_class_counts": [
+          152,
+          104
+        ],
+        "validation_rows": 256
+      },
+      "env": {},
+      "epochs": 2,
+      "expected_runtime_signature": "4d981bc6bc35192471e38a9508c2c5e3360473493365920925d3a0fad5b9d379",
+      "image_size": 224,
+      "maximize": true,
+      "metadata": {
+        "archived_source": {
+          "original_archive_path": "/home/justin/MLEvolve/replay_model_sources/histopathologic-cancer-detection_20260704_212842/sources/runfile_8_3d50f893c4cf43028f9af38c37765b57_466bb1f3281f415c94b99bd12c940e95.py",
+          "path": "archived_sources/runfile_8_3d50f893c4cf43028f9af38c37765b57_466bb1f3281f415c94b99bd12c940e95.py",
+          "provenance": "archived agent source; prior archive probe/repair changes retained; not pristine original",
+          "sha256": "21d8a0ad9325e59a9e6d1b874fecb4729d7fb85d50d3727bdc4f08a3db99b680"
+        },
+        "constructed_dependency": false,
+        "deviations": [
+          "deterministic random initialization instead of pretrained/downloaded weights",
+          "IEEE FP32 instead of original mixed precision",
+          "shared_training.v1 synchronous map-style loop",
+          "fixed AdamW LR 0.0001 instead of original cosine schedule",
+          "bounded 2 epochs x 32 successful updates",
+          "pilot batch differs from original",
+          "fixed 256-image single-view validation; no test/submission or TTA",
+          "shared stratified 80/20 seed42 split; custom source22 original 90/10 split changed"
+        ],
+        "perfseer_model": {
+          "dataset_size": 32768,
+          "entry": "CandidateAdapter",
+          "epochs": 2,
+          "precision": "fp32_ieee",
+          "steps_per_epoch_by_batch": {
+            "16": 32
+          },
+          "workload_contract": {
+            "adapter": {
+              "batch_spec": {
+                "image": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    3,
+                    224,
+                    224
+                  ]
+                },
+                "target": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    1
+                  ]
+                }
+              },
+              "context": {
+                "channels_last": true,
+                "image_size": 224,
+                "lr": 0.0001,
+                "model_family": "efficientnet_b0",
+                "parameter_count": 4008829,
+                "seed": 42,
+                "trainable_parameter_count": 4008829,
+                "weight_decay": 1e-05
+              },
+              "scenario": {
+                "batch_size": 16
+              }
+            },
+            "entry": "CandidateAdapter",
+            "loss": {
+              "kind": "candidate_adapter_training_step"
+            },
+            "max_input_numel": 16000000,
+            "mode": "candidate_adapter",
+            "training": {
+              "backend": "pytorch_shared_training_v1",
+              "gradient_accumulation_steps": 1,
+              "optimizer": {
+                "amsgrad": false,
+                "betas": [
+                  0.9,
+                  0.999
+                ],
+                "eps": 1e-08,
+                "foreach": null,
+                "fused": null,
+                "lr": 0.0001,
+                "name": "adamw",
+                "weight_decay": 1e-05
+              },
+              "precision": "fp32_ieee",
+              "scheduler": {
+                "name": "none"
+              }
+            },
+            "version": "mlevolve.perfseer_workload.v1"
+          }
+        },
+        "preprocessing": {
+          "augmentation": "H/V flip, rotation90 custom/20 others, color jitter(.1,.1,.1,.05)",
+          "model_input_size": 224,
+          "native_size": 96,
+          "normalization": "ImageNet"
+        },
+        "returned_metric": "validation_auc",
+        "returned_metric_maximize": true,
+        "selection_metric_internal": "negative_validation_auc",
+        "trace_derivation": "TRACE-DERIVED"
+      },
+      "metric_name": "validation_auc",
+      "model_family": "efficientnet_b0",
+      "name": "source8_calibration_b16",
+      "package_pins": {
+        "__init__.py": "7afa16707e9e4693e599d3d9927fbcb75db3584031a3ae4aaf1b720e5ff55783",
+        "candidate.py": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+        "core.py": "f2cd6b79d1583f79348e5703b5060cfa9fba4044e28702325d21466bbe2f387a",
+        "split.json": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4"
+      },
+      "parameter_count": 4008829,
+      "role": "calibration",
+      "seed": 42,
+      "source": "candidate.py",
+      "source_id": 8,
+      "source_sha256": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+      "spec_sha256": "9c1dddfca8a267d458e4d4a5d36aa0299434e213f4ff6374af56a4aae0e8884e",
+      "steps_per_epoch": 32,
+      "trainable_parameter_count": 4008829,
+      "validation_size": 256
+    },
+    {
+      "batch": 32,
+      "chain": null,
+      "data_identity": {
+        "heldout_rows": 8192,
+        "images_manifest_sha256": "bcc17b68bd8c7723eb14f97b8a1aed32e2a8546b6804048fcce6fd92e3a71994",
+        "labels_sha256": "be333a83020cbdf12a6d6ba2e33abff25a18840603cc96be97c8adf2a712d6e3",
+        "schema": "histopathologic-cancer-data-v1",
+        "source_dataset": "Kaggle histopathologic-cancer-detection real 40960-image stratified subset",
+        "split_sha256": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4",
+        "subset_provenance_sha256": "68c8afafb6f2733d70ed7a0efb58143914367bf68856abd3a8346e3f5025b1f4",
+        "total_rows": 40960,
+        "training_rows": 32768,
+        "validation_class_counts": [
+          152,
+          104
+        ],
+        "validation_rows": 256
+      },
+      "env": {},
+      "epochs": 2,
+      "expected_runtime_signature": "fecceb1f0652c0c3e71d6b72cec31131e4e7d445f24ccb9cbbe6559ce12ce2f9",
+      "image_size": 224,
+      "maximize": true,
+      "metadata": {
+        "archived_source": {
+          "original_archive_path": "/home/justin/MLEvolve/replay_model_sources/histopathologic-cancer-detection_20260704_212842/sources/runfile_8_3d50f893c4cf43028f9af38c37765b57_466bb1f3281f415c94b99bd12c940e95.py",
+          "path": "archived_sources/runfile_8_3d50f893c4cf43028f9af38c37765b57_466bb1f3281f415c94b99bd12c940e95.py",
+          "provenance": "archived agent source; prior archive probe/repair changes retained; not pristine original",
+          "sha256": "21d8a0ad9325e59a9e6d1b874fecb4729d7fb85d50d3727bdc4f08a3db99b680"
+        },
+        "constructed_dependency": false,
+        "deviations": [
+          "deterministic random initialization instead of pretrained/downloaded weights",
+          "IEEE FP32 instead of original mixed precision",
+          "shared_training.v1 synchronous map-style loop",
+          "fixed AdamW LR 0.0001 instead of original cosine schedule",
+          "bounded 2 epochs x 32 successful updates",
+          "pilot batch differs from original",
+          "fixed 256-image single-view validation; no test/submission or TTA",
+          "shared stratified 80/20 seed42 split; custom source22 original 90/10 split changed"
+        ],
+        "perfseer_model": {
+          "dataset_size": 32768,
+          "entry": "CandidateAdapter",
+          "epochs": 2,
+          "precision": "fp32_ieee",
+          "steps_per_epoch_by_batch": {
+            "32": 32
+          },
+          "workload_contract": {
+            "adapter": {
+              "batch_spec": {
+                "image": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    3,
+                    224,
+                    224
+                  ]
+                },
+                "target": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    1
+                  ]
+                }
+              },
+              "context": {
+                "channels_last": true,
+                "image_size": 224,
+                "lr": 0.0001,
+                "model_family": "efficientnet_b0",
+                "parameter_count": 4008829,
+                "seed": 42,
+                "trainable_parameter_count": 4008829,
+                "weight_decay": 1e-05
+              },
+              "scenario": {
+                "batch_size": 32
+              }
+            },
+            "entry": "CandidateAdapter",
+            "loss": {
+              "kind": "candidate_adapter_training_step"
+            },
+            "max_input_numel": 16000000,
+            "mode": "candidate_adapter",
+            "training": {
+              "backend": "pytorch_shared_training_v1",
+              "gradient_accumulation_steps": 1,
+              "optimizer": {
+                "amsgrad": false,
+                "betas": [
+                  0.9,
+                  0.999
+                ],
+                "eps": 1e-08,
+                "foreach": null,
+                "fused": null,
+                "lr": 0.0001,
+                "name": "adamw",
+                "weight_decay": 1e-05
+              },
+              "precision": "fp32_ieee",
+              "scheduler": {
+                "name": "none"
+              }
+            },
+            "version": "mlevolve.perfseer_workload.v1"
+          }
+        },
+        "preprocessing": {
+          "augmentation": "H/V flip, rotation90 custom/20 others, color jitter(.1,.1,.1,.05)",
+          "model_input_size": 224,
+          "native_size": 96,
+          "normalization": "ImageNet"
+        },
+        "returned_metric": "validation_auc",
+        "returned_metric_maximize": true,
+        "selection_metric_internal": "negative_validation_auc",
+        "trace_derivation": "TRACE-DERIVED"
+      },
+      "metric_name": "validation_auc",
+      "model_family": "efficientnet_b0",
+      "name": "source8_calibration_b32",
+      "package_pins": {
+        "__init__.py": "7afa16707e9e4693e599d3d9927fbcb75db3584031a3ae4aaf1b720e5ff55783",
+        "candidate.py": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+        "core.py": "f2cd6b79d1583f79348e5703b5060cfa9fba4044e28702325d21466bbe2f387a",
+        "split.json": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4"
+      },
+      "parameter_count": 4008829,
+      "role": "calibration",
+      "seed": 42,
+      "source": "candidate.py",
+      "source_id": 8,
+      "source_sha256": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+      "spec_sha256": "edca68ee9ed6fc0f02cf36afd534f606e2446b91b92a558ecaddc854ee1dd08d",
+      "steps_per_epoch": 32,
+      "trainable_parameter_count": 4008829,
+      "validation_size": 256
+    },
+    {
+      "batch": 8,
+      "chain": null,
+      "data_identity": {
+        "heldout_rows": 8192,
+        "images_manifest_sha256": "bcc17b68bd8c7723eb14f97b8a1aed32e2a8546b6804048fcce6fd92e3a71994",
+        "labels_sha256": "be333a83020cbdf12a6d6ba2e33abff25a18840603cc96be97c8adf2a712d6e3",
+        "schema": "histopathologic-cancer-data-v1",
+        "source_dataset": "Kaggle histopathologic-cancer-detection real 40960-image stratified subset",
+        "split_sha256": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4",
+        "subset_provenance_sha256": "68c8afafb6f2733d70ed7a0efb58143914367bf68856abd3a8346e3f5025b1f4",
+        "total_rows": 40960,
+        "training_rows": 32768,
+        "validation_class_counts": [
+          152,
+          104
+        ],
+        "validation_rows": 256
+      },
+      "env": {},
+      "epochs": 2,
+      "expected_runtime_signature": "8941a323a5e14efca62df91313cbe661dbbe8cfc3f20c7445cbdb91162a03bad",
+      "image_size": 224,
+      "maximize": true,
+      "metadata": {
+        "archived_source": {
+          "original_archive_path": "/home/justin/MLEvolve/replay_model_sources/histopathologic-cancer-detection_20260704_212842/sources/runfile_12_906d21c2c3d94fd9b9548d9e347f81bf_a5205b7432914787a48ff979e56e9238.py",
+          "path": "archived_sources/runfile_12_906d21c2c3d94fd9b9548d9e347f81bf_a5205b7432914787a48ff979e56e9238.py",
+          "provenance": "archived agent source; prior archive probe/repair changes retained; not pristine original",
+          "sha256": "24e25318d5d5a8a0da6f17a29b3fac337b2b07fdf6c07c260e0f407e1e7c5765"
+        },
+        "constructed_dependency": false,
+        "deviations": [
+          "deterministic random initialization instead of pretrained/downloaded weights",
+          "IEEE FP32 instead of original mixed precision",
+          "shared_training.v1 synchronous map-style loop",
+          "fixed AdamW LR 0.0001 instead of original cosine schedule",
+          "bounded 2 epochs x 32 successful updates",
+          "pilot batch differs from original",
+          "fixed 256-image single-view validation; no test/submission or TTA",
+          "shared stratified 80/20 seed42 split; custom source22 original 90/10 split changed"
+        ],
+        "perfseer_model": {
+          "dataset_size": 32768,
+          "entry": "CandidateAdapter",
+          "epochs": 2,
+          "precision": "fp32_ieee",
+          "steps_per_epoch_by_batch": {
+            "8": 32
+          },
+          "workload_contract": {
+            "adapter": {
+              "batch_spec": {
+                "image": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    3,
+                    224,
+                    224
+                  ]
+                },
+                "target": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    1
+                  ]
+                }
+              },
+              "context": {
+                "channels_last": true,
+                "image_size": 224,
+                "lr": 0.0001,
+                "model_family": "convnext_tiny",
+                "parameter_count": 27820897,
+                "seed": 42,
+                "trainable_parameter_count": 27820897,
+                "weight_decay": 1e-05
+              },
+              "scenario": {
+                "batch_size": 8
+              }
+            },
+            "entry": "CandidateAdapter",
+            "loss": {
+              "kind": "candidate_adapter_training_step"
+            },
+            "max_input_numel": 16000000,
+            "mode": "candidate_adapter",
+            "training": {
+              "backend": "pytorch_shared_training_v1",
+              "gradient_accumulation_steps": 1,
+              "optimizer": {
+                "amsgrad": false,
+                "betas": [
+                  0.9,
+                  0.999
+                ],
+                "eps": 1e-08,
+                "foreach": null,
+                "fused": null,
+                "lr": 0.0001,
+                "name": "adamw",
+                "weight_decay": 1e-05
+              },
+              "precision": "fp32_ieee",
+              "scheduler": {
+                "name": "none"
+              }
+            },
+            "version": "mlevolve.perfseer_workload.v1"
+          }
+        },
+        "preprocessing": {
+          "augmentation": "H/V flip, rotation90 custom/20 others, color jitter(.1,.1,.1,.05)",
+          "model_input_size": 224,
+          "native_size": 96,
+          "normalization": "ImageNet"
+        },
+        "returned_metric": "validation_auc",
+        "returned_metric_maximize": true,
+        "selection_metric_internal": "negative_validation_auc",
+        "trace_derivation": "TRACE-DERIVED"
+      },
+      "metric_name": "validation_auc",
+      "model_family": "convnext_tiny",
+      "name": "source12_calibration_b8",
+      "package_pins": {
+        "__init__.py": "7afa16707e9e4693e599d3d9927fbcb75db3584031a3ae4aaf1b720e5ff55783",
+        "candidate.py": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+        "core.py": "f2cd6b79d1583f79348e5703b5060cfa9fba4044e28702325d21466bbe2f387a",
+        "split.json": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4"
+      },
+      "parameter_count": 27820897,
+      "role": "calibration",
+      "seed": 42,
+      "source": "candidate.py",
+      "source_id": 12,
+      "source_sha256": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+      "spec_sha256": "17019c9ea271bc513d76310794356edade4282528f9cdd9e51a2497b2231f8c1",
+      "steps_per_epoch": 32,
+      "trainable_parameter_count": 27820897,
+      "validation_size": 256
+    },
+    {
+      "batch": 16,
+      "chain": null,
+      "data_identity": {
+        "heldout_rows": 8192,
+        "images_manifest_sha256": "bcc17b68bd8c7723eb14f97b8a1aed32e2a8546b6804048fcce6fd92e3a71994",
+        "labels_sha256": "be333a83020cbdf12a6d6ba2e33abff25a18840603cc96be97c8adf2a712d6e3",
+        "schema": "histopathologic-cancer-data-v1",
+        "source_dataset": "Kaggle histopathologic-cancer-detection real 40960-image stratified subset",
+        "split_sha256": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4",
+        "subset_provenance_sha256": "68c8afafb6f2733d70ed7a0efb58143914367bf68856abd3a8346e3f5025b1f4",
+        "total_rows": 40960,
+        "training_rows": 32768,
+        "validation_class_counts": [
+          152,
+          104
+        ],
+        "validation_rows": 256
+      },
+      "env": {},
+      "epochs": 2,
+      "expected_runtime_signature": "ed0b38ff98eacc5a38234f2c4281078b483c92a263ce22adf3ca988a1fd57b19",
+      "image_size": 224,
+      "maximize": true,
+      "metadata": {
+        "archived_source": {
+          "original_archive_path": "/home/justin/MLEvolve/replay_model_sources/histopathologic-cancer-detection_20260704_212842/sources/runfile_12_906d21c2c3d94fd9b9548d9e347f81bf_a5205b7432914787a48ff979e56e9238.py",
+          "path": "archived_sources/runfile_12_906d21c2c3d94fd9b9548d9e347f81bf_a5205b7432914787a48ff979e56e9238.py",
+          "provenance": "archived agent source; prior archive probe/repair changes retained; not pristine original",
+          "sha256": "24e25318d5d5a8a0da6f17a29b3fac337b2b07fdf6c07c260e0f407e1e7c5765"
+        },
+        "constructed_dependency": false,
+        "deviations": [
+          "deterministic random initialization instead of pretrained/downloaded weights",
+          "IEEE FP32 instead of original mixed precision",
+          "shared_training.v1 synchronous map-style loop",
+          "fixed AdamW LR 0.0001 instead of original cosine schedule",
+          "bounded 2 epochs x 32 successful updates",
+          "pilot batch differs from original",
+          "fixed 256-image single-view validation; no test/submission or TTA",
+          "shared stratified 80/20 seed42 split; custom source22 original 90/10 split changed"
+        ],
+        "perfseer_model": {
+          "dataset_size": 32768,
+          "entry": "CandidateAdapter",
+          "epochs": 2,
+          "precision": "fp32_ieee",
+          "steps_per_epoch_by_batch": {
+            "16": 32
+          },
+          "workload_contract": {
+            "adapter": {
+              "batch_spec": {
+                "image": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    3,
+                    224,
+                    224
+                  ]
+                },
+                "target": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    1
+                  ]
+                }
+              },
+              "context": {
+                "channels_last": true,
+                "image_size": 224,
+                "lr": 0.0001,
+                "model_family": "convnext_tiny",
+                "parameter_count": 27820897,
+                "seed": 42,
+                "trainable_parameter_count": 27820897,
+                "weight_decay": 1e-05
+              },
+              "scenario": {
+                "batch_size": 16
+              }
+            },
+            "entry": "CandidateAdapter",
+            "loss": {
+              "kind": "candidate_adapter_training_step"
+            },
+            "max_input_numel": 16000000,
+            "mode": "candidate_adapter",
+            "training": {
+              "backend": "pytorch_shared_training_v1",
+              "gradient_accumulation_steps": 1,
+              "optimizer": {
+                "amsgrad": false,
+                "betas": [
+                  0.9,
+                  0.999
+                ],
+                "eps": 1e-08,
+                "foreach": null,
+                "fused": null,
+                "lr": 0.0001,
+                "name": "adamw",
+                "weight_decay": 1e-05
+              },
+              "precision": "fp32_ieee",
+              "scheduler": {
+                "name": "none"
+              }
+            },
+            "version": "mlevolve.perfseer_workload.v1"
+          }
+        },
+        "preprocessing": {
+          "augmentation": "H/V flip, rotation90 custom/20 others, color jitter(.1,.1,.1,.05)",
+          "model_input_size": 224,
+          "native_size": 96,
+          "normalization": "ImageNet"
+        },
+        "returned_metric": "validation_auc",
+        "returned_metric_maximize": true,
+        "selection_metric_internal": "negative_validation_auc",
+        "trace_derivation": "TRACE-DERIVED"
+      },
+      "metric_name": "validation_auc",
+      "model_family": "convnext_tiny",
+      "name": "source12_calibration_b16",
+      "package_pins": {
+        "__init__.py": "7afa16707e9e4693e599d3d9927fbcb75db3584031a3ae4aaf1b720e5ff55783",
+        "candidate.py": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+        "core.py": "f2cd6b79d1583f79348e5703b5060cfa9fba4044e28702325d21466bbe2f387a",
+        "split.json": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4"
+      },
+      "parameter_count": 27820897,
+      "role": "calibration",
+      "seed": 42,
+      "source": "candidate.py",
+      "source_id": 12,
+      "source_sha256": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+      "spec_sha256": "137274acdbc03e95e93d433656648493f61cf64f5be955f01a112b3ddff0b640",
+      "steps_per_epoch": 32,
+      "trainable_parameter_count": 27820897,
+      "validation_size": 256
+    }
+  ],
+  "calibration_model_groups": [
+    "efficientnet_b0",
+    "convnext_tiny"
+  ],
+  "data_identity": {
+    "heldout_rows": 8192,
+    "images_manifest_sha256": "bcc17b68bd8c7723eb14f97b8a1aed32e2a8546b6804048fcce6fd92e3a71994",
+    "labels_sha256": "be333a83020cbdf12a6d6ba2e33abff25a18840603cc96be97c8adf2a712d6e3",
+    "schema": "histopathologic-cancer-data-v1",
+    "source_dataset": "Kaggle histopathologic-cancer-detection real 40960-image stratified subset",
+    "split_sha256": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4",
+    "subset_provenance_sha256": "68c8afafb6f2733d70ed7a0efb58143914367bf68856abd3a8346e3f5025b1f4",
+    "total_rows": 40960,
+    "training_rows": 32768,
+    "validation_class_counts": [
+      152,
+      104
+    ],
+    "validation_rows": 256
+  },
+  "deadline_utc": "2026-10-30T15:00:00Z",
+  "dependency_semantics": "CONSTRUCTED three 2-job chains; no claimed historical causal edges",
+  "episode_timeout_seconds": 720,
+  "evaluation_cohorts": 20,
+  "evaluation_jobs": 120,
+  "evaluation_model_groups": [
+    "efficientnet_b4",
+    "convnext_small",
+    "custom_cnn"
+  ],
+  "experiment_series": "a10-causal-three-iterations",
+  "feedback_contract": "positive finite AUC maximize; negative AUC internal minimization; real-image BCE separate; both validation classes required",
+  "iteration": 1,
+  "job_timeout_seconds": 480,
+  "jobs": [
+    {
+      "batch": 16,
+      "chain": 0,
+      "data_identity": {
+        "heldout_rows": 8192,
+        "images_manifest_sha256": "bcc17b68bd8c7723eb14f97b8a1aed32e2a8546b6804048fcce6fd92e3a71994",
+        "labels_sha256": "be333a83020cbdf12a6d6ba2e33abff25a18840603cc96be97c8adf2a712d6e3",
+        "schema": "histopathologic-cancer-data-v1",
+        "source_dataset": "Kaggle histopathologic-cancer-detection real 40960-image stratified subset",
+        "split_sha256": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4",
+        "subset_provenance_sha256": "68c8afafb6f2733d70ed7a0efb58143914367bf68856abd3a8346e3f5025b1f4",
+        "total_rows": 40960,
+        "training_rows": 32768,
+        "validation_class_counts": [
+          152,
+          104
+        ],
+        "validation_rows": 256
+      },
+      "env": {},
+      "epochs": 2,
+      "expected_runtime_signature": "530b960885daf11e38df846301a844dc00a609d45143ecf0eff8b9e26f308db4",
+      "image_size": 380,
+      "maximize": true,
+      "metadata": {
+        "archived_source": {
+          "original_archive_path": "/home/justin/MLEvolve/replay_model_sources/histopathologic-cancer-detection_20260704_212842/sources/runfile_17_fa1e328d9d444f1495ace2c9e06d025d_0ea2b1e27f164ab6b9e5067d4485652a.py",
+          "path": "archived_sources/runfile_17_fa1e328d9d444f1495ace2c9e06d025d_0ea2b1e27f164ab6b9e5067d4485652a.py",
+          "provenance": "archived agent source; prior archive probe/repair changes retained; not pristine original",
+          "sha256": "d66b131bea8029bcd0351d04109a55a349bfadd3bcb2e37a1fb83bc8cb4a9196"
+        },
+        "constructed_dependency": true,
+        "deviations": [
+          "deterministic random initialization instead of pretrained/downloaded weights",
+          "IEEE FP32 instead of original mixed precision",
+          "shared_training.v1 synchronous map-style loop",
+          "fixed AdamW LR 0.0001 instead of original cosine schedule",
+          "bounded 2 epochs x 32 successful updates",
+          "pilot batch differs from original",
+          "fixed 256-image single-view validation; no test/submission or TTA",
+          "shared stratified 80/20 seed42 split; custom source22 original 90/10 split changed"
+        ],
+        "perfseer_model": {
+          "dataset_size": 32768,
+          "entry": "CandidateAdapter",
+          "epochs": 2,
+          "precision": "fp32_ieee",
+          "steps_per_epoch_by_batch": {
+            "16": 32
+          },
+          "workload_contract": {
+            "adapter": {
+              "batch_spec": {
+                "image": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    3,
+                    380,
+                    380
+                  ]
+                },
+                "target": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    1
+                  ]
+                }
+              },
+              "context": {
+                "channels_last": true,
+                "image_size": 380,
+                "lr": 0.0001,
+                "model_family": "efficientnet_b4",
+                "parameter_count": 17550409,
+                "seed": 42,
+                "trainable_parameter_count": 17550409,
+                "weight_decay": 1e-05
+              },
+              "scenario": {
+                "batch_size": 16
+              }
+            },
+            "entry": "CandidateAdapter",
+            "loss": {
+              "kind": "candidate_adapter_training_step"
+            },
+            "max_input_numel": 16000000,
+            "mode": "candidate_adapter",
+            "training": {
+              "backend": "pytorch_shared_training_v1",
+              "gradient_accumulation_steps": 1,
+              "optimizer": {
+                "amsgrad": false,
+                "betas": [
+                  0.9,
+                  0.999
+                ],
+                "eps": 1e-08,
+                "foreach": null,
+                "fused": null,
+                "lr": 0.0001,
+                "name": "adamw",
+                "weight_decay": 1e-05
+              },
+              "precision": "fp32_ieee",
+              "scheduler": {
+                "name": "none"
+              }
+            },
+            "version": "mlevolve.perfseer_workload.v1"
+          }
+        },
+        "preprocessing": {
+          "augmentation": "H/V flip, rotation90 custom/20 others, color jitter(.1,.1,.1,.05)",
+          "model_input_size": 380,
+          "native_size": 96,
+          "normalization": "ImageNet"
+        },
+        "returned_metric": "validation_auc",
+        "returned_metric_maximize": true,
+        "selection_metric_internal": "negative_validation_auc",
+        "trace_derivation": "TRACE-DERIVED"
+      },
+      "metric_name": "validation_auc",
+      "model_family": "efficientnet_b4",
+      "name": "source17_parent_b16",
+      "package_pins": {
+        "__init__.py": "7afa16707e9e4693e599d3d9927fbcb75db3584031a3ae4aaf1b720e5ff55783",
+        "candidate.py": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+        "core.py": "f2cd6b79d1583f79348e5703b5060cfa9fba4044e28702325d21466bbe2f387a",
+        "split.json": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4"
+      },
+      "parameter_count": 17550409,
+      "role": "parent",
+      "seed": 42,
+      "source": "candidate.py",
+      "source_id": 17,
+      "source_sha256": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+      "spec_sha256": "20e5b65edd9c6638c83d3616e98235575ebe66ef720eabf05a398d2de275215d",
+      "steps_per_epoch": 32,
+      "trainable_parameter_count": 17550409,
+      "validation_size": 256
+    },
+    {
+      "batch": 16,
+      "chain": 0,
+      "data_identity": {
+        "heldout_rows": 8192,
+        "images_manifest_sha256": "bcc17b68bd8c7723eb14f97b8a1aed32e2a8546b6804048fcce6fd92e3a71994",
+        "labels_sha256": "be333a83020cbdf12a6d6ba2e33abff25a18840603cc96be97c8adf2a712d6e3",
+        "schema": "histopathologic-cancer-data-v1",
+        "source_dataset": "Kaggle histopathologic-cancer-detection real 40960-image stratified subset",
+        "split_sha256": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4",
+        "subset_provenance_sha256": "68c8afafb6f2733d70ed7a0efb58143914367bf68856abd3a8346e3f5025b1f4",
+        "total_rows": 40960,
+        "training_rows": 32768,
+        "validation_class_counts": [
+          152,
+          104
+        ],
+        "validation_rows": 256
+      },
+      "env": {},
+      "epochs": 2,
+      "expected_runtime_signature": "8673dc9e1ae1886bae08746eccb288eecfd06348e39c798a8e2587cd23a6b6c7",
+      "image_size": 380,
+      "maximize": true,
+      "metadata": {
+        "archived_source": {
+          "original_archive_path": "/home/justin/MLEvolve/replay_model_sources/histopathologic-cancer-detection_20260704_212842/sources/runfile_20_bff5e62dfbd34e049905945ed1527727_33a49f39328148faa1d95988406f1cc1.py",
+          "path": "archived_sources/runfile_20_bff5e62dfbd34e049905945ed1527727_33a49f39328148faa1d95988406f1cc1.py",
+          "provenance": "archived agent source; prior archive probe/repair changes retained; not pristine original",
+          "sha256": "23d3e2a858e9a78be9203625dcde05166968fd6c872b4c978e883ead66b439ae"
+        },
+        "constructed_dependency": true,
+        "deviations": [
+          "deterministic random initialization instead of pretrained/downloaded weights",
+          "IEEE FP32 instead of original mixed precision",
+          "shared_training.v1 synchronous map-style loop",
+          "fixed AdamW LR 0.0001 instead of original cosine schedule",
+          "bounded 2 epochs x 32 successful updates",
+          "pilot batch differs from original",
+          "fixed 256-image single-view validation; no test/submission or TTA",
+          "shared stratified 80/20 seed42 split; custom source22 original 90/10 split changed"
+        ],
+        "perfseer_model": {
+          "dataset_size": 32768,
+          "entry": "CandidateAdapter",
+          "epochs": 2,
+          "precision": "fp32_ieee",
+          "steps_per_epoch_by_batch": {
+            "16": 32
+          },
+          "workload_contract": {
+            "adapter": {
+              "batch_spec": {
+                "image": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    3,
+                    380,
+                    380
+                  ]
+                },
+                "target": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    1
+                  ]
+                }
+              },
+              "context": {
+                "channels_last": true,
+                "image_size": 380,
+                "lr": 0.0001,
+                "model_family": "efficientnet_b4",
+                "parameter_count": 17550409,
+                "seed": 42,
+                "trainable_parameter_count": 17550409,
+                "weight_decay": 1e-05
+              },
+              "scenario": {
+                "batch_size": 16
+              }
+            },
+            "entry": "CandidateAdapter",
+            "loss": {
+              "kind": "candidate_adapter_training_step"
+            },
+            "max_input_numel": 16000000,
+            "mode": "candidate_adapter",
+            "training": {
+              "backend": "pytorch_shared_training_v1",
+              "gradient_accumulation_steps": 1,
+              "optimizer": {
+                "amsgrad": false,
+                "betas": [
+                  0.9,
+                  0.999
+                ],
+                "eps": 1e-08,
+                "foreach": null,
+                "fused": null,
+                "lr": 0.0001,
+                "name": "adamw",
+                "weight_decay": 1e-05
+              },
+              "precision": "fp32_ieee",
+              "scheduler": {
+                "name": "none"
+              }
+            },
+            "version": "mlevolve.perfseer_workload.v1"
+          }
+        },
+        "preprocessing": {
+          "augmentation": "H/V flip, rotation90 custom/20 others, color jitter(.1,.1,.1,.05)",
+          "model_input_size": 380,
+          "native_size": 96,
+          "normalization": "ImageNet"
+        },
+        "returned_metric": "validation_auc",
+        "returned_metric_maximize": true,
+        "selection_metric_internal": "negative_validation_auc",
+        "trace_derivation": "TRACE-DERIVED"
+      },
+      "metric_name": "validation_auc",
+      "model_family": "efficientnet_b4",
+      "name": "source20_child_b16",
+      "package_pins": {
+        "__init__.py": "7afa16707e9e4693e599d3d9927fbcb75db3584031a3ae4aaf1b720e5ff55783",
+        "candidate.py": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+        "core.py": "f2cd6b79d1583f79348e5703b5060cfa9fba4044e28702325d21466bbe2f387a",
+        "split.json": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4"
+      },
+      "parameter_count": 17550409,
+      "role": "child",
+      "seed": 42,
+      "source": "candidate.py",
+      "source_id": 20,
+      "source_sha256": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+      "spec_sha256": "fa0503fb402112baba9e0443645324b61ae500271b34077e2b6e68dac849c989",
+      "steps_per_epoch": 32,
+      "trainable_parameter_count": 17550409,
+      "validation_size": 256
+    },
+    {
+      "batch": 16,
+      "chain": 1,
+      "data_identity": {
+        "heldout_rows": 8192,
+        "images_manifest_sha256": "bcc17b68bd8c7723eb14f97b8a1aed32e2a8546b6804048fcce6fd92e3a71994",
+        "labels_sha256": "be333a83020cbdf12a6d6ba2e33abff25a18840603cc96be97c8adf2a712d6e3",
+        "schema": "histopathologic-cancer-data-v1",
+        "source_dataset": "Kaggle histopathologic-cancer-detection real 40960-image stratified subset",
+        "split_sha256": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4",
+        "subset_provenance_sha256": "68c8afafb6f2733d70ed7a0efb58143914367bf68856abd3a8346e3f5025b1f4",
+        "total_rows": 40960,
+        "training_rows": 32768,
+        "validation_class_counts": [
+          152,
+          104
+        ],
+        "validation_rows": 256
+      },
+      "env": {},
+      "epochs": 2,
+      "expected_runtime_signature": "c12a3ea00533a233970eb585e6f60609c696d2cae4739a5eb04880387af27b28",
+      "image_size": 224,
+      "maximize": true,
+      "metadata": {
+        "archived_source": {
+          "original_archive_path": "/home/justin/MLEvolve/replay_model_sources/histopathologic-cancer-detection_20260704_212842/sources/runfile_14_f9b8ac767dbc4aabbfec7c4c605c3f01_9fa58f88abcc44ac80bb4fc64924c03c.py",
+          "path": "archived_sources/runfile_14_f9b8ac767dbc4aabbfec7c4c605c3f01_9fa58f88abcc44ac80bb4fc64924c03c.py",
+          "provenance": "archived agent source; prior archive probe/repair changes retained; not pristine original",
+          "sha256": "fe01548d5030c583ad6b53fbdcdb9cfc456699ddda52abe9e6c12ad7c84e6b78"
+        },
+        "constructed_dependency": true,
+        "deviations": [
+          "deterministic random initialization instead of pretrained/downloaded weights",
+          "IEEE FP32 instead of original mixed precision",
+          "shared_training.v1 synchronous map-style loop",
+          "fixed AdamW LR 0.0001 instead of original cosine schedule",
+          "bounded 2 epochs x 32 successful updates",
+          "pilot batch differs from original",
+          "fixed 256-image single-view validation; no test/submission or TTA",
+          "shared stratified 80/20 seed42 split; custom source22 original 90/10 split changed"
+        ],
+        "perfseer_model": {
+          "dataset_size": 32768,
+          "entry": "CandidateAdapter",
+          "epochs": 2,
+          "precision": "fp32_ieee",
+          "steps_per_epoch_by_batch": {
+            "16": 32
+          },
+          "workload_contract": {
+            "adapter": {
+              "batch_spec": {
+                "image": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    3,
+                    224,
+                    224
+                  ]
+                },
+                "target": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    1
+                  ]
+                }
+              },
+              "context": {
+                "channels_last": true,
+                "image_size": 224,
+                "lr": 0.0001,
+                "model_family": "convnext_small",
+                "parameter_count": 49455457,
+                "seed": 42,
+                "trainable_parameter_count": 49455457,
+                "weight_decay": 1e-05
+              },
+              "scenario": {
+                "batch_size": 16
+              }
+            },
+            "entry": "CandidateAdapter",
+            "loss": {
+              "kind": "candidate_adapter_training_step"
+            },
+            "max_input_numel": 16000000,
+            "mode": "candidate_adapter",
+            "training": {
+              "backend": "pytorch_shared_training_v1",
+              "gradient_accumulation_steps": 1,
+              "optimizer": {
+                "amsgrad": false,
+                "betas": [
+                  0.9,
+                  0.999
+                ],
+                "eps": 1e-08,
+                "foreach": null,
+                "fused": null,
+                "lr": 0.0001,
+                "name": "adamw",
+                "weight_decay": 1e-05
+              },
+              "precision": "fp32_ieee",
+              "scheduler": {
+                "name": "none"
+              }
+            },
+            "version": "mlevolve.perfseer_workload.v1"
+          }
+        },
+        "preprocessing": {
+          "augmentation": "H/V flip, rotation90 custom/20 others, color jitter(.1,.1,.1,.05)",
+          "model_input_size": 224,
+          "native_size": 96,
+          "normalization": "ImageNet"
+        },
+        "returned_metric": "validation_auc",
+        "returned_metric_maximize": true,
+        "selection_metric_internal": "negative_validation_auc",
+        "trace_derivation": "TRACE-DERIVED"
+      },
+      "metric_name": "validation_auc",
+      "model_family": "convnext_small",
+      "name": "source14_parent_b16",
+      "package_pins": {
+        "__init__.py": "7afa16707e9e4693e599d3d9927fbcb75db3584031a3ae4aaf1b720e5ff55783",
+        "candidate.py": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+        "core.py": "f2cd6b79d1583f79348e5703b5060cfa9fba4044e28702325d21466bbe2f387a",
+        "split.json": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4"
+      },
+      "parameter_count": 49455457,
+      "role": "parent",
+      "seed": 42,
+      "source": "candidate.py",
+      "source_id": 14,
+      "source_sha256": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+      "spec_sha256": "8f133821a6d460c00b5310f8f56ba726a8821a7ac019a916ed7545dff4b38149",
+      "steps_per_epoch": 32,
+      "trainable_parameter_count": 49455457,
+      "validation_size": 256
+    },
+    {
+      "batch": 16,
+      "chain": 1,
+      "data_identity": {
+        "heldout_rows": 8192,
+        "images_manifest_sha256": "bcc17b68bd8c7723eb14f97b8a1aed32e2a8546b6804048fcce6fd92e3a71994",
+        "labels_sha256": "be333a83020cbdf12a6d6ba2e33abff25a18840603cc96be97c8adf2a712d6e3",
+        "schema": "histopathologic-cancer-data-v1",
+        "source_dataset": "Kaggle histopathologic-cancer-detection real 40960-image stratified subset",
+        "split_sha256": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4",
+        "subset_provenance_sha256": "68c8afafb6f2733d70ed7a0efb58143914367bf68856abd3a8346e3f5025b1f4",
+        "total_rows": 40960,
+        "training_rows": 32768,
+        "validation_class_counts": [
+          152,
+          104
+        ],
+        "validation_rows": 256
+      },
+      "env": {},
+      "epochs": 2,
+      "expected_runtime_signature": "8ac661bca98b4b512686fe0fdd0934e56363b95120d0cc1b280cd63f7dae39d0",
+      "image_size": 224,
+      "maximize": true,
+      "metadata": {
+        "archived_source": {
+          "original_archive_path": "/home/justin/MLEvolve/replay_model_sources/histopathologic-cancer-detection_20260704_212842/sources/runfile_16_1972bb9074714b178e006f9ac49b4e4a_2e743d8dca6d4c2ca8481fccee9aaafe.py",
+          "path": "archived_sources/runfile_16_1972bb9074714b178e006f9ac49b4e4a_2e743d8dca6d4c2ca8481fccee9aaafe.py",
+          "provenance": "archived agent source; prior archive probe/repair changes retained; not pristine original",
+          "sha256": "b0bf0b804c672ceaf1aa74edc0674b26926f7b27fa1995baa34a45839c779348"
+        },
+        "constructed_dependency": true,
+        "deviations": [
+          "deterministic random initialization instead of pretrained/downloaded weights",
+          "IEEE FP32 instead of original mixed precision",
+          "shared_training.v1 synchronous map-style loop",
+          "fixed AdamW LR 0.0001 instead of original cosine schedule",
+          "bounded 2 epochs x 32 successful updates",
+          "pilot batch differs from original",
+          "fixed 256-image single-view validation; no test/submission or TTA",
+          "shared stratified 80/20 seed42 split; custom source22 original 90/10 split changed"
+        ],
+        "perfseer_model": {
+          "dataset_size": 32768,
+          "entry": "CandidateAdapter",
+          "epochs": 2,
+          "precision": "fp32_ieee",
+          "steps_per_epoch_by_batch": {
+            "16": 32
+          },
+          "workload_contract": {
+            "adapter": {
+              "batch_spec": {
+                "image": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    3,
+                    224,
+                    224
+                  ]
+                },
+                "target": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    1
+                  ]
+                }
+              },
+              "context": {
+                "channels_last": true,
+                "image_size": 224,
+                "lr": 0.0001,
+                "model_family": "convnext_small",
+                "parameter_count": 49455457,
+                "seed": 42,
+                "trainable_parameter_count": 49455457,
+                "weight_decay": 1e-05
+              },
+              "scenario": {
+                "batch_size": 16
+              }
+            },
+            "entry": "CandidateAdapter",
+            "loss": {
+              "kind": "candidate_adapter_training_step"
+            },
+            "max_input_numel": 16000000,
+            "mode": "candidate_adapter",
+            "training": {
+              "backend": "pytorch_shared_training_v1",
+              "gradient_accumulation_steps": 1,
+              "optimizer": {
+                "amsgrad": false,
+                "betas": [
+                  0.9,
+                  0.999
+                ],
+                "eps": 1e-08,
+                "foreach": null,
+                "fused": null,
+                "lr": 0.0001,
+                "name": "adamw",
+                "weight_decay": 1e-05
+              },
+              "precision": "fp32_ieee",
+              "scheduler": {
+                "name": "none"
+              }
+            },
+            "version": "mlevolve.perfseer_workload.v1"
+          }
+        },
+        "preprocessing": {
+          "augmentation": "H/V flip, rotation90 custom/20 others, color jitter(.1,.1,.1,.05)",
+          "model_input_size": 224,
+          "native_size": 96,
+          "normalization": "ImageNet"
+        },
+        "returned_metric": "validation_auc",
+        "returned_metric_maximize": true,
+        "selection_metric_internal": "negative_validation_auc",
+        "trace_derivation": "TRACE-DERIVED"
+      },
+      "metric_name": "validation_auc",
+      "model_family": "convnext_small",
+      "name": "source16_child_b16",
+      "package_pins": {
+        "__init__.py": "7afa16707e9e4693e599d3d9927fbcb75db3584031a3ae4aaf1b720e5ff55783",
+        "candidate.py": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+        "core.py": "f2cd6b79d1583f79348e5703b5060cfa9fba4044e28702325d21466bbe2f387a",
+        "split.json": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4"
+      },
+      "parameter_count": 49455457,
+      "role": "child",
+      "seed": 42,
+      "source": "candidate.py",
+      "source_id": 16,
+      "source_sha256": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+      "spec_sha256": "70666b3be34c09267769c5f7a44811343330e5bd63530caae4c2ad1ede3aa0c8",
+      "steps_per_epoch": 32,
+      "trainable_parameter_count": 49455457,
+      "validation_size": 256
+    },
+    {
+      "batch": 64,
+      "chain": 2,
+      "data_identity": {
+        "heldout_rows": 8192,
+        "images_manifest_sha256": "bcc17b68bd8c7723eb14f97b8a1aed32e2a8546b6804048fcce6fd92e3a71994",
+        "labels_sha256": "be333a83020cbdf12a6d6ba2e33abff25a18840603cc96be97c8adf2a712d6e3",
+        "schema": "histopathologic-cancer-data-v1",
+        "source_dataset": "Kaggle histopathologic-cancer-detection real 40960-image stratified subset",
+        "split_sha256": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4",
+        "subset_provenance_sha256": "68c8afafb6f2733d70ed7a0efb58143914367bf68856abd3a8346e3f5025b1f4",
+        "total_rows": 40960,
+        "training_rows": 32768,
+        "validation_class_counts": [
+          152,
+          104
+        ],
+        "validation_rows": 256
+      },
+      "env": {},
+      "epochs": 2,
+      "expected_runtime_signature": "0e52805975734b8b376a731a2ea72cd195de85cc803125bd8565040ddf1a5b0b",
+      "image_size": 96,
+      "maximize": true,
+      "metadata": {
+        "archived_source": {
+          "original_archive_path": "/home/justin/MLEvolve/replay_model_sources/histopathologic-cancer-detection_20260704_212842/sources/runfile_22_28041cb6f1ba409b949c6ba85dff301c_7019a04e6aea40c1ae0b14723af6ddaa.py",
+          "path": "archived_sources/runfile_22_28041cb6f1ba409b949c6ba85dff301c_7019a04e6aea40c1ae0b14723af6ddaa.py",
+          "provenance": "archived agent source; prior archive probe/repair changes retained; not pristine original",
+          "sha256": "1fc9bb2617098137eb2a36a192f5e1e72552a6ac75a7efc41d4871e5f05470ae"
+        },
+        "constructed_dependency": true,
+        "deviations": [
+          "deterministic random initialization instead of pretrained/downloaded weights",
+          "IEEE FP32 instead of original mixed precision",
+          "shared_training.v1 synchronous map-style loop",
+          "fixed AdamW LR 0.0001 instead of original cosine schedule",
+          "bounded 2 epochs x 32 successful updates",
+          "pilot batch differs from original",
+          "fixed 256-image single-view validation; no test/submission or TTA",
+          "shared stratified 80/20 seed42 split; custom source22 original 90/10 split changed"
+        ],
+        "perfseer_model": {
+          "dataset_size": 32768,
+          "entry": "CandidateAdapter",
+          "epochs": 2,
+          "precision": "fp32_ieee",
+          "steps_per_epoch_by_batch": {
+            "64": 32
+          },
+          "workload_contract": {
+            "adapter": {
+              "batch_spec": {
+                "image": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    3,
+                    96,
+                    96
+                  ]
+                },
+                "target": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    1
+                  ]
+                }
+              },
+              "context": {
+                "channels_last": false,
+                "image_size": 96,
+                "lr": 0.0001,
+                "model_family": "custom_cnn",
+                "parameter_count": 4812801,
+                "seed": 42,
+                "trainable_parameter_count": 4812801,
+                "weight_decay": 1e-05
+              },
+              "scenario": {
+                "batch_size": 64
+              }
+            },
+            "entry": "CandidateAdapter",
+            "loss": {
+              "kind": "candidate_adapter_training_step"
+            },
+            "max_input_numel": 16000000,
+            "mode": "candidate_adapter",
+            "training": {
+              "backend": "pytorch_shared_training_v1",
+              "gradient_accumulation_steps": 1,
+              "optimizer": {
+                "amsgrad": false,
+                "betas": [
+                  0.9,
+                  0.999
+                ],
+                "eps": 1e-08,
+                "foreach": null,
+                "fused": null,
+                "lr": 0.0001,
+                "name": "adamw",
+                "weight_decay": 1e-05
+              },
+              "precision": "fp32_ieee",
+              "scheduler": {
+                "name": "none"
+              }
+            },
+            "version": "mlevolve.perfseer_workload.v1"
+          }
+        },
+        "preprocessing": {
+          "augmentation": "H/V flip, rotation90 custom/20 others, color jitter(.1,.1,.1,.05)",
+          "model_input_size": 96,
+          "native_size": 96,
+          "normalization": "0.5/0.5"
+        },
+        "returned_metric": "validation_auc",
+        "returned_metric_maximize": true,
+        "selection_metric_internal": "negative_validation_auc",
+        "trace_derivation": "TRACE-DERIVED"
+      },
+      "metric_name": "validation_auc",
+      "model_family": "custom_cnn",
+      "name": "source22_parent_b64",
+      "package_pins": {
+        "__init__.py": "7afa16707e9e4693e599d3d9927fbcb75db3584031a3ae4aaf1b720e5ff55783",
+        "candidate.py": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+        "core.py": "f2cd6b79d1583f79348e5703b5060cfa9fba4044e28702325d21466bbe2f387a",
+        "split.json": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4"
+      },
+      "parameter_count": 4812801,
+      "role": "parent",
+      "seed": 42,
+      "source": "candidate.py",
+      "source_id": 22,
+      "source_sha256": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+      "spec_sha256": "15f72c7b587c88a0af51c830615e1df8681b1a903dec9d58b2d8992605a6acb2",
+      "steps_per_epoch": 32,
+      "trainable_parameter_count": 4812801,
+      "validation_size": 256
+    },
+    {
+      "batch": 16,
+      "chain": 2,
+      "data_identity": {
+        "heldout_rows": 8192,
+        "images_manifest_sha256": "bcc17b68bd8c7723eb14f97b8a1aed32e2a8546b6804048fcce6fd92e3a71994",
+        "labels_sha256": "be333a83020cbdf12a6d6ba2e33abff25a18840603cc96be97c8adf2a712d6e3",
+        "schema": "histopathologic-cancer-data-v1",
+        "source_dataset": "Kaggle histopathologic-cancer-detection real 40960-image stratified subset",
+        "split_sha256": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4",
+        "subset_provenance_sha256": "68c8afafb6f2733d70ed7a0efb58143914367bf68856abd3a8346e3f5025b1f4",
+        "total_rows": 40960,
+        "training_rows": 32768,
+        "validation_class_counts": [
+          152,
+          104
+        ],
+        "validation_rows": 256
+      },
+      "env": {},
+      "epochs": 2,
+      "expected_runtime_signature": "11f08e38347d200024a8c5f9eb2e27a25aa717594bb62a21e9c10dd2c54c8a36",
+      "image_size": 224,
+      "maximize": true,
+      "metadata": {
+        "archived_source": {
+          "original_archive_path": "/home/justin/MLEvolve/replay_model_sources/histopathologic-cancer-detection_20260704_212842/sources/runfile_18_d3592689440f405db83569d1aac13b1e_05899e6183be4b29ae9201fabadaa9f2.py",
+          "path": "archived_sources/runfile_18_d3592689440f405db83569d1aac13b1e_05899e6183be4b29ae9201fabadaa9f2.py",
+          "provenance": "archived agent source; prior archive probe/repair changes retained; not pristine original",
+          "sha256": "831fe34887daa6a3edb753155c41082a8cb63a4143fca41c35ac098755473c85"
+        },
+        "constructed_dependency": true,
+        "deviations": [
+          "deterministic random initialization instead of pretrained/downloaded weights",
+          "IEEE FP32 instead of original mixed precision",
+          "shared_training.v1 synchronous map-style loop",
+          "fixed AdamW LR 0.0001 instead of original cosine schedule",
+          "bounded 2 epochs x 32 successful updates",
+          "pilot batch differs from original",
+          "fixed 256-image single-view validation; no test/submission or TTA",
+          "shared stratified 80/20 seed42 split; custom source22 original 90/10 split changed"
+        ],
+        "perfseer_model": {
+          "dataset_size": 32768,
+          "entry": "CandidateAdapter",
+          "epochs": 2,
+          "precision": "fp32_ieee",
+          "steps_per_epoch_by_batch": {
+            "16": 32
+          },
+          "workload_contract": {
+            "adapter": {
+              "batch_spec": {
+                "image": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    3,
+                    224,
+                    224
+                  ]
+                },
+                "target": {
+                  "dtype": "float32",
+                  "shape": [
+                    "$batch",
+                    1
+                  ]
+                }
+              },
+              "context": {
+                "channels_last": true,
+                "image_size": 224,
+                "lr": 0.0001,
+                "model_family": "convnext_small",
+                "parameter_count": 49455457,
+                "seed": 42,
+                "trainable_parameter_count": 49455457,
+                "weight_decay": 1e-05
+              },
+              "scenario": {
+                "batch_size": 16
+              }
+            },
+            "entry": "CandidateAdapter",
+            "loss": {
+              "kind": "candidate_adapter_training_step"
+            },
+            "max_input_numel": 16000000,
+            "mode": "candidate_adapter",
+            "training": {
+              "backend": "pytorch_shared_training_v1",
+              "gradient_accumulation_steps": 1,
+              "optimizer": {
+                "amsgrad": false,
+                "betas": [
+                  0.9,
+                  0.999
+                ],
+                "eps": 1e-08,
+                "foreach": null,
+                "fused": null,
+                "lr": 0.0001,
+                "name": "adamw",
+                "weight_decay": 1e-05
+              },
+              "precision": "fp32_ieee",
+              "scheduler": {
+                "name": "none"
+              }
+            },
+            "version": "mlevolve.perfseer_workload.v1"
+          }
+        },
+        "preprocessing": {
+          "augmentation": "H/V flip, rotation90 custom/20 others, color jitter(.1,.1,.1,.05)",
+          "model_input_size": 224,
+          "native_size": 96,
+          "normalization": "ImageNet"
+        },
+        "returned_metric": "validation_auc",
+        "returned_metric_maximize": true,
+        "selection_metric_internal": "negative_validation_auc",
+        "trace_derivation": "TRACE-DERIVED"
+      },
+      "metric_name": "validation_auc",
+      "model_family": "convnext_small",
+      "name": "source18_child_b16",
+      "package_pins": {
+        "__init__.py": "7afa16707e9e4693e599d3d9927fbcb75db3584031a3ae4aaf1b720e5ff55783",
+        "candidate.py": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+        "core.py": "f2cd6b79d1583f79348e5703b5060cfa9fba4044e28702325d21466bbe2f387a",
+        "split.json": "548cc18e09f283c5364ef4236d1da371efab19d25763f3b4ca5136e2617b1ff4"
+      },
+      "parameter_count": 49455457,
+      "role": "child",
+      "seed": 42,
+      "source": "candidate.py",
+      "source_id": 18,
+      "source_sha256": "97bfd5c03b8f436c94e98372fa8a4069cb236818232e4e7adb33cf13ec6d1394",
+      "spec_sha256": "816f588d92333b72372000287f41e2315a38164fec26b08ce0a4d3713ce44cc4",
+      "steps_per_epoch": 32,
+      "trainable_parameter_count": 49455457,
+      "validation_size": 256
+    }
+  ],
+  "phase_proxy": "calibration timings are proxies, not direct eval measurements; all arms share identical frozen calibration",
+  "schema": "a10-feedback-latency-workloads-v1",
+  "treatment_note": "same calibrated profiles in all five arms; synchronous first-demand vs acceptance-enqueued asynchronous preparation"
+}

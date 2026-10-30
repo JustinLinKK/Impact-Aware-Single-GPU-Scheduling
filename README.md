@@ -1,5 +1,10 @@
 # Impact-Aware Single-GPU Scheduling
 
+This research branch adds opt-in [A10 causal experiments](benchmarks/a10_feedback_latency/CAUSAL-ITERATIONS.md)
+to distinguish prediction preparation from admission decisions. The first
+iteration compares five common-calibration arms over 20 cohorts (120 jobs).
+These experiments do not change the default scheduler or promote a predictor.
+
 ## V4: opt-in request feedback latency
 
 This branch implements a shared admission scorer with two per-request policies:

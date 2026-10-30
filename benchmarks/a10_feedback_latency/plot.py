@@ -20,6 +20,9 @@ def episode_plot(output):
     fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True,
                              gridspec_kw={"height_ratios": [2, 1, 1, 1]})
     palette = plt.get_cmap("tab10")
+    preparation = output / "preparation-timeline.json"
+    prep = json.loads(preparation.read_text()) if preparation.exists() else {}
+    origin = result.get("episode_started_monotonic", prep.get("episode_started_monotonic"))
     for index, name in enumerate(names):
         color = palette(index % 10)
         seen = [(row["elapsed_seconds"], row["jobs"][name]) for row in rows if name in row["jobs"]]
@@ -31,8 +34,21 @@ def episode_plot(output):
         axes[1].step(times, steps, where="post", color=color, label=name)
         rates = [(steps[i] - steps[i - 1]) / (times[i] - times[i - 1]) for i in range(1, len(times))]
         axes[2].step(times[1:], rates, where="post", color=color)
-        memory = [(t, state["reserved_mib"]) for t, state in seen if state.get("reserved_mib") is not None]
+        memory = [(t, state["reserved_mib"] if state["status"] in {"RUNNING", "PAUSING"} else float("nan"))
+                  for t, state in seen if state.get("reserved_mib") is not None]
         if memory: axes[3].plot([x[0] for x in memory], [x[1] for x in memory], color=color, alpha=.6)
+        job_file = output / "jobs" / name / "job-final.json"
+        if origin is not None and job_file.exists():
+            job_id = json.loads(job_file.read_text())["job_id"]
+            for event in prep.get("events", []):
+                if event.get("job_id") == job_id and event.get("phase") == "end":
+                    a, b = event["started_monotonic_seconds"] - origin, event["ended_monotonic_seconds"] - origin
+                    axes[0].broken_barh([(a, b-a)], (index+.24, .18), facecolors="none",
+                                       edgecolors="black", hatch="////", linewidth=.5)
+            receipt = result.get("receipts", {}).get(job_id)
+            if receipt:
+                axes[0].scatter([receipt["feedback_ready_monotonic"] - origin], [index],
+                                marker="|", s=90, c="black", zorder=5)
     axes[0].set_yticks(range(len(names)), names, fontsize=8)
     axes[0].set_ylabel("Worker state")
     axes[1].set_ylabel("Successful updates")
@@ -42,7 +58,7 @@ def episode_plot(output):
     axes[3].set_ylabel("VRAM MiB")
     axes[3].set_xlabel("Seconds from first request acceptance")
     axes[3].legend(loc="upper left", fontsize=8)
-    axes[0].set_title(f"{result.get('arm', 'calibration')} / {result.get('mode', '')}: real worker timeline; sampled states")
+    axes[0].set_title(f"{result.get('arm', 'calibration')} / {result.get('mode', '')}: worker states; hatched=preparation, | = receipt")
     for axis in axes: axis.grid(alpha=.2)
     fig.tight_layout()
     target = output / "cohort-measurements.png"
@@ -63,7 +79,8 @@ def comparison_plot(root):
                        if len(part) > 1 and part[0] == "r" and part[1:].isdigit()), "repeat unknown")
         if "arm" in row: records.append({"path": str(path.relative_to(root)), "observed_repeat": repeat, **row})
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-    arms = ("reference_v4", "calibrated_v4", "calibrated_revised", "fixed_three")
+    protocol = root / "campaign-protocol-before.json"
+    arms = tuple(dict.fromkeys(r["arm"] for r in json.loads(protocol.read_text())["order"])) if protocol.exists() else tuple(dict.fromkeys(r["arm"] for r in records))
     for axis, mode in zip(axes, ("individual", "group")):
         for index, arm in enumerate(arms):
             matched = [r for r in records if r.get("complete") and r.get("predictor_comparison_eligible")

@@ -53,6 +53,8 @@ def main():
     parser.add_argument("--settings", type=Path,
         help="Exact experiment settings JSON; omitted only to reproduce the original one-thread proof")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--prepared-proxy-proof", action="store_true",
+        help="Verify synchronous/asynchronous cache paths expose the same real captured profile")
     args = parser.parse_args()
     if os.environ.get("CUDA_VISIBLE_DEVICES") != "":
         raise RuntimeError("run CPU proof with CUDA_VISIBLE_DEVICES='' before importing torch")
@@ -125,9 +127,32 @@ def main():
             if profile["hardware"] != "A10": raise ValueError("wrong target hardware")
             case.update(complete=True, profile=profile,
                         capture_audit=predictor._released.last_capture_audits.get(batch, {}))
+            if args.prepared_proxy_proof:
+                from .async_preparation import PreparedPredictor
+                from .calibration import RecordingPredictor
+                common = RecordingPredictor(predictor, lambda *_: None)
+                sync = PreparedPredictor(common, asynchronous=False, prepare_on_read=True)
+                asynchronous = PreparedPredictor(common, asynchronous=True)
+                try:
+                    sync_profile = sync.predict_profile_options(job, [batch])[batch]
+                    asynchronous.enqueue(job, batch)
+                    bound = time.monotonic() + 10.
+                    while not asynchronous.ready(job, batch) and time.monotonic() < bound:
+                        if asynchronous.failures: raise ValueError(str(asynchronous.failures))
+                        time.sleep(.01)
+                    async_profile = asynchronous.predict_profile_options(job, [batch])[batch]
+                    if sync_profile != profile or async_profile != profile:
+                        raise ValueError("prepared proxy changed the real numeric profile")
+                    case["prepared_proxy_proof"] = {"complete": True, "profile_equality": True,
+                        "sync_events": sync.events, "async_events": asynchronous.events,
+                        "scope": "same frozen captured profile; cache paths only, not scheduler evaluation"}
+                finally:
+                    sync.stop(timeout=1.)
+                    if not asynchronous.stop(timeout=1.):
+                        raise RuntimeError("preflight preparation worker did not stop")
             atomic_json(work / "cpu-prepared-profile.json", case)
         except Exception:
-            case.update(error=traceback.format_exc(), predictor_errors=dict(predictor.last_errors))
+            case.update(complete=False, error=traceback.format_exc(), predictor_errors=dict(predictor.last_errors))
         finally:
             stop.set(); watcher.join(timeout=2)
             case.update(elapsed_seconds=time.monotonic() - started, child_peak_rss_mib=peaks,

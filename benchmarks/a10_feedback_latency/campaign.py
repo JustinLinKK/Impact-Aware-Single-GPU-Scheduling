@@ -11,14 +11,14 @@ import time
 
 from ...execution.process_utils import terminate_process_tree
 from .plot import comparison_plot
-from .run import ARMS, atomic_json, check_deadline, file_hash, source_snapshot, with_hard_deadline
+from .run import ARMS, CAUSAL_ARMS, atomic_json, check_deadline, file_hash, source_snapshot, with_hard_deadline
 
 
-def episode_order():
+def episode_order(arms=ARMS):
     return [{"repeat": repeat + 1, "mode": mode, "arm": arm}
             for repeat in range(2)
             for mode in (("individual", "group") if repeat == 0 else ("group", "individual"))
-            for arm in (ARMS if repeat == 0 else tuple(reversed(ARMS)))]
+            for arm in (arms if repeat == 0 else tuple(reversed(arms)))]
 
 
 def main(argv=None):
@@ -30,6 +30,8 @@ def main(argv=None):
     parser.add_argument("--episode-max-seconds", type=int, default=600)
     parser.add_argument("--campaign-max-seconds", type=int, default=7200)
     parser.add_argument("--deadline-utc", default="2026-10-30T03:10:00Z")
+    parser.add_argument("--causal-iteration-one", action="store_true",
+                        help="Five common-calibration preparation-ablation arms, 20 cohorts")
     args = parser.parse_args(argv)
     def interrupted(signum, frame):
         raise InterruptedError("campaign terminated; cleaning up the owned episode child")
@@ -40,7 +42,8 @@ def main(argv=None):
     check_deadline(manifest)
     before = source_snapshot(manifest, manifest_path)
     root.mkdir(parents=True, exist_ok=False)
-    frozen = {"order": episode_order(), "source_pins": before,
+    frozen = {"order": episode_order(CAUSAL_ARMS if args.causal_iteration_one else ARMS), "source_pins": before,
+        "causal_iteration_one": args.causal_iteration_one,
         "settings_sha256": file_hash(args.settings), "calibration_sha256": file_hash(args.calibration),
         "episode_max_seconds": args.episode_max_seconds, "campaign_max_seconds": args.campaign_max_seconds,
         "effective_deadline_utc": manifest["deadline_utc"],
