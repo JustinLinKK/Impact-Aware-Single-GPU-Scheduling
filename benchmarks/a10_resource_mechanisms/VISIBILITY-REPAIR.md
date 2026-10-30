@@ -20,7 +20,7 @@ Calibrate now requires `--visibility-qualification /path/qualification-proof.jso
 
 The calibration-only context sentinel is exactly one int64 (8logical bytes), retained until worker exit. Actual workload_resources.json records it. Raw allocated/reserved/device measurements are preserved without subtraction; templates conservatively retain any allocator overhead. The8MiB standalone qualification probe allocation is absent from calibration/evaluation. Evaluation has no context-challenge environment and no sentinel; its workload/data/budget recipe is unchanged.
 
-Once training is released, eligible samples must retain the same singleton NVML association and live source-owned process birth in both process snapshots. An empty NVML list while that worker remains live rejects. An empty list is allowed only as explicitly classified terminal-context drain with the source-owned process absent or same-birth zombie in both snapshots. Drain/startup evidence stays raw and **cannot enter any fit peak or update-window aggregate**. Missing eligible evidence rejects instead of inventing measurements.
+Once training is released, eligible samples must retain the same singleton NVML association and live source-owned process birth in both process snapshots. An empty NVML list while that worker remains live rejects. An empty list is allowed only as an explicitly ineligible terminal transition or drain, with the source-owned worker absent or a same-birth zombie in the final snapshot and no terminal-to-live resurrection. Drain/startup evidence stays raw and **cannot enter any fit peak or update-window aggregate**. Missing eligible evidence rejects instead of inventing measurements.
 
 ## Diagnostic timing and replay
 
@@ -37,7 +37,7 @@ and `job_paused` events preceded this query. This is retained as a terminal
 transition, never a usable measurement. A known stale singleton with both worker
 snapshots terminal is similarly retained only as a drain, with unchanged launch
 root and previous context binding. Unknown/extra NVML PIDs, worker/root PID reuse,
-changed parent identity, terminal-to-live resurrection, and live-empty visibility
+changed live-worker parent identity, terminal-to-live resurrection, and live-empty visibility
 still reject. No measurement window or peak may use either terminal class, and a
 terminal sample cannot satisfy a window's required valid sample coverage. Normal
 pause exit-zero/checkpoint and complete-budget receipt audits remain mandatory;
@@ -56,3 +56,8 @@ rejects. A root may be missing only on a terminal-worker side; every present roo
 and worker must retain its birth identity, duplicate PID records reject, and every
 live worker must still satisfy full owned ancestry. Thus live orphan contexts
 cannot become drains merely because their wrapper disappeared.
+
+A same-birth zombie may have been reparented during ordinary Linux teardown; its
+current parent PID is not required to match its former live parent. This remains
+ineligible evidence. Every live worker still requires the original parent PID
+and current owned ancestry; a reused root or worker PID always rejects.

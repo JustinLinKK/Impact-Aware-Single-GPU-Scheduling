@@ -98,8 +98,8 @@ def sample_lifecycle(sample,association):
         if root['pid'] in by and by[root['pid']]['start_ticks']!=root['start_ticks']:
             raise ValueError('context launch root PID reused during query')
         row=by.get(worker['pid'])
-        if row is not None and any(row[k]!=worker[k] for k in ('pid','ppid','start_ticks')):
-            raise ValueError('context worker reused or ancestry changed during query')
+        if row is not None and any(row[k]!=worker[k] for k in ('pid','start_ticks')):
+            raise ValueError('context worker PID reused during query')
         terminal=row is None or row.get('state')=='Z'
         if not terminal:check_live(sample[key],root,worker)
         states.append(terminal)

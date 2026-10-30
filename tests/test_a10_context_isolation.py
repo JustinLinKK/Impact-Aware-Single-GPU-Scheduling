@@ -203,7 +203,7 @@ def test_teardown_does_not_mask_identity_or_visibility_errors(mutation):
     a,q,s,records=association();x=sample(a,deepcopy(records));x['process_snapshot']=deepcopy(records)
     x['process_snapshot'][1]['state']='Z'
     if mutation=='birth':x['process_snapshot'][1]['start_ticks']+=1
-    elif mutation=='ancestry':x['process_snapshot'][1]['ppid']=999
+    elif mutation=='ancestry':x['process_snapshot'][1].update(ppid=999,state='R')
     elif mutation=='unknown':x['compute_apps'][0]['pid']=999
     elif mutation=='extra':x['compute_apps'].append({'pid':999})
     elif mutation=='resurrection':x['process_snapshot_before'][1]['state']='Z';x['process_snapshot'][1]['state']='R'
@@ -256,3 +256,15 @@ def test_query_lifecycle_visibility_matrix(visibility_pids,before_terminal,after
         if classification!='live':x['drain_classification']=classification
         result=c.audit_sample(x,a)
         assert (result.get('window_eligible',True))is (not after_terminal)
+
+
+@pytest.mark.parametrize('root_state',['absent','Z'])
+def test_same_birth_zombie_reparenting_is_only_ineligible_teardown(root_state):
+    a,q,s,records=association();x=sample(a,deepcopy(records));x['process_snapshot']=deepcopy(records)
+    x['process_snapshot'][1].update(state='Z',ppid=1)
+    if root_state=='absent':x['process_snapshot']=x['process_snapshot'][1:]
+    else:x['process_snapshot'][0]['state']='Z'
+    x.update(window_eligible=False,drain_classification=c.sample_lifecycle(x,a))
+    assert c.audit_sample(x,a)['window_eligible']is False
+    x['process_snapshot'][-1]['state']='R'
+    with pytest.raises(ValueError):c.sample_lifecycle(x,a)
