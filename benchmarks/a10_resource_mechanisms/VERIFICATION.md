@@ -6,6 +6,11 @@ Checked locally on October 30, 2026, before any iteration-2 GPU dispatch.
   campaign, study manifests, calibration evidence/cleanup, profile identities,
   and bounded measurement windows. The expensive CPU subprocess integration
   was excluded from this repeated run because it had already passed separately.
+- Calibration replay now uses the recorded feedback-ready timestamp rather than
+  the verification clock. A regression check confirms identical rows and fitted
+  tables when the same retained evidence is verified later. The four affected
+  resource suites passed 92 checks, with the previously verified real CPU
+  subprocess integration excluded; the nine window-bound checks passed separately.
 - The full campaign auditor passed a real six-worker CPU episode using the
   incremental policy, exact two-epoch budgets and two causal brackets. All GPU
   readings in that test were explicitly labeled fixtures, with CUDA disabled.

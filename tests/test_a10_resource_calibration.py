@@ -79,6 +79,20 @@ def evidence():
         "final_audit": {"all_adamw_steps": 64, "global_step": 64}}
 
 
+def test_extraction_replays_identically_after_wall_clock_changes(monkeypatch):
+    spec, raw = evidence()
+    monkeypatch.setattr(module, "utc_now", lambda: iso(200.))
+    original = module.extract_row(spec, **raw)
+    monkeypatch.setattr(module, "utc_now", lambda: iso(2000.))
+    replayed = module.extract_row(spec, **raw)
+    assert original == replayed
+    assert original["observed_at"] == iso(raw["receipt"]["feedback_ready_unix"])
+    source = {"fixture_only": True}
+    assert fit_templates([original], hardware_key="fixture-hardware", gpu_uuid="fixture-uuid",
+                         source_identity=source) == fit_templates(
+        [replayed], hardware_key="fixture-hardware", gpu_uuid="fixture-uuid", source_identity=source)
+
+
 def test_extraction_binds_raw_evidence_keeps_launch_maxima_and_window_only_samples():
     spec, raw = evidence()
     row = module.extract_row(spec, **raw)

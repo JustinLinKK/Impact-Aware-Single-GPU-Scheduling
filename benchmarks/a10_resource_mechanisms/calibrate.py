@@ -327,7 +327,9 @@ def extract_row(spec, *, hardware_key, gpu_uuid, samples, windows, launches,
         "peak_allocated_mib": peak_allocated, "peak_reserved_mib": peak_reserved,
         "peak_device_used_mib": positive(max(positive(s["gpu"]["used_mib"], zero=True) for s in samples)),
         "steady_allocated_mib": allocated, "steady_gpu_busy_percent": busy,
-        "phase_seconds": phase_costs, "observed_at": utc_now(),
+        "phase_seconds": phase_costs,
+        # Bind observation time to retained evidence so later replay is exact.
+        "observed_at": datetime.fromtimestamp(receipt["feedback_ready_unix"], timezone.utc).isoformat(),
         "steady_sample_indices": selected, "raw_evidence_sha256": workloads.digest({
             "samples": samples, "windows": windows, "launches": launches, "events": events,
             "phase_history": phase_history, "pause": pause, "receipt": receipt,
