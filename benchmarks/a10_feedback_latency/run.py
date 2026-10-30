@@ -41,6 +41,7 @@ from .service import RevisedPilotService
 ARMS = ("reference_v4", "calibrated_v4", "calibrated_revised", "fixed_three")
 CAUSAL_ARMS = ("causal_v4_sync", "causal_v4_async", "causal_revised_sync",
                "causal_revised_async", "causal_fixed_three")
+RESOURCE_ARMS = ("resource_v4", "resource_revised", "resource_incremental", "resource_fixed_three")
 REFERENCE_COMMIT = "95b651d2e2a89599138c790ab4f9c1363f29e65f"
 STUDENT_SHA256 = "96d31d84d8d809c1ed9a4154f84389a3cb3b673d75445deb650cee4297398e03"
 
@@ -107,16 +108,18 @@ def source_snapshot(manifest, manifest_path):
 
 
 def gpu_sample():
-    result = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,memory.used,utilization.gpu",
+    result = subprocess.run(["nvidia-smi", "--query-gpu=name,uuid,memory.total,memory.used,utilization.gpu,utilization.memory,power.draw",
         "--format=csv,noheader,nounits"], capture_output=True, text=True, check=True, timeout=5)
     rows = [line for line in result.stdout.splitlines() if line.strip()]
     if len(rows) != 1:
         raise ValueError("pilot requires exactly one visible rented GPU")
-    name, total, used, utilization = [part.strip() for part in rows[0].split(",")]
+    name, gpu_uuid, total, used, utilization, memory_busy, power = [part.strip() for part in rows[0].split(",")]
     if name != "NVIDIA A10":
         raise ValueError("pilot is frozen to NVIDIA A10, got " + name)
-    return {"name": name, "total_mib": float(total), "used_mib": float(used),
-            "utilization_percent": float(utilization)}
+    optional = lambda x: None if x in {"[N/A]", "N/A", "[Not Supported]"} else float(x)
+    return {"name": name, "gpu_uuid": gpu_uuid, "total_mib": float(total), "used_mib": float(used),
+            "utilization_percent": float(utilization), "memory_controller_busy_percent": optional(memory_busy),
+            "power_watts": optional(power), "occupancy_note": "NVML busy counters are not SM occupancy"}
 
 
 def make_settings(raw, output, hardware):
@@ -149,6 +152,14 @@ def build_job(spec, *, manifest_path, output, manifest, memory_budget_mib):
         "trial_memory_limit_mb": memory_budget_mib, "metric_maximize": False,
         "pilot_parameter_count": spec["parameter_count"],
         "pilot_frozen_workload_sha256": digest(spec)}
+    if spec.get("workload_kind") == "synthetic_resource_control":
+        from ..a10_resource_mechanisms.workloads import adapter_context, recipe, template_key
+        metadata.update(resource_workload_spec=json.loads(json.dumps(spec)),
+                        resource_template_key=template_key(spec))
+        metadata["perfseer_model"] = {"epochs": spec["epochs"],
+            "steps_per_epoch_by_batch": {str(spec["batch"]): spec["steps_per_epoch"]},
+            "workload_contract": {"adapter": {"context": adapter_context(spec)},
+                                  "training": recipe(spec).prediction_training()}}
     kwargs = {"script_path": str(source), "working_dir": str(work),
               "result_path": str(work / "execution.json"), "batch_size": spec["batch"],
               "timeout": manifest["job_timeout_seconds"]}
@@ -182,17 +193,17 @@ def accept_job(client, job, accepted_unix):
     return client.submit(job)
 
 
-def require_predictor_exposure(predictor, jobs, specs, *, require_all=False):
+def require_predictor_exposure(predictor, jobs, specs, *, require_all=False, required_source="ml_predictor"):
     """A failed or missing prior aborts diagnostically; never continue a comparator."""
     failures = dict(getattr(predictor, "failures", {}))
     sources, errors = dict(predictor.last_sources), dict(predictor.last_errors)
     finished = getattr(predictor, "preparations_finished", set())
     for name, job in jobs.items():
-        if job.job_id in failures or job.job_id in errors or sources.get(job.job_id) not in (None, "ml_predictor"):
+        if job.job_id in failures or job.job_id in errors or sources.get(job.job_id) not in (None, required_source):
             raise RuntimeError("predictor exposure failed for " + name + ":" + str(
                 failures.get(job.job_id) or errors.get(job.job_id) or sources.get(job.job_id)))
         if (require_all or job.job_id in finished) and (
-                sources.get(job.job_id) != "ml_predictor"
+                sources.get(job.job_id) != required_source
                 or specs[name]["batch"] not in predictor.records.get(job.job_id, {})):
             raise RuntimeError("missing required numeric predictor exposure for " + name)
 
@@ -416,13 +427,20 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
     if hardware["used_mib"] > 512: raise RuntimeError("episode requires an otherwise idle A10")
     settings = make_settings(raw_settings, output, hardware)
     client = SchedulerClient(settings)
-    causal = arm in CAUSAL_ARMS
-    fixed_three = arm in {"fixed_three", "causal_fixed_three"}
-    revised = arm in {"calibrated_revised", "causal_revised_sync", "causal_revised_async"}
-    asynchronous = arm in {"causal_v4_async", "causal_revised_async", "causal_fixed_three"}
+    resource_control = manifest.get("profile_source") == "dedicated_solo_template_proxy"
+    if (arm in RESOURCE_ARMS) != resource_control:
+        raise ValueError("resource controls and their explicit profile source must be selected together")
+    causal = arm in CAUSAL_ARMS + RESOURCE_ARMS
+    fixed_three = arm in {"fixed_three", "causal_fixed_three", "resource_fixed_three"}
+    revised = arm in {"calibrated_revised", "causal_revised_sync", "causal_revised_async", "resource_revised", "resource_incremental"}
+    asynchronous = arm in {"causal_v4_async", "causal_revised_async", "causal_fixed_three", *RESOURCE_ARMS}
     if causal and asynchronous and not fixed_three:
         from .async_preparation import AsyncRevisedService, AsyncV4Service
-        service = (AsyncRevisedService if revised else AsyncV4Service)(settings, store=client.store)
+        if arm == "resource_incremental":
+            from ..a10_resource_mechanisms.policy import IncrementalService
+            service = IncrementalService(settings, store=client.store)
+        else:
+            service = (AsyncRevisedService if revised else AsyncV4Service)(settings, store=client.store)
     else:
         service = (RevisedPilotService(settings, store=client.store) if revised else client.create_service())
     supervisor_exit_observations, harness_exit_observations = [], {}
@@ -435,20 +453,33 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
                 "observed_monotonic": observed,
                 "source": "supervisor_record_process_exit_entry_after_process_poll"})
         service.supervisor._record_process_exit = record_exit
-    predictor = service.planner.estimator.ml_predictor
-    if not predictor or not predictor.available: raise ValueError("published A10 predictor unavailable")
-    if predictor.artifact_hash != STUDENT_SHA256: raise ValueError("published S_A10 student hash mismatch")
-    if causal or arm in {"calibrated_v4", "calibrated_revised"}:
-        service.planner.estimator.ml_predictor = CalibratedPredictor(predictor, calibration, client.store.hardware_key())
-    elif predictor.artifact_hash != calibration["predictor_artifact_sha256"]:
-        raise ValueError("reference artifact differs from dedicated calibration")
+    source_tag, phase_factory = "ml_predictor", phase_model
+    if resource_control:
+        from ..a10_resource_mechanisms.profiles import MeasuredTemplatePredictor, SOURCE, phase_model as template_phases
+        source_tag, phase_factory = SOURCE, template_phases
+        service.planner.estimator.ml_predictor = MeasuredTemplatePredictor(calibration,
+            client.store.hardware_profile(), gpu_uuid=hardware["gpu_uuid"])
+    else:
+        predictor = service.planner.estimator.ml_predictor
+        if not predictor or not predictor.available: raise ValueError("published A10 predictor unavailable")
+        if predictor.artifact_hash != STUDENT_SHA256: raise ValueError("published S_A10 student hash mismatch")
+        if causal or arm in {"calibrated_v4", "calibrated_revised"}:
+            service.planner.estimator.ml_predictor = CalibratedPredictor(predictor, calibration, client.store.hardware_key())
+        elif predictor.artifact_hash != calibration["predictor_artifact_sha256"]:
+            raise ValueError("reference artifact differs from dedicated calibration")
     jobs, works, specs = {}, {}, {}
     for spec in manifest["jobs"]:
         job, work = build_job(spec, manifest_path=manifest_path, output=output, manifest=manifest,
                               memory_budget_mib=hardware["total_mib"] * .9)
-        job.metadata["feedback_phase_model"] = phase_model(calibration, job,
+        job.metadata["feedback_phase_model"] = phase_factory(calibration, job,
             hardware_key=client.store.hardware_key(), batch_size=spec["batch"])
-        job.metadata["feedback_trial_reserve_seconds"] = trial_reserve(calibration)
+        if resource_control:
+            entry = calibration["entries"][job.metadata["resource_template_key"]]
+            c = entry["phase_seconds"]
+            reserve = c["startup"] + c["pause"] + c["resume"] + 20 / entry["updates_per_second"]
+        else:
+            reserve = trial_reserve(calibration)
+        job.metadata["feedback_trial_reserve_seconds"] = reserve
         jobs[spec["name"]], works[spec["name"]], specs[spec["name"]] = job, work, spec
     names_by_id = {job.job_id: name for name, job in jobs.items()}
     recording = RecordingPredictor(service.planner.estimator.ml_predictor,
@@ -458,7 +489,7 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
     if causal:
         from .async_preparation import PreparedPredictor
         preparation = PreparedPredictor(recording, asynchronous=asynchronous,
-            prepare_on_read=not asynchronous, hardware="A10")
+            prepare_on_read=not asynchronous, hardware="A10", profile_source=source_tag)
         service.planner.estimator.ml_predictor = preparation
         if asynchronous and not fixed_three:
             service.predictor_preparation = preparation
@@ -478,7 +509,7 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
         while len(receipts) != len(jobs):
             elapsed = time.monotonic() - start
             check_deadline(manifest, elapsed, max_seconds)
-            require_predictor_exposure(recording, jobs, specs)
+            require_predictor_exposure(recording, jobs, specs, required_source=source_tag)
             if preparation is not None and preparation.failures:
                 raise RuntimeError("prediction preparation failed: " + str(preparation.failures))
             if mode == "group" and group_child_release is None and all(jobs[n].job_id in receipts for n in parents.values()):
@@ -560,12 +591,15 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
                     raise RuntimeError("GPU live memory exceeds predeclared emergency cutoff")
                 timeline.append({"elapsed_seconds": elapsed, "gpu": sample,
                     "jobs": {n: {"status": j.status.value, "global_step": j.metadata.get("runtime_global_step", 0),
-                        "reserved_mib": j.metadata.get("trial_reserved_mb")} for n, j in current.items()}})
+                        "allocated_mib": j.metadata.get("trial_allocated_mb"),
+                        "peak_allocated_mib": j.metadata.get("trial_peak_allocated_mb"),
+                        "reserved_mib": j.metadata.get("trial_reserved_mb"),
+                        "peak_reserved_mib": j.metadata.get("trial_peak_reserved_mb")} for n, j in current.items()}})
                 with (output / "timeline.jsonl").open("a") as stream: stream.write(json.dumps(timeline[-1]) + "\n")
                 atomic_json(output / "status.json", {"elapsed_seconds": elapsed, "submitted": len(submitted), "receipts": len(receipts)})
                 next_sample = elapsed + 1.
             time.sleep(.02)
-        require_predictor_exposure(recording, jobs, specs, require_all=True)
+        require_predictor_exposure(recording, jobs, specs, require_all=True, required_source=source_tag)
     finally:
         if not fixed_three: service.stop()
         for handle in handles.values(): terminate_process_tree(handle.process)
@@ -599,6 +633,8 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
               - submitted[parents[chain]].accepted_monotonic for chain in range(3)}
     result = {"complete": True, "arm": arm, "mode": mode, "requestor": "colocated_python_controller",
         "common_calibrated_profile_access": causal,
+        "profile_source": source_tag,
+        "evaluation_scope": "scheduler mechanism control; no neural accuracy claim" if resource_control else "released student pipeline",
         "harness_exit_observations": harness_exit_observations,
         "preparation_treatment": ("acceptance_enqueued_serial_async" if asynchronous else
             "first_demand_sync") if causal else "legacy_pilot",
@@ -610,9 +646,9 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
         "request_latencies_seconds": latencies, "mean_request_latency_seconds": statistics.mean(latencies.values()),
         "chain_root_to_child_seconds": chains, "arrivals": arrivals,
         "first_progress_observations": first_progress, "last_progress_observations": last_progress,
-        "calibration_sha256": calibration["calibration_sha256"], "receipts": receipts,
+        "calibration_sha256": calibration["artifact_sha256"] if resource_control else calibration["calibration_sha256"], "receipts": receipts,
         "source_and_budget_audits": audits,
-        "phase_model_role": "calibrated_cross_workload_phase_proxy_v1",
+        "phase_model_role": "dedicated_same_configuration_template_proxy" if resource_control else "calibrated_cross_workload_phase_proxy_v1",
         "group_arrival_note": "group parents submitted together; individual parents at0/2/4s",
         "fixed_reference_memory_profiles": fixed_profiles,
         "prepared_numeric_profiles": recording.records,
@@ -625,7 +661,7 @@ def run_episode(manifest, manifest_path, raw_settings, output, calibration, *, a
         or (revised and result["policy_activation"]["amortization_skips"] > 0))
     result["policy_activation_note"] = "zero actionable v4 forecasts are not evidence of a measured admission-policy comparison; legitimate revised skips are separate observable decisions"
     result["predictor_comparison_eligible"] = all(
-        result["prediction_sources"].get(job.job_id) == "ml_predictor"
+        result["prediction_sources"].get(job.job_id) == source_tag
         and specs[name]["batch"] in recording.records.get(job.job_id, {})
         for name, job in jobs.items())
     if not result["predictor_comparison_eligible"]:
@@ -641,7 +677,7 @@ def main(argv=None):
     parser.add_argument("--settings", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--calibration", type=Path)
-    parser.add_argument("--arm", choices=ARMS + CAUSAL_ARMS, default="reference_v4")
+    parser.add_argument("--arm", choices=ARMS + CAUSAL_ARMS + RESOURCE_ARMS, default="reference_v4")
     parser.add_argument("--mode", choices=["individual", "group"], default="individual")
     parser.add_argument("--max-seconds", type=int, default=600)
     parser.add_argument("--deadline-utc", default="2026-10-30T03:10:00Z")

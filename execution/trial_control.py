@@ -16,6 +16,15 @@ def _phase_proof(metadata):
             counter if isinstance(counter, int) and not isinstance(counter, bool) and counter >= 0 else None)
 
 
+def _window_max_steps(command):
+    # Dedicated solo calibration can request a sustained window. Ordinary
+    # scheduler trials retain their original 64-update bound.
+    value = command.get("window_max_steps", 64)
+    if type(value) is not int or not 8 <= value <= 4096 or value % 4:
+        raise ValueError("measurement window cap must be 8..4096 updates in blocks of four")
+    return value
+
+
 def configure_trial_memory(context):
     """Limit the PyTorch allocator before a cooperative runner builds its model."""
     allowance = context.job.metadata.get("trial_memory_limit_mb")
@@ -70,6 +79,9 @@ class StepTrialControlMixin:
                 self.event_logger.emit("trial_runner_ready", job_id=self.job.job_id, payload={"global_step": global_step})
                 state["ready"] = True
             if self.job.resource_requirements.requires_gpu and torch.cuda.is_initialized():
+                updates["trial_memory_sampled_at"] = time.time()
+                updates["trial_allocated_mb"] = torch.cuda.memory_allocated() / 1024**2
+                updates["trial_peak_allocated_mb"] = torch.cuda.max_memory_allocated() / 1024**2
                 updates["trial_reserved_mb"] = torch.cuda.memory_reserved() / 1024**2
                 updates["trial_peak_reserved_mb"] = torch.cuda.max_memory_reserved() / 1024**2
             self.store.update_job(self.job.job_id, last_heartbeat_at=utc_now(), metadata_updates=updates)
@@ -189,7 +201,7 @@ class StepTrialControlMixin:
                 # A slow step must never permanently finish an incomplete
                 # token. Collect both independent halves; the controller owns
                 # the measured-duration and absolute trial bounds.
-                if sufficient and (elapsed >= float(command.get("window_min_seconds", 1.0)) or steps >= 64):
+                if sufficient and (elapsed >= float(command.get("window_min_seconds", 1.0)) or steps >= _window_max_steps(command)):
                     samples = state["samples"]
                     half = len(samples) // 2
                     window = {
@@ -198,7 +210,9 @@ class StepTrialControlMixin:
                         "samples": samples, "steps": steps, "start_step": state["measurement_step"],
                         "end_step": global_step, "elapsed_seconds": elapsed, "finished_at": utc_now(),
                         "started_at": state["measurement_started_at"],
+                        "completion_identity": state["measurement_identity"],
                         "nonupdate_phase_counter": state["measurement_phase_counter"],
+                        "completed_nonupdate_phase_counter": phase_counter,
                         "excludes_nonupdate_phases": identity is not None and phase_counter is not None,
                     }
                     self.store.update_job(self.job.job_id, metadata_updates={"trial_step_window": window})

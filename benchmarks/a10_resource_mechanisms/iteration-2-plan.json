@@ -1,0 +1,32 @@
+{
+  "schema": "a10_resource_study_v1",
+  "iteration": 2,
+  "status": "candidate_protocol_pending_iteration1_review",
+  "deadline_utc": "2026-10-30T15:30:00Z",
+  "arms": ["resource_v4", "resource_revised", "resource_incremental", "resource_fixed_three"],
+  "modes": ["individual", "group"],
+  "repeats": 2,
+  "calibration_replicas": 2,
+  "calibration_steps_per_epoch": 2048,
+  "maximum_updates": 65536,
+  "seed_base": 41000,
+  "job_timeout_seconds": 600,
+  "episode_max_seconds": 600,
+  "campaign_max_seconds": 14400,
+  "configurations": {
+    "tiny": {"width": 128, "input_features": 128, "repetitions": 2, "batch": 32, "ballast_mib": 0, "precision": "fp32_ieee", "pool_size": 4096, "validation_size": 256},
+    "resident": {"width": 128, "input_features": 128, "repetitions": 2, "batch": 32, "ballast_mib": 8192, "precision": "fp32_ieee", "pool_size": 4096, "validation_size": 256},
+    "compute": {"width": 2048, "input_features": 128, "repetitions": 8, "batch": 256, "ballast_mib": 0, "precision": "fp32_ieee", "pool_size": 4096, "validation_size": 256},
+    "both": {"width": 2048, "input_features": 128, "repetitions": 8, "batch": 256, "ballast_mib": 8192, "precision": "fp32_ieee", "pool_size": 4096, "validation_size": 256}
+  },
+  "conditions": [
+    {"name": "complementary-short", "classes": ["tiny", "resident", "compute"], "target_training_seconds": 12},
+    {"name": "complementary-long", "classes": ["tiny", "resident", "compute"], "target_training_seconds": 40},
+    {"name": "competing-short", "classes": ["compute", "both", "both"], "target_training_seconds": 12},
+    {"name": "competing-long", "classes": ["compute", "both", "both"], "target_training_seconds": 40}
+  ],
+  "measurement_scope": "Synthetic training controls, dedicated same-configuration measured template forecasts, no neural accuracy claim. Resource names are hypotheses; retain actual allocated/reserved/device memory, successful-update rate, power and GPU busy. GPU busy is not SM occupancy.",
+  "budget_selection": "Round dedicated calibration rate times the declared target duration to an integral two-epoch update budget, with a fixed 65536-update bound, before any policy evaluation. Report clipping and realized durations.",
+  "policy_contrast": "Incremental versus revised removes only the historical reserve from the post-trial margin. Both retain future pause/resume costs, pre-trial exploration guard, stress scenarios and two measurement halves.",
+  "common_amendments": "All new arms use the same cached epoch permutations, source-bound profile lookup, asynchronous preparation and added allocated-memory telemetry. Absolute differences from iteration1 are not policy-only effects."
+}

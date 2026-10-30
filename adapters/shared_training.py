@@ -282,6 +282,7 @@ def run_candidate_training(prepare: Callable[[], CandidateWorkload], *, context=
 
     safe_point(SafePointType.BEFORE_TRAIN)
     total = recipe.epochs * recipe.steps_per_epoch
+    order_epoch, order = None, None
     while global_step < total or completed_epochs < recipe.epochs:
         # Validation is a separately committed phase. A pause on the final STEP
         # resumes pending validation instead of skipping/repeating an update.
@@ -308,7 +309,12 @@ def run_candidate_training(prepare: Callable[[], CandidateWorkload], *, context=
             safe_point(SafePointType.MANUAL)
             continue
         epoch, step = divmod(global_step, recipe.steps_per_epoch)
-        order = torch.randperm(len(workload.train_dataset), generator=torch.Generator().manual_seed(recipe.seed + epoch))
+        # Reconstruct the same private permutation once per epoch (or resume),
+        # rather than regenerating a full dataset permutation for every update.
+        # No RNG state or batch identity changes; only one epoch stays resident.
+        if order_epoch != epoch:
+            order = torch.randperm(len(workload.train_dataset), generator=torch.Generator().manual_seed(recipe.seed + epoch))
+            order_epoch = epoch
         indices = order[step * recipe.batch_size:(step + 1) * recipe.batch_size].tolist()
         batch = _move(workload.collate([workload.train_dataset[i] for i in indices]), device)
         model.train()

@@ -5,6 +5,13 @@ to distinguish prediction preparation from admission decisions. The first
 iteration compares five common-calibration arms over 20 cohorts (120 jobs).
 These experiments do not change the default scheduler or promote a predictor.
 
+The separate [iteration-2 candidate protocol](benchmarks/a10_resource_mechanisms/PROTOCOL.md)
+adds controlled resource/duration workloads, evidence-backed solo calibration,
+and a one-change post-trial margin ablation. Its plan remains pending iteration-1
+review. All new arms share cached deterministic epoch permutations and memory
+telemetry; cross-iteration absolute times therefore include a common runtime
+amendment. No iteration-2 GPU result is available yet.
+
 ## V4: opt-in request feedback latency
 
 This branch implements a shared admission scorer with two per-request policies:

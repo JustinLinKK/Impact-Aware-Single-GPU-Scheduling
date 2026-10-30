@@ -49,7 +49,7 @@ class PreparedPredictor:
     requires_branch_memory = False
 
     def __init__(self, predictor, *, asynchronous=True, hardware="A10",
-                 hardware_key=None, prepare_on_read=False):
+                 hardware_key=None, prepare_on_read=False, profile_source="ml_predictor"):
         if asynchronous and prepare_on_read:
             raise ValueError("asynchronous prediction reads must never prepare")
         if not getattr(predictor, "available", False):
@@ -57,6 +57,9 @@ class PreparedPredictor:
         if not isinstance(getattr(predictor, "artifact_hash", None), str) or not predictor.artifact_hash:
             raise ValueError("preparation requires an artifact identity")
         self._predictor = predictor
+        if profile_source not in {"ml_predictor", "dedicated_solo_template_proxy"}:
+            raise ValueError("explicit supported profile source required")
+        self.profile_source = profile_source
         self.asynchronous = bool(asynchronous)
         self.prepare_on_read = bool(prepare_on_read)
         self.hardware = str(hardware)
@@ -97,7 +100,7 @@ class PreparedPredictor:
         # recipe, precision and source hashes without including live progress.
         fields = ("perfseer_model", "architecture_source", "source_path", "source_sha256",
                   "input_shape", "precision", "precision_mode", "uses_amp",
-                  "pilot_frozen_workload_sha256")
+                  "pilot_frozen_workload_sha256", "resource_workload_spec", "resource_template_key")
         contract = {name: job.metadata.get(name) for name in fields}
         contract["baseline_model_path"] = getattr(job, "baseline_model_path", None)
         contract["runner_target"] = getattr(job.config, "runner_target", None)
@@ -230,8 +233,8 @@ class PreparedPredictor:
             if self._identity(job, identity.batch_size) != identity:
                 raise JobPredictionError("predictor identity changed during preparation")
             sources, errors = getattr(self._predictor, "last_sources", {}), getattr(self._predictor, "last_errors", {})
-            if sources.get(identity.job_id) != "ml_predictor" or errors.get(identity.job_id):
-                raise JobPredictionError("preparation did not use the selected ML predictor")
+            if sources.get(identity.job_id) != self.profile_source or errors.get(identity.job_id):
+                raise JobPredictionError("preparation did not use the selected profile source")
         except Exception as exc:
             failure = {"type": type(exc).__name__, "error": str(exc)}
         ended = time.monotonic()
@@ -241,7 +244,7 @@ class PreparedPredictor:
             status = "cancelled" if cancelled else "failed" if failure else "ready"
             if status == "ready":
                 self._profiles[identity] = profile
-                self._last_sources[identity.job_id] = "ml_predictor"
+                self._last_sources[identity.job_id] = self.profile_source
                 self._last_errors.pop(identity.job_id, None)
                 self._failures.pop(identity.job_id, None)
             elif failure:

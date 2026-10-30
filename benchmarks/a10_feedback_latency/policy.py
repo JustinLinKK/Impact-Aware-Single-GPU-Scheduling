@@ -26,7 +26,7 @@ def trial_amortizes(*, remaining_updates, solo_updates_per_second,
 
 
 def conservative_admission(*, measured_reserve_seconds, min_gain_seconds=1.0,
-                           solo_lower=None, solo_upper=None, **kwargs):
+                           solo_lower=None, solo_upper=None, include_historical_reserve=True, **kwargs):
     """Require gain in both windows under nominal, bounded, no-recovery priors.
 
     Lower/upper rates are a *frozen calibration* interval, not a packed-rate solo
@@ -64,7 +64,7 @@ def conservative_admission(*, measured_reserve_seconds, min_gain_seconds=1.0,
             cautious = dict(solo)
             cautious[candidate] = min(cautious[candidate], observed_rate)
             scenarios.append((f"no_recovery_half_{index}", cautious))
-        threshold = min_gain_seconds + measured_reserve_seconds
+        threshold = min_gain_seconds + (measured_reserve_seconds if include_historical_reserve else 0.)
         scores = []
         for name, rates in scenarios:
             args = {**kwargs, "solo": rates, "min_gain_seconds": threshold,
@@ -77,6 +77,7 @@ def conservative_admission(*, measured_reserve_seconds, min_gain_seconds=1.0,
             scores.extend(half["gain_seconds"] for half in forecast["halves"])
         result.update(worst_gain_seconds=min(scores), required_gain_seconds=threshold,
                       measured_reserve_seconds=measured_reserve_seconds,
+                      includes_historical_reserve_in_posttrial_margin=include_historical_reserve,
                       decision="accepted" if min(scores) >= threshold else "rejected")
     except (ValueError, TypeError, KeyError, IndexError, OverflowError, ZeroDivisionError) as exc:
         result["error"] = str(exc)

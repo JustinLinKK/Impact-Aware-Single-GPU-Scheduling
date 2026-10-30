@@ -37,6 +37,11 @@ def episode_plot(output):
         memory = [(t, state["reserved_mib"] if state["status"] in {"RUNNING", "PAUSING"} else float("nan"))
                   for t, state in seen if state.get("reserved_mib") is not None]
         if memory: axes[3].plot([x[0] for x in memory], [x[1] for x in memory], color=color, alpha=.6)
+        allocated = [(t, state["allocated_mib"] if state["status"] in {"RUNNING", "PAUSING"} else float("nan"))
+                     for t, state in seen if state.get("allocated_mib") is not None]
+        if allocated:
+            axes[3].plot([x[0] for x in allocated], [x[1] for x in allocated],
+                         color=color, alpha=.8, linestyle=":")
         job_file = output / "jobs" / name / "job-final.json"
         if origin is not None and job_file.exists():
             job_id = json.loads(job_file.read_text())["job_id"]
@@ -55,7 +60,7 @@ def episode_plot(output):
     axes[2].set_ylabel("Sampled updates/s")
     axes[3].plot([r["elapsed_seconds"] for r in rows], [r["gpu"]["used_mib"] for r in rows],
                  color="black", linewidth=2, label="Device used")
-    axes[3].set_ylabel("VRAM MiB")
+    axes[3].set_ylabel("VRAM MiB\nsolid=reserved; dotted=allocated")
     axes[3].set_xlabel("Seconds from first request acceptance")
     axes[3].legend(loc="upper left", fontsize=8)
     axes[0].set_title(f"{result.get('arm', 'calibration')} / {result.get('mode', '')}: worker states; hatched=preparation, | = receipt")
