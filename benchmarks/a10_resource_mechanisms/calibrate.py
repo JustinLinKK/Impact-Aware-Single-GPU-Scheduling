@@ -552,8 +552,8 @@ def calibrate(manifest, manifest_path, raw_settings, output, max_seconds, *, vis
                         import shutil
                         shutil.copyfile(latest.latest_checkpoint_path, work / "pause-checkpoint.pt")
                         controls.clear_command(job.job_id)
+                        # The persisted latest_checkpoint_path is the worker's resume fallback.
                         latest = client.store.update_job(job.job_id, status=JobStatus.READY, hold=False,
-                            resume_from_checkpoint=latest.latest_checkpoint_path,
                             metadata_updates={"trial_step_window": None, "trial_step_command": command()})
                         active = launch(latest, pause["checkpoint"]["global_step"])
                         continue

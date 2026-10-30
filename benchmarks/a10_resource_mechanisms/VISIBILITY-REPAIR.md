@@ -61,3 +61,13 @@ A same-birth zombie may have been reparented during ordinary Linux teardown; its
 current parent PID is not required to match its former live parent. This remains
 ineligible evidence. Every live worker still requires the original parent PID
 and current owned ancestry; a reused root or worker PID always rejects.
+
+Resume API correction: calibration now releases the paused record using only
+SQLiteStateStore.update_job's supported status/hold/metadata arguments. The
+checkpoint path already persisted by the worker remains intact;
+RunnerContext.load_resume_checkpoint uses latest_checkpoint_path as its normal
+resume fallback. No store schema or training recipe change is needed. A real CPU
+calibration state-machine integration covers SQLite, executor, pause checkpoint,
+resume, exit-zero receipt and final two-epoch optimizer counters. Only GPU
+qualification/context/sampling and GPU numerical fitting are labeled fixtures;
+these CPU-test outputs are not actual-host calibration evidence.

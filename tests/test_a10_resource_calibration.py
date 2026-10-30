@@ -299,3 +299,66 @@ def test_expired_deadline_aborts_before_any_gpu_probe(tmp_path, monkeypatch):
     monkeypatch.setattr(module.lifecycle, "gpu_sample", lambda: pytest.fail("expired run must not query GPU"))
     with pytest.raises(TimeoutError, match="deadline"):
         module.calibrate(manifest, tmp_path / "manifest.json", {}, tmp_path / "output", 10.)
+
+
+def test_actual_cpu_calibration_state_machine_pauses_resumes_and_completes(tmp_path,monkeypatch):
+    """Real SQLite/executor/worker/checkpoints; only GPU evidence/fit are fixtures."""
+    import importlib,os,time
+    from pathlib import Path
+    from localml_scheduler.hardware import HardwareProfile
+    from localml_scheduler.domain import JobStatus
+    from localml_scheduler.adapters import shared_training
+    hardware=HardwareProfile(hardware_key='CPU-calibration-state-machine-only',os_name='cpu-test',
+        gpu_name='NVIDIA A10',total_vram_mb=24000,compute_capability='8.6',
+        cuda_runtime=None,torch_version=torch.__version__)
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES','')
+    introspection=importlib.import_module('engine.script_introspection')
+    monkeypatch.setenv('PYTHONPATH',os.pathsep.join([str(Path(shared_training.__file__).parents[2]),
+        str(Path(introspection.__file__).parents[1]),os.environ.get('PYTHONPATH','')]))
+    monkeypatch.setattr(torch.cuda,'is_available',lambda:False)
+    monkeypatch.setattr('localml_scheduler.storage.sqlite_store.detect_hardware_profile',lambda **_:hardware)
+    gpu=dict(name='NVIDIA A10',gpu_uuid='CPU-TEST-NO-GPU',total_mib=24000.,used_mib=0.)
+    monkeypatch.setattr(module.lifecycle,'gpu_sample',lambda:gpu)
+    original_build=module.lifecycle.build_job
+    def cpu_job(*args,**kwargs):
+        job,work=original_build(*args,**kwargs)
+        job.resource_requirements.requires_gpu=False
+        job.metadata.pop('trial_memory_limit_mb',None)
+        return job,work
+    monkeypatch.setattr(module.lifecycle,'build_job',cpu_job)
+    monkeypatch.setattr(module.context_isolation,'qualification_gate',lambda *a,**kw:{'fixture_only':True})
+    monkeypatch.setattr(module.context_isolation,'prepare',lambda *a,**kw:({},{}))
+    monkeypatch.setattr(module.context_isolation,'associate',lambda *a,**kw:{'root':kw['root']})
+    def collect(*args,**kwargs):
+        time.sleep(.005)
+        return {'gpu':gpu,'compute_apps':[],'fixture_only':'CPU state-machine evidence, not GPU measurement'}
+    monkeypatch.setattr(module,'collect_sample',collect)
+    spec=make_spec(resource_config('tiny',width=8,input_features=8,batch=2,pool_size=16,validation_size=128),
+        name='cpu-calibration-integration',role='calibration',chain=None,epochs=2,steps_per_epoch=512,
+        seed=1001,train_pool_seed=10001,validation_pool_seed=10002,source_path=workloads.HERE/'candidate.py')
+    manifest={'calibration':[spec],'jobs':[],'job_timeout_seconds':60,'calibration_window_seconds':.02,
+        'deadline_utc':(datetime.now(timezone.utc)+timedelta(minutes=2)).isoformat(),
+        'fixture_only':'CPU state-machine test, not actual-host calibration'}
+    manifest_path=tmp_path/'manifest.json';manifest_path.write_text(json.dumps(manifest))
+    captured=[]
+    def inspect_actual_completion(actual_spec,**raw):
+        captured.append(raw)
+        assert actual_spec==spec and len(raw['launches'])==2
+        assert raw['pause']['exit_code']==0 and raw['pause']['status']=='PAUSED'
+        paused=raw['pause']['checkpoint']['global_step']
+        assert 0<paused<1024 and raw['launches'][1]['resume_step']==paused
+        assert {w['launch'] for w in raw['windows']}=={0,1}
+        assert raw['receipt']['worker_exit_code']==0 and raw['receipt']['expected_updates']==1024
+        assert raw['receipt']['returned_result']['device']=='cpu'
+        assert raw['final_audit']['global_step']==raw['final_audit']['all_adamw_steps']==1024
+        assert raw['final_audit']['completed_epochs']==2
+        assert [e['event_type'] for e in raw['events']].count('job_resumed')==1
+        assert [e['event_type'] for e in raw['events']].count('job_paused')==1
+        return {'fixture_only':'actual CPU workflow passed; no GPU fit produced'}
+    monkeypatch.setattr(module,'extract_row',inspect_actual_completion)
+    monkeypatch.setattr(module,'fit_templates',lambda rows,**kw:{'fixture_only':True,'rows':rows})
+    result=module.calibrate(manifest,manifest_path,{},tmp_path/'output',90,visibility_qualification={'fixture_only':True})
+    assert result['complete'] and len(captured)==1
+    saved=json.loads((tmp_path/'output/jobs/cpu-calibration-integration/job-final.json').read_text())
+    assert saved['status']==JobStatus.COMPLETED.value and saved['latest_checkpoint_path']
+    assert not torch.cuda.is_initialized()
