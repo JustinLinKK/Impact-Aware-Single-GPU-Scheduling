@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from localml_scheduler.benchmarks.a10_resource_mechanisms import campaign, heldout, study
+from localml_scheduler.benchmarks.a10_resource_mechanisms import calibrate, campaign, heldout, study
 from localml_scheduler.benchmarks.a10_resource_mechanisms.profiles import SOURCE, SCHEMA
 from localml_scheduler.tests.test_a10_resource_campaign import fake_execution, write
 
@@ -25,6 +25,7 @@ def sealed_fixture(tmp_path, monkeypatch, arm='resource_incremental'):
     plan=json.loads(json.dumps(plan,sort_keys=True))
     calibration=study.calibration_manifest(plan)
     table={'source':SOURCE,'schema':SCHEMA,
+        'source_identity':calibrate.calibration_source_identity({'fixture_only':True}, calibration),
         'entries':{spec['template_key']:{'updates_per_second':10.} for spec in calibration['calibration']}}
     table['artifact_sha256']=campaign.digest(table)
     directory=tmp_path/'sealed';directory.mkdir()
@@ -74,17 +75,70 @@ def test_runtime_plan_cannot_change_predeclared_inputs(mutation):
 
 def test_sorted_json_preserves_calibration_seed_order_and_actual_budget_semantics():
     plan=json.loads(json.dumps(fixture_plan(),sort_keys=True))
-    calibration=study.calibration_manifest(plan)['calibration']
+    calibration_manifest=study.calibration_manifest(plan)
+    calibration=calibration_manifest['calibration']
     assert [(row['name'],row['seed']) for row in calibration]==[
         (f'{label}-cal-{replica}',91000+2*index+replica)
         for index,label in enumerate(('tiny','resident','compute','both')) for replica in range(2)]
     table=dict(schema=SCHEMA,source=SOURCE,
+        source_identity=calibrate.calibration_source_identity({'fixture_only':True}, calibration_manifest),
         entries={row['template_key']:{'updates_per_second':10.} for row in calibration})
     table['artifact_sha256']=campaign.digest(table)
     manifests=study.evaluation_manifests(plan,table)
     assert {2*job['steps_per_epoch'] for manifest in manifests.values() for job in manifest['jobs']}=={184,552}
     assert all(job['epochs']==2 for manifest in manifests.values() for job in manifest['jobs'])
     assert len(study.episode_order(plan))==48
+
+
+def test_calibration_identity_keeps_raw_snapshot_and_binds_runtime_for_replay():
+    manifest=study.calibration_manifest(fixture_plan())
+    snapshot={'fixture_only':True,'manifest_sha256':'c'*64}
+    identity=calibrate.calibration_source_identity(snapshot,manifest)
+    assert snapshot=={'fixture_only':True,'manifest_sha256':'c'*64}
+    assert identity['torch_version']==manifest['source_runtime']['torch_version']
+    assert identity['source_runtime']==manifest['source_runtime']
+    # Verification on a different host must replay retained, externally verified
+    # remote metadata rather than substitute that host's local Torch version.
+    remote=deepcopy(manifest)
+    remote['source_runtime']['torch_version']='SYNTHETIC-REMOTE-RUNTIME'
+    for spec in remote['calibration']:spec['torch_version']='SYNTHETIC-REMOTE-RUNTIME'
+    replay=calibrate.calibration_source_identity(snapshot,remote,
+        runtime_metadata=remote['source_runtime'])
+    assert replay['torch_version']=='SYNTHETIC-REMOTE-RUNTIME'
+    with pytest.raises(ValueError,match='actual source/runtime differ'):
+        calibrate.calibration_source_identity(snapshot,remote)
+
+
+@pytest.mark.parametrize('mutation',['schema','manifest_runtime','spec_runtime','spec_source','empty_specs'])
+def test_calibration_runtime_mismatch_rejects_before_gpu_work(mutation):
+    manifest=study.calibration_manifest(fixture_plan())
+    if mutation=='schema':manifest['calibration_identity_schema']='unknown'
+    elif mutation=='manifest_runtime':manifest['source_runtime']['torch_version']='mismatched'
+    elif mutation=='spec_runtime':manifest['calibration'][0]['torch_version']='mismatched'
+    elif mutation=='spec_source':manifest['calibration'][0]['runner_sha256']='0'*64
+    else:manifest['calibration']=[]
+    with pytest.raises(ValueError):calibrate.calibration_source_identity({'fixture_only':True},manifest)
+
+
+def test_legacy_calibration_table_representation_is_preserved():
+    snapshot={'scheduler_python_sources':{'synthetic.py':'d'*64}}
+    actual=calibrate.calibration_source_identity(snapshot,{})
+    assert actual==snapshot
+    actual['scheduler_python_sources']['synthetic.py']='changed-copy'
+    assert snapshot['scheduler_python_sources']['synthetic.py']=='d'*64
+
+
+@pytest.mark.parametrize('mutation',['missing','torch','source'])
+def test_heldout_budget_generation_rejects_table_from_another_runtime(mutation):
+    plan=fixture_plan();manifest=study.calibration_manifest(plan)
+    identity=calibrate.calibration_source_identity({'fixture_only':True},manifest)
+    if mutation=='missing':identity={}
+    elif mutation=='torch':identity['torch_version']='mismatched'
+    else:identity['source_runtime']['runner_sha256']='0'*64
+    table=dict(schema=SCHEMA,source=SOURCE,source_identity=identity,entries={})
+    table['artifact_sha256']=campaign.digest(table)
+    with pytest.raises(ValueError,match='actual source/runtime'):
+        study.evaluation_manifests(plan,table)
 
 
 @pytest.mark.parametrize('arm',['resource_revised','resource_incremental'])

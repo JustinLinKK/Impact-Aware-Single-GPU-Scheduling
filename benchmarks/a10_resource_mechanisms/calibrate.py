@@ -339,6 +339,34 @@ def extract_row(spec, *, hardware_key, gpu_uuid, samples, windows, launches,
                             "source": workloads.source_metadata()}}
 
 
+CALIBRATION_IDENTITY_SCHEMA = "resource_solo_runtime_v1"
+
+
+def calibration_source_identity(snapshot, manifest, *, runtime_metadata=None):
+    """Bind table identity to the actual runtime without changing raw snapshots.
+
+    Offline auditors may supply the already SHA-verified remote metadata. The
+    calibration controller omits that argument and reads its own runtime.
+    Legacy manifests keep their original table representation.
+    """
+    schema = manifest.get("calibration_identity_schema")
+    if schema is None:
+        return deepcopy(snapshot)
+    if schema != CALIBRATION_IDENTITY_SCHEMA:
+        raise ValueError("unknown calibration runtime identity schema")
+    runtime = workloads.source_metadata() if runtime_metadata is None else runtime_metadata
+    required = ("workload_version", "package_pins", "runner_sha256", "torch_version")
+    if (not isinstance(runtime, dict) or any(not runtime.get(key) for key in required)
+            or not isinstance(runtime.get("torch_version"), str)
+            or manifest.get("source_runtime") != runtime):
+        raise ValueError("calibration manifest and actual source/runtime differ")
+    specs = manifest.get("calibration")
+    if not specs or any(any(spec.get(key) != runtime[key] for key in required) for spec in specs):
+        raise ValueError("calibration specifications and actual source/runtime differ")
+    return {**deepcopy(snapshot), "calibration_identity_schema": schema,
+            "torch_version": runtime["torch_version"], "source_runtime": deepcopy(runtime)}
+
+
 def _check_sources(snapshot, manifest, manifest_path):
     after = lifecycle.source_snapshot(manifest, manifest_path)
     if after != snapshot:
@@ -358,6 +386,7 @@ def calibrate(manifest, manifest_path, raw_settings, output, max_seconds):
     try:
         snapshot = lifecycle.source_snapshot(manifest, manifest_path)
         lifecycle.atomic_json(output / "source-snapshot.json", snapshot)
+        table_identity = calibration_source_identity(snapshot, manifest)
         specs = manifest.get("calibration") or []
         if not specs or len({s["name"] for s in specs}) != len(specs):
             raise ValueError("unique dedicated calibration specifications required")
@@ -484,7 +513,9 @@ def calibrate(manifest, manifest_path, raw_settings, output, max_seconds):
             lifecycle.atomic_json(work / "post-exit-idle-evidence.json", idle)
             if idle["compute_apps"]:
                 raise ValueError("compute process remains after dedicated worker exit")
-        table = fit_templates(rows, hardware_key=hardware_key, gpu_uuid=hardware["gpu_uuid"], source_identity=snapshot)
+        if calibration_source_identity(snapshot, manifest) != table_identity:
+            raise ValueError("source/runtime changed during dedicated calibration")
+        table = fit_templates(rows, hardware_key=hardware_key, gpu_uuid=hardware["gpu_uuid"], source_identity=table_identity)
         lifecycle.atomic_json(output / "source-snapshot-after.json", _check_sources(snapshot, manifest, manifest_path))
         lifecycle.atomic_json(output / "calibration.json", table)
         result = {"complete": True, "kind": "dedicated_resource_calibration", "calibration": table,

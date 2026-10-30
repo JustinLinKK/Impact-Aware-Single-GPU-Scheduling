@@ -65,11 +65,15 @@ def calibration_manifest(plan):
             rows.append(_spec(plan, config, name=f'{label}-cal-{replica}', role='calibration',
                 chain=None, steps_per_epoch=plan['calibration_steps_per_epoch'],
                 index=len(rows), calibration=True))
-    return dict(jobs=[], calibration=rows, profile_source=SOURCE,
+    manifest = dict(jobs=[], calibration=rows, profile_source=SOURCE,
         deadline_utc=plan['deadline_utc'], job_timeout_seconds=plan['job_timeout_seconds'],
         prune_completed_weights=True, study_plan_sha256=workloads.digest(plan),
         source_runtime=workloads.source_metadata(),
         scope='synthetic training controls; resource labels are hypotheses until measured')
+    if plan['iteration'] == 3:
+        from .calibrate import CALIBRATION_IDENTITY_SCHEMA
+        manifest['calibration_identity_schema'] = CALIBRATION_IDENTITY_SCHEMA
+    return manifest
 
 
 def evaluation_manifests(plan, table):
@@ -78,6 +82,14 @@ def evaluation_manifests(plan, table):
             or table.get('artifact_sha256') != workloads.digest(
                 {k:v for k,v in table.items() if k != 'artifact_sha256'})):
         raise ValueError('intact dedicated calibration table required')
+    if plan['iteration'] == 3:
+        from .calibrate import CALIBRATION_IDENTITY_SCHEMA
+        identity = table.get('source_identity') or {}
+        runtime = workloads.source_metadata()
+        if (identity.get('calibration_identity_schema') != CALIBRATION_IDENTITY_SCHEMA
+                or identity.get('source_runtime') != runtime
+                or identity.get('torch_version') != runtime['torch_version']):
+            raise ValueError('held-out calibration must bind the actual source/runtime')
     output = {}
     for ci, condition in enumerate(plan['conditions']):
         jobs, decisions = [], {}
