@@ -59,7 +59,9 @@ def comparison_plot(root):
     records = []
     for path in sorted(root.glob("*/result.json")):
         row = json.loads(path.read_text())
-        if "arm" in row: records.append({"path": str(path.relative_to(root)), **row})
+        repeat = next((part for part in path.parent.name.split("-")
+                       if len(part) > 1 and part[0] == "r" and part[1:].isdigit()), "repeat unknown")
+        if "arm" in row: records.append({"path": str(path.relative_to(root)), "observed_repeat": repeat, **row})
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     arms = ("reference_v4", "calibrated_v4", "calibrated_revised", "fixed_three")
     for axis, mode in zip(axes, ("individual", "group")):
@@ -69,18 +71,35 @@ def comparison_plot(root):
             if matched:
                 values = [r["episode_duration_seconds"] for r in matched]
                 axis.scatter([index] * len(values), values, label=arm)
-                axis.plot([index - .15, index + .15], [sum(values) / len(values)] * 2, color="black")
+                for record, value in zip(matched, values):
+                    axis.annotate(record["observed_repeat"], (index, value), xytext=(5, 3),
+                                  textcoords="offset points", fontsize=8)
             axis.text(index, .01, f"eligible {len(matched)}/2", ha="center", fontsize=8,
                       transform=axis.get_xaxis_transform())
         axis.set_xticks(range(len(arms)), [a.replace("_", "\n") for a in arms], fontsize=8)
         axis.set_ylabel("Whole episode result-ready seconds")
-        axis.set_title(mode + ": dots are completed eligible paired repeats")
+        axis.set_title(mode + ": individual observed eligible repeats; no unmatched means")
         axis.grid(axis="y", alpha=.2)
     fig.suptitle("Descriptive A10 pilot; incomplete/ineligible episodes remain in comparison.json")
     fig.tight_layout()
     fig.savefig(root / "combined-comparison.png", dpi=150)
     plt.close(fig)
     (root / "comparison.json").write_text(json.dumps(records, indent=2, allow_nan=False) + "\n")
+    cohorts = sorted(root.glob("*/cohort-measurements.png"))
+    if cohorts:
+        import math
+        columns = min(4, len(cohorts))
+        rows = math.ceil(len(cohorts) / columns)
+        contact, panels = plt.subplots(rows, columns, figsize=(8 * columns, 8 * rows),
+                                       squeeze=False)
+        for panel, path in zip(panels.flat, cohorts):
+            panel.imshow(plt.imread(path))
+            panel.set_title(path.parent.name, fontsize=12)
+        for panel in panels.flat: panel.axis("off")
+        contact.suptitle("Observed cohort Gantt + update/rate/VRAM metrics; includes partial episode plots", fontsize=16)
+        contact.tight_layout()
+        contact.savefig(root / "combined-cohort-gantt-metrics.png", dpi=200)
+        plt.close(contact)
 
 
 def main():
