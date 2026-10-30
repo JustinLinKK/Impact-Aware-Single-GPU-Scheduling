@@ -160,10 +160,12 @@ def collect_sample(gpu_uuid, *, root_pid=None, launch=None, latest=None, hardwar
             sample["mps_identity"] = context_isolation.visibility.mps_identity(association["mps_identity"]["path"]) if association is not None else None
             if association is not None:
                 sample["context_association_sha256"] = context_isolation.canonical(association)
-                sample["window_eligible"] = bool(raw_query["compute_pids"])
-                if not sample["window_eligible"]:
-                    sample["drain_classification"] = "terminal_context_absent_or_zombie"
         sample["process_snapshot"] = process_snapshot()
+        if association is not None:
+            classification = context_isolation.sample_lifecycle(sample, association)
+            sample["window_eligible"] = classification == "live"
+            if not sample["window_eligible"]:
+                sample["drain_classification"] = classification
         sample["sample_finished_monotonic"] = time.monotonic()
         sample["isolation_audit"] = verify_isolation(sample, gpu_uuid=gpu_uuid, root_pid=root_pid, association=association)
         if sample["gpu"]["used_mib"] > sample["gpu"]["total_mib"] * .94:
@@ -348,7 +350,7 @@ def extract_row(spec, *, hardware_key, gpu_uuid, samples, windows, launches,
             and sample["worker_observed_unix"] is not None
             and begin <= sample["worker_observed_unix"] <= finish
             and start <= (sample["worker"].get("runtime_global_step") or -1) <= end
-            and sample["compute_apps"]]
+            and sample["compute_apps"] and sample.get("window_eligible", True)]
         if not within:
             raise ValueError("no owned GPU/memory samples bounded to update window")
         for sample in within:

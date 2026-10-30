@@ -118,6 +118,19 @@ def test_full_raw_row_replay_preserves_windows_updates_and_explicit_sentinel_ove
     drain['gpu']['used_mib']=15000.;drained['samples'].append(drain)
     replay=calibrate.extract_row(spec,**drained)
     assert replay['peak_allocated_mib']==row['peak_allocated_mib'] and replay['peak_device_used_mib']==row['peak_device_used_mib']
+    transitioned=deepcopy(raw);transition=deepcopy(transitioned['samples'][1])
+    transition['process_snapshot_before']=deepcopy(transition['process_snapshot_before'])
+    transition['process_snapshot']=deepcopy(transition['process_snapshot'])
+    transition['process_snapshot'][1]['state']='Z'
+    transition.update(window_eligible=False,drain_classification='known_context_terminal_transition')
+    transition['worker'].update(trial_allocated_mb=9999.,trial_peak_allocated_mb=9999.,trial_peak_reserved_mb=10000.)
+    transition['gpu'].update(used_mib=15000.,utilization_percent=99.)
+    transitioned['samples'].append(transition)
+    replay=calibrate.extract_row(spec,**transitioned)
+    for field in ('steady_sample_indices','steady_allocated_mib','steady_gpu_busy_percent','peak_allocated_mib','peak_reserved_mib','peak_device_used_mib'):
+        assert replay[field]==row[field]
+    transitioned['samples'][1]=transitioned['samples'].pop()
+    with pytest.raises(ValueError,match='no owned GPU/memory samples'):calibrate.extract_row(spec,**transitioned)
     missing=deepcopy(raw);missing.pop('visibility_qualification')
     with pytest.raises(ValueError,match='requires retained'):calibrate.extract_row(spec,**missing)
     bad=deepcopy(raw);bad['windows'][0]['started_at']=100.5
@@ -171,3 +184,41 @@ def test_absolute_manifest_cutoff_bounds_context_proof_before_dispatch():
     common=dict(started=90.,job_started=95.,max_seconds=100.,job_timeout=100.,now_monotonic=100.,now_unix=1000.)
     assert c.bounded_context_deadline(**common,absolute_unix=1002.)==102.
     with pytest.raises(TimeoutError,match='before preparation'):c.bounded_context_deadline(**common,absolute_unix=999.)
+
+
+@pytest.mark.parametrize('after', ['zombie','absent','both_terminal'])
+def test_known_context_teardown_is_retained_but_never_eligible(after):
+    a,q,s,records=association();x=sample(a,deepcopy(records))
+    x['process_snapshot']=deepcopy(records)
+    if after=='absent':x['process_snapshot']=x['process_snapshot'][:1]
+    else:x['process_snapshot'][1]['state']='Z'
+    if after=='both_terminal':x['process_snapshot_before'][1]['state']='Z'
+    label=c.sample_lifecycle(x,a)
+    with pytest.raises(ValueError,match='eligible terminal'):c.audit_sample(x,a)
+    x.update(window_eligible=False,drain_classification=label)
+    assert c.audit_sample(x,a)['window_eligible']is False
+
+@pytest.mark.parametrize('mutation',['birth','ancestry','unknown','extra','resurrection','rootbirth'])
+def test_teardown_does_not_mask_identity_or_visibility_errors(mutation):
+    a,q,s,records=association();x=sample(a,deepcopy(records));x['process_snapshot']=deepcopy(records)
+    x['process_snapshot'][1]['state']='Z'
+    if mutation=='birth':x['process_snapshot'][1]['start_ticks']+=1
+    elif mutation=='ancestry':x['process_snapshot'][1]['ppid']=999
+    elif mutation=='unknown':x['compute_apps'][0]['pid']=999
+    elif mutation=='extra':x['compute_apps'].append({'pid':999})
+    elif mutation=='resurrection':x['process_snapshot_before'][1]['state']='Z';x['process_snapshot'][1]['state']='R'
+    else:x['process_snapshot'][0]['start_ticks']+=1
+    with pytest.raises(ValueError):c.sample_lifecycle(x,a)
+
+
+def test_saved_actual_pause_query_race_replays_without_rewriting_raw_evidence():
+    import json
+    from pathlib import Path
+    fixture=json.loads((Path(__file__).parent/'fixtures/a10_teardown_race.json').read_text())
+    original=deepcopy(fixture);x=deepcopy(fixture['sample']);a=fixture['association']
+    assert x['evidence_error']=='CUDA proof is not a live owned descendant with matching birth'
+    assert c.sample_lifecycle(x,a)=='known_context_terminal_transition'
+    x.update(window_eligible=False,drain_classification=c.sample_lifecycle(x,a))
+    result=c.audit_sample(x,a)
+    assert result['window_eligible']is False and result['observed_compute_pids']==[3578593]
+    assert fixture==original

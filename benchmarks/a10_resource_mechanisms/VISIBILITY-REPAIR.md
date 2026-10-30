@@ -29,3 +29,21 @@ Raw launched/runner-ready timestamps and phase histories stay unchanged. Fitted 
 The pure stdlib `context_isolation.audit_raw_evidence(spec, evidence, gpu_uuid=...)` is the local export entry point after saved source/archive/member hashes are verified. It replays qualification, both fresh context associations, raw eligible/drain observations, MPS/process identities and after-release window eligibility without importing local Torch or recomputing host signatures. `extract_row` independently applies those gates alongside all original source/spec/update/window/receipt/allocator checks and retains the raw-evidence digest. Actual source/runtime validation and pooled table replay remain mandatory. Failed/unattempted denominators and original source packages remain separate.
 
 Focused tests use synthetic saved evidence, fake process queries and bounded real CPU-only separate-session/orphan cleanup; they do not run GPU workloads or the expensive six-worker CPU episode. The final exact-host packaged preflight still exercises those existing worker cases before any calibration/evaluation.
+
+Teardown replay correction (separate attempt/source): the first calibration pause
+in the preceding attempt saved a known singleton NVML context while its same-birth
+owned worker changed from running to zombie across the query. The saved checkpoint
+and `job_paused` events preceded this query. This is retained as a terminal
+transition, never a usable measurement. A known stale singleton with both worker
+snapshots terminal is similarly retained only as a drain, with unchanged launch
+root and previous context binding. Unknown/extra NVML PIDs, worker/root PID reuse,
+changed parent identity, terminal-to-live resurrection, and live-empty visibility
+still reject. No measurement window or peak may use either terminal class, and a
+terminal sample cannot satisfy a window's required valid sample coverage. Normal
+pause exit-zero/checkpoint and complete-budget receipt audits remain mandatory;
+the failed preceding attempt is not retrospectively accepted.
+
+The actual saved query/association are retained unmodified in
+`tests/fixtures/a10_teardown_race.json`, with source-file SHA provenance. Focused
+CPU replay also injects excessive in-window terminal memory/busy values to ensure
+they cannot affect fitted sample indices, means or allocator/device peaks.

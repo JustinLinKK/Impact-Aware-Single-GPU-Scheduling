@@ -86,6 +86,25 @@ def audit_association(value,qualification,*,spec,gpu_uuid,require_finished=True)
     return {'compute_pid':inferred,'visible_pid':ready['pid'],'start_ticks':ready['start_ticks'],
             'method':'empirical sampled association under NVML completeness; not kernel PID mapping'}
 
+def sample_lifecycle(sample,association):
+    """Classify only the already-associated singleton; teardown never measures."""
+    pids=[app['pid'] for app in sample['compute_apps']]
+    if not pids:return 'terminal_context_absent_or_zombie'
+    if pids!=[association['compute_pid']]:raise ValueError('unknown/extra GPU context during eligible calibration')
+    root,worker=association['root'],association['ready']
+    states=[]
+    for key in ('process_snapshot_before','process_snapshot'):
+        by,_=owned(sample[key],root)
+        row=by.get(worker['pid'])
+        if row is not None and any(row[k]!=worker[k] for k in ('pid','ppid','start_ticks')):
+            raise ValueError('context worker reused or ancestry changed during query')
+        terminal=row is None or row.get('state')=='Z'
+        if not terminal:check_live(sample[key],root,worker)
+        states.append(terminal)
+    if states==[True,False]:raise ValueError('terminal context resurrected during query')
+    return ('known_context_terminal_transition' if states==[False,True] else
+            'known_context_terminal_drain' if states==[True,True] else 'live')
+
 def audit_sample(sample,association):
     pids=[app['pid'] for app in sample['compute_apps']]
     query=sample['nvml_process_query']
@@ -103,10 +122,12 @@ def audit_sample(sample,association):
                 raise ValueError('retained-sentinel worker still live or reused while NVML is empty')
         if sample.get('context_association_sha256')!=canonical(association):raise ValueError('unbound terminal drain')
         return {'observed_compute_pids':[],'window_eligible':False,'classification':'terminal_context_absent_or_zombie'}
-    if pids and (len(pids)!=1 or pids[0]!=association['compute_pid']):raise ValueError('unknown/extra GPU context during eligible calibration')
-    if pids:
-        for key in ('process_snapshot_before','process_snapshot'):
-            check_live(sample[key],association['root'],association['ready'])
+    classification=sample_lifecycle(sample,association)
+    if classification!='live':
+        if (sample.get('window_eligible')is not False or sample.get('drain_classification')!=classification
+                or sample.get('context_association_sha256')!=canonical(association)):
+            raise ValueError('unbound or eligible terminal context transition')
+        return {'observed_compute_pids':pids,'window_eligible':False,'classification':classification}
     if sample.get('sample_started_monotonic',-1)<association['eligible_after_monotonic']:raise ValueError('startup sample is not eligible')
     if sample.get('context_association_sha256')!=canonical(association) or sample.get('window_eligible')is not True:
         raise ValueError('startup or unbound context sample is ineligible')
