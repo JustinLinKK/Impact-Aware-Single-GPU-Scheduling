@@ -12,10 +12,46 @@ import time
 import traceback
 
 
+def load_preflight_settings(path):
+    """Bind the receipt hash and parsed configuration to the same byte read."""
+    if path is None:
+        return None, None
+    payload = Path(path).read_bytes()
+    return json.loads(payload), hashlib.sha256(payload).hexdigest()
+
+
+def prediction_settings_for_preflight(raw_settings, release):
+    """Use the evaluation predictor configuration without silently overriding it."""
+    from ...config import PredictionSettings
+
+    release = Path(release).resolve()
+    if raw_settings is None:
+        # Preserve the original command for reproducing the failed v2 preflight.
+        raw_settings = {"prediction": {"mode": "ml_predictor",
+            "student_release_path": str(release),
+            "student_model_path": str(release / "checkpoints/S_A10"),
+            "conversion_timeout_seconds": 180, "conversion_max_rss_mb": 16384,
+            "cpu_threads": 1}}
+    settings = PredictionSettings.from_dict(raw_settings.get("prediction"))
+    if settings.mode != "ml_predictor" or settings.test_override_enabled:
+        raise ValueError("preflight requires the published ML predictor, without test overrides")
+    if (not settings.student_release_path
+            or Path(settings.student_release_path).expanduser().resolve() != release):
+        raise ValueError("preflight --release differs from the experiment predictor release")
+    if (not settings.student_model_path
+            or Path(settings.student_model_path).expanduser().resolve() != release / "checkpoints/S_A10"):
+        raise ValueError("preflight requires the experiment's explicit S_A10 model path")
+    if settings.conversion_timeout_seconds != 180 or settings.conversion_max_rss_mb != 16384:
+        raise ValueError("this pilot's preflight retains the 180-second / 16384-MiB capture limits")
+    return settings
+
+
 def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--release", type=Path, required=True)
+    parser.add_argument("--settings", type=Path,
+        help="Exact experiment settings JSON; omitted only to reproduce the original one-thread proof")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if os.environ.get("CUDA_VISIBLE_DEVICES") != "":
@@ -25,12 +61,13 @@ def main():
     import timm
     import torchvision
     from ...client import SchedulerClient
-    from ...config import PredictionSettings
     from ...hardware import HardwareProfile, build_hardware_key
     from ...prediction.ml_predictor import MLVramPredictor
     from .run import STUDENT_SHA256, accept_job, atomic_json, build_job, file_hash, make_settings
     if torch.cuda.is_initialized() or torch.cuda.is_available(): raise RuntimeError("CPU-only proof required")
-    torch.set_num_threads(1)
+    raw_settings, settings_sha256 = load_preflight_settings(args.settings)
+    predictor_settings = prediction_settings_for_preflight(raw_settings, args.release)
+    torch.set_num_threads(predictor_settings.cpu_threads)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     manifest_path = args.manifest.resolve()
@@ -39,20 +76,23 @@ def main():
         compute_capability="8.6", cuda_runtime=torch.version.cuda, torch_version=torch.__version__,
         driver_version=None)
     hardware = HardwareProfile(hardware_key=build_hardware_key(**hardware_fields), **hardware_fields)
-    predictor_settings = PredictionSettings(mode="ml_predictor", student_release_path=str(args.release.resolve()),
-        student_model_path=str(args.release.resolve() / "checkpoints/S_A10"),
-        conversion_timeout_seconds=180, conversion_max_rss_mb=16384, cpu_threads=1)
     predictor = MLVramPredictor(predictor_settings, hardware)
     if not predictor.available or predictor.artifact_hash != STUDENT_SHA256:
         raise ValueError("published S_A10 unavailable or wrong artifact:" + str(predictor.unavailable_reason))
-    settings = make_settings({}, output, {"total_mib": hardware.total_vram_mb})
+    settings = make_settings({"prediction": predictor_settings.to_dict()}, output,
+                             {"total_mib": hardware.total_vram_mb})
     client = SchedulerClient(settings)
     client.store.backend._hardware_profile = hardware
     state = {"complete": False, "scope": "CPU synthetic graph capture; no real-data fit or GPU allocation",
         "versions": {"python": platform.python_version(), "torch": torch.__version__,
                      "torchvision": torchvision.__version__, "timm": timm.__version__},
         "explicit_target_hardware": hardware.to_dict(), "physical_local_gpu_inspected": False,
-        "conversion_max_rss_mib": 16384, "conversion_timeout_seconds": 180,
+        "conversion_max_rss_mib": predictor_settings.conversion_max_rss_mb,
+        "conversion_timeout_seconds": predictor_settings.conversion_timeout_seconds,
+        "cpu_threads": predictor_settings.cpu_threads,
+        "prediction_settings": predictor_settings.to_dict(),
+        "settings_sha256": settings_sha256,
+        "settings_source": "experiment_settings" if args.settings else "legacy_one_thread_defaults",
         "manifest_sha256": file_hash(manifest_path), "student_sha256": predictor.artifact_hash,
         "driver_sha256": file_hash(__file__), "cuda_initialized_before": torch.cuda.is_initialized(),
         "cases": []}
