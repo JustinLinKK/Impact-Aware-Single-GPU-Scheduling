@@ -86,7 +86,7 @@ def test_eligible_sample_raw_queries_and_live_brackets_replay_fail_closed(kind):
     with pytest.raises(ValueError):c.audit_sample(x,a)
 
 
-def test_full_raw_row_replay_preserves_windows_updates_and_explicit_sentinel_overhead():
+def instrumented_evidence():
     spec,raw=evidence();runtime=spec['torch_version'];qualification=qualified('fixture-uuid',runtime)
     for index,launch in enumerate(raw['launches']):
         a,q,_,records=association(gpu='fixture-uuid',spec=spec,root_pid=launch['pid'],ticks=launch['pid_start_ticks'],
@@ -102,6 +102,11 @@ def test_full_raw_row_replay_preserves_windows_updates_and_explicit_sentinel_ove
     raw['events'][0]['created_at']='1970-01-01T00:01:41.500000+00:00'
     raw['events'][1]['created_at']='1970-01-01T00:01:49.500000+00:00'
     raw['visibility_qualification']=qualification;raw['resources']['calibration_context_sentinel_bytes']=8
+    return spec,raw
+
+
+def test_full_raw_row_replay_preserves_windows_updates_and_explicit_sentinel_overhead():
+    spec,raw=instrumented_evidence()
     assert c.audit_raw_evidence(spec,raw,gpu_uuid='fixture-uuid')['valid']
     retained=deepcopy(raw)
     row=calibrate.extract_row(spec,**raw)

@@ -182,3 +182,32 @@ def test_predeclared_blueprint_is_revalidated_between_episodes(tmp_path,monkeypa
         (heldout.HERE/'iteration-3-blueprint.json').read_bytes()+b' ')
     monkeypatch.setattr(heldout,'HERE',changed)
     with pytest.raises(ValueError,match='blueprint changed'):campaign.verify_bundle(value)
+
+
+def test_heldout_enriched_runtime_identity_composes_with_qualified_raw_replay(monkeypatch):
+    from localml_scheduler.tests.test_a10_context_isolation import instrumented_evidence
+    from localml_scheduler.benchmarks.a10_resource_mechanisms import context_isolation
+    from localml_scheduler.benchmarks.a10_resource_mechanisms.profiles import fit_templates
+    spec,raw=instrumented_evidence()
+    manifest=study.calibration_manifest(fixture_plan())
+    assert {'context_isolation.py','visibility_qualification.py'} <= set(manifest['source_runtime']['package_pins'])
+    # A small synthetic row exercises composition, not a held-out measurement.
+    row=calibrate.extract_row(spec,**raw)
+    snapshot={'fixture_only':True,'scheduler_python_sources':{'saved.py':'c'*64}}
+    retained_snapshot=deepcopy(snapshot);retained_raw=deepcopy(raw)
+    saved_runtime=deepcopy(manifest['source_runtime'])
+    context_isolation.qualification_gate(raw['visibility_qualification'],'fixture-uuid',runtime=saved_runtime)
+    assert context_isolation.audit_raw_evidence(spec,raw,gpu_uuid='fixture-uuid')['valid']
+    monkeypatch.setattr(study.workloads,'source_metadata',lambda:pytest.fail('offline replay must use saved remote metadata'))
+    identity=calibrate.calibration_source_identity(snapshot,manifest,runtime_metadata=saved_runtime)
+    table=fit_templates([row],hardware_key='fixture-hardware',gpu_uuid='fixture-uuid',source_identity=identity)
+    replay=calibrate.calibration_source_identity(snapshot,manifest,runtime_metadata=saved_runtime)
+    assert fit_templates([row],hardware_key='fixture-hardware',gpu_uuid='fixture-uuid',source_identity=replay)==table
+    assert table['source_identity']['calibration_identity_schema']=='resource_solo_runtime_v1'
+    assert table['source_identity']['source_runtime']==saved_runtime
+    assert raw==retained_raw and snapshot==retained_snapshot
+    wrong_runtime={**saved_runtime,'torch_version':'SYNTHETIC-WRONG-RUNTIME'}
+    with pytest.raises(ValueError,match='actual runtime changed'):
+        context_isolation.qualification_gate(raw['visibility_qualification'],'fixture-uuid',runtime=wrong_runtime)
+    with pytest.raises(ValueError,match='actual source/runtime differ'):
+        calibrate.calibration_source_identity(snapshot,manifest,runtime_metadata=wrong_runtime)

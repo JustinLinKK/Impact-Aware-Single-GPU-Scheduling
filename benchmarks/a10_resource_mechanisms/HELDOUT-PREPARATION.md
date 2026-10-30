@@ -70,3 +70,34 @@ held-out controller, calibration evidence and study planner. These include
 runtime/source mismatch rejection, remote-metadata replay, legacy representation
 preservation and held-out budget rejection. This run does not repeat the earlier
 six-worker integration or claim actual A10 calibration.
+
+Calibration isolation repair preparation
+----------------------------------------
+The reviewed iteration-2 namespace/context/teardown repair through source
+5058f94ace1ef8715901d152c77b2b9d4229a49e is ported here. Qualification,
+context isolation, candidate challenge and workload instrumentation bytes match
+that prepared source. `calibrate --visibility-qualification` and pure
+`context_isolation.audit_raw_evidence` keep the same interfaces. See
+VISIBILITY-REPAIR.md for the conditional sampled-isolation scope and limits.
+
+Iteration-3 raw lifecycle snapshots remain unchanged. Calibration still derives
+`resource_solo_runtime_v1` enriched table identity from the actual-host manifest,
+checks source/runtime again before fitting, and supports offline replay using
+retained remote metadata. The combined replay regression fits qualified evidence
+with that enriched identity without substituting local runtime metadata, and
+rejects contradictory runtime bindings. All ineligible startup/terminal samples,
+window checks, explicit diagnostic-wait subtraction and raw memory accounting
+remain as reviewed in the repaired iteration-2 source.
+
+The immutable blueprint SHA remains
+a95a277a9c5969c9ec698d7bd85c67322f87818f523b4928abf3bee8e17962ce.
+This is source preparation only: policy selection still requires the complete
+reviewed iteration-2 results. No deployment identity, runtime evidence, selected
+policy, calibration results or evaluation is created by this port. Actual-host
+CPU preflight, fresh packaged qualification and dedicated calibration remain
+required after a separately reviewed source/package/protocol freeze.
+
+Focused verification: 156 CPU tests passed with zero failures/errors/skips across
+context isolation, visibility qualification, calibration, profiles, study and
+held-out campaign tests. This includes synthetic full48-cell coverage and the
+saved actual teardown-race replay, but does not rerun training or use a GPU.
