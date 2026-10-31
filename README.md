@@ -968,3 +968,10 @@ the agent supplies its model, loss and dataset. The two PetFinder drafts now hav
 adapted runnable copies under `verification/mlevolve_petfinder_20261027/adapted/`;
 the original drafts remain preserved. MLEvolve detects the canonical wrapper
 entry, and runtime checks reject a recipe that differs from the predictor sidecar.
+
+### Experimental V5 latency redesign
+
+The `oct_proposed_v5` branch adds independently selectable continuation forecasts,
+persistent individual deferral reservations and bracket admission changes. See
+[implementation and A10 comparison](docs/oct-proposed-v5-implementation.md) and
+[per-host experiment operations](benchmarks/a10_v5_ablation/OPERATIONS.md).
