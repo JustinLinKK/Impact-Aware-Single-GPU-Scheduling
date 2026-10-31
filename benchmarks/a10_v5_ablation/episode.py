@@ -16,9 +16,10 @@ from ...domain import JobStatus
 from ...execution.executor import SubprocessExecutor
 from ...execution.process_utils import terminate_process_tree
 from ..a10_feedback_latency.run import (atomic_json,check_deadline,with_hard_deadline,
-    build_job,accept_job,submission,parent_due,fixed_fifo_fits,require_predictor_exposure,
+    accept_job,submission,parent_due,fixed_fifo_fits,require_predictor_exposure,
     audit_checkpoint,events_for,prune_owned_weights,policy_activation,make_settings,
     gpu_sample as default_gpu_sample,source_snapshot as baseline_source_snapshot,STUDENT_SHA256)
+from .job_builder import build_job
 from ..a10_feedback_latency.calibration import CalibratedPredictor,RecordingPredictor,phase_model,trial_reserve
 from ..a10_feedback_latency.receipts import receive,request_latency
 from ..a10_feedback_latency.async_preparation import AsyncV4Service

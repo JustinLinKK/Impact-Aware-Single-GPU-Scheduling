@@ -123,3 +123,20 @@ same exact-host CPU checks, visibility qualification, fresh solo calibration and
 development review before the held-out campaign. Raw receipts, source hashes,
 Gantt/update/VRAM plots and comparison JSON/Markdown are retained and exported.
 A negative result is a valid experiment outcome; no checkpoint is promoted.
+
+## Pre-evaluation contract amendment
+
+The first dedicated A10 calibration completed all eight jobs, but the subsequent
+released-predictor capture rejected the historical synthetic builder's partial
+workload contract. V5 now supplies the complete public `candidate_adapter` v1
+contract through one shared builder for every evaluation arm and CPU calibration.
+It explicitly describes the existing adapter, batch tensors, loss, optimizer and
+training recipe. It does not change the executable workload, update counts,
+predictor weights or baseline scheduler.
+
+CPU preflight includes real S_A10 capture and inference for the frozen light,
+medium and compute configurations when `A10_V5_TEST_RELEASE` is supplied. The
+owned A10 preflight supplies this path explicitly. The earlier successful
+calibration and failed capture remain archived as diagnostics. Fresh source pins,
+GPU qualification and calibration are required before the repaired evaluation;
+no development or held-out outcomes existed when this amendment was made.

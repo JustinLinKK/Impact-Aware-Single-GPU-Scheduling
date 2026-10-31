@@ -23,10 +23,11 @@ from ...hardware import HardwareProfile
 from ...prediction.ml_predictor import MLVramPredictor
 from ..a10_feedback_latency.calibration import fit_calibration
 from ..a10_feedback_latency.receipts import Submission, receive
-from ..a10_feedback_latency.run import STUDENT_SHA256, atomic_json, build_job, file_hash, source_snapshot, digest as runtime_digest
+from ..a10_feedback_latency.run import STUDENT_SHA256, atomic_json, file_hash, source_snapshot, digest as runtime_digest
 from ..a10_resource_mechanisms import workloads
 from ..a10_resource_mechanisms.calibrate import calibration_source_identity, extract_row
 from ..a10_resource_mechanisms.profiles import fit_templates
+from .job_builder import build_job
 from .campaign import receipt_artifact_path
 from .protocol import neural_digest, validate_neural_table, validate_table
 
