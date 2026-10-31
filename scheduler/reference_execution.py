@@ -373,8 +373,24 @@ class ReferenceExecutionMixin:
         uncertain=[j for j in known if j not in active and not (by_id[j].status==JobStatus.COMPLETED
             and by_id[j].metadata.get('feedback_ready_at'))and not self._v5_reference_has_release(j)]
         if uncertain:
-            self._v5_reference_wait_release(uncertain,'absence_from_supervisor_is_not_release_proof')
-            return
+            # active_job_ids polls handles too: a worker may exit after the
+            # tick's earlier reap. Consume that actual owned exit once before
+            # classifying it as lost ownership against the original deadline.
+            reconcile=getattr(self,'_poll_active_workers',None)
+            if callable(reconcile):
+                reconcile()
+                if self._v5_reference_state is not state:return
+                reason=self._v5_reference_check()
+                if reason:
+                    self._v5_reference_invalidate(reason)
+                    return
+                by_id={j:self.store.get_job(j)for j in state['cohort']}
+                active=tuple(sorted(self._supervisor_active_job_ids()))
+                uncertain=[j for j in known if j not in active and not (by_id[j].status==JobStatus.COMPLETED
+                    and by_id[j].metadata.get('feedback_ready_at'))and not self._v5_reference_has_release(j)]
+            if uncertain:
+                self._v5_reference_wait_release(uncertain,'absence_from_supervisor_is_not_release_proof')
+                return
         if getattr(self,'_exclusive_probe_job_id',None)is not None:
             self._v5_reference_invalidate('exclusive_probe_reservation_requires_online_planning')
             return super()._dispatch_pending_work()

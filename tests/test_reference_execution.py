@@ -291,3 +291,105 @@ def test_repeated_authoritative_score_cannot_reset_same_trial_cleanup_bound(tmp_
     s.clock.now+=50;begin(s,'inconclusive')
     assert s._v5_reference_state['reconciliation_deadline_at']==deadline
     assert s._v5_reference_state['begun_at']==begun
+
+
+def owned_resume_with_real_supervisor(tmp_path,monkeypatch):
+    """Real ownership/dispatch/reaping, with inert processes and no GPU backend."""
+    from threading import Condition
+    from types import MethodType
+    from localml_scheduler.execution.executor import WorkerProcessHandle
+    from localml_scheduler.scheduler.supervisor import WorkerSupervisor
+    from localml_scheduler.scheduler.run_tracking import RunTrackingMixin
+    s=fixture(tmp_path,monkeypatch)
+    class Process:
+        def __init__(self):self.returncode=None;self.answers=[]
+        def poll(self):
+            if self.answers:self.returncode=self.answers.pop(0)
+            return self.returncode
+    class Backend:
+        def __init__(self):self.launches=[];self.processes={}
+        def available(self):return True
+        def launch(self,jobs):
+            if self.launches:
+                assert s.supervisor.observed_exit_code('a')==0,'refill requires actual current-launch exit proof'
+            self.launches.append(tuple(j.job_id for j in jobs))
+            handles=[]
+            for job in jobs:
+                process=Process();self.processes[job.job_id]=process
+                handles.append(WorkerProcessHandle(job.job_id,process,tmp_path/'unused.stdout',tmp_path/'unused.stderr'))
+            return handles
+    backend=Backend()
+    s.supervisor=WorkerSupervisor(s.settings,store=s.store,backends={'cuda_process':backend})
+    s._completion_condition=Condition()
+    s._exclusive_probe_job_id=None
+    s.log_store=SimpleNamespace(close_run_group=lambda **kw:None)
+    s._record_solo_profiles=lambda *a:None
+    s._record_combination_profiles=lambda *a:None
+    s._finalize_pending_pattern=lambda:None
+    s._handle_worker_exit=MethodType(RunTrackingMixin._handle_worker_exit,s)
+    poll=MethodType(RunTrackingMixin._poll_active_workers,s)
+    s.poll_ticks=0
+    def observed_poll():
+        s.poll_ticks+=1
+        return poll()
+    s._poll_active_workers=observed_poll
+    # The trial's earlier cooperative pause exited cleanly. A later normal
+    # reference resume must discard that old-generation exit receipt.
+    s.supervisor._record_process_exit('a',0)
+    begin(s,'inconclusive')
+    deadline=s._v5_reference_state['reconciliation_deadline_at']
+    s.clock.now=deadline+500
+    s._dispatch_pending_work()
+    assert backend.launches==[('a',)]
+    assert s.supervisor.observed_exit_code('a')is None
+    assert not s.supervisor.has_reaped_process('a')
+    return s,backend,deadline
+
+
+@pytest.mark.parametrize('returncode',[0,2])
+def test_resumed_generation_exit_between_tick_poll_and_active_query_is_authoritatively_reaped(tmp_path,monkeypatch,returncode):
+    s,backend,deadline=owned_resume_with_real_supervisor(tmp_path,monkeypatch)
+    process=backend.processes['a']
+    # The normal tick observes a still-live process. Its next active-ID query
+    # observes actual exit, before WorkerSupervisor.poll records that exit.
+    s.store.update_job('a',status=JobStatus.COMPLETED,metadata_updates={'runtime_global_step':300})
+    process.answers=[None,None,returncode]
+    s._poll_active_workers()
+    assert s.supervisor.observed_exit_code('a')is None
+    previous_ticks=s.poll_ticks
+    if returncode==0:
+        s._dispatch_pending_work()
+        assert backend.launches==[('a',),('b',)]
+        assert not hasattr(s,'v5_failure')
+    else:
+        with pytest.raises(TimeoutError,match='original finite deadline'):s._dispatch_pending_work()
+        assert backend.launches==[('a',)]
+    assert s.poll_ticks==previous_ticks+1
+    assert s.supervisor.observed_exit_code('a')==returncode
+    assert s.supervisor.has_reaped_process('a')
+    assert s._v5_reference_state['reconciliation_deadline_at']==deadline
+
+
+def test_live_unreaped_owned_handle_cannot_turn_absence_into_success(tmp_path,monkeypatch):
+    s,backend,deadline=owned_resume_with_real_supervisor(tmp_path,monkeypatch)
+    worker=next(iter(s.supervisor.active_groups().values())).workers['a']
+    worker.handle.monitor_via_store=True
+    s.store.update_job('a',status=JobStatus.COMPLETED,metadata_updates={'runtime_global_step':300})
+    assert s.supervisor.has_live_process('a')
+    assert s.supervisor.active_job_ids()==[]
+    with pytest.raises(TimeoutError,match='original finite deadline'):s._dispatch_pending_work()
+    assert s.supervisor.observed_exit_code('a')is None
+    assert not s.supervisor.has_reaped_process('a')
+    assert backend.launches==[('a',)]
+    assert s._v5_reference_state['reconciliation_deadline_at']==deadline
+
+
+def test_old_pause_receipt_cannot_release_resumed_generation_after_supervisor_loss(tmp_path,monkeypatch):
+    s,backend,deadline=owned_resume_with_real_supervisor(tmp_path,monkeypatch)
+    s.supervisor._groups.clear();s._active_runs.clear()
+    s._v5_reference_state=None;s._v5_reference_restored=False
+    with pytest.raises(TimeoutError,match='original finite deadline'):s._dispatch_pending_work()
+    assert s.supervisor.observed_exit_code('a')is None
+    assert backend.launches==[('a',)]
+    assert s.v5_failure['pending_job_ids']==['a']
+    assert s._v5_reference_state['reconciliation_deadline_at']==deadline
