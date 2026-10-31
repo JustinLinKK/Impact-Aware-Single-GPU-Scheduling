@@ -149,3 +149,91 @@ def test_accepted_score_downgrades_when_reference_install_refuses_changed_cohort
  result=s._score_feedback_admission(SimpleNamespace(candidate_job_id='j',trial_id='trial'),[],{})
  assert result['decision']=='inconclusive'and 'changed before reference installation'in result['error']
  assert any(e[0][0]=='v5_reference_installation_unavailable'for e in events)
+
+
+@pytest.mark.parametrize('command_present', [False, True])
+def test_finisher_before_candidate_start_releases_real_cooperative_control(tmp_path, monkeypatch, command_present):
+ from localml_scheduler.tests.test_bracket_bootstrap import fixture, iso
+ from localml_scheduler.scheduler.experimental_v5 import V5Service, V5Options
+ from localml_scheduler.domain import SafePointType
+ from localml_scheduler.execution import trial_control
+ original = fixture(tmp_path, monkeypatch, count=2)
+ now = original.clock.now
+ supervisor = SimpleNamespace(active_job_ids=lambda: ['a'])
+ service = V5Service(original.settings, store=original.store, supervisor=supervisor, v5_options=V5Options(bracket=True))
+ service.store.update_job('a', status=JobStatus.RUNNING, metadata_updates={'runtime_global_step': 300})
+ published = {'trial_id': 'retired-prepare', 'cold_start': {'admission_policy': 'test'},
+  'phase': 'prepare', 'decision': 'pending'}
+ metadata = {'colocation_trial': published}
+ if command_present:
+  metadata['trial_step_command'] = {'owner': 'retired-prepare', 'action': 'yield', 'kind': 'prepare',
+   'token': 'old-yield', 'expires_at': now+5}
+ service.store.update_job('b', metadata_updates=metadata)
+ trial = SimpleNamespace(preexisting_job_ids=('a',), candidate_job_id='b', trial_id='retired-prepare',
+  phase='prepare', started_at=iso(now))
+ service._colocation_trial = trial
+ service._evaluate_cold_start_trial(trial)
+ candidate = service.store.get_job('b')
+ assert candidate.metadata['colocation_trial']['decision'] == 'completed_unverified'
+ assert candidate.metadata['runtime_global_step'] == 0
+ assert not candidate.metadata.get('trial_step_command')
+ assert service._colocation_trial is None
+ # Run the actual shared safe-point implementation. A stale prepare barrier
+ # would sleep for 120 seconds per update; fail immediately if it tries to wait.
+ clock = SimpleNamespace(now=now)
+ def unexpected_sleep(_):
+  pytest.fail('retired prepare metadata blocked productive optimizer progress')
+ monkeypatch.setattr(trial_control, 'time', SimpleNamespace(time=lambda: clock.now,
+  monotonic=lambda: clock.now, perf_counter=lambda: clock.now, sleep=unexpected_sleep))
+ class Control(trial_control.StepTrialControlMixin):
+  pass
+ hook = Control()
+ hook.job, hook.store, hook.event_logger = candidate, service.store, service.event_logger
+ hook.control_plane = SimpleNamespace(settings=original.settings,
+  read_command=lambda _: SimpleNamespace(action='run'))
+ context = SimpleNamespace(store=service.store, control_hook=hook)
+ for step in range(4):
+  clock.now += 1
+  assert context.control_hook._cooperative_step(SafePointType.STEP, epoch=0,
+   global_step=step, steps_per_epoch=100, metrics={})
+ assert context.store.get_job('b').metadata['runtime_global_step'] == 3
+ assert not context.store.get_job('b').metadata.get('trial_lease_expired')
+ # The same survivor must be able to supply the next admission's pre-add
+ # measurements, rather than yielding under its abandoned candidate metadata.
+ context.store.update_job('b', metadata_updates={'trial_step_command': {'owner': 'next-trial',
+  'token': 'next-measure', 'action': 'measure', 'kind': 'pre_add', 'candidate': False,
+  'expires_at': clock.now+100, 'window_min_seconds': 1}})
+ for step in range(4, 15):
+  clock.now += 1
+  context.control_hook._cooperative_step(SafePointType.STEP, epoch=0,
+   global_step=step, steps_per_epoch=100, metrics={})
+ measured = context.store.get_job('b').metadata['trial_step_window']
+ assert measured['owner'] == 'next-trial' and measured['kind'] == 'pre_add'
+ assert measured['complete'] and measured['steps'] >= 8 and len(measured['halves']) == 2
+
+
+@pytest.mark.parametrize('published_owner,command_owner', [
+ ('retired', 'newer'), ('newer', 'retired'), ('newer', 'newer'), ('retired', None)])
+def test_finishing_retires_only_matching_published_trial_and_command_owners(tmp_path, monkeypatch, published_owner, command_owner):
+ from localml_scheduler.tests.test_bracket_bootstrap import fixture, iso
+ from localml_scheduler.scheduler.experimental_v5 import V5Service, V5Options
+ original = fixture(tmp_path, monkeypatch, count=2)
+ now = original.clock.now
+ service = V5Service(original.settings, store=original.store,
+  supervisor=SimpleNamespace(active_job_ids=lambda: ['a']), v5_options=V5Options(bracket=True))
+ service.store.update_job('a', status=JobStatus.RUNNING, metadata_updates={'runtime_global_step': 300})
+ published = {'trial_id': published_owner, 'cold_start': True, 'phase': 'prepare', 'decision': 'pending'}
+ command = {'owner': command_owner, 'token': 'owned-token', 'kind': 'prepare', 'action': 'yield', 'expires_at': now+5}
+ service.store.update_job('b', metadata_updates={'colocation_trial': published,
+  'trial_step_command': command if command_owner else {}})
+ trial = SimpleNamespace(preexisting_job_ids=('a',), candidate_job_id='b', trial_id='retired',
+  phase='prepare', started_at=iso(now))
+ service._colocation_trial = trial
+ service._evaluate_cold_start_trial(trial)
+ metadata = service.store.get_job('b').metadata
+ if published_owner == 'retired':
+  assert metadata['colocation_trial']['decision'] == 'completed_unverified'
+  assert metadata['colocation_trial']['phase'] == 'decide'
+ else:
+  assert metadata['colocation_trial'] == published
+ assert metadata['trial_step_command'] == (command if command_owner == 'newer' else {})

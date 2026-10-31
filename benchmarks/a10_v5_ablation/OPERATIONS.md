@@ -11,8 +11,12 @@ No commands below have been executed against a GPU by the preparer.
    blueprint declares 120 cohorts / 864 jobs per host, six arms in every matched
    condition/mode/repeat block, and two repeats per host. Freeze the numeric
    job/episode bound (at most 3600 seconds), calibration bound (at most 7200),
-   campaign bound (at most 28800), and the parent's finite host deadline before
+   campaign bound (at most 43200), and the parent's finite host deadline before
    work starts. These are bounds, not a reset of any billing or lease clock.
+   An amended operational allowance must be recorded before the next attempt,
+   reserved against the same cumulative budget, and applied equally to all arms.
+   Preserve failed development evidence separately; a source repair requires
+   fresh qualification, calibration and the complete development suite.
 2. Run the reviewed host CPU checks. Create the dedicated calibration manifest
    with `protocol calibration-manifest`; this preserves eight replicas, two
    epochs and 1024 updates per epoch from the current blueprint. On the owned

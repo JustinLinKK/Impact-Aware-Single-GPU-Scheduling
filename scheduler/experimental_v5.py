@@ -256,8 +256,20 @@ class V5Service(DeferralReservationMixin, ReferenceExecutionMixin, BracketBootst
                 if unsafe:
                     return super()._evaluate_cold_start_trial(trial)
                 for job in members:
-                    if job is not None and (job.metadata.get('trial_step_command') or {}).get('owner') == trial.trial_id:
-                        self.store.update_job(job.job_id, metadata_updates={'trial_step_command': {}})
+                    if job is None:
+                        continue
+                    updates = {}
+                    if (job.metadata.get('trial_step_command') or {}).get('owner') == trial.trial_id:
+                        updates['trial_step_command'] = {}
+                    published = job.metadata.get('colocation_trial') or {}
+                    if published.get('trial_id') == trial.trial_id:
+                        # A runner can start after its incumbent finishes. Retire
+                        # the published prepare barrier even without a command.
+                        updates['colocation_trial'] = {**published, 'phase': 'decide',
+                            'decision': 'completed_unverified',
+                            'reason': 'measurement closed at training completion; no artificial rejection/pause'}
+                    if updates:
+                        self.store.update_job(job.job_id, metadata_updates=updates)
                 self.event_logger.emit('v5_training_complete_pending_feedback', job_id=trial.candidate_job_id,
                     payload={'trial_id': trial.trial_id, 'decision': 'completed_unverified',
                         'finished_update_ids': [j.job_id for j in finished],

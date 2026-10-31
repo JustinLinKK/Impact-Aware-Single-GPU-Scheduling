@@ -421,9 +421,9 @@ def test_candidate_and_reseal_are_never_implicitly_authorized(bundle_files,tmp_p
     with pytest.raises(FileExistsError):protocol.seal_evaluation_bundle(bundle_files[0]/'plan.json',bundle_files[2],bundle_files[1],bundle_files[0])
 
 
-def test_revised_operational_bounds_accept_eight_hour_campaign_and_reject_excess():
+def test_revised_operational_bounds_accept_twelve_hour_campaign_and_reject_excess():
     p=plan();p.update(job_timeout_seconds=3600,episode_max_seconds=3600,
-        calibration_max_seconds=7200,campaign_max_seconds=28800)
+        calibration_max_seconds=7200,campaign_max_seconds=43200)
     assert protocol.validate_plan(p) is p
     for key in ('job_timeout_seconds','episode_max_seconds','calibration_max_seconds','campaign_max_seconds'):
         bad=deepcopy(p);bad[key]+=1
