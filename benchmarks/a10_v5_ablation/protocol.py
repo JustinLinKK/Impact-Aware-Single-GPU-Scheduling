@@ -47,7 +47,11 @@ def validate_plan(plan):
     configs, conditions = plan['configurations'], plan['conditions']
     if not isinstance(configs, dict) or not configs or not conditions:
         raise ValueError('declared configurations and conditions required')
-    if plan.get('configuration_order') != list(configs):
+    # JSON objects have no semantic key order. Seed assignment follows the
+    # separately frozen list, including after canonical sort_keys serialization.
+    order = plan.get('configuration_order')
+    if (not isinstance(order, list) or any(not isinstance(k, str) for k in order)
+            or len(order) != len(configs) or set(order) != set(configs)):
         raise ValueError('explicit calibration seed order required')
     if len({c['name'] for c in conditions}) != len(conditions):
         raise ValueError('condition names must be unique')

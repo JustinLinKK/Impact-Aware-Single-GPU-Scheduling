@@ -140,3 +140,10 @@ owned A10 preflight supplies this path explicitly. The earlier successful
 calibration and failed capture remain archived as diagnostics. Fresh source pins,
 GPU qualification and calibration are required before the repaired evaluation;
 no development or held-out outcomes existed when this amendment was made.
+
+Canonical JSON serialization also exposed an order check in the experiment
+protocol: it compared configuration-map insertion order with the frozen seed
+order list. The list now remains authoritative across serialization; it must
+contain each configuration exactly once. Round-trip checks preserve the exact
+calibration seeds, update budgets, development inputs and 120-cell comparison
+order. This changes validation only, without changing the frozen experiment.

@@ -449,3 +449,62 @@ def test_parent_five_condition_blueprint_has120_matched_cohorts864_jobs_per_host
     assert len({e['block'] for e in order})==20
     assert sum(protocol.profile_source(c)=='ml_predictor' for c in p['conditions'])==1
     assert len(protocol.calibration_manifest(p)['calibration'])==8
+
+
+def test_sorted_json_round_trip_preserves_explicit_calibration_seeds_and_cli_manifest(tmp_path):
+    path=Path(protocol.__file__).with_name('blueprint.json');bp=json.loads(path.read_text())
+    p=protocol.candidate_plan(bp,blueprint_sha256=campaign.file_hash(path),source_commit='a'*40,
+        host_id='fixture-host',deadline_utc=(datetime.now(timezone.utc)+timedelta(hours=10)).isoformat(),
+        job_timeout_seconds=1800,episode_max_seconds=3600,campaign_max_seconds=28800,calibration_max_seconds=3600)
+    p['status']='frozen';before=protocol.calibration_manifest(p)
+    plan_path=tmp_path/'plan.json';write(plan_path,p)
+    restored=campaign.load(plan_path)
+    assert list(restored['configurations'])!=restored['configuration_order']
+    assert restored['configuration_order']==p['configuration_order']
+    assert protocol.calibration_manifest(restored)==before
+    assert protocol.episode_order(restored)==protocol.episode_order(p)
+    output=tmp_path/'calibration-manifest.json'
+    protocol.main(['calibration-manifest','--plan',str(plan_path),'--output',str(output)])
+    assert campaign.load(output)==before
+    names=[s['name']for s in before['calibration']]
+    assert names==[f'{label}-cal-{replica}'for label in p['configuration_order']for replica in range(2)]
+    assert [s['seed']for s in before['calibration']]==list(range(p['seed_base'],p['seed_base']+8))
+
+
+@pytest.mark.parametrize('bad_order',[None,[],['tiny','tiny'],['unknown'],{},[None]])
+def test_seed_order_must_cover_each_configuration_exactly_once(bad_order):
+    p=plan();p['configuration_order']=bad_order
+    with pytest.raises(ValueError,match='explicit calibration seed order'):
+        protocol.validate_plan(p)
+
+
+def test_full_blueprint_round_trip_seals_and_loads_both_development_and_heldout(tmp_path,monkeypatch):
+    """Real protocol/configuration flow; synthetic calibration, no GPU work."""
+    from localml_scheduler.benchmarks.a10_v5_ablation import episode,development
+    path=Path(protocol.__file__).with_name('blueprint.json');bp=json.loads(path.read_text())
+    p=protocol.candidate_plan(bp,blueprint_sha256=campaign.file_hash(path),source_commit='a'*40,
+        host_id='fixture-host',deadline_utc=(datetime.now(timezone.utc)+timedelta(hours=10)).isoformat(),
+        job_timeout_seconds=1800,episode_max_seconds=3600,campaign_max_seconds=28800,calibration_max_seconds=3600)
+    p['status']='frozen';pp=tmp_path/'plan.json';write(pp,p)
+    cm=protocol.calibration_manifest(campaign.load(pp));runtime=workloads.source_metadata()
+    table={'schema':SCHEMA,'source':SOURCE,'hardware_key':'fixture-hardware','gpu_uuid':'GPU-fixture',
+        'source_identity':{'calibration_identity_schema':'resource_solo_runtime_v1',
+            'source_runtime':runtime,'torch_version':runtime['torch_version'],
+            'scheduler_python_sources':{'fixture.py':'b'*64}},
+        'entries':{s['template_key']:{'updates_per_second':10.,'mean_allocated_mib':100.,
+            'admission_reservation_mib':200.,'phase_seconds':{'startup':1.,'pause':1.,'resume':1.,
+            'checkpoint':1.,'validation':1.,'finalization':1.,'delivery':1.}}for s in cm['calibration']}}
+    table['artifact_sha256']=workloads.digest(table)
+    settings=tmp_path/'settings.json';cal=tmp_path/'calibration.json';neural=tmp_path/'neural.json'
+    write(settings,{});write(cal,table);write(neural,neural_table(table))
+    for target in (episode,campaign,development):monkeypatch.setattr(target,'source_snapshot',mock_snapshot)
+    sealed=protocol.seal_evaluation_bundle(pp,cal,settings,tmp_path/'sealed',neural)
+    heldout=campaign.sealed_bundle(sealed,settings,cal,neural);campaign.verify_bundle(heldout)
+    dev=development.sealed_inputs(sealed,settings,cal,'a'*40);development.verify_inputs(dev)
+    assert len(heldout['order'])==120 and sum(r['expected_jobs']for r in heldout['order'])==864
+    assert sum(r['expected_jobs']for r in development.planned_records())==120
+    for record in development.planned_records():
+        original=dev['inputs'][record['condition']]['manifest']
+        amended=development.development_manifest(original,record)
+        assert [s['template_key']for s in original['jobs']]==[s['template_key']for s in amended['jobs']]
+        assert [s['steps_per_epoch']for s in original['jobs']]==[s['steps_per_epoch']for s in amended['jobs']]
