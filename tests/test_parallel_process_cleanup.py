@@ -109,3 +109,81 @@ def test_repeated_termination_cannot_interrupt_bounded_cleanup_or_change_handler
         assert owned.cleanup(Executor(),{},timeout=.1)['remaining_live_pids']==[]
         assert signal.getsignal(signal.SIGTERM)is interrupted
     finally:signal.signal(signal.SIGTERM,previous)
+
+
+def cached_incomplete_backend(tmp_path,monkeypatch,*,terminal_after=None,terminal_state="Z",reused=False):
+    """Deterministic process-birth observations, without spawning or signaling."""
+    from localml_scheduler.scheduler import parallel_preparation
+    clock=SimpleNamespace(now=10.)
+    fake_time=SimpleNamespace(monotonic=lambda:clock.now,sleep=lambda delay:setattr(clock,'now',clock.now+delay))
+    monkeypatch.setattr(owned,'time',fake_time)
+    monkeypatch.setattr(parallel_preparation,'time',fake_time)
+    expected={'pid':12345,'ppid':os.getpid(),'state':'S','start_ticks':111}
+    calls=[]
+    def cleanup(executor,known,*,timeout):
+        calls.append(timeout)
+        return {'owned_identities':[dict(expected)],'remaining_live_pids':[expected['pid']],
+            'elapsed_seconds':0.,'terminal_states':['absent','Z','X']}
+    monkeypatch.setattr(owned,'cleanup',cleanup)
+    def identity(pid):
+        assert pid==expected['pid'],'re-observation must not inspect an unrelated process'
+        if reused:return {**expected,'start_ticks':222}
+        if terminal_after is not None and clock.now>=terminal_after:
+            return None if terminal_state is None else {**expected,'state':terminal_state}
+        return dict(expected)
+    monkeypatch.setattr(owned,'identity',identity)
+    monkeypatch.setattr(owned.os,'kill',lambda *_:pytest.fail('cached cleanup re-observation must never signal a PID'))
+    settings=SchedulerSettings(runtime_root=tmp_path/'runtime')
+    b=IsolatedPredictionBackend(SimpleNamespace(artifact_hash='frozen',available=True),kind='ml_predictor',
+        settings_dict=settings.to_dict(),calibration={},hardware=SimpleNamespace(hardware_key='cpu'),
+        gpu_uuid='cpu',_executor=SimpleNamespace())
+    b._known_owned={expected['pid']:dict(expected)}
+    assert b.stop(timeout=0.)is False
+    assert calls==[0.]
+    return b,clock,calls
+
+
+@pytest.mark.parametrize("terminal_state", [None,"Z","X"])
+def test_zero_time_stop_then_delayed_terminal_birth_refreshes_cached_incomplete_report(tmp_path,monkeypatch,terminal_state):
+    b,clock,calls=cached_incomplete_backend(tmp_path,monkeypatch,terminal_after=10.03,terminal_state=terminal_state)
+    assert b.stop(timeout=.2)
+    assert clock.now>=10.03 and clock.now-10<=.2
+    assert b.cleanup_report['remaining_live_pids']==[]
+    assert b.cleanup_report['reobservations'][-1]['observed_monotonic_seconds']==clock.now
+    assert calls==[0.]  # Existing TERM/KILL cleanup is not repeated.
+    previous_clock=clock.now;previous_report=b.cleanup_report
+    assert b.stop(timeout=.2)
+    assert b.cleanup_report is previous_report and clock.now==previous_clock
+
+
+def test_persistent_live_owned_birth_remains_failed_within_each_callers_budget(tmp_path,monkeypatch):
+    b,clock,calls=cached_incomplete_backend(tmp_path,monkeypatch)
+    started=clock.now
+    assert not b.stop(timeout=.05)
+    assert clock.now-started<=.05+1e-9
+    assert b.cleanup_report['remaining_live_pids']==[12345]
+    assert b.cleanup_report['reobservations'][-1]['elapsed_seconds']<=.05+1e-9
+    assert calls==[0.]
+
+
+def test_reused_pid_is_not_signaled_and_does_not_keep_the_old_owned_birth_live(tmp_path,monkeypatch):
+    b,clock,calls=cached_incomplete_backend(tmp_path,monkeypatch,reused=True)
+    assert b.stop(timeout=.1)
+    assert b.cleanup_report['remaining_live_pids']==[]
+    assert clock.now==10. and calls==[0.]
+
+
+def test_backend_stop_state_lock_wait_consumes_its_existing_deadline(tmp_path):
+    # A busy prediction-state lock must not turn a bounded stop into an
+    # unbounded lock acquisition before the cleanup budget even starts.
+    settings=SchedulerSettings(runtime_root=tmp_path/'runtime')
+    b=IsolatedPredictionBackend(SimpleNamespace(artifact_hash='frozen',available=True),kind='ml_predictor',
+        settings_dict=settings.to_dict(),calibration={},hardware=SimpleNamespace(hardware_key='cpu'),
+        gpu_uuid='cpu',_executor=SimpleNamespace())
+    b._lock.acquire()
+    try:
+        started=time.monotonic()
+        assert b.stop(timeout=.02)is False
+        assert time.monotonic()-started<.2
+        assert b.cleanup_report is None
+    finally:b._lock.release()

@@ -40,6 +40,19 @@ def live(known):
     return result
 
 
+def reobserve(known, *, timeout=0.):
+    """Refresh an incomplete cleanup snapshot; observe exact births, never signal."""
+    started=time.monotonic();deadline=started+max(0.,timeout)
+    while True:
+        remaining=live(known)
+        observed=time.monotonic()
+        if not remaining or observed>=deadline:
+            return {'remaining_live_pids':remaining,'elapsed_seconds':observed-started,
+                'observed_monotonic_seconds':observed,
+                'scope':'Re-observed the same owned PID births; no additional processes signaled.'}
+        time.sleep(min(.01,deadline-observed))
+
+
 def _cleanup(executor, known, *, timeout=2.):
     started=time.monotonic();deadline=started+max(0.,timeout)
     roots=remember(executor,known)

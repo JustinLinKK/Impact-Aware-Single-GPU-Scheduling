@@ -125,11 +125,21 @@ class IsolatedPredictionBackend:
         until=time.monotonic()+timeout
         if not self._stop_lock.acquire(timeout=timeout):return False
         try:
-            with self._lock:
+            if not self._lock.acquire(timeout=max(0.,until-time.monotonic())):return False
+            try:
                 self._closed=True
-                if self.cleanup_report is not None:return not self.cleanup_report['remaining_live_pids']
-                self.cleanup_report=owned.cleanup(self._executor,self._known_owned,timeout=max(0.,until-time.monotonic()))
-            return not self.cleanup_report['remaining_live_pids']
+                if self.cleanup_report is None:
+                    self.cleanup_report=owned.cleanup(self._executor,self._known_owned,timeout=max(0.,until-time.monotonic()))
+                elif self.cleanup_report['remaining_live_pids']:
+                    # A zero-time stop may sample just after SIGKILL, before the
+                    # owned workers become terminal. Refresh that observation;
+                    # an old incomplete snapshot is not a permanent live leak.
+                    observation=owned.reobserve(self._known_owned,timeout=max(0.,until-time.monotonic()))
+                    self.cleanup_report={**self.cleanup_report,
+                        'remaining_live_pids':observation['remaining_live_pids'],
+                        'reobservations':[*self.cleanup_report.get('reobservations',[]),observation]}
+                return not self.cleanup_report['remaining_live_pids']
+            finally:self._lock.release()
         finally:self._stop_lock.release()
 
 

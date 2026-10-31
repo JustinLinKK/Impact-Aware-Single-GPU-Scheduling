@@ -83,7 +83,7 @@ def validate_plan(plan):
             or type(plan['seed_base']) is not int or plan['seed_base'] < 0):
         raise ValueError('sustained replicated calibration and explicit budget/seed bounds required')
     limits={'job_timeout_seconds':3600,'episode_max_seconds':3600,
-            'campaign_max_seconds':43200,'calibration_max_seconds':7200}
+            'campaign_max_seconds':70200,'calibration_max_seconds':7200}
     for key,upper in limits.items():
         if type(plan.get(key)) is not int or not 0 < plan[key] <= upper:
             raise ValueError('finite positive operational bound exceeded: ' + key)

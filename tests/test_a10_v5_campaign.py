@@ -508,3 +508,14 @@ def test_full_blueprint_round_trip_seals_and_loads_both_development_and_heldout(
         amended=development.development_manifest(original,record)
         assert [s['template_key']for s in original['jobs']]==[s['template_key']for s in amended['jobs']]
         assert [s['steps_per_epoch']for s in original['jobs']]==[s['steps_per_epoch']for s in amended['jobs']]
+
+@pytest.mark.parametrize('seconds,valid',[(70200,True),(70201,False),(0,False),(float('inf'),False)])
+def test_campaign_operational_ceiling_supports_full_finite_replication(seconds,valid):
+    p=plan();p['campaign_max_seconds']=seconds
+    before={k:p[k] for k in ('job_timeout_seconds','episode_max_seconds','calibration_max_seconds')}
+    if valid:
+        assert protocol.validate_plan(p) is p
+        assert {k:p[k] for k in before}==before
+    else:
+        with pytest.raises(ValueError,match='operational bound'):
+            protocol.validate_plan(p)
