@@ -1,0 +1,161 @@
+{
+  "schema": "v5_1_primary_blueprint_v1",
+  "arms": [
+    "fixed_three",
+    "combined",
+    "v5_1"
+  ],
+  "modes": [
+    "individual",
+    "group"
+  ],
+  "repeats": 2,
+  "configurations": {
+    "light": {
+      "input_features": 128,
+      "precision": "fp32_ieee",
+      "pool_size": 4096,
+      "validation_size": 256,
+      "width": 256,
+      "repetitions": 4,
+      "batch": 64,
+      "ballast_mib": 0
+    },
+    "resident": {
+      "input_features": 128,
+      "precision": "fp32_ieee",
+      "pool_size": 4096,
+      "validation_size": 256,
+      "width": 256,
+      "repetitions": 4,
+      "batch": 64,
+      "ballast_mib": 7168
+    },
+    "medium": {
+      "input_features": 128,
+      "precision": "fp32_ieee",
+      "pool_size": 4096,
+      "validation_size": 256,
+      "width": 768,
+      "repetitions": 6,
+      "batch": 96,
+      "ballast_mib": 0
+    },
+    "compute": {
+      "input_features": 128,
+      "precision": "fp32_ieee",
+      "pool_size": 4096,
+      "validation_size": 256,
+      "width": 1792,
+      "repetitions": 9,
+      "batch": 160,
+      "ballast_mib": 0
+    }
+  },
+  "seed_base": 731000,
+  "calibration_replicas": 2,
+  "calibration_steps_per_epoch": 1024,
+  "maximum_updates": 100000,
+  "conditions": [
+    {
+      "name": "short-mixed",
+      "classes": [
+        "light",
+        "medium",
+        "compute"
+      ],
+      "steps_per_epoch": {
+        "light": 1500,
+        "medium": 400,
+        "compute": 64
+      }
+    },
+    {
+      "name": "long-mixed",
+      "classes": [
+        "light",
+        "medium",
+        "compute"
+      ],
+      "steps_per_epoch": {
+        "light": 20000,
+        "medium": 6000,
+        "compute": 1500
+      }
+    },
+    {
+      "name": "memory-pair",
+      "classes": [
+        "resident",
+        "resident",
+        "compute"
+      ],
+      "steps_per_epoch": {
+        "resident": 5000,
+        "compute": 512
+      }
+    },
+    {
+      "name": "backlog-six",
+      "classes": [
+        "light",
+        "medium",
+        "light",
+        "medium",
+        "compute",
+        "light"
+      ],
+      "steps_per_epoch": {
+        "light": 3000,
+        "medium": 800,
+        "compute": 256
+      }
+    },
+    {
+      "name": "published-pipeline",
+      "classes": [
+        "light",
+        "medium",
+        "compute"
+      ],
+      "steps_per_epoch": {
+        "light": 1500,
+        "medium": 400,
+        "compute": 64
+      },
+      "profile_source": "ml_predictor"
+    }
+  ],
+  "summary": "Unweighted mean of condition-specific request means, per mode; each condition equal weight and each host/repeat equal within condition. Measured and published-profile strata reported separately.",
+  "provisional_gates": {
+    "mean_reduction_vs_combined": 0.05,
+    "mean_reduction_vs_fixed_three": 0.05,
+    "p95_max_worsening": 0.05,
+    "per_condition_mean_max_worsening": 0.1,
+    "independent_repeat_note": "Two complete paired repeats within mandatory host-c; host-b optional subject finite resource bounds; missing host coverage explicit, no heterogeneous pooled headline."
+  },
+  "development": {
+    "conditions": [
+      "short-mixed",
+      "backlog-six",
+      "published-pipeline"
+    ],
+    "modes": [
+      "individual",
+      "group"
+    ],
+    "arm": "v5_1",
+    "seed_offset": 18000000,
+    "activation": "descriptive only; no forced acceptance or tuning",
+    "cpu_regressions": [
+      "head_hold",
+      "drain_without_preemption"
+    ],
+    "tuning": "No outcome-based policy, threshold, workload or seed changes.",
+    "overall_seconds": 3600
+  },
+  "planned_host_blocks": {
+    "host-c": "mandatory",
+    "host-b": "optional_subject_finite_bounds"
+  }
+}

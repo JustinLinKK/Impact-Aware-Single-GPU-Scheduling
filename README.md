@@ -1,5 +1,21 @@
 # Impact-Aware Single-GPU Scheduling
 
+## V5.1: FIFO with adaptive concurrency
+
+This branch adds an experimental FIFO controller that adjusts the concurrency
+target **alpha** while retaining submission order. It forecasts individual
+result latency or all-required bracket latency, and lowers concurrency by
+draining existing workers without admission-related pauses or restarts.
+
+- [V5.1 design, research, mathematics and control loop](docs/oct-proposed-v5-1-design.md)
+- [Existing V5 behavior and ablations](docs/oct-proposed-v5-implementation.md)
+- [Three-arm experiment blueprint](benchmarks/a10_v5_1_ablation/blueprint.json)
+
+The new primary comparison is fixed-three FIFO, combined V5 and V5.1. GPU
+evaluation requires a frozen source/package and reviewed host preparation;
+implementation and CPU tests alone do not establish a latency improvement.
+Predictor weights, labels, splits, recipes and update budgets are unchanged.
+
 This research branch adds opt-in [A10 causal experiments](benchmarks/a10_feedback_latency/CAUSAL-ITERATIONS.md)
 to distinguish prediction preparation from admission decisions. The first
 iteration compares five common-calibration arms over 20 cohorts (120 jobs).
