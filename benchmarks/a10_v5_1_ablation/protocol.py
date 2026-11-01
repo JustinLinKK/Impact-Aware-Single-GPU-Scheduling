@@ -31,6 +31,10 @@ def _sha(value):
 def validate_plan(plan):
     if plan.get('schema') != SCHEMA_PLAN:
         raise ValueError('explicit v5.1 three-arm schema required')
+    if 'calibration_refresh' in plan:
+        from .fresh_calibration import CONTRACT
+        if plan['calibration_refresh'] != CONTRACT:
+            raise ValueError('exact predeclared fresh-calibration lifecycle required')
     if (tuple(plan.get('arms', ())) != ARMS or plan.get('modes') != ['individual', 'group']
             or type(plan.get('repeats')) is not int or plan['repeats'] != 2):
         raise ValueError('all three exact arms and both modes in every repeated block required')

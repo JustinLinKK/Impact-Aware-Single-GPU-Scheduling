@@ -122,6 +122,9 @@ def gpu_sample():
             "power_watts": optional(power), "occupancy_note": "NVML busy counters are not SM occupancy"}
 
 
+FEEDBACK_PHASE_MODEL_TTL_SECONDS = 14400.
+
+
 def make_settings(raw, output, hardware):
     raw = json.loads(json.dumps(raw))
     raw.update(runtime_root=str(output / "runtime"), python_executable=sys.executable,
@@ -134,7 +137,7 @@ def make_settings(raw, output, hardware):
     gpu.setdefault("memory", {}).update(gpu_vram_gib=hardware["total_mib"] / 1024.,
                                        predicted_budget_fraction=.9)
     gpu["feedback_latency"] = {"enabled": True, "allow_zero_overhead": False,
-        "bracket_admission_mode": "recovery_regret", "phase_model_ttl_seconds": 14400.}
+        "bracket_admission_mode": "recovery_regret", "phase_model_ttl_seconds": FEEDBACK_PHASE_MODEL_TTL_SECONDS}
     settings = SchedulerSettings.from_dict(raw)
     settings.ensure_runtime_layout()
     atomic_json(settings.runtime_root / "scheduler_settings.json", settings.to_dict())

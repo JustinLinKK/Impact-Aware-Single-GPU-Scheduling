@@ -428,13 +428,16 @@ def execute(bundle, root):
         if root.exists(): raise FileExistsError('never overwrite/resume an existing campaign')
         verify_bundle(bundle)
         root.mkdir(exist_ok=False)
-        started=time.monotonic();records=planned_records(bundle['order']);plan=bundle['plan'];profiles={};active=None
+        started=time.monotonic();started_unix=time.time();records=planned_records(bundle['order']);plan=bundle['plan'];profiles={};active=None
+        original_bundle=bundle;refresh=None
         frozen={'order':bundle['order'],'input_sha256':bundle['hashes'],'source_pins':bundle['snapshots'],
             'episode_max_seconds':plan['episode_max_seconds'],'campaign_max_seconds':plan['campaign_max_seconds'],'deadline_utc':plan['deadline_utc'],
             'planned_cohorts':len(records),'planned_jobs':sum(r['expected_jobs'] for r in records),'settings':str(bundle['settings']),'calibration':str(bundle['calibration']),
             'cache_policy':'fresh scheduler/predictor process and runtime per episode; charged dedicated calibration shared OS/data caches',
             'host_id':plan['host_id'],'source_commit':plan['source_commit'],
-            'scope':'three-arm matched blocks within one host; no neural-predictor accuracy or cross-host pooled claim'}
+            'scope':'three-arm matched blocks within one host; no neural-predictor accuracy or cross-host pooled claim',
+            'calibration_refresh':plan.get('calibration_refresh'),
+            'campaign_started_unix':started_unix,'campaign_expires_unix':started_unix+plan['campaign_max_seconds']}
         atomic_json(root/'campaign-protocol-before.json',frozen)
         def save(status,error=None):
             atomic_json(root/'campaign-results.json',records)
@@ -445,12 +448,21 @@ def execute(bundle, root):
                 'error':error,'coverage':coverage(records,bundle['order'])})
         def deadline():
             check_deadline(plan,time.monotonic()-started,plan['campaign_max_seconds'])
+            if refresh is not None:refresh.guard()
         def interrupted(signum,frame): raise InterruptedError('resource campaign signal '+str(signum)+'; terminating only owned episode child')
         previous={sig:signal.getsignal(sig) for sig in (signal.SIGTERM,signal.SIGINT,signal.SIGHUP)}
         for sig in previous:signal.signal(sig,interrupted)
         save('running')
         try:
-            for record in records:
+            if plan.get('calibration_refresh'):
+                from .fresh_calibration import FreshCalibration
+                refresh=FreshCalibration(bundle,root,deadline,started_unix+plan['campaign_max_seconds'])
+            for index,record in enumerate(records):
+                if refresh is not None:
+                    if index%3==0:bundle=refresh.begin_block(index)
+                    refresh.before_episode(index)
+                    record['calibration_generation']=refresh.generations[-1]['generation']
+                    record['calibration_block']=index//3
                 deadline();verify_bundle(bundle);active=record
                 item=bundle['manifests'][record['condition']];output=root/record['output']
                 if output.exists():raise FileExistsError('refuse duplicate cohort output')
@@ -478,8 +490,10 @@ def execute(bundle, root):
                     audit=audit_episode(output,record,item['manifest'],bundle['snapshots'][record['condition']],item['table'])
                     record.update(audit=audit,usable_receipts=audit['usable_receipts'],result={key:audit.get(key) for key in ('complete','predictor_comparison_eligible')})
                     if record['exit_code']!=0 or not audit['valid']:raise RuntimeError('required episode failed/ineligible: '+json.dumps(audit['errors']))
-                    common=profiles.setdefault(record['condition'],audit['profiles_by_name'])
-                    if audit['profiles_by_name']!=common:raise ValueError('numeric profile identity changed within condition across arms/repeats')
+                    profile_key=(index//3,record['condition']) if refresh is not None else record['condition']
+                    common=profiles.setdefault(profile_key,audit['profiles_by_name'])
+                    if audit['profiles_by_name']!=common:raise ValueError('numeric profile identity changed within matched calibration scope')
+                    if refresh is not None:refresh.end_episode(index)
                     record['status']='completed';active=None;save('running')
                     atomic_json(root/'active-child.json',{'pid':child.pid,'owned':True,'status':'exited','exit_code':child.returncode,'output':record['output']})
                 except BaseException as exc:
@@ -487,7 +501,7 @@ def execute(bundle, root):
                     atomic_json(root/'active-child.json',{'pid':child.pid if child is not None else None,'owned':child is not None,
                         'status':'failed','exit_code':record['exit_code'],'output':record['output'],'error':repr(exc)})
                     raise
-            deadline();verify_bundle(bundle)
+            deadline();verify_bundle(bundle);verify_bundle(original_bundle)
             if coverage(records,bundle['order'])['completed_valid_cohorts']!=len(records) or coverage(records,bundle['order'])['usable_receipts']!=sum(r['expected_jobs'] for r in records):raise ValueError('required complete campaign coverage absent')
             atomic_json(root/'campaign-source-pins-after.json',bundle['snapshots'])
             deadline();verify_bundle(bundle)
