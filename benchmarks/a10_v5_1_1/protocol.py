@@ -98,7 +98,11 @@ def row_manifest(plan, row, measured, neural, *, history_root):
             # Paths relocate, while complete executable recipe and seeds stay
             # identical. Hashes that bind paths are recomputed transparently.
             spec['source'] = str(workloads.HERE / 'candidate.py')
-            spec['source_sha256'] = workloads.file_hash(spec['source'])
+            if spec['source_sha256'] != workloads.file_hash(spec['source']):
+                raise ValueError('anchor executable source changed')
+            # The template identity includes the executable path. Rebind it
+            # before the enclosing spec/signature hashes; keep recipe/seeds.
+            spec['template_key'] = workloads.template_key(spec)
             spec['spec_sha256'] = workloads.spec_digest(spec)
             spec['expected_runtime_signature'] = workloads.expected_signature(spec)
             specs.append(spec)

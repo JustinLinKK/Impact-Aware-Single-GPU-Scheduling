@@ -113,3 +113,67 @@ def test_all_manifest_rows_roundtrip_with_actual_base_and_variant_template_keys(
             assert all(j['template_key'] in table['entries'] for j in result['jobs'])
             assert {(s['role'],s['chain']):s['seed'] for s in result['jobs']}=={
                 (s['role'],s['chain']):s['seed'] for s in row['jobs']}
+
+
+def screening_fixture(tmp_path):
+    """Historical anchors carry an old absolute path, as recovered real runs do."""
+    from localml_scheduler.tests.test_a10_v5_campaign import neural_table
+    from localml_scheduler.benchmarks.a10_resource_mechanisms.profiles import SCHEMA,SOURCE
+    prepared=p.build_plan('screening'); anchors={}
+    old=tmp_path/'old-host'/'candidate.py';old.parent.mkdir();old.write_bytes((p.workloads.HERE/'candidate.py').read_bytes())
+    for row in prepared['rows']:
+        if row['role']!='stability_anchor':continue
+        condition=next(x for x in prepared['blueprint']['conditions'] if x['name']==row['condition'])
+        jobs=[]
+        for chain,label in enumerate(condition['classes']):
+            for role in ('parent','child'):
+                seed=830000+chain*2+(role=='child')
+                jobs.append(p.base.make_spec(prepared['blueprint']['configurations'][label],
+                    name=f'{role}-{chain}-{label}',role=role,chain=chain,epochs=2,
+                    steps_per_epoch=condition['steps_per_epoch'][label],seed=seed,
+                    train_pool_seed=seed+10000,validation_pool_seed=seed+20000,source_path=old))
+        anchors[row['id']]={'manifest_sha256':'a'*64,'terminal_audit_sha256':'b'*64,'jobs':jobs}
+    value=p.execution_plan('screening',source_commit='c'*40,host_id='test-host',deadline_utc='2099-01-01T00:00:00Z',anchors=anchors)
+    manifest=p.base.calibration_manifest(p.calibration_plan(value))
+    table={'schema':SCHEMA,'source':SOURCE,'hardware_key':'fixture','gpu_uuid':'GPU-test',
+        'source_identity':{'calibration_identity_schema':'resource_solo_runtime_v1',
+          'torch_version':p.workloads.source_metadata()['torch_version'],
+          'source_runtime':p.workloads.source_metadata(),'scheduler_python_sources':{'fixture.py':'a'*64}},
+        'entries':{s['template_key']:{'updates_per_second':10.,'mean_allocated_mib':100.,
+          'admission_reservation_mib':200.,'phase_seconds':dict.fromkeys(
+           ('startup','pause','resume','checkpoint','validation','finalization','delivery'),1.)}
+          for s in manifest['calibration']}}
+    table['artifact_sha256']=p.digest(table)
+    return json.loads(json.dumps(value,sort_keys=True)),table,neural_table(table)
+
+
+def test_all_screening_rows_relocate_historical_anchors_without_recipe_changes(tmp_path):
+    from localml_scheduler.benchmarks.a10_v5_1_1.episode import validate_manifest
+    from localml_scheduler.benchmarks.a10_v5_ablation.episode import validate_manifest as baseline_validate
+    value,table,neural=screening_fixture(tmp_path)
+    count=0
+    for row in value['prepared']['rows']:
+        result=p.row_manifest(value,row,table,neural,history_root=tmp_path/'history')
+        validator=validate_manifest if row['arm']=='v5_1_1' else baseline_validate
+        validator(result,arm=row['arm'],mode=row['mode'])
+        count+=len(result['jobs'])
+        for spec in result['jobs']:
+            assert spec['template_key']==p.workloads.template_key(spec)
+            assert spec['template_key'] in table['entries']
+        if row['role']=='stability_anchor':
+            original={(x['role'],x['chain']):x for x in value['anchors'][row['id']]['jobs']}
+            allowed={'source','template_key','spec_sha256','expected_runtime_signature'}
+            for spec in result['jobs']:
+                old=original[(spec['role'],spec['chain'])]
+                assert {k:v for k,v in spec.items() if k not in allowed}=={k:v for k,v in old.items() if k not in allowed}
+                assert spec['template_key']!=old['template_key']
+    assert count==360 and len(value['prepared']['rows'])==48
+
+
+def test_anchor_relocation_rejects_different_executable_bytes(tmp_path):
+    value,table,neural=screening_fixture(tmp_path)
+    row=value['prepared']['rows'][0];job=value['anchors'][row['id']]['jobs'][0]
+    job['source_sha256']='0'*64;job['spec_sha256']=p.workloads.spec_digest(job)
+    value['sha256']=p.digest({k:v for k,v in value.items() if k!='sha256'})
+    with pytest.raises(ValueError,match='anchor executable source changed'):
+        p.row_manifest(value,row,table,neural,history_root=tmp_path/'history')
