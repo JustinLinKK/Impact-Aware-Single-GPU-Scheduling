@@ -1,11 +1,27 @@
 # V5.1.1 — FIFO concurrency with persistent workload experience
 
-Status: finalized design specification and CPU-prepared experiment protocol.
-The runtime integration and new GPU evaluation are not implemented by this
-document. Base source: `053f0a412e2060b1ba17b25226e4082205e1ae40`.
+Status: opt-in runtime implementation and guarded screening protocol. New GPU
+qualification, development review and screening remain separate execution gates.
+Base source: `053f0a412e2060b1ba17b25226e4082205e1ae40`.
 Branch: `oct_proposed_v5_1_1`. This design supersedes V5.1's short-lived,
-count-only evidence mechanism for a future opt-in policy; it does not modify the
+count-only evidence mechanism for the new opt-in policy; it does not modify the
 active frozen fresh-calibration comparison.
+
+The implementation is in `scheduler/adaptive_fifo_v511.py`, with separate
+training-graph preparation, append-only experience and contextual-rate modules.
+The execution details in `benchmarks/a10_v5_1_1/protocol.py:AMENDMENT` are frozen
+before any new A10 outcomes. A compatible initial prefix can carry one adjacent
+alpha step from a prior episode only after two actual stable windows at that
+occupancy; this is a warm-start heuristic, not a forecast-gain claim. A context
+is demoted after two consecutive factor-1.5 rate misses. Approximate transfer
+requires three independent episodes under the same calibration generation;
+exact raw rates may be re-expressed against a new reference without redating.
+
+Graph capture is charged CPU preparation after acceptance. Incomplete dynamic
+dependency analysis forbids a graph-cache hit; the frozen application closure
+remains mandatory. The capture has a serialized lane; the published-predictor
+group path retains two isolated inference consumers. Observer persistence and
+telemetry are reported separately from the 10ms retrieval/scoring limit.
 
 The user's explicit FIFO/alpha experiment overrides the older repository rule
 against concurrency caps for this experiment. It does not authorize neural

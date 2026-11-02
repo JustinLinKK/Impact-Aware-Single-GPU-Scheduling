@@ -1,7 +1,7 @@
 # V5.1.1 A10 preparation and evidence reuse
 
-Status: reviewable specification and deterministic CPU-only run manifest.
-No V5.1.1 runtime is installed or new GPU campaign dispatched. The currently
+Status: implemented runtime and deterministic guarded screening manifest.
+No new GPU campaign has been dispatched at this implementation freeze. The currently
 running `053f0a4` fresh-calibration campaign remains authoritative for its own
 results. V5.1.1 uses a new branch and separate output namespace.
 
@@ -52,6 +52,26 @@ instrumentation and hardware identity. Missing fields or a mismatch downgrade
 to contextual use. The already completed C primary used a different GPU; its
 timing baseline currently qualifies only as historical context. The active
 refresh study has not completed final export and is pending, not reusable-final.
+
+## Pre-execution implementation amendment
+
+The repeat-two development width variants need their own measured templates.
+Preparation therefore measures **16 solo calibration jobs** (8 base and 8
+variant), and runs **24 development cohorts /192 jobs**. Subsequent screening
+refreshes measure 8 base jobs per generation. Development has a 7200-second
+campaign limit with a 7300-second outer limit; preparation and parent review
+reserve 21600 seconds. Screening retains 43200 seconds, jobs 1800 seconds,
+episodes 3600 seconds, recovery 900 seconds and the original finite host cutoff.
+These bounds are frozen before new outcomes, with no runtime lease extension.
+
+The separate controller uses only submitted jobs. Its experience is cold at
+each of four independent traces and persists through that trace's idle periods
+and real calibration refreshes. Every first dispatch records the fresh device
+memory reading, resident reservations, candidate reservation and limit. The
+memory reservation is the larger of the measured startup envelope and the
+predicted peak plus max(256 MiB, 10%); this is a guard, not a reserved-VRAM label.
+Uncertainty, lack of similar observations, and the cost of graph preparation can
+prevent an improvement. Report them rather than changing frozen thresholds.
 
 Stability rule, frozen before candidate results: compare same-condition/mode
 anchor means to compatible historical means; flag >10% change in either

@@ -1,16 +1,19 @@
 # Impact-Aware Single-GPU Scheduling
 
-## V5.1.1 design and A10 preparation
+## V5.1.1 implementation and A10 screening
 
-The next opt-in design retains strict FIFO, starts from a precision-aware GPU
+The new opt-in controller retains strict FIFO, starts from a precision-aware GPU
 capacity prior bounded by live memory, and preserves workload/group experience
-across jobs. PerfSeer weights stay frozen. This branch currently contains the
-finalized specification and CPU-only preparation tools; the new runtime and GPU
-experiment have not been implemented or launched.
+across jobs. PerfSeer weights stay frozen. This branch contains the runtime,
+real CPU training-graph preparation, durable causal history, receipt/FIFO
+auditors and finite screening runner. A new GPU experiment requires fresh host
+qualification and a separate development review; it has not launched yet.
 
 - [V5.1.1 design](docs/oct-proposed-v5-1-1-design.md)
 - [A10 screening, fresh comparison and baseline reuse](docs/a10-v5-1-1-experiment.md)
 - [Deterministic preparation tool](benchmarks/a10_v5_1_1/prepare.py)
+- [FIFO experience controller](scheduler/adaptive_fifo_v511.py)
+- [Source-bound screening runner](benchmarks/a10_v5_1_1/campaign.py)
 
 The active fresh-calibration V5.1 comparison remains frozen at `053f0a4` in its
 separate remote package. A local branch change is not a remote source change.
