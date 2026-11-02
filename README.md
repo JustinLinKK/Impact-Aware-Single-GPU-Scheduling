@@ -1,5 +1,20 @@
 # Impact-Aware Single-GPU Scheduling
 
+## V5.1.1 design and A10 preparation
+
+The next opt-in design retains strict FIFO, starts from a precision-aware GPU
+capacity prior bounded by live memory, and preserves workload/group experience
+across jobs. PerfSeer weights stay frozen. This branch currently contains the
+finalized specification and CPU-only preparation tools; the new runtime and GPU
+experiment have not been implemented or launched.
+
+- [V5.1.1 design](docs/oct-proposed-v5-1-1-design.md)
+- [A10 screening, fresh comparison and baseline reuse](docs/a10-v5-1-1-experiment.md)
+- [Deterministic preparation tool](benchmarks/a10_v5_1_1/prepare.py)
+
+The active fresh-calibration V5.1 comparison remains frozen at `053f0a4` in its
+separate remote package. A local branch change is not a remote source change.
+
 ## V5.1: FIFO with adaptive concurrency
 
 This branch adds an experimental FIFO controller that adjusts the concurrency
