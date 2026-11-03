@@ -1,6 +1,7 @@
 """Charged CPU preparation of the V5.1.1 graph cache; no scheduler-path capture."""
 from copy import deepcopy
 import multiprocessing
+import queue
 from pathlib import Path
 import threading
 import time
@@ -13,7 +14,7 @@ from ..scheduler.workload_fingerprint import digest, make_fingerprint
 
 
 class FingerprintPredictor:
-    def __init__(self, predictor, released, *, gpu_uuid, runtime_identity, backend, profile_source, source_closure):
+    def __init__(self, predictor, released, *, gpu_uuid, runtime_identity, backend, profile_source, source_closure, optional_async=False):
         self.predictor, self.released = predictor, released
         if not source_closure or any(not isinstance(v, str) or len(v) != 64 for v in source_closure.values()):
             raise ValueError('frozen execution-closure SHA map required')
@@ -22,6 +23,43 @@ class FingerprintPredictor:
         self.profile_source = profile_source
         self._cache, self._lock = {}, threading.Lock()
         self.capture_events = []
+        self.optional_async = optional_async
+        self._results, self._requested, self.failures = {}, set(), []
+        self._result_lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._queue = queue.Queue(maxsize=64)
+        self._worker = None
+        self._cleanup_complete = True
+        if optional_async:
+            self._worker = threading.Thread(target=self._run_optional, name='v511-optional-features', daemon=True)
+            self._worker.start()
+
+    def _run_optional(self):
+        while not self._cancel.is_set():
+            try: job, batch = self._queue.get(timeout=.05)
+            except queue.Empty: continue
+            try:
+                fp = self._capture(job, batch)
+                with self._result_lock:
+                    self._results[(job.job_id, batch)] = deepcopy(fp)
+            except Exception as exc:
+                # Optional features can abstain. Numeric memory preparation and
+                # normal FIFO service are never failed or held by this worker.
+                self.failures.append({'job_id': job.job_id, 'batch': batch, 'reason': str(exc)})
+            finally:
+                self._queue.task_done()
+
+    def augment(self, job, batch, profile):
+        result = deepcopy(profile)
+        with self._result_lock:
+            fp = self._results.get((job.job_id, batch))
+            if fp is not None: result['v511_fingerprint'] = deepcopy(fp)
+        return result
+
+    def stop(self, timeout=3.):
+        self._cancel.set()
+        if self._worker is not None: self._worker.join(timeout)
+        return self._cleanup_complete and (self._worker is None or not self._worker.is_alive())
 
     def __getattr__(self, name):
         return getattr(self.predictor, name)
@@ -52,6 +90,7 @@ class FingerprintPredictor:
             try:
                 deadline = start + self.released.settings.conversion_timeout_seconds
                 while not receiver.poll(.05):
+                    if self._cancel.is_set(): raise ValueError('optional capture cancelled at episode close')
                     rss = worker_resident_mib(child.pid)
                     if rss is not None and rss > self.released.settings.conversion_max_rss_mb:
                         raise ValueError('fingerprint capture CPU memory bound')
@@ -68,7 +107,9 @@ class FingerprintPredictor:
                 receiver.close(); child.join(timeout=.2)
                 if child.is_alive(): child.terminate(); child.join(timeout=2)
                 if child.is_alive(): child.kill(); child.join(timeout=2)
-                if child.is_alive(): raise RuntimeError('fingerprint worker cleanup incomplete')
+                if child.is_alive():
+                    self._cleanup_complete = False
+                    raise RuntimeError('fingerprint worker cleanup incomplete')
             contract = metadata['workload_contract']
             training, adapter = contract['training'], contract.get('adapter', {}).get('context', {})
             recipe = {'batch': batch, 'accumulation': training.get('gradient_accumulation_steps', 1),
@@ -91,7 +132,18 @@ class FingerprintPredictor:
     def predict_profile_options(self, job, batch_sizes):
         outputs = deepcopy(self.predictor.predict_profile_options(job, batch_sizes))
         for batch, profile in outputs.items():
-            profile['v511_fingerprint'] = deepcopy(self._capture(job, batch))
+            if self.optional_async:
+                key = (job.job_id, batch)
+                with self._result_lock:
+                    if key not in self._requested and not self._cancel.is_set():
+                        try:
+                            self._queue.put_nowait((deepcopy(job), batch))
+                            self._requested.add(key)
+                        except queue.Full:
+                            self.failures.append({'job_id': job.job_id, 'batch': batch, 'reason': 'optional queue full'})
+                profile.update(self.augment(job, batch, profile))
+            else:
+                profile['v511_fingerprint'] = deepcopy(self._capture(job, batch))
             # Conservative fallback is explicit, not a claim about reserved VRAM
             # accuracy. Fresh device checks still gate every dispatch.
             peak = profile['peak_vram_mib']

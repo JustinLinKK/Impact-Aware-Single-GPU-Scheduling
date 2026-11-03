@@ -14,7 +14,10 @@ class GraphFixture:
     def __init__(self, predictor, released, **kwargs):
         self.predictor = predictor
         self.capture_events = []
+        self.failures, self._results = [], {}
     def __getattr__(self, name): return getattr(self.predictor, name)
+    def augment(self, job, batch, profile): return profile
+    def stop(self, timeout=3.): return True
     def predict_profile_options(self, job, batches):
         values = self.predictor.predict_profile_options(job, batches)
         for p in values.values():

@@ -12,6 +12,8 @@ def capture_fingerprint_worker(connection, runtime_src, normalization_path, requ
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["NVIDIA_VISIBLE_DEVICES"] = "void"
     try:
+        # Optional graph work yields CPU priority to numeric preparation and jobs.
+        if hasattr(os, 'nice'): os.nice(10)
         from dataclasses import replace
         import hashlib
         sys.path[:0] = [str(Path(runtime_src).parent / "aliases"), runtime_src]

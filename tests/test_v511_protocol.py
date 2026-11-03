@@ -75,16 +75,22 @@ def test_child_will_not_dispatch_without_full_phase_headroom(tmp_path, monkeypat
 def test_append_log_replay_binds_actual_counters_and_rejects_tampering(tmp_path):
     store = ExperienceStore('trace', path=tmp_path)
     fp = fingerprint(); peers = context([], resident_count=1)
+    phases={'j':'training'};identity=['fixture'];identity_hash=p.digest(identity)
     store.observe(episode='one', fingerprint=fp, context=peers, updates=4, seconds=1,
         observed_unix=102, reference_rate=4, reference_memory=100, reference_generation='g',
         job_id='j', accepted_unix=100, window_start_unix=101,
-        counter_proof={'start_step':4,'end_step':8,'stable_identity_sha256':'identity'})
+        counter_proof={'start_step':4,'end_step':8,'stable_identity_sha256':identity_hash,'resident_phases':phases,'peer_context':peers})
     store.checkpoint()
     result = {'receipts': {'j': {'expected_updates':64,'accepted_unix':100,'feedback_ready_unix':103}},
         'alpha_events':[{'kind':'valid_windows','halves':[dict(start=1,end=2,rates={'j':4},
-            start_steps={'j':4},end_steps={'j':8},stable_identity_sha256='identity')]}]}
+            start_steps={'j':4},end_steps={'j':8},stable_identity_sha256=identity_hash,resident_phases=phases)]}]}
+    result['alpha_events'] += [dict(kind='phase_snapshot',at=at,identity=identity,identity_sha256=identity_hash,
+        counters={'j':counter},resident_phases=phases) for at,counter in ((1,4),(2,8))]
     episodes={'one':{'result':result,'offset':100}}
     assert history_audit(tmp_path,'trace',episodes)['observations'] == 1
+    result['alpha_events'][1]['resident_phases']={'j':'starting'}
+    with pytest.raises(ValueError,match='endpoint'): history_audit(tmp_path,'trace',episodes)
+    result['alpha_events'][1]['resident_phases']=phases
     result['alpha_events'][0]['halves'][0]['end_steps']['j']=9
     with pytest.raises(ValueError,match='actual stable counter'): history_audit(tmp_path,'trace',episodes)
 

@@ -102,7 +102,16 @@ def audit_episode(output, episode, manifest, snapshot, table, *, remote_output=N
         if episode['arm']=='v5_1_1':
             alpha=load(output/'alpha-decisions.json')
             if alpha.get('events')!=result.get('alpha_events') or alpha.get('ordered_launch_events')!=result.get('ordered_launch_events') or result.get('fixed_concurrency_cap')is not None:raise ValueError('V5.1 durable alpha/dispatch evidence mismatch')
-        if episode['arm']=='v5_1_1':audit_fifo_dispatch(output,result)
+        if episode['arm']=='v5_1_1':
+            audit_fifo_dispatch(output,result)
+            optional=load(output/'optional-feature-preparation.json')
+            if optional.get('worker_stopped') is not True or optional['events'] != result['fingerprint_capture_events']:
+                raise ValueError('optional graph worker cleanup/events unproven')
+            for event in optional['events']:
+                receipt=result['receipts'][event['job_id']]
+                if (event.get('cuda_initialized') is not False or not
+                        receipt['accepted_monotonic'] <= event['started_monotonic'] <= event['completed_monotonic']):
+                    raise ValueError('optional feature work is not charged after acceptance or is not CPU-only')
         receipts=result.get('receipts',{})
         if len(receipts)!=count: errors.append('all required receipts absent')
         saved_audits=load(output/'validity-audits.json')

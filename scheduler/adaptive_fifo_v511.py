@@ -70,11 +70,40 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
             raise ValueError('missing prepared training-graph fingerprint')
         return fp
 
-    def _peer_context(self, members, target, occupancy, profiles):
-        if occupancy != len(members):
-            raise ValueError('no historical rate evidence for non-training resident phases')
+    def _peer_context(self, members, target, occupancy, profiles, phases=None):
+        phases = phases or {j: 'training' for j in members}
+        if occupancy != len(phases) or phases.get(target) != 'training':
+            raise ValueError('resident phase membership not proven')
+        if any(p not in {'starting', 'training', 'finishing'} for p in phases.values()):
+            raise ValueError('unknown resident phase')
+        transient = {p: [self._fingerprint(profiles[j]) for j in phases if phases[j] == p]
+                     for p in ('starting', 'finishing')}
         return context([self._fingerprint(profiles[j]) for j in members if j != target],
-                       resident_count=occupancy)
+            resident_count=occupancy, starting=len(transient['starting']), finishing=len(transient['finishing']),
+            phase_peers=transient if any(transient.values()) else None)
+
+    def _snapshot(self, jobs, profiles, now):
+        # Every resident remains in both the identity and memory accounting.
+        # Only jobs doing successful optimizer updates contribute training rates.
+        phases, training, residents = {}, [], []
+        for job in sorted(jobs, key=lambda j: j.job_id):
+            m = job.metadata
+            phase = m.get('v51_phase', 'training' if m.get('trial_runner_ready') else 'starting')
+            if phase == 'training' and self._remaining(job) == 0: phase = 'finishing'
+            if phase not in {'starting', 'training', 'finishing'} or job.job_id not in self._launched:
+                raise ValueError('resident phase identity not proven')
+            phases[job.job_id] = phase
+            residents.append((job.job_id, phase, self._launched[job.job_id],
+                m.get('runtime_completion_identity'), m.get('runtime_nonupdate_phase_counter'),
+                digest(self._profile_identity(job, profiles[job.job_id]))))
+            if phase == 'training': training.append(job)
+        identity, counters = super()._snapshot(training, profiles, now)
+        self._window_phases = phases
+        identity = tuple(tuple(digest(v) if i == 4 else v for i, v in enumerate(row)) for row in identity)
+        full_identity = (identity, tuple(residents))
+        self._event(now, 'phase_snapshot', identity=full_identity, counters=counters[1],
+                    resident_phases=dict(phases), identity_sha256=digest(full_identity))
+        return full_identity, counters
 
     def _measure(self, running, profiles, now):
         try:
@@ -96,23 +125,26 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
         self._halves.append({'start': start, 'end': now,
             'rates': {j: n / duration for j, n in deltas.items()},
             'start_steps': dict(old), 'end_steps': dict(current[1]),
-            'stable_identity_sha256': digest(identity)})
+            'stable_identity_sha256': digest(identity), 'resident_phases': dict(self._window_phases)})
         self._anchor = current
-        if len(self._halves) < 2: return None
+        required = 2 if all(p == 'training' for p in self._window_phases.values()) else 1
+        if len(self._halves) < required: return None
         halves, self._halves = self._halves, []
         self._event(now, 'valid_windows', members=[j.job_id for j in running], halves=halves,
                     basis='exact successful-update counters; stable membership and phase')
         return halves
 
     def _record_windows(self, running, profiles, halves, now):
-        members = [j.job_id for j in running]
+        phases = halves[0]['resident_phases']
+        members = [j for j, phase in phases.items() if phase == 'training']
         # Query previous history before adding this observation, so error checks
         # cannot grade a row against itself.
         old_deadline = time.perf_counter() + .010
         for job in running:
+            if job.job_id not in members: continue
             j, p = job.job_id, profiles[job.job_id]
             fp = self._fingerprint(p)
-            peers = self._peer_context(members, j, len(members), profiles)
+            peers = self._peer_context(members, j, len(phases), profiles, phases)
             key = digest([fp['exact'], peers['key']])
             try:
                 prior = estimate(self.store, fp, peers, p, now=halves[0]['start'] + self.wall_offset,
@@ -138,7 +170,10 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
                     accepted_unix=self._accepted[j] + self.wall_offset,
                     window_start_unix=half['start'] + self.wall_offset,
                     counter_proof={'start_step': half['start_steps'][j], 'end_step': half['end_steps'][j],
-                                   'stable_identity_sha256': half['stable_identity_sha256']})
+                                   'stable_identity_sha256': half['stable_identity_sha256'],
+                                   'resident_phases': dict(phases), 'peer_context': deepcopy(peers)})
+        if len(members) != len(running) or len(halves) != 2:
+            return  # Mixed-phase evidence never proves a stable alpha prior.
         if self._trace_pending and len(running) == self._trace_pending['target']:
             self._event(now, 'exploration_observed', pending=self._trace_pending,
                         note='observed occupancy, not causal counterfactual proof')
@@ -150,8 +185,16 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
                 'basis': 'two_clean_windows_at_actual_occupancy'}
         self._save_control()
 
+    def _rates_for_state(self, active, half, profiles, halves, now):
+        phases = {j: row[0] for j, row in active.items()}
+        members = [j for j in phases if phases[j] == 'training']
+        return self._phase_rates(members, len(active), half, profiles, halves, now, phases)
+
     def _rates(self, members, occupancy, half, profiles, halves, now):
-        if (set(members) == set(halves[half]['rates']) and occupancy == len(members)
+        return self._phase_rates(members, occupancy, half, profiles, halves, now)
+
+    def _phase_rates(self, members, occupancy, half, profiles, halves, now, phases=None):
+        if (len(halves) > half and set(members) == set(halves[half]['rates']) and occupancy == len(members)
                 and now - halves[half]['end'] <= self.options.evidence_ttl_seconds):
             factor = .8 if self._rate_bound == 'lower' else 1.2 if self._rate_bound == 'upper' else 1.
             return {j: halves[half]['rates'][j] * factor for j in members}
@@ -160,7 +203,7 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
             if time.perf_counter() >= self._query_deadline:
                 raise TimeoutError('retrieval and scoring elapsed budget')
             fp = self._fingerprint(profiles[j])
-            peers = self._peer_context(members, j, occupancy, profiles)
+            peers = self._peer_context(members, j, occupancy, profiles, phases)
             if digest([fp['exact'], peers['key']]) in self._demoted:
                 raise ValueError('context demoted after consecutive rate misses')
             key = (j, peers['key'])
@@ -246,7 +289,7 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
         # Bind a learned initial prior to a prepared accepted prefix. A partial
         # preparation queue is not evidence that alpha should be reduced.
         prefix = self._order[:3]
-        if self._initial_context is None and len(prefix) == 3 and all(j in profiles for j in prefix):
+        if self._initial_context is None and len(prefix) == 3 and all(j in profiles and profiles[j].get('v511_fingerprint') for j in prefix):
             self._initial_context = digest([self._fingerprint(profiles[j])['exact'] for j in prefix])
             prior = self._context_priors.get(self._initial_context)
             if (prior and self._trace_pending is None and
@@ -277,7 +320,15 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
             halves = self._measure(running_jobs, profiles, now)
             if halves is None: return
             self._record_windows(running_jobs, profiles, halves, now)
+            if len(halves) != 2 or any(p != 'training' for p in halves[0]['resident_phases'].values()):
+                return
             self._latest_halves = halves
+            # No queued, prepared FIFO head means there is no useful admission
+            # decision. Learning continues, but expensive tail forecasts do not.
+            if not queued or queued[0] not in profiles or self._jobs[queued[0]].hold:
+                return
+            if not profiles[queued[0]].get('v511_fingerprint'):
+                return
             if now - self._last_change < self.options.dwell_seconds or now - self._last_score < 2.:
                 return
             self._last_score = now

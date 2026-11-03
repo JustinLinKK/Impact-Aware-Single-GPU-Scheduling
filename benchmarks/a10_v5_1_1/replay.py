@@ -101,6 +101,30 @@ def history_audit(path, namespace, episodes):
                        and h['end_steps'][row['job_id']] == cp['end_step']
                        and h['stable_identity_sha256'] == cp['stable_identity_sha256']]
             if len(matches) != 1: raise ValueError('history does not bind one actual stable counter window')
+            window = matches[0]
+            phases = cp.get('resident_phases')
+            if (not phases or phases != window.get('resident_phases')
+                    or phases.get(row['job_id']) != 'training'
+                    or set(window['rates']) != {j for j, phase in phases.items() if phase == 'training'}
+                    or cp.get('peer_context') != row['context']):
+                raise ValueError('history phase/peer proof differs from stable resident window')
+            snapshots = [e for e in result['alpha_events'] if e['kind'] == 'phase_snapshot'
+                         and e.get('identity_sha256') == cp['stable_identity_sha256']]
+            for at, counter_key in ((window['start'], 'start_step'), (window['end'], 'end_step')):
+                proof_snapshots = [e for e in snapshots if e['at'] == at
+                    and digest(e['identity']) == e['identity_sha256']
+                    and e['resident_phases'] == phases
+                    and e['counters'].get(row['job_id']) == cp[counter_key]]
+                if len(proof_snapshots) != 1:
+                    raise ValueError('phase history lacks exact stable endpoint counter/identity snapshots')
+            phase_counts = row['context']['phases']
+            if (phase_counts['resident'] != len(phases) or any(
+                    phase_counts[p] != list(phases.values()).count(p) for p in ('training', 'starting', 'finishing'))):
+                raise ValueError('history resident phase count mismatch')
+            for resident in phases:
+                rr = result['receipts'][resident]
+                if not rr['accepted_unix'] <= row['window_start_unix'] < row['observed_unix'] <= rr['feedback_ready_unix'] + .1:
+                    raise ValueError('resident phase evidence outside accepted lifetime')
             observations += 1
         elif kind in {'decision', 'history_query'}:
             episode = episodes[payload['episode']]

@@ -182,7 +182,7 @@ def _run_episode(manifest, manifest_path, raw_settings, output, calibration, *, 
         released_for_fingerprint, gpu_uuid=hardware['gpu_uuid'],
         runtime_identity=asdict(client.store.hardware_profile()),
         backend=settings.gpu_scheduler.packing_backend, profile_source=source_tag,
-        source_closure=source_snapshot(manifest, manifest_path, source_commit)['scheduler_python_sources'])
+        source_closure=source_snapshot(manifest, manifest_path, source_commit)['scheduler_python_sources'], optional_async=True)
     service.planner.estimator.ml_predictor = graph_preparation
     recording = RecordingPredictor(service.planner.estimator.ml_predictor,
         lambda job_id, profiles: atomic_json(works[names_by_id[job_id]] / "predicted-profiles.json", profiles))
@@ -281,7 +281,8 @@ def _run_episode(manifest, manifest_path, raw_settings, output, calibration, *, 
                 ready_profiles = {}
                 for name in submitted:
                     if preparation is not None and preparation.ready(jobs[name], specs[name]['batch']):
-                        ready_profiles[jobs[name].job_id] = service.planner.estimator.predicted_profile(jobs[name], specs[name]['batch'])
+                        ready_profiles[jobs[name].job_id] = graph_preparation.augment(jobs[name], specs[name]['batch'],
+                            service.planner.estimator.predicted_profile(jobs[name], specs[name]['batch']))
                 for name, job in current.items():
                     job.metadata['v51_accepted_at']=submitted[name].accepted_monotonic
                     job.metadata['v51_hardware_key']=client.store.hardware_key()
@@ -415,6 +416,14 @@ def _run_episode(manifest, manifest_path, raw_settings, output, calibration, *, 
                 "failures": preparation.failures,
                 "isolated_process_cleanup": getattr(getattr(preparation, "_backend", None), "cleanup_report", None),
                 "timeout_contract": getattr(getattr(preparation, "_backend", None), "timeout_contract", None)})
+        features_stopped = graph_preparation.stop(timeout=3.)
+        atomic_json(output / 'optional-feature-preparation.json', {
+            'worker_stopped': features_stopped, 'events': graph_preparation.capture_events,
+            'failures': graph_preparation.failures,
+            'ready_fingerprints': {j + ':' + str(b): fp for (j, b), fp in graph_preparation._results.items()},
+            'contract': 'numeric profiles gate FIFO; optional features never gate launch; no cross-seed cache substitution'})
+        if not features_stopped:
+            raise RuntimeError('optional graph worker cleanup incomplete')
         atomic_json(output / "predictor-exposure.json", {"failures": recording.failures,
             "prediction_sources": dict(recording.last_sources), "prediction_errors": dict(recording.last_errors),
             "prepared_numeric_profiles": recording.records})
@@ -488,7 +497,7 @@ def _run_episode(manifest, manifest_path, raw_settings, output, calibration, *, 
     result["head_block_seconds"] = dict(head_block_seconds)
     result["occupancy_seconds_by_resident_count"] = dict(occupancy_seconds)
     result["preparation_treatment"] = "acceptance_enqueued_parallel_isolated_async" if preparation_workers==2 else "acceptance_enqueued_serial_async"
-    result["whole_system_comparison_note"] = "V5.1.1 adds charged serialized CPU graph capture behind its asynchronous prepared-profile gate; neural group profile inference retains two isolated consumers. Fixed-three retains original serial preparation. Whole-system screening, not isolated controller overhead"
+    result["whole_system_comparison_note"] = "V5.1.1 numeric memory preparation gates FIFO; optional low-priority CPU graph capture runs independently and may abstain; neural group profile inference retains two isolated consumers. Fixed-three retains original serial preparation. Whole-system screening, not isolated controller overhead"
     result["development_shadow"] = manifest.get("development_shadow", False)
     if result["development_only"]:
         result["admission_policy_comparison_eligible"] = False

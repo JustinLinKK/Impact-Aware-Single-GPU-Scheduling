@@ -97,7 +97,7 @@ def structural_distances(a, b):
     return graph, shape
 
 
-def context(fingerprints, *, resident_count, starting=0, finishing=0):
+def context(fingerprints, *, resident_count, starting=0, finishing=0, phase_peers=None):
     """Target is excluded by caller; peer vector has no job-id dependence."""
     if resident_count != len(fingerprints) + 1 + starting + finishing:
         raise ValueError('peer membership/count mismatch')
@@ -116,13 +116,18 @@ def context(fingerprints, *, resident_count, starting=0, finishing=0):
         return means + spreads
     result = {'phases': phases, 'exact_peers': sorted(fp['exact'] for fp in fingerprints),
               'operations': ops, 'moments': moments(sizes, 4) + moments(structures, 4)}
+    if phase_peers is not None:
+        if set(phase_peers) != {'starting', 'finishing'} or any(
+                len(phase_peers[k]) != phases[k] for k in phase_peers):
+            raise ValueError('non-training peer identity/count mismatch')
+        result['phase_peers'] = {k: sorted(fp['exact'] for fp in v) for k, v in phase_peers.items()}
     result['key'] = digest(result)
     return result
 
 
 def peer_distance(a, b):
     # Do not borrow evidence across a different occupancy or phase composition.
-    if a['phases'] != b['phases']:
+    if a['phases'] != b['phases'] or a.get('phase_peers') != b.get('phase_peers'):
         return 1.
     return (histogram_distance(a['operations'], b['operations']) +
             log_distance(a['moments'], b['moments'])) / 2.

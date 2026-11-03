@@ -266,6 +266,11 @@ class AdaptiveFIFOController:
             factor = min(solo_anchor, factor)
         return {j: (1000. / profiles[j]['step_cost']) * factor for j in members}
 
+    def _rates_for_state(self, active, half, profiles, halves, now):
+        # Override point for controllers that have explicit resident-phase history.
+        training = [j for j, row in active.items() if row[0] == 'training' and row[1] > 1e-9]
+        return self._rates(training, len(active), half, profiles, halves, now) if training else {}
+
     def _forecast(self, cap, half, queued, running, profiles, completed, sample, halves, now, deadline, budget=None):
         """Fixed-alpha FIFO drain/refill. Actual residents survive a decrease."""
         queue, active, receipts, trace = list(queued), {}, dict(completed), []
@@ -336,7 +341,7 @@ class AdaptiveFIFOController:
                     raise ValueError('FIFO head memory infeasible')
                 break
             training = [j for j, r in active.items() if r[0] == 'training' and r[1] > 1e-9]
-            rates = self._rates(training, len(active), half, profiles, halves, now) if training else {}
+            rates = self._rates_for_state(active, half, profiles, halves, now) if training else {}
             durations = [row[1] / rates[j] if row[0] == 'training' else row[2] for j, row in active.items()]
             dt = min(durations)
             if not math.isfinite(dt) or dt < 0:

@@ -29,7 +29,16 @@ def estimate(store, fingerprint, peers, profile, *, now, deadline, allow_old=Fal
     """
     reference = 1000. / profile['step_cost']
     exact, approximate, rejected = [], [], {}
-    for row in store.candidates(now, deadline=deadline):
+    candidates = store.candidates(now, deadline=deadline)
+    # Exact evidence already dominates approximate matches below. Identify it
+    # before expensive graph distances, preserving eligibility and envelopes.
+    exact_candidates = []
+    for row in candidates:
+        if time.perf_counter() >= deadline: raise TimeoutError('history matching elapsed budget')
+        if (fingerprint['exact'] == row['fingerprint']['exact'] and peers['key'] == row['context']['key']
+                and (now - row['observed_unix'] <= 14400 or allow_old)):
+            exact_candidates.append(row)
+    for row in exact_candidates or candidates:
         if time.perf_counter() >= deadline:
             raise TimeoutError('history matching elapsed budget')
         age = now - row['observed_unix']

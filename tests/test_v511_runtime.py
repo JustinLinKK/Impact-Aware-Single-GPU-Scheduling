@@ -239,3 +239,124 @@ def test_unchanged_student_weights_do_not_hide_new_reference_calibration():
     exact=estimate(store,fingerprint(),context([],resident_count=1),target,
                    now=110.,deadline=time.perf_counter()+1.)
     assert exact['rate']==pytest.approx(10.)
+
+
+def test_mixed_phase_history_records_real_counters_and_keeps_transient_identity(monkeypatch):
+    c, jobs, profiles = setup_controller(monkeypatch)
+    launch(c, jobs)
+    jobs[2].metadata['v51_phase'] = 'starting'
+    jobs[2].metadata['trial_runner_ready'] = False
+    observe(c, jobs, profiles, 10.)
+    for j in jobs[:2]: j.metadata['runtime_global_step'] += 20
+    observe(c, jobs, profiles, 11.)
+    rows = list(c.store.rows.values())
+    assert len(rows) == 1  # Same graph/context/episode aggregate, not two independent votes.
+    assert rows[0]['context']['phases'] == dict(resident=3, training=2, starting=1, finishing=0)
+    assert rows[0]['context']['phase_peers']['starting'] == [fingerprint()['exact']]
+    assert not c._context_priors and c.admission_limit == 3
+    c._query_deadline = time.perf_counter() + 1
+    result = c._rates_for_state({'a': ['training', 100, 0], 'b': ['training', 100, 0],
+                                'c': ['starting', 100, 1]}, 0, profiles, [], 12.)
+    assert result == {'a': 20., 'b': 20.} and len(c._queries) == 2
+
+
+def test_phase_change_invalidates_window_and_never_borrows_unseen_phase(monkeypatch):
+    c, jobs, profiles = setup_controller(monkeypatch)
+    launch(c, jobs)
+    observe(c, jobs, profiles, 10.)
+    jobs[2].metadata['v51_phase'] = 'finishing'
+    for j in jobs[:2]: j.metadata['runtime_global_step'] += 20
+    observe(c, jobs, profiles, 11.)
+    assert not c.store.rows
+    c._query_deadline = time.perf_counter() + 1
+    with pytest.raises(ValueError, match='insufficient compatible'):
+        c._rates_for_state({'a': ['training', 100, 0], 'c': ['finishing', 0, 2]}, 0, profiles, [], 12.)
+
+
+def test_supported_phase_history_can_select_alpha_with_full_fifo_completion(monkeypatch):
+    # Algorithm fixture, not performance evidence: freeze CPU clock so test load
+    # cannot manufacture an elapsed-budget failure. Production keeps its 10ms bound.
+    from localml_scheduler.scheduler import adaptive_fifo_v511, contextual_rates
+    clock = SimpleNamespace(time=time.time, monotonic=time.monotonic, perf_counter=lambda: 0.)
+    monkeypatch.setattr(adaptive_fifo_v511, 'time', clock)
+    monkeypatch.setattr(contextual_rates, 'time', clock)
+    c, jobs, profiles = setup_controller(monkeypatch)
+    from localml_scheduler.scheduler import adaptive_fifo, fifo_experience
+    monkeypatch.setattr(fifo_experience, 'time', clock)
+    monkeypatch.setattr(adaptive_fifo, 'time', SimpleNamespace(time=time.time, monotonic=lambda: 0., perf_counter=lambda: 0.))
+    fp = fingerprint()
+    for total in range(1, 5):
+        for starting in range(total):
+            for finishing in range(total - starting):
+                training = total - starting - finishing
+                peers = context([fp] * (training - 1), resident_count=total,
+                    starting=starting, finishing=finishing,
+                    phase_peers={'starting': [fp] * starting, 'finishing': [fp] * finishing}
+                    if starting or finishing else None)
+                add(c.store, f'prior-{total}-{starting}-{finishing}', peers=peers, at=5.,
+                    rate=100. if total == 4 else 20., generation='student')
+    launch(c, jobs)
+    observe(c, jobs, profiles, 10.)
+    for j in jobs[:3]: j.metadata['runtime_global_step'] += 20
+    observe(c, jobs, profiles, 11.)
+    for j in jobs[:3]: j.metadata['runtime_global_step'] += 20
+    observe(c, jobs, profiles, 12.)
+    decision = [e for e in c.events if e['kind'] == 'decision'][-1]
+    assert decision['reason'] == 'two_half_pessimistic_history_gain', decision
+    assert c.admission_limit == 4 and not c._tried and decision['history_queries']
+    for forecasts in decision['predictions'].values():
+        for prediction in forecasts:
+            assert set(prediction['receipts']) == set(profiles)
+            assert [e['job_id'] for e in prediction['trace'] if e['kind'] == 'launch'] == ['d']
+    assert any(q['context']['phases']['starting'] for q in decision['history_queries'])
+    assert any(q['context']['phases']['finishing'] for q in decision['history_queries'])
+
+
+def test_no_queue_skips_scoring_but_keeps_learning(monkeypatch):
+    c, jobs, profiles = setup_controller(monkeypatch, n=3)
+    launch(c, jobs)
+    observe(c, jobs, profiles, 10.)
+    for j in jobs: j.metadata['runtime_global_step'] += 20
+    observe(c, jobs, profiles, 11.)
+    for j in jobs: j.metadata['runtime_global_step'] += 20
+    observe(c, jobs, profiles, 12.)
+    assert c.store.rows and not [e for e in c.events if e['kind'] == 'decision']
+
+
+def test_optional_fingerprint_never_blocks_numeric_publication_or_fifo(monkeypatch):
+    import threading
+    from localml_scheduler.prediction.fingerprint_preparation import FingerprintPredictor
+    started, release = threading.Event(), threading.Event()
+    def slow_capture(self, job, batch):
+        started.set(); assert release.wait(3.); return fingerprint()
+    monkeypatch.setattr(FingerprintPredictor, '_capture', slow_capture)
+    j = job('a')
+    base = SimpleNamespace(predict_profile_options=lambda job, batches: {b: profile(job) for b in batches})
+    predictor = FingerprintPredictor(base, None, gpu_uuid='gpu', runtime_identity='runtime',
+        backend='cuda_process', profile_source='test', source_closure={'fixture': 'a' * 64}, optional_async=True)
+    try:
+        p = predictor.predict_profile_options(j, [1])[1]
+        assert started.wait(1.)
+        assert 'v511_fingerprint' not in p and p['v511_reservation_mib'] == 356.
+        c = AdaptiveFIFO511Controller()
+        c.observe(now=0., queued_jobs=[j], running_jobs=[], profiles={'a': p}, gpu_sample=SAMPLE, completed_job_ids={})
+        c.on_launch('a', 0.)  # Graph worker is still blocked, numeric FIFO is not.
+        assert c._launched == {'a': 0.}
+        release.set(); predictor._queue.join()
+        assert predictor.augment(j, 1, p)['v511_fingerprint'] == fingerprint()
+    finally:
+        release.set(); assert predictor.stop()
+
+
+def test_optional_capture_failure_only_disables_adaptation(monkeypatch):
+    from localml_scheduler.prediction.fingerprint_preparation import FingerprintPredictor
+    def fail(*args): raise ValueError('unsupported graph')
+    monkeypatch.setattr(FingerprintPredictor, '_capture', fail)
+    j = job('a')
+    predictor = FingerprintPredictor(SimpleNamespace(predict_profile_options=lambda job, batches: {1: profile(job)}),
+        None, gpu_uuid='gpu', runtime_identity='runtime', backend='cuda_process', profile_source='test',
+        source_closure={'fixture': 'a' * 64}, optional_async=True)
+    p = predictor.predict_profile_options(j, [1])[1]
+    predictor._queue.join()
+    assert predictor.augment(j, 1, p) == p and predictor.failures
+    assert predictor.stop()
