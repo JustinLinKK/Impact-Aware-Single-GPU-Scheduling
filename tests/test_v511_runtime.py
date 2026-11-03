@@ -128,22 +128,30 @@ def observe(c, jobs, profiles, now, n=3):
               gpu_sample=SAMPLE, completed_job_ids={})
 
 
-def test_exploration_independent_of_missing_future_rate_forecast(monkeypatch):
+@pytest.mark.parametrize('rate,allowed', [(None, False), (15., False), (100., True)])
+def test_fourth_exploration_requires_safe_release_but_not_a_complete_tail(monkeypatch, rate, allowed):
     c, jobs, profiles = setup_controller(monkeypatch)
+    if rate is not None:
+        add(c.store, 'prior-four', peers=context([fingerprint()]*3, resident_count=4), at=5., rate=rate)
     launch(c, jobs)
     observe(c, jobs, profiles, 10.)
     for j in jobs[:3]: j.metadata['runtime_global_step'] += 20
     observe(c, jobs, profiles, 11.)
     for j in jobs[:3]: j.metadata['runtime_global_step'] += 20
     observe(c, jobs, profiles, 12.)
-    assert c.admission_limit == 4, c.events
-    assert c._trace_pending and len(c._tried) == 1
+    assert c.admission_limit == (4 if allowed else 3), c.events
+    assert bool(c._trace_pending) == allowed and len(c._tried) == int(allowed)
     decisions = [e for e in c.events if e['kind'] == 'decision']
-    assert decisions[-1]['reason'] == 'productive_head_exploration_no_latency_guarantee'
+    check = decisions[-1]['next_slot_check']
+    assert check['passed'] == allowed
+    if allowed:
+        assert all(h['4'] <= h['3'] for h in check['halves']) and len(check['halves']) == 2
+        assert '4' not in decisions[-1]['predictions']
+        assert decisions[-1]['reason'] == 'productive_head_exploration_no_latency_guarantee'
     assert decisions[-1]['failures']  # no invented future rates
     c.observe(now=13., queued_jobs=[], running_jobs=[], profiles={},
               gpu_sample=SAMPLE, completed_job_ids={j.job_id: 12.5 for j in jobs})
-    assert c.admission_limit == 4 and c._trace_pending and c.store.rows
+    assert c.admission_limit == (4 if allowed else 3) and bool(c._trace_pending) == allowed and c.store.rows
 
 
 def test_strict_fifo_and_pending_exploration_checkpoint(monkeypatch, tmp_path):
@@ -172,6 +180,7 @@ def test_stale_phase_cannot_explore_even_with_fresh_rates(monkeypatch):
 
 def test_only_observed_compatible_prefix_can_supply_warm_initial_target(monkeypatch):
     c, jobs, profiles = setup_controller(monkeypatch)
+    add(c.store, 'prior-four', peers=context([fingerprint()]*3, resident_count=4), at=5., rate=100.)
     launch(c, jobs)
     observe(c, jobs, profiles, 10.)
     for j in jobs[:3]: j.metadata['runtime_global_step'] += 20
@@ -420,3 +429,56 @@ def test_ready_fifo_head_with_free_slot_skips_forecasting(monkeypatch):
         observe(c, jobs, profiles, t, n=2)
     assert c.store.rows and c.admission_limit == 3
     assert c.on_launch(jobs[2].job_id, 12.) is None
+
+
+@pytest.mark.parametrize('short_index', [0, 3, 4])
+def test_missing_raise_evidence_protects_any_accepted_short_job(monkeypatch, short_index):
+    c, jobs, profiles = setup_controller(monkeypatch, n=5)
+    short = jobs[short_index]
+    short.max_steps = short.metadata['runtime_total_optimizer_updates'] = short.metadata['runtime_steps_per_epoch'] = 128
+    launch(c, jobs)
+    for t in (10., 11., 12.):
+        for j in jobs[:3]: j.metadata['runtime_global_step'] += 20
+        observe(c, jobs, profiles, t)
+    assert c.events[-1]['reason'] == 'short_job_veto_unproven_increase'
+    assert c.admission_limit == 3 and not c._tried and c._trace_pending is None
+
+
+@pytest.mark.parametrize('budget,initial', [(128, 3), (129, 4), (None, 3)])
+def test_unscored_remembered_raise_checks_all_accepted_budgets(budget, initial):
+    c = AdaptiveFIFO511Controller(wall_offset=0.)
+    jobs = [job(str(i), ordinal=i+1) for i in range(4)]
+    last = jobs[-1]
+    last.max_steps = last.metadata['runtime_total_optimizer_updates'] = last.metadata['runtime_steps_per_epoch'] = budget
+    profiles = {j.job_id: {**profile(j), 'v511_fingerprint': fingerprint()} for j in jobs}
+    key = digest([fingerprint()['exact']] * 3)
+    c._context_priors[key] = {'basis': 'two_clean_windows_at_actual_occupancy', 'observed_unix': 0., 'alpha': 4}
+    c.observe(now=1., queued_jobs=jobs, running_jobs=[], profiles=profiles, gpu_sample=SAMPLE, completed_job_ids={})
+    assert c.admission_limit == initial and not c._tried
+    assert c._short_job_outstanding({last.job_id: 1.}) is False
+    c.on_launch(jobs[0].job_id, 1.)  # Ordinary ready FIFO head still launches.
+
+
+def test_protected_raise_needs_both_halves_and_every_accepted_receipt():
+    c = AdaptiveFIFO511Controller()
+    base = {'receipts': {'long': 20., 'short': 10.}}
+    equal = {'receipts': {'long': 19., 'short': 10.}}
+    late = {'receipts': {'long': 21., 'short': 8.}}
+    accepted = base['receipts'].keys()
+    assert c._no_job_later([base, base], [equal, equal], accepted)
+    for invalid in ([equal], [equal, late], [equal, {'receipts': {'short': 8.}}]):
+        assert not c._no_job_later([base, base], invalid, accepted)
+
+@pytest.mark.parametrize('late_half,launch_immediate,passed', [
+    (None, True, True), (0, True, False), (1, True, False), (None, False, False)])
+def test_next_opening_compares_both_half_releases_after_immediate_launch(late_half, launch_immediate, passed):
+    controller = AdaptiveFIFO511Controller()
+    for half in range(2):
+        for cap in (3, 4):
+            # Equal release times qualify, even if feedback delivery happens later.
+            release = 14. + (cap == 4 and half == late_half)
+            controller._support_log.append({'cap': cap, 'half': half, 'first_release': {'at': release},
+                                            'head_launched_now': cap == 4 and launch_immediate})
+    check = {}
+    assert controller._fourth_preserves_opening(10., [], [], {}, {}, [], {}, {}, check) == passed
+    assert check['passed'] == passed

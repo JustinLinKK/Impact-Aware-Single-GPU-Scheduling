@@ -8,6 +8,7 @@ import math
 import time
 
 from .adaptive_fifo import AdaptiveFIFOController, _number
+from .completion_objective import remaining_optimizer_updates
 from .fifo_experience import ExperienceStore
 from .contextual_rates import InsufficientHistory, estimate, reference_generation
 from .workload_fingerprint import context, digest
@@ -188,14 +189,24 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
                 'basis': 'two_clean_windows_at_actual_occupancy'}
         self._save_control()
 
-    def _forecast(self, cap, half, queued, running, profiles, completed, sample, halves, now, deadline, budget=None):
+    def _forecast(self, cap, half, queued, running, profiles, completed, sample, halves, now, deadline, budget=None,
+                  *, first_release_only=False):
         evidence = {'cap': cap, 'half': half, 'direction': self._rate_bound,
                     'suspended_targets': 0, 'optimistic_tail': False}
+        if first_release_only:
+            evidence['horizon'] = 'first_release'
+        trace = []
         self._support = evidence
         try:
             return super()._forecast(cap, half, queued, running, profiles, completed, sample,
-                                     halves, now, deadline, budget)
+                                     halves, now, deadline, budget, trace=trace, first_release_only=first_release_only)
         finally:
+            if self.admission_limit == 3 and cap in (3, 4):
+                release = next((event for event in trace if event['kind'] == 'release'), None)
+                if release:
+                    evidence['first_release'] = release
+                    evidence['head_launched_now'] = bool(queued and trace[0] == {
+                        'kind': 'launch', 'job_id': queued[0], 'at': now})
             self._support = None
             self._instant_tail = False
             self._support_log.append(evidence)
@@ -277,7 +288,65 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
         self._queue_order = queued
         return queued
 
-    def _explore(self, now, queued, running, profiles, sample, halves):
+    def _short_job_outstanding(self, completed):
+        # Classify by the accepted total budget, never by observed speed.
+        for key in self._order:
+            if key in completed:
+                continue
+            job = self._jobs.get(key)
+            if job is None:  # An outstanding member may lack a snapshot after restore.
+                return True
+            metadata = job.metadata
+            total = remaining_optimizer_updates(job, {
+                'global_step': 0, 'steps_per_epoch': metadata.get('runtime_steps_per_epoch'),
+                'planned_epochs': metadata.get('runtime_planned_epochs'),
+                'total_optimizer_updates': metadata.get('runtime_total_optimizer_updates')})
+            if total is None or total <= 128:
+                return True
+        return False
+
+    @staticmethod
+    def _no_job_later(incumbent, candidate, accepted):
+        if len(incumbent) != 2 or len(candidate) != 2:
+            return False
+        for base, proposed in zip(incumbent, candidate):
+            before, after = base['receipts'], proposed['receipts']
+            if before.keys() != accepted or after.keys() != accepted:
+                return False
+            if not all(after[j] <= before[j] for j in before):
+                return False
+        return True
+
+    def _fourth_preserves_opening(self, now, queued, running, profiles, sample, halves, completed, budget, check):
+        # Compare the next physical release after admitting the FIFO head with
+        # the next release if the original three keep running. Feedback can lag release.
+        attempts = {(e['cap'], e['half']): e for e in self._support_log}
+        check.update(passed=False, halves=[])
+        for half in range(2):
+            openings = {}
+            check['halves'].append(openings)
+            for cap, bound in ((3, 'upper'), (4, 'lower')):
+                evidence = attempts.get((cap, half))
+                if evidence is None:
+                    # A missing later drain rate can interrupt the full forecast
+                    # before its second half starts. Reuse the same deadline and event budget.
+                    self._rate_bound = bound
+                    try:
+                        self._forecast(cap, half, queued, running, profiles, completed, sample, halves, now,
+                                       self._query_deadline, budget, first_release_only=True)
+                    except (ValueError, KeyError, TimeoutError):
+                        return False
+                    evidence = self._support_log[-1]
+                release = evidence.get('first_release')
+                if not release or (cap == 4 and not evidence['head_launched_now']):
+                    return False
+                openings[str(cap)] = release['at']
+            if openings['4'] > openings['3']:
+                return False
+        check['passed'] = True
+        return True
+
+    def _explore(self, now, queued, running, profiles, sample, halves, completed, budget, slot_check):
         old = self.admission_limit
         if not queued or self._trace_pending is not None or len(self._tried) >= 6 or old >= 6:
             return False
@@ -299,6 +368,9 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
         remaining = min(self._remaining(self._jobs[j]) / max(h['rates'][j] for h in halves) for j in running)
         observation = halves[-1]['end'] - halves[0]['start']
         if occupied + reserve(head) > capacity or remaining < startup + observation + 5:
+            return False
+        if old == 3 and not self._fourth_preserves_opening(
+                now, queued, running, profiles, sample, halves, completed, budget, slot_check):
             return False
         if time.perf_counter() >= self._query_deadline:
             raise TimeoutError('exploration scoring elapsed budget')
@@ -336,7 +408,11 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
                 # Asynchronous preparation can finish after the first dispatch.
                 # Reconsider the initial target once the same accepted prefix is
                 # known; never wait for all captures before ordinary FIFO starts.
-                self.admission_limit = max(old - 1, min(old + 1, prior['alpha']))
+                target = max(old - 1, min(old + 1, prior['alpha']))
+                if target > old and self._short_job_outstanding(completed_job_ids):
+                    self._event(now, 'short_job_veto', source='compatible_initial_prefix_prior', target=target)
+                else:
+                    self.admission_limit = target
                 if self.admission_limit != old:
                     self._last_change = now
                     payload = {'at': now, 'kind': 'decision', 'episode': self.episode,
@@ -395,14 +471,20 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
                 for cap, pair in results.items():
                     if cap != old and self._benefits_every_half(results[old], pair):
                         eligible.append(cap)
+            slot_check = {}
             reason = 'insufficient_or_no_gain'
             if time.perf_counter() >= self._query_deadline:
                 raise TimeoutError('retrieval and scoring elapsed budget')
             if eligible:
                 self.admission_limit = min(eligible, key=lambda c: (max(v['score'] for v in results[c]), c))
                 reason = 'two_half_pessimistic_history_gain'
-            elif self._explore(now, queued, running, profiles, gpu_sample, halves):
+            elif (old < 6 and self._short_job_outstanding(completed_job_ids)
+                  and not self._no_job_later(results.get(old, ()), results.get(old + 1, ()), self._accepted.keys())):
+                reason = 'short_job_veto_unproven_increase'
+            elif self._explore(now, queued, running, profiles, gpu_sample, halves, completed_job_ids, budget, slot_check):
                 reason = 'productive_head_exploration_no_latency_guarantee'
+            elif slot_check:
+                reason = 'fourth_job_next_opening_unproven_or_later'
             elapsed = time.perf_counter() - started
             if self.admission_limit != old:
                 self._last_change = now
@@ -414,6 +496,8 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
                 'retrieval_and_scoring_seconds': elapsed, 'history_queries': self._queries,
                 'forecast_support': self._support_log, 'previous_scoring_seconds': previous_overhead,
                 'history_parent_sha256': self.store.parent}
+            if slot_check:
+                payload['next_slot_check'] = slot_check
             self.events.append(payload)
             self.store.append({'kind': 'decision', 'episode': self.episode, **payload})
             self._save_control()
@@ -431,11 +515,11 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
                 self._last_hold = str(exc)
 
     def _benefits_every_half(self, incumbent, challenger):
-        for base, proposed in zip(incumbent, challenger, strict=True):
+        if not incumbent or not self._no_job_later(incumbent, challenger, incumbent[0]['receipts'].keys()):
+            return False
+        for base, proposed in zip(incumbent, challenger):
             required = max(self.options.min_gain_seconds, self.options.min_gain_fraction * base['score'])
             if base['score'] - proposed['score'] < required + self._last_overhead_seconds:
-                return False
-            if any(proposed['receipts'][j] > when for j, when in base['receipts'].items()):
                 return False
         return True
 

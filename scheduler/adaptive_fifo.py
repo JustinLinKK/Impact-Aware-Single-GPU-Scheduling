@@ -271,9 +271,11 @@ class AdaptiveFIFOController:
         training = [j for j, row in active.items() if row[0] == 'training' and row[1] > 1e-9]
         return self._rates(training, len(active), half, profiles, halves, now) if training else {}
 
-    def _forecast(self, cap, half, queued, running, profiles, completed, sample, halves, now, deadline, budget=None):
+    def _forecast(self, cap, half, queued, running, profiles, completed, sample, halves, now, deadline, budget=None,
+                  *, trace=None, first_release_only=False):
         """Fixed-alpha FIFO drain/refill. Actual residents survive a decrease."""
-        queue, active, receipts, trace = list(queued), {}, dict(completed), []
+        queue, active, receipts = list(queued), {}, dict(completed)
+        trace = [] if trace is None else trace
         if any(v is None for v in self._accepted.values()):
             raise ValueError('missing accepted monotonic clock')
         budget = {'remaining': self.options.max_events} if budget is None else budget
@@ -329,6 +331,8 @@ class AdaptiveFIFOController:
                     receipts[j] = t + costs[j]['delivery']
                     del active[j]
                     trace.append({'at': t, 'kind': 'release', 'job_id': j})
+                    if first_release_only:
+                        return  # The caller consumes the physical release from the trace.
             while queue and len(active) < cap:
                 j = queue[0]
                 if external + sum(reservations[k] for k in active) + reservations[j] > capacity:
