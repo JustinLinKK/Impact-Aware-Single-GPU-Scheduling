@@ -9,7 +9,7 @@ import time
 
 from .adaptive_fifo import AdaptiveFIFOController, _number
 from .fifo_experience import ExperienceStore
-from .contextual_rates import estimate, reference_generation
+from .contextual_rates import InsufficientHistory, estimate, reference_generation
 from .workload_fingerprint import context, digest
 
 
@@ -26,6 +26,9 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
         self._last_observation = self._last_score = -math.inf
         self._rate_bound, self._query_deadline = 'rate', 0.
         self._queries, self._estimates = [], {}
+        self._support = None
+        self._support_log = []
+        self._instant_tail = False
         self._demoted = set(self.store.control.get('demoted', []))
         self._errors = {}
         self._tried = set(self.store.control.get('tried', []))
@@ -185,6 +188,18 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
                 'basis': 'two_clean_windows_at_actual_occupancy'}
         self._save_control()
 
+    def _forecast(self, cap, half, queued, running, profiles, completed, sample, halves, now, deadline, budget=None):
+        evidence = {'cap': cap, 'half': half, 'direction': self._rate_bound,
+                    'suspended_targets': 0, 'optimistic_tail': False}
+        self._support = evidence
+        try:
+            return super()._forecast(cap, half, queued, running, profiles, completed, sample,
+                                     halves, now, deadline, budget)
+        finally:
+            self._support = None
+            self._instant_tail = False
+            self._support_log.append(evidence)
+
     def _rates_for_state(self, active, half, profiles, halves, now):
         phases = {j: row[0] for j, row in active.items()}
         members = [j for j in phases if phases[j] == 'training']
@@ -194,6 +209,8 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
         return self._phase_rates(members, occupancy, half, profiles, halves, now)
 
     def _phase_rates(self, members, occupancy, half, profiles, halves, now, phases=None):
+        if self._instant_tail:
+            return dict.fromkeys(members, None)
         if (len(halves) > half and set(members) == set(halves[half]['rates']) and occupancy == len(members)
                 and now - halves[half]['end'] <= self.options.evidence_ttl_seconds):
             factor = .8 if self._rate_bound == 'lower' else 1.2 if self._rate_bound == 'upper' else 1.
@@ -208,8 +225,28 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
                 raise ValueError('context demoted after consecutive rate misses')
             key = (j, peers['key'])
             if key not in self._estimates:
-                value = estimate(self.store, fp, peers, profiles[j], now=now + self.wall_offset,
-                                 deadline=self._query_deadline)
+                try:
+                    value = estimate(self.store, fp, peers, profiles[j], now=now + self.wall_offset,
+                                     deadline=self._query_deadline)
+                except InsufficientHistory as exc:
+                    if self._support is None:
+                        raise
+                    miss = {'target': j, 'fingerprint': fp['exact'], 'context': peers['key'],
+                            'phases': peers['phases'], **exc.evidence}
+                    if occupancy == len(members):
+                        self._support['unsupported_steady'] = miss
+                        raise
+                    self._support.setdefault('first_transition_gap', miss)
+                    if self._rate_bound == 'upper':
+                        # Favor keeping the limit. Subsequent training can finish
+                        # instantly; FIFO, reservations and lifecycle timers still apply.
+                        self._instant_tail = self._support['optimistic_tail'] = True
+                        return dict.fromkeys(members, None)
+                    if self._rate_bound != 'lower':
+                        raise
+                    self._support['suspended_targets'] += 1
+                    result[j] = 0.
+                    continue
                 self._estimates[key] = value
                 self._queries.append({'target_job': j, 'context': peers, **value})
             result[j] = self._estimates[key][self._rate_bound]
@@ -280,7 +317,7 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
         if now - self._last_observation < 1.:
             return
         self._last_observation = now
-        self._queries = []
+        self._queries, self._support_log = [], []
         if self._last_change is None: self._last_change = now
         running = [j.job_id for j in running_jobs]
         for j, p in profiles.items():
@@ -327,6 +364,10 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
             # decision. Learning continues, but expensive tail forecasts do not.
             if not queued or queued[0] not in profiles or self._jobs[queued[0]].hold:
                 return
+            # The FIFO head already has a slot. Its ordinary admission path
+            # can perform the memory check without a speculative score first.
+            if len(running) < self.admission_limit:
+                return
             if not profiles[queued[0]].get('v511_fingerprint'):
                 return
             if now - self._last_change < self.options.dwell_seconds or now - self._last_score < 2.:
@@ -346,15 +387,13 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
                     results[cap] = [self._forecast(cap, h, queued, running, profiles,
                         completed_job_ids, gpu_sample, halves, now, self._query_deadline, budget) for h in range(2)]
                     for value in results[cap]:
-                        value['rate_model'] = 'current group or trace-local graph/context empirical rate envelope'
+                        value['rate_model'] = 'current group or trace-local empirical envelope, with explicit mixed-phase scenarios'
                 except (ValueError, KeyError, TimeoutError) as exc:
                     failures[str(cap)] = str(exc)
             eligible = []
             if old in results:
                 for cap, pair in results.items():
-                    if cap != old and all(b['score'] - v['score'] >= max(self.options.min_gain_seconds,
-                        self.options.min_gain_fraction * b['score']) + self._last_overhead_seconds
-                        for b, v in zip(results[old], pair)):
+                    if cap != old and self._benefits_every_half(results[old], pair):
                         eligible.append(cap)
             reason = 'insufficient_or_no_gain'
             if time.perf_counter() >= self._query_deadline:
@@ -367,26 +406,38 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
             elapsed = time.perf_counter() - started
             if self.admission_limit != old:
                 self._last_change = now
+            previous_overhead = self._last_overhead_seconds
             self._last_overhead_seconds = elapsed
             payload = {'at': now, 'kind': 'decision', 'previous_alpha': old,
                 'alpha': self.admission_limit, 'reason': reason, 'occupancy': len(running),
                 'predictions': {str(k): v for k, v in results.items()}, 'failures': failures,
                 'retrieval_and_scoring_seconds': elapsed, 'history_queries': self._queries,
+                'forecast_support': self._support_log, 'previous_scoring_seconds': previous_overhead,
                 'history_parent_sha256': self.store.parent}
             self.events.append(payload)
             self.store.append({'kind': 'decision', 'episode': self.episode, **payload})
             self._save_control()
             self._last_hold = None
         except (ValueError, KeyError, TypeError, OverflowError, ZeroDivisionError, TimeoutError) as exc:
-            if self._queries:
+            if self._queries or self._support_log:
                 # Retain every estimate actually consulted, including scoring
                 # attempts that abstained or exhausted their elapsed budget.
                 self.store.append({'kind': 'history_query', 'episode': self.episode,
                     'at': now, 'reason': str(exc), 'history_queries': self._queries,
+                    'forecast_support': self._support_log,
                     'history_parent_sha256': self.store.parent})
             if str(exc) != self._last_hold:
                 self._event(now, 'forecast_hold', reason=str(exc))
                 self._last_hold = str(exc)
+
+    def _benefits_every_half(self, incumbent, challenger):
+        for base, proposed in zip(incumbent, challenger, strict=True):
+            required = max(self.options.min_gain_seconds, self.options.min_gain_fraction * base['score'])
+            if base['score'] - proposed['score'] < required + self._last_overhead_seconds:
+                return False
+            if any(proposed['receipts'][j] > when for j, when in base['receipts'].items()):
+                return False
+        return True
 
     def close_episode(self):
         self.store.append({'kind': 'episode_closed', 'episode': self.episode,

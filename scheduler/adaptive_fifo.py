@@ -342,14 +342,24 @@ class AdaptiveFIFOController:
                 break
             training = [j for j, r in active.items() if r[0] == 'training' and r[1] > 1e-9]
             rates = self._rates_for_state(active, half, profiles, halves, now) if training else {}
-            durations = [row[1] / rates[j] if row[0] == 'training' else row[2] for j, row in active.items()]
+            durations = [row[2] for row in active.values() if row[0] != 'training']
+            for j in training:
+                rate = rates[j]
+                if rate is None:  # Explicit zero-work scenario, never a measured rate.
+                    durations.append(0.)
+                elif rate > 0:
+                    durations.append(active[j][1] / rate)
+                elif rate != 0:
+                    raise ValueError('invalid training rate')
+            if not durations:
+                raise ValueError('no timed event for suspended training')
             dt = min(durations)
             if not math.isfinite(dt) or dt < 0:
                 raise ValueError('invalid forecast time')
             t += dt
             for j, row in active.items():
                 if row[0] == 'training':
-                    row[1] = max(0., row[1] - dt * rates[j])
+                    row[1] = 0. if rates[j] is None else max(0., row[1] - dt * rates[j])
                 else:
                     row[2] = max(0., row[2] - dt)
         else:

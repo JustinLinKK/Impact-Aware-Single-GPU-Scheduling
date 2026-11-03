@@ -273,7 +273,8 @@ def test_phase_change_invalidates_window_and_never_borrows_unseen_phase(monkeypa
         c._rates_for_state({'a': ['training', 100, 0], 'c': ['finishing', 0, 2]}, 0, profiles, [], 12.)
 
 
-def test_supported_phase_history_can_select_alpha_with_full_fifo_completion(monkeypatch):
+@pytest.mark.parametrize('include_mixed', [True, False])
+def test_supported_phase_history_can_select_alpha_with_full_fifo_completion(monkeypatch, include_mixed):
     # Algorithm fixture, not performance evidence: freeze CPU clock so test load
     # cannot manufacture an elapsed-budget failure. Production keeps its 10ms bound.
     from localml_scheduler.scheduler import adaptive_fifo_v511, contextual_rates
@@ -288,6 +289,8 @@ def test_supported_phase_history_can_select_alpha_with_full_fifo_completion(monk
     for total in range(1, 5):
         for starting in range(total):
             for finishing in range(total - starting):
+                if not include_mixed and (starting or finishing):
+                    continue
                 training = total - starting - finishing
                 peers = context([fp] * (training - 1), resident_count=total,
                     starting=starting, finishing=finishing,
@@ -308,8 +311,13 @@ def test_supported_phase_history_can_select_alpha_with_full_fifo_completion(monk
         for prediction in forecasts:
             assert set(prediction['receipts']) == set(profiles)
             assert [e['job_id'] for e in prediction['trace'] if e['kind'] == 'launch'] == ['d']
-    assert any(q['context']['phases']['starting'] for q in decision['history_queries'])
-    assert any(q['context']['phases']['finishing'] for q in decision['history_queries'])
+    if include_mixed:
+        assert any(q['context']['phases']['starting'] for q in decision['history_queries'])
+        assert any(q['context']['phases']['finishing'] for q in decision['history_queries'])
+    else:
+        assert all(q['context']['phases']['training'] == q['context']['phases']['resident']
+                   for q in decision['history_queries'])
+        assert any(s['suspended_targets'] for s in decision['forecast_support'] if s['cap'] == 4)
 
 
 def test_no_queue_skips_scoring_but_keeps_learning(monkeypatch):
@@ -360,3 +368,55 @@ def test_optional_capture_failure_only_disables_adaptation(monkeypatch):
     predictor._queue.join()
     assert predictor.augment(j, 1, p) == p and predictor.failures
     assert predictor.stop()
+
+
+def test_unknown_transition_advances_time_without_borrowing_a_rate(monkeypatch):
+    c, jobs, profiles = setup_controller(monkeypatch)
+    launch(c, jobs)
+    c._query_deadline = time.perf_counter() + 1
+    active = {'a': ['training', 120, 0], 'b': ['finishing', 0, 2]}
+    c._support = {'suspended_targets': 0}
+    c._rate_bound = 'lower'
+    assert c._rates_for_state(active, 0, profiles, [], 10.) == {'a': 0.}
+    assert c._support['suspended_targets'] == 1 and not c._queries
+    del active['b']
+    with pytest.raises(ValueError, match='insufficient compatible'):
+        c._rates_for_state(active, 0, profiles, [], 10.)
+    assert c._support['unsupported_steady']['phases']['training'] == 1
+
+
+def test_incumbent_relaxation_keeps_fifo_release_and_delivery(monkeypatch):
+    c, jobs, profiles = setup_controller(monkeypatch)
+    launch(c, jobs)
+    c._query_deadline = time.perf_counter() + 2
+    c._rate_bound = 'upper'
+    jobs[2].metadata.update(v51_phase='starting', v51_phase_started_at=10.)
+    result = c._forecast(3, 0, ['d'], ['a','b','c'], profiles, {}, SAMPLE,
+                         [], 10., c._query_deadline)
+    assert c._support_log[-1]['optimistic_tail'] and not c._instant_tail
+    assert not c._queries and set(result['receipts']) == set(profiles)
+    events = result['trace']
+    assert [e['job_id'] for e in events if e['kind'] == 'launch'] == ['d']
+    assert events[0]['kind'] == 'release'
+    assert all(e['at'] <= result['receipts'][e['job_id']] for e in events)
+
+
+def test_forecast_cannot_trade_one_short_jobs_delay_for_a_mean_gain(monkeypatch):
+    c, *_ = setup_controller(monkeypatch)
+    base = {'score': 100., 'receipts': {'short': 10., 'long': 190.}}
+    win = {'score': 50., 'receipts': {'short': 10., 'long': 90.}}
+    late = {'score': 50., 'receipts': {'short': 11., 'long': 89.}}
+    assert c._benefits_every_half([base, base], [win, win])
+    assert not c._benefits_every_half([base, base], [win, late])
+
+
+def test_ready_fifo_head_with_free_slot_skips_forecasting(monkeypatch):
+    c, jobs, profiles = setup_controller(monkeypatch)
+    launch(c, jobs, n=2)
+    monkeypatch.setattr(c, '_forecast', lambda *a: pytest.fail('admissible head entered scoring'))
+    for t in (10., 11., 12.):
+        for job in jobs[:2]:
+            job.metadata['runtime_global_step'] += 20
+        observe(c, jobs, profiles, t, n=2)
+    assert c.store.rows and c.admission_limit == 3
+    assert c.on_launch(jobs[2].job_id, 12.) is None

@@ -139,6 +139,33 @@ def history_audit(path, namespace, episodes):
                         abs(payload['alpha'] - payload['previous_alpha']) != 1 or
                         replay.control.get('pending') is not None):
                     raise ValueError('warm initial prior lacks preceding compatible observed evidence')
+            for scenario in payload.get('forecast_support', []):
+                mixed = scenario.get('first_transition_gap')
+                steady = scenario.get('unsupported_steady')
+                if mixed and not (mixed['phases']['starting'] or mixed['phases']['finishing']):
+                    raise ValueError('transition fallback requires a transient resident')
+                if steady and steady['phases']['resident'] != steady['phases']['training']:
+                    raise ValueError('non-steady terminal history miss')
+                if scenario['optimistic_tail'] and (not mixed or scenario['direction'] != 'upper'):
+                    raise ValueError('zero-work relaxation only allowed for the incumbent')
+                if scenario['suspended_targets'] and (not mixed or scenario['direction'] != 'lower'):
+                    raise ValueError('suspended training only allowed for the challenger')
+                if 'previous_alpha' in payload and (scenario['cap'] == payload['previous_alpha']) != (scenario['direction'] == 'upper'):
+                    raise ValueError('incumbent and challenger scenario directions differ')
+            if payload.get('reason') == 'two_half_pessimistic_history_gain':
+                forecasts = payload['predictions']
+                base, challenger = (forecasts[str(payload[k])] for k in ('previous_alpha', 'alpha'))
+                if len(base) != 2 or len(challenger) != 2 or not payload.get('forecast_support'):
+                    raise ValueError('missing two-half forecast evidence')
+                from ...scheduler.adaptive_fifo import AdaptiveFIFOOptions
+                options = AdaptiveFIFOOptions()
+                for b, c in zip(base, challenger):
+                    margin = max(options.min_gain_seconds, options.min_gain_fraction * b['score'])
+                    if b['score'] - c['score'] < margin + payload['previous_scoring_seconds']:
+                        raise ValueError('selected forecast misses required gain')
+                    if set(b['receipts']) != set(c['receipts']) or any(
+                            c['receipts'][j] > t for j, t in b['receipts'].items()):
+                        raise ValueError('selected forecast delays an accepted job')
             for query in payload['history_queries']:
                 receipt = episode['result']['receipts'][query['target_job']]
                 if receipt['accepted_unix'] > at + .1: raise ValueError('future accepted job inspected')

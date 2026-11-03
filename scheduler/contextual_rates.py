@@ -4,6 +4,13 @@ import time
 from .workload_fingerprint import structural_distances, peer_distance, log_distance
 
 
+class InsufficientHistory(ValueError):
+    def __init__(self, candidates, independent, rejected):
+        super().__init__('insufficient compatible independent episode history')
+        self.evidence = {'candidates': candidates, 'compatible_episodes': independent,
+                         'rejected': dict(rejected)}
+
+
 def quantile(values, q):
     values = sorted(values)
     total = sum(w for _, w in values)
@@ -45,6 +52,14 @@ def estimate(store, fingerprint, peers, profile, *, now, deadline, allow_old=Fal
         if age > 14400 and not allow_old:
             rejected['older_than_phase_ttl'] = rejected.get('older_than_phase_ttl', 0) + 1
             continue
+        # These were already hard failures in peer_distance. Reject them
+        # before graph comparison and distinguish the two causes in receipts.
+        if peers['phases'] != row['context']['phases']:
+            rejected['phase_counts'] = rejected.get('phase_counts', 0) + 1
+            continue
+        if peers.get('phase_peers') != row['context'].get('phase_peers'):
+            rejected['transient_identity'] = rejected.get('transient_identity', 0) + 1
+            continue
         try:
             graph, shape = structural_distances(fingerprint, row['fingerprint'])
             solo = log_distance([reference, profile['peak_vram_mib']],
@@ -74,7 +89,7 @@ def estimate(store, fingerprint, peers, profile, *, now, deadline, allow_old=Fal
         unique.setdefault(value['row']['episode'], value)
     selected = list(unique.values())[:16]
     if not selected or (not exact and len(selected) < 3):
-        raise ValueError('insufficient compatible independent episode history')
+        raise InsufficientHistory(len(candidates), len(selected), rejected)
     residuals = [(math.log(v['row']['raw_rate'] / (reference if exact else v['row']['reference_rate'])),
                   v['weight']) for v in selected]
     mid = reference * math.exp(quantile(residuals, .5))
