@@ -1,0 +1,4 @@
+gpu_family,starting_concurrency
+A10,3
+A100,5
+H100,8

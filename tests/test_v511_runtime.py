@@ -154,6 +154,19 @@ def test_fourth_exploration_requires_safe_release_but_not_a_complete_tail(monkey
     assert c.admission_limit == (4 if allowed else 3) and bool(c._trace_pending) == allowed and c.store.rows
 
 
+def test_h100_restore_retains_ceiling_after_lowering_the_target():
+    controller = AdaptiveFIFO511Controller(gpu_name='NVIDIA H100 PCIe')
+    assert controller.admission_limit == controller.max_alpha == 8
+    controller.admission_limit = 6
+    restored = AdaptiveFIFO511Controller.restore_state(controller.export_state(), store=controller.store)
+    assert restored.max_alpha == 8 and restored.admission_limit == 6
+    legacy = AdaptiveFIFO511Controller(gpu_name='NVIDIA A10')
+    state = legacy.export_state()
+    del state['initial_hardware_alpha']
+    restored = AdaptiveFIFO511Controller.restore_state(state, store=legacy.store)
+    assert restored.admission_limit == 3 and restored.max_alpha == 6
+
+
 def test_strict_fifo_and_pending_exploration_checkpoint(monkeypatch, tmp_path):
     store = ExperienceStore('trace', path=tmp_path)
     c, jobs, profiles = setup_controller(monkeypatch, store=store)

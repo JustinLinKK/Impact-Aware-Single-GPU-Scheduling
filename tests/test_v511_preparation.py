@@ -73,6 +73,21 @@ def test_forged_preparation_rejected(mutation):
     with pytest.raises(ValueError): validate_preparation(plan)
 
 
+@pytest.mark.parametrize('model,expected', [
+    ('NVIDIA A10', 3), ('NVIDIA A100-SXM4-40GB', 5), ('Tesla A100-PCIE-80GB', 5),
+    ('H100', 8), ('NVIDIA H100 80GB HBM3', 8), ('nvidia h100 pcie', 8),
+    ('NVIDIA A10G', 3), ('NVIDIA H1000', 3), ('NVIDIA A100-SXM4-80GB MIG 1g.10gb', 3),
+    ('unknown', 3),
+])
+def test_family_start_takes_precedence_over_precision_formula(model, expected):
+    result = hardware_prior(gpu_name=model)
+    assert result['alpha'] == expected
+    assert not result['validated_optimum']
+    if expected > 3:
+        assert hardware_prior(gpu_name=model, device_tflops=19.5, a10_tflops=31.2,
+                              bandwidth_gbs=1935, arithmetic_path_verified=True)['alpha'] == expected
+
+
 def test_arithmetic_path_changes_hardware_prior():
     assert hardware_prior(device_tflops=125, a10_tflops=125, bandwidth_gbs=600,
                           arithmetic_path_verified=True)['alpha'] == 3

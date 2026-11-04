@@ -105,46 +105,30 @@ claims; changing them after evaluation requires a new version and report.
 
 ## 4. Initial alpha is hardware-aware
 
-Use throughput for the actual eligible arithmetic path, not Tensor Core count
-alone. Dense and sparse peak rates must not be mixed. Strict `fp32_ieee` with
-TF32 disabled uses FP32 capability even if the GPU has Tensor Cores.
+Use the [starting-concurrency CSV](gpu-starting-concurrency.csv) for recognized full
+GPU models. The A10, A100 and H100 start at 3, 5 and 8 jobs respectively. These
+are team-supplied workload measurements used as initial targets. This release
+has CPU coverage of the mapping; the existing GPU screen measured the A10.
+Model-specific targets take precedence even for strict FP32 work. The GPU model
+sets the initial target, while the oldest queued job's reservation and live
+device memory determine whether it can actually start.
 
-For known compatible capabilities, define the deliberately conservative prior:
+For an unlisted model with verified, comparable dense arithmetic throughput and
+memory bandwidth, the existing fallback uses the same precision path on both
+devices:
 
 ```
 scale = min(device_dense_TFLOPS / A10_dense_TFLOPS_for_same_path,
             device_bandwidth_GBs / 600)
-alpha_hardware = clamp(ceil(3 * sqrt(scale)), 1, 6)
+initial_alpha = clamp(ceil(3 * sqrt(scale)), 1, 6)
 ```
 
-This is a predeclared heuristic, not a performance law or an optimal cap. Missing
-or incomparable capabilities use a prior of 3. Mixed workloads use the smallest
-applicable capacity ratio among the accepted initial prefix. Do not infer a
-favorable arithmetic path solely from advertised precision or model name.
-
-At an idle start, bound the initial dispatch target by the largest *prepared
-FIFO prefix* that fits the live device budget and conservative per-job memory
-reservations, then by the experimental ceiling 6. Dispatch each head through a
-fresh live-memory check. An unprepared head waits; a head proven too large alone
-fails explicitly. A temporary lack of ready jobs is not evidence of saturation.
-Reconsider the hardware target as preparation completes; do not permanently
-learn alpha=1 merely because only one profile was initially ready.
-
-Reservations use predicted allocated peak plus a measured same-host reserved
-memory/startup margin. Unknown reservation error retains conservative fallback
-and is not fabricated as zero. The initial prior cannot guarantee absence of OOM.
-
-| Example arithmetic path | A10 starting prior | A100 80GB PCIe illustrative prior |
-|---|---:|---:|
-| Dense FP16/BF16 Tensor Core eligible | 3 | 5 |
-| Strict FP32 without TF32 | 3 | 3 |
-
-These examples precede memory and readiness limits. A100 values use dense
-312 TFLOPS FP16, 19.5 TFLOPS FP32 and 1935 GB/s; A10 uses 125, 31.2 and
-600 respectively. NVIDIA specifications: [A10](https://www.nvidia.com/en-us/data-center/products/a10-gpu/)
-and [A100](https://images.nvidia.com/data-center/a100/a100-datasheet.pdf).
-The current A10 workloads are strict FP32. This A10 study cannot establish that
-4–5 is better on A100. Hardware-scaling behavior gets CPU checks only here.
+Without those inputs use 3. Use the full-device table only for full GPUs; an
+explicit MIG or vGPU label falls back to 3. CUDA core counts, Tensor Core
+counts and VRAM capacity alone do not give a measured co-running job rate.
+The adaptive ceiling is 6 unless the hardware starting target is higher, so
+an H100 can return to 8 after a decrease. FIFO, the six exploration-trial
+budget, inherited forecast gates and live VRAM checks still apply.
 
 ## 5. Persistent experience, with separate freshness rules
 
@@ -188,7 +172,7 @@ history and the learned context prior instead of resetting all experience.
 
 ## 6. Decision and exploration contract
 
-Compare current alpha and adjacent targets in [1,6]. Simulate FIFO drain/refill
+Compare current alpha and adjacent targets from 1 through the device-specific ceiling. Simulate FIFO drain/refill
 over already accepted jobs using per-job rates and phase costs. Existing
 residents remain after a target decrease. Model validation/finish/delivery even
 when successful optimizer updates are complete. Respect actual bracket

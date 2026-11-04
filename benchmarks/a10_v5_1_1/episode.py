@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime,timezone
 from pathlib import Path
 import json,math,re,signal,statistics,time,traceback
+from ...scheduler.hardware_concurrency import MAX_START
 from ...client import SchedulerClient
 from ...domain import JobStatus
 from ...execution.executor import SubprocessExecutor
@@ -102,16 +103,12 @@ def _run_episode(manifest, manifest_path, raw_settings, output, calibration, *, 
     if controller_factory is None:
         from ...scheduler.adaptive_fifo_v511 import AdaptiveFIFO511Controller
         from ...scheduler.fifo_experience import ExperienceStore
-        from .prepare import hardware_prior
         trace = manifest['v511_trace']
         if not trace['history_namespace'] or Path(trace['history_path']).name != trace['history_namespace']:
             raise ValueError('explicit owned history namespace required')
         history = ExperienceStore(trace['history_namespace'], path=trace['history_path'])
-        # Exact verified A10 strict-FP32 experiment capability, not an A100 claim.
-        prior = hardware_prior(device_tflops=31.2, a10_tflops=31.2,
-                               bandwidth_gbs=600., arithmetic_path_verified=True)
         controller_factory = lambda mode: AdaptiveFIFO511Controller(mode, store=history,
-            episode=trace['episode'], hardware_prior=prior['alpha'])
+            episode=trace['episode'], gpu_name=hardware['name'])
     controller = controller_factory(mode=mode)
     revised, causal, asynchronous = False, True, True
     flags = arm_flags(arm, development_shadow=manifest.get('development_shadow', False))
@@ -314,7 +311,7 @@ def _run_episode(manifest, manifest_path, raw_settings, output, calibration, *, 
                 if controller._last_observation >= observation_sample_at:
                     controller._last_overhead_seconds = max(controller._last_overhead_seconds, observe_wall[-1])
                 fixed_cap=controller.admission_limit
-                if type(fixed_cap)is not int or not 1<=fixed_cap<=len(jobs):raise ValueError('finite positive actual-cohort admission limit required')
+                if type(fixed_cap)is not int or not 1<=fixed_cap<=MAX_START:raise ValueError('finite positive actual-cohort admission limit required')
                 head_name=pending[0] if pending else None
                 head_block='alpha' if pending and len(handles)>=fixed_cap else None
                 for name in pending[:max(0, fixed_cap - len(handles))]:

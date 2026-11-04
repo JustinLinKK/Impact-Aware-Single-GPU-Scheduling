@@ -10,8 +10,9 @@ from collections import Counter
 from copy import deepcopy
 from hashlib import sha256
 import json
-import math
 from pathlib import Path
+
+from ...scheduler.hardware_concurrency import hardware_prior
 
 BASE_SOURCE = '053f0a412e2060b1ba17b25226e4082205e1ae40'
 BASE_BLUEPRINT = Path(__file__).parents[1] / 'a10_v5_1_ablation' / 'blueprint.json'
@@ -30,20 +31,6 @@ PENDING_GATES = (
 def digest(value):
     return sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
                              allow_nan=False).encode()).hexdigest()
-
-
-def hardware_prior(*, device_tflops=None, a10_tflops=None,
-                   bandwidth_gbs=None, arithmetic_path_verified=False):
-    """Reference heuristic only; does not perform admission or live memory checks."""
-    if not arithmetic_path_verified:
-        return {'alpha': 3, 'basis': 'unverified_capability_fallback', 'validated_optimum': False}
-    for value in (device_tflops, a10_tflops, bandwidth_gbs):
-        if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
-            raise ValueError('verified arithmetic path requires positive finite capabilities')
-    scale = min(device_tflops / a10_tflops, bandwidth_gbs / 600.)
-    return {'alpha': max(1, min(6, math.ceil(3 * math.sqrt(scale)))),
-            'basis': 'dense_precision_and_bandwidth_heuristic', 'scale': scale,
-            'validated_optimum': False}
 
 
 def _row(condition, mode, repeat, cycle, arm, index, *, development=False):

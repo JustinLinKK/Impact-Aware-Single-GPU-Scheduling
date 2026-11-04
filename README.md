@@ -2,12 +2,23 @@
 
 ## V5.1.1 implementation and A10 screening
 
-The new opt-in controller retains strict FIFO, starts from a precision-aware GPU
-capacity prior bounded by live memory, and preserves workload/group experience
-across jobs. PerfSeer weights stay frozen. This branch contains the runtime,
-real CPU training-graph preparation, durable causal history, receipt/FIFO
-auditors and finite screening runner. A new GPU experiment requires fresh host
-qualification and a separate development review; it has not launched yet.
+The opt-in controller retains strict FIFO and starts from a GPU-family target.
+A full A10 starts at **3**, A100 at **5**, and H100 at **8**. These are the
+team's experiment-based starting values. Each job must still fit the live VRAM
+budget before launch, and the controller can later raise or lower concurrency.
+
+Pass the GPU model reported by the scheduler host:
+
+```python
+from localml_scheduler.scheduler.adaptive_fifo_v511 import AdaptiveFIFO511Controller
+
+controller = AdaptiveFIFO511Controller(gpu_name=hardware_profile.gpu_name)
+```
+
+The [starting-concurrency CSV](docs/gpu-starting-concurrency.csv) lists the
+mapped full-device families. Without a model match or verified capability data,
+the initial target is 3. The A10 screen uses an A10-only runner. A100 and H100
+mapping tests run on CPU; this release adds no new A100 or H100 latency measurements.
 
 - [V5.1.1 design](docs/oct-proposed-v5-1-1-design.md)
 - [A10 screening, fresh comparison and baseline reuse](docs/a10-v5-1-1-experiment.md)
@@ -15,8 +26,7 @@ qualification and a separate development review; it has not launched yet.
 - [FIFO experience controller](scheduler/adaptive_fifo_v511.py)
 - [Source-bound screening runner](benchmarks/a10_v5_1_1/campaign.py)
 
-The active fresh-calibration V5.1 comparison remains frozen at `053f0a4` in its
-separate remote package. A local branch change is not a remote source change.
+The original next-slot A10 screening used the frozen `v5.1.1-rc.1` source.
 
 ## V5.1: FIFO with adaptive concurrency
 

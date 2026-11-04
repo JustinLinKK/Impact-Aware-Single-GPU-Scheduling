@@ -10,18 +10,23 @@ import time
 from .adaptive_fifo import AdaptiveFIFOController, _number
 from .completion_objective import remaining_optimizer_updates
 from .fifo_experience import ExperienceStore
+from .hardware_concurrency import LEGACY_CEILING, MAX_START, hardware_prior as starting_prior
 from .contextual_rates import InsufficientHistory, estimate, reference_generation
 from .workload_fingerprint import context, digest
 
 
 class AdaptiveFIFO511Controller(AdaptiveFIFOController):
     def __init__(self, mode='individual', *, options=None, store=None, episode='standalone',
-                 hardware_prior=3, wall_offset=None):
+                 hardware_prior=None, gpu_name=None, wall_offset=None):
         super().__init__(mode, options=options)
-        if type(hardware_prior) is not int or not 1 <= hardware_prior <= 6:
+        if hardware_prior is None:
+            hardware_prior = starting_prior(gpu_name=gpu_name)['alpha']
+        if type(hardware_prior) is not int or not 1 <= hardware_prior <= MAX_START:
             raise ValueError('hardware prior outside experimental bounds')
         self.store = store or ExperienceStore('standalone-' + mode)
         self.episode = episode
+        self.initial_hardware_alpha = hardware_prior
+        self.max_alpha = max(LEGACY_CEILING, hardware_prior)
         self.admission_limit = hardware_prior
         self.wall_offset = time.time() - time.monotonic() if wall_offset is None else wall_offset
         self._last_observation = self._last_score = -math.inf
@@ -49,7 +54,7 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
         return {**super().export_state(), 'schema': 'adaptive_fifo_v511_v1',
             'namespace': self.store.namespace, 'episode': self.episode,
             'history_parent_sha256': self.store.parent, 'trace_control': deepcopy(self.store.control),
-            'wall_offset': self.wall_offset}
+            'initial_hardware_alpha': self.initial_hardware_alpha, 'wall_offset': self.wall_offset}
 
     @classmethod
     def restore_state(cls, state, *, store):
@@ -60,7 +65,11 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
         legacy = {**state, 'schema': 'adaptive_fifo_v1'}
         base = AdaptiveFIFOController.restore_state(legacy)
         result = cls(state['mode'], options=base.options, store=store, episode=state['episode'],
-                     hardware_prior=state['admission_limit'], wall_offset=state['wall_offset'])
+                     hardware_prior=state.get('initial_hardware_alpha', state['admission_limit']),
+                     wall_offset=state['wall_offset'])
+        if base.admission_limit > result.max_alpha:
+            raise ValueError('restored alpha exceeds hardware ceiling')
+        result.admission_limit = base.admission_limit
         for key in ('_order', '_accepted', '_launched', '_accepted_metadata', '_last_change', '_explored'):
             setattr(result, key, deepcopy(getattr(base, key)))
         # Raw windows are intentionally discarded after restart; pending debt is
@@ -348,7 +357,7 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
 
     def _explore(self, now, queued, running, profiles, sample, halves, completed, budget, slot_check):
         old = self.admission_limit
-        if not queued or self._trace_pending is not None or len(self._tried) >= 6 or old >= 6:
+        if not queued or self._trace_pending is not None or len(self._tried) >= 6 or old >= self.max_alpha:
             return False
         head = queued[0]
         if head not in profiles or self._jobs[head].hold or len(running) != old:
@@ -408,7 +417,7 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
                 # Asynchronous preparation can finish after the first dispatch.
                 # Reconsider the initial target once the same accepted prefix is
                 # known; never wait for all captures before ordinary FIFO starts.
-                target = max(old - 1, min(old + 1, prior['alpha']))
+                target = max(old - 1, min(self.max_alpha, old + 1, prior['alpha']))
                 if target > old and self._short_job_outstanding(completed_job_ids):
                     self._event(now, 'short_job_veto', source='compatible_initial_prefix_prior', target=target)
                 else:
@@ -456,7 +465,7 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
             budget = {'remaining': self.options.max_events}
             # Optimistic incumbent vs pessimistic alternatives prevents a wide
             # empirical envelope from manufacturing an improvement.
-            for cap in (old, max(1, old - 1), min(6, old + 1)):
+            for cap in (old, max(1, old - 1), min(self.max_alpha, old + 1)):
                 if cap in results or str(cap) in failures: continue
                 self._rate_bound = 'upper' if cap == old else 'lower'
                 try:
@@ -478,7 +487,7 @@ class AdaptiveFIFO511Controller(AdaptiveFIFOController):
             if eligible:
                 self.admission_limit = min(eligible, key=lambda c: (max(v['score'] for v in results[c]), c))
                 reason = 'two_half_pessimistic_history_gain'
-            elif (old < 6 and self._short_job_outstanding(completed_job_ids)
+            elif (old < self.max_alpha and self._short_job_outstanding(completed_job_ids)
                   and not self._no_job_later(results.get(old, ()), results.get(old + 1, ()), self._accepted.keys())):
                 reason = 'short_job_veto_unproven_increase'
             elif self._explore(now, queued, running, profiles, gpu_sample, halves, completed_job_ids, budget, slot_check):

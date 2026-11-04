@@ -7,6 +7,7 @@ from datetime import datetime
 from hashlib import sha256
 import json, math
 from pathlib import Path, PurePosixPath
+from ...scheduler.hardware_concurrency import MAX_START
 from ..a10_feedback_latency.run import file_hash, digest as runtime_digest
 from ..a10_resource_mechanisms.profiles import SOURCE, SCHEMA
 def load(path): return json.loads(Path(path).read_text())
@@ -63,7 +64,7 @@ def audit_fifo_dispatch(output,result):
         jid=event['job_id'];at=event.get('launched_monotonic');cap=event.get('alpha');resident=event.get('resident_count')
         ready=[e['monotonic_seconds']for e in preparation if e.get('job_id')==jid and e.get('phase')=='end'and e.get('status')=='ready']
         if not finite(at)or at<last or at<receipts[jid]['accepted_monotonic']or not ready or at<min(ready):raise ValueError('dispatch predates acceptance/profile publication or is nonmonotonic')
-        if type(cap)is not int or not 1<=cap<=len(receipts)or type(resident)is not int or not 1<=resident<=cap:raise ValueError('dispatch resident count exceeds valid target alpha')
+        if type(cap)is not int or not 1<=cap<=MAX_START or type(resident)is not int or not 1<=resident<=min(cap,len(receipts)):raise ValueError('dispatch resident count exceeds valid target alpha')
         gate=event.get('memory_gate',{});reserves=gate.get('resident_reservations_mib',{})
         values=[gate.get(k)for k in ('device_used_mib','budget_mib','candidate_reservation_mib')]+list(reserves.values())
         if (any(not finite(v)or v<0 for v in values)or len(reserves)!=resident-1

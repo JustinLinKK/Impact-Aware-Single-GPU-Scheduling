@@ -26,9 +26,13 @@ class GraphFixture:
         return values
 
 
-@pytest.mark.parametrize('mode', ['individual', 'group'])
-@pytest.mark.parametrize('development', [False, True])
-def test_new_harness_fifo_receipt_audit_and_history_gate(tmp_path, monkeypatch, mode, development):
+@pytest.mark.parametrize('mode,development,gpu_name,initial_alpha', [
+    ('individual', False, 'NVIDIA A10', 3), ('individual', True, 'NVIDIA A10', 3),
+    ('group', False, 'NVIDIA A10', 3), ('group', True, 'NVIDIA A10', 3),
+    ('individual', False, 'NVIDIA H100 PCIe', 8),
+])
+def test_new_harness_fifo_receipt_audit_and_history_gate(tmp_path, monkeypatch, mode, development,
+                                                         gpu_name, initial_alpha):
     from localml_scheduler.prediction import fingerprint_preparation
     monkeypatch.setattr(original, 'e', f)
     harness = original.harness.__wrapped__(monkeypatch)
@@ -50,8 +54,9 @@ def test_new_harness_fifo_receipt_audit_and_history_gate(tmp_path, monkeypatch, 
     path = tmp_path / 'manifest.json'; path.write_text(json.dumps(manifest))
     output = tmp_path / 'episode'; output.mkdir()
     result = f.run_episode(manifest, path, {}, output, table, arm='v5_1_1', mode=mode,
-        max_seconds=35, source_commit='a' * 40, service_factory=factory, gpu_reader=lambda: dict(original.GPU))
+        max_seconds=35, source_commit='a' * 40, service_factory=factory, gpu_reader=lambda: dict(original.GPU, name=gpu_name))
     assert result['complete'] and len(result['receipts']) == 6
+    assert result['ordered_launch_events'][0]['alpha'] == initial_alpha
     assert result['history_namespace'] == namespace
     assert (tmp_path / 'history' / namespace / 'index.json').exists()
     snapshot = f.source_snapshot(manifest, path, 'a' * 40)
