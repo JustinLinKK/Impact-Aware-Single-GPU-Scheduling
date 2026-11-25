@@ -1,0 +1,62 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Ready-set scheduler</title>
+<style>body{font:16px/1.6 system-ui;max-width:1000px;margin:2rem auto;padding:0 1rem;color:#233}pre{background:#f3f5f7;padding:1rem;overflow:auto}table{border-collapse:collapse}td,th{padding:.5rem;border-bottom:1px solid #ddd;text-align:left}</style>
+<h1>Arrived-only resource-aware scheduling</h1>
+<p>This is an optional Scheduler policy added on top of commit <code>14b28fe62745a5e6172e675bffa228a96ec34d06</code> of <code>oct_proposed_v5_1_1</code>. The original adaptive FIFO controllers and cooperative training path remain byte-identical. The new policy is exercised by a separate raw-program replay executor; it is not silently enabled in the web service or original controller.</p>
+<h2>Data and control flow</h2>
+<pre>Actual candidate arrival
+  → offline static preflight and context-matched resource prediction
+  → arrived, checked ready pool (preserve original arrival identity)
+  → resource-shape coverage across the entire ready pool
+  → enumerate feasible admission sets and optionally CPU partitions
+  → forecast interference, resident completion and remaining queue drain time
+  → select a set, or wait with current residents
+  → shrink owned CPU reservations before expanding or launching
+  → run original candidate processes concurrently through private MPS
+  → actual process exits release resources; replan on arrival/exit and periodically</pre>
+<p>Only an actual exit completes a job. Forecast progress never marks completion, terminates training or replaces native logs. No future candidate source, generated result, private label or evaluation outcome is supplied to selection. The original candidate code, data, learning objective and native time guards are unchanged.</p>
+<h2>Current explicit resource envelope</h2>
+<ul><li>Six classified P cores for candidates; two E cores for offline preflight. At most three resident programs.</li>
+<li>Uniform policy: 6, 3+3 or 2+2+2 cores. Optional joint policy: also consider 2+4 and 4+2 for a pair. No extra CPU capacity is granted.</li>
+<li>Measured solo profiles at 2, 3, 4 and 6 cores. Exact matching measured co-runs take precedence; absent combinations use a declared peer-sensitivity extrapolation.</li>
+<li>A caller-supplied non-job GPU memory reservation is retained even when peak resident reservations exceed current actual allocations. The replay comparison reserves 1024 MiB in every arm and checks idle use against it before starting.</li>
+<li>Unknown-source jobs execute exclusively when selected. An unknown queue tail does not disable optimization among known arrived jobs.</li></ul>
+<h2>Queue policies and fairness</h2>
+<p>The ready pool is not a destructive FIFO pop. Up to eight resource-diverse candidates are selected from all arrived jobs, retaining the three oldest as options. A bounded rollout compares feasible sets and a wait action. If its planning budget expires, it retains the best fully evaluated alternative instead of discarding completed work and blindly falling back to FIFO.</p>
+<p>Open queues retain the default 180-second queued-age protection. An explicit finite-cohort mode may disable that age threshold, because repeatedly forcing aged heads can defeat the finite batch's makespan objective. This mode is not a fairness guarantee for an unbounded incoming stream. The finite mode still requires every declared task to complete, and does not fabricate its future features or change its arrival time.</p>
+<p>The optional arrival-aware mode keeps age protection until every declared task has actually arrived, then switches to draining the finite set. Unknown totals retain age protection. Use actual acceptance sequence numbers, not static manifest positions or precheck completion order. A strict FIFO control blocks later entries while an earlier precheck remains unresolved; the optimizing path may choose any arrived, checked job.</p>
+<h2>Integration contract</h2>
+<pre>from localml_scheduler.scheduler.arrival_order import ready_order
+from localml_scheduler.scheduler.arrival_phase import phase_controls
+
+ready_ids = ready_order(accepted_sequence, arrived_reports, active, done, fifo=False)
+# A known total is only a lifecycle declaration, not future task features.
+phase = phase_controls(len(accepted_sequence), declared_total)
+costs = Costs(independent_history, arrived_reports, joint_cpu=False, budget_guard=True)
+# remaining is estimated normalized work, not measured optimizer progress.
+# Use current actual CPU counts when integrating the service-rate estimate:
+rates, evidence = costs.rates(active_ids, actual_cpu_counts)
+
+decision = choose(
+    ready_ids, remaining, costs,
+    accepted=original_arrival_times, now=monotonic_elapsed,
+    used_mib=live_gpu_used, capacity_mib=memory_budget,
+    policy="lookahead_drain", finite_cohort=phase["finite"], max_wait=phase["max_wait"],
+    external_floor_mib=non_job_memory_reservation,
+)
+# Apply decision["cpu_counts"] to birth-verified owned process sessions.
+# Launch only decision["admit"], which is a subset of checked ready_ids.
+# Keep existing residents running; never infer an exit from a predicted finish.</pre>
+<p>Do not pass reordered launch events to the original v5.1.1 FIFO controller's <code>on_launch</code>: that controller intentionally enforces its FIFO contract. The optional ready-set path replaces admission selection for this executor and retains separate durable decisions. The replay adapter for original v5.1.1 records its unchanged FIFO behavior independently.</p>
+<h2>Optional native-budget admission guard</h2>
+<p>The preflight performance extension can attach a source-bound <code>native_training_budget</code> hint, using bounded static AST inspection without executing candidate code. This hint does not change the correctness verdict. Enable <code>Costs(..., budget_guard=True, budget_fraction=.9)</code> to reject a new co-run combination when a known member's stationary whole-program runtime forecast exceeds 90% of its inferred native training clock. Both FIFO and rollout must receive the same guard in a controlled ordering comparison.</p>
+<p>This is a conservative heuristic, not a statistically calibrated confidence bound. Whole-program runtime includes preparation and finalization whereas the native timer can cover training only. Unknown budgets do not become invented limits. A single job remains eligible to avoid a deadlock, and an existing resident is never killed, paused or declared complete by this guard. Actual epoch logs and native mid-epoch time checks must still be audited.</p>
+<h2>Optional compatible-family transfer</h2>
+<p>A separate preflight extension can estimate a source without an exact historical record when its static model family, batch, image size, precision and frozen stages match an independently measured donor. It estimates fixed overhead plus target epochs times the donor's measured per-epoch slope. It requires a complete donor CPU curve and untruncated training logs; mismatches return unknown. The current holdout removes every target-source solo and co-run record. Borrowed memory and duty are conservative heuristics, and missing target interference is explicitly extrapolated. A two-source, same-family result cannot establish prediction accuracy on arbitrary new models. The target had already been observed during earlier development; withholding its runtime records is not a blind, untouched generalization test.</p>
+<h2>Delivery validation</h2>
+<p>The GPU trials used the frozen budget-aware policy plus the recorded executor version. This delivery additionally fixes one control-only edge case: when idle and the FIFO head cannot fit memory, the FIFO reference waits rather than silently taking a later task. Forty-six portable CPU contract tests pass, including the reproduced edge case. Sixty-nine distinct unchanged FIFO/v5.1.1 CPU contracts also pass; one original training-graph capture test remains blocked by the absent A10_V5_TEST_RELEASE artifact. It is not replaced by a synthetic pass. The change was not GPU-benchmarked; a separate audit verifies that no recorded FIFO decision exercised this branch. Arrival order and arrival phase helpers are byte-identical to the respective tested executors. Original upstream files remain unchanged.</p>
+<p>Reproduction entry points and environment identities are in the results bundle under each trial's evidence directory. This repository is imported as the <code>localml_scheduler</code> package, as documented by the upstream checkout. The scheduler tests added here need pytest; source prediction, GPU execution and original candidate data require the separately recorded environment. Loading a policy does not start a worker or create a cluster job.</p>
+<h2>Evidence limits</h2>
+<p>Measured experiments replay five unchanged MLEvolve-generated Petfinder programs on an RTX 5080. A 20-job test consists of four instances of those five programs with each stream's recorded release gaps and parent-result dependency; it is not 20 unique models or a live LLM search. Historical same-source profiling costs are excluded from reported warm-run makespan and must be amortized separately. General accuracy on unseen source programs has not been established; the compatible-family holdout is a separately scoped diagnostic.</p>
+<p>Whole-program interference forecasts do not measure exact CPU/GPU phases or kernel overlap. The executor keeps native training budgets: fewer completed epochs cannot be counted as an equal-work speedup. One candidate has a timer inside its batch loop, so even a full list of printed epoch numbers is insufficient without an additional timing check. Public development RMSE and mean job completion time are reported alongside makespan; no general quality-equivalence or statistical-significance claim follows from a small timing gain.</p>
+<p>The real-program runner, frozen manifests, original logs, interrupted attempts and result plots are delivered in the separate results/source/log archive. Inputs, large working arrays, model caches and the Python environment are not included in that archive.</p>
+</html>
